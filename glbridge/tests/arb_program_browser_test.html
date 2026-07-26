@@ -3,7 +3,7 @@
 <title>ARB program browser test: running</title>
 <canvas id="v86gl_canvas" width="64" height="64"></canvas>
 <pre id="result">running</pre>
-<script src="../libglwasm/gl4es.js?v=d3d8-shutdown-clean-20260715"></script>
+<script src="../libglwasm/gl4es.js?v=d3d8-fbo-allocation-trace-v5-20260726"></script>
 <script>
 (async () => {
     "use strict";
@@ -16,17 +16,20 @@
     const GL_PROGRAM_LENGTH_ARB = 0x8627;
     const GL_PROGRAM_STRING_ARB = 0x8628;
     const GL_PROGRAM_FORMAT_ASCII_ARB = 0x8875;
-    const source = "!!ARBfp1.0\nPARAM const = {0.0, 1.0, 0.0, 1.0};\n" +
-        "TEMP foo$bar, foo_bar;\n" +
-        "MOV foo$bar, const;\n" +
-        "SWZ foo_bar, foo$bar, y, x, -z, 1;\n" +
-        "MOV result.color, foo_bar;\nEND";
+    const GL_INVALID_VALUE = 0x0501;
+    const GL_MAX_PROGRAM_NATIVE_PARAMETERS_ARB = 0x88AB;
+    const GL_MAX_PROGRAM_LOCAL_PARAMETERS_ARB = 0x88B4;
+    const GL_MAX_PROGRAM_ENV_PARAMETERS_ARB = 0x88B5;
+    const V86GL_PROGRAM_PARAMETER_ENV = 1;
+    const source = "!!ARBfp1.0\n" +
+        "PARAM edge = program.env[27];\n" +
+        "MOV result.color, edge;\nEND";
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
     const module = await createV86GL4ES({
         canvas: document.getElementById("v86gl_canvas"),
         locateFile(path) {
-            return `../libglwasm/${path}?v=d3d8-shutdown-clean-20260715`;
+            return `../libglwasm/${path}?v=d3d8-fbo-allocation-trace-v5-20260726`;
         },
     });
 
@@ -42,7 +45,43 @@
     module._v86gl_glProgramStringARB(GL_FRAGMENT_PROGRAM_ARB,
         GL_PROGRAM_FORMAT_ASCII_ARB, sourceBytes.length, sourcePtr);
 
+    const valuePtr = module._malloc(16);
+    const values = new Float32Array(module.HEAPU8.buffer, valuePtr, 4);
+    values.set([1, 0, 0, 1]);
+    module._v86gl_glProgramParameterfvARB(V86GL_PROGRAM_PARAMETER_ENV,
+        GL_FRAGMENT_PROGRAM_ARB, 27, 1, valuePtr);
+    module._v86gl_glGetProgramParameterfvARB(V86GL_PROGRAM_PARAMETER_ENV,
+        GL_FRAGMENT_PROGRAM_ARB, 27, valuePtr);
+    if (Array.from(values).join(",") !== "1,0,0,1") {
+        throw new Error(`fragment program.env[27] round-trip failed: ${Array.from(values)}`);
+    }
+
+    values.set([0, 1, 0, 1]);
+    module._v86gl_glProgramParameterfvARB(V86GL_PROGRAM_PARAMETER_ENV,
+        GL_FRAGMENT_PROGRAM_ARB, 28, 1, valuePtr);
+    const boundaryError = module._v86gl_glQueryError();
+    if (boundaryError !== GL_INVALID_VALUE) {
+        throw new Error(`program.env[28] returned 0x${boundaryError.toString(16)}, expected GL_INVALID_VALUE`);
+    }
+
     const lengthPtr = module._malloc(4);
+    const limitNames = [
+        ["env", GL_MAX_PROGRAM_ENV_PARAMETERS_ARB],
+        ["native", GL_MAX_PROGRAM_NATIVE_PARAMETERS_ARB],
+        ["local", GL_MAX_PROGRAM_LOCAL_PARAMETERS_ARB],
+    ];
+    for (const [name, pname] of limitNames) {
+        if (!module._v86gl_glGetProgramivARB(GL_FRAGMENT_PROGRAM_ARB,
+                pname, lengthPtr)) {
+            throw new Error(`fragment ${name}-parameter limit query failed`);
+        }
+        const limit = new DataView(module.HEAPU8.buffer)
+            .getInt32(lengthPtr, true);
+        if (limit !== 28) {
+            throw new Error(`fragment ${name}-parameter limit is ${limit}, expected 28`);
+        }
+    }
+    const fragmentEnvParams = 28;
     if (!module._v86gl_glGetProgramivARB(GL_FRAGMENT_PROGRAM_ARB,
             GL_PROGRAM_LENGTH_ARB, lengthPtr)) {
         throw new Error("program length query failed");
@@ -82,7 +121,8 @@
     }
 
     document.title = "ARB program browser test: PASS";
-    document.getElementById("result").textContent = `PASS ${pixel.join(",")}`;
+    document.getElementById("result").textContent =
+        `PASS env=${fragmentEnvParams} pixel=${pixel.join(",")}`;
 })().catch(error => {
     document.title = "ARB program browser test: FAIL";
     document.getElementById("result").textContent = `FAIL ${error.stack || error}`;

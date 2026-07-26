@@ -14,6 +14,7 @@ const GLFN_QUERY_UNIFORM = 213;
 const GLFN_INVALIDATE_PROGRAM_LOCATIONS = 214;
 const GLFN_COPY_TEX_SUB_IMAGE_3D = 215;
 const GLFN_QUERY_OBJECT_BATCH = 216;
+const GLFN_BLIT_FRAMEBUFFER = 217;
 const GL_TEXTURE_2D = 0x0DE1;
 const GL_TEXTURE_3D = 0x806F;
 const GL_COMPRESSED_RGB_S3TC_DXT1_EXT = 0x83F0;
@@ -112,6 +113,12 @@ function makeModule() {
         _v86gl_glInvalidateProgramLocations(program) {
             calls.push(["invalidateLocations", program]);
         },
+        _v86gl_glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1,
+                                 dstX0, dstY0, dstX1, dstY1,
+                                 mask, filter) {
+            calls.push(["blit", srcX0, srcY0, srcX1, srcY1,
+                dstX0, dstY0, dstX1, dstY1, mask, filter]);
+        },
     };
 }
 
@@ -192,6 +199,15 @@ function queryBatchPayload(names) {
     return payload;
 }
 
+function blitPayload() {
+    const payload = Buffer.alloc(40);
+    const coordinates = [-2, 3, 62, 61, 1, -4, 65, 60];
+    coordinates.forEach((value, i) => payload.writeInt32LE(value, i * 4));
+    payload.writeUInt32LE(0x4000, 32);
+    payload.writeUInt32LE(0x2600, 36);
+    return payload;
+}
+
 function main() {
     const module = makeModule();
     const bridge = makeBridge(module);
@@ -258,6 +274,7 @@ function main() {
         [0, 0x7FFFFFFF],
         [1, 0x7FFFFFFF],
     ]);
+    bridge.renderer.glCall(GLFN_BLIT_FRAMEBUFFER, blitPayload());
 
     assert.deepEqual(module.calls[0].slice(1, 7), [
         GL_TEXTURE_2D, 0, GL_COMPRESSED_RGB_S3TC_DXT1_EXT,
@@ -274,6 +291,7 @@ function main() {
         ["invalidateLocations", 77],
         ["copyVolume", GL_TEXTURE_3D, 2, 3, 4, 5, 6, 7, 8, 9],
         ["queryBatch", [301, 302, 303]],
+        ["blit", -2, 3, 62, 61, 1, -4, 65, 60, 0x4000, 0x2600],
     ]);
     console.log("v86_network_bridge_extended_features_test: ok");
 }

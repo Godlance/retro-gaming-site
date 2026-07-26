@@ -175,8 +175,10 @@ renderable (`EXT_color_buffer_float`) and linearly filterable
 (`OES_texture_float_linear`); anisotropy is exposed only when the browser's
 anisotropy extension is enabled. A missing/late renderer yields the
 conservative bridge-guaranteed profile and never enables those optional paths.
-Destroying the last WGL context invalidates the snapshot so a replacement
-canvas/context is probed again. S3TC remains advertised independently because
+Deleting the last WGL context keeps the process renderer alive because
+WineD3D uses a short-lived capability context immediately before its device
+context. The renderer and its capability snapshot are destroyed when the
+guest DLL/process unloads. S3TC remains advertised independently because
 the bridge implements DXT1/3/5 by deterministic CPU decode. Pixel-buffer
 objects likewise use guest-side storage and resolve pack/unpack offsets before
 the PCI transfer; compiled vertex arrays are a safe performance hint, and the
@@ -219,6 +221,13 @@ texture stand-ins are also rebound per target and texture unit before texture
 parameter updates and after deleting a bound texture. `GL_ARB_imaging` remains
 outside the advertised profile.
 
+The gl4es build and proxy both expose 28 fragment-program ENV/LOCAL/NATIVE
+parameters. WineD3D 1.7.52's fixed-function ARBfp replacement uses
+`program.env[27]`; the previous ARB minimum of 24 let WineD3D write four bytes
+past its `pshader_const_dirty` allocation and later crash in
+`IDirect3DDevice8::Release()`. The value 28 covers that internal layout without
+moving WineD3D to its `ps_consts >= 32` Pixel Shader 2 capability branch.
+
 ## Build the DLL
 
 From Linux/macOS with mingw-w64:
@@ -236,6 +245,15 @@ application. Its WDK build and installation steps are in
 `../v86gl_driver/README.md`.
 
 Build the test programs:
+
+To build all D3D8 stages and reject accidental MSVCRT/UCRT imports in one
+step, run this from the repository root:
+
+```bash
+./glbridge/sample/build_d3d8_samples.sh /private/tmp/v86gl-d3d8-tests
+```
+
+The equivalent individual commands are listed below.
 
 ```bash
 cd src/glbridge/sample
@@ -435,6 +453,32 @@ prefixed with `[d3d8-triangle]`, and every newly exercised D3D8 call reports
 its HRESULT independently. Before each call, the window title is changed to
 `D3D8 triangle: calling NN API-name`; if WineD3D blocks, the title therefore
 identifies the exact call that did not return.
+
+When this proxy is installed, the sample also resolves the optional
+`v86glTraceCheckpoint` export dynamically. It synchronously sends every
+CALLING/RETURNED/PASS/FAIL record through PCI without adding a static
+`opengl32.dll` import. The browser console therefore reports the exact boundary
+even when WineD3D blocks or Chrome has stopped printing ordinary WebGL errors:
+
+```text
+[v86gl:guest-test] CALLING 0x00000000 20 DrawPrimitive
+[v86gl:guest-test] FAIL 0x8876086C DrawPrimitive
+```
+
+The proxy independently emits a profile checkpoint such as
+`TEXT ... opengl32 proxy trace-v10 gpu=svga3d arb-frag-params=28 caps=wined3d-gl15 no-fbo no-shaders` on its
+first successful `wglMakeCurrent`, and the sample emits
+`TEXT ... d3d8_triangle_test trace-v9-fbo-allocation-20260726`. Missing one of
+these lines identifies which guest artifact is stale. If the export cannot be
+resolved or its PCI send fails, the sample keeps retrying and adds
+`[TRACE EXPORT MISSING]` or `[TRACE SEND FAILED]` to the window title.
+
+After a successful Present, closing the sample emits distinct checkpoints for
+`23 VertexBuffer::Release`, `24 Device::Release`, `25 Direct3D8::Release`,
+`26 teardown complete`, and `27 ExitProcess`. This prevents an exception during
+WineD3D cleanup from being misreported as a failure in the already-completed
+Present call. The proxy additionally traces post-PASS ARB program deletion and
+WGL context release/deletion boundaries.
 
 After the coloured triangle succeeds, run `d3d8_texture_test.exe`. It adds a
 single-level 64x64 managed `D3DFMT_A8R8G8B8` texture and exercises:
@@ -837,6 +881,79 @@ It executes the descriptor command stream directly and renders it into the
 WebGL canvas. Create the emulator with `v86gl_pci` enabled and set
 `net_device.type` to `"none"` when no guest networking is required.
 
+The existing PRESENT descriptor flag is the complete PCI contract. The driver
+doorbell and `v86gl-pci-frame` listener are synchronous, but
+`emscripten_webgl_commit_frame()` returning does not prove that the browser
+compositor has displayed the canvas. `reserved0` therefore remains reserved;
+there is no PCI "Present completion" status.
+
+### WineD3D capability profiles
+
+The WebGL2/gl4es implementation and the OpenGL contract advertised to a guest
+are intentionally separate. WineD3D 1.7.52 selects both its shader backend and
+offscreen swapchain path from `GL_VERSION` plus `GL_EXTENSIONS`. The full FBO
+profiles now include `GL_EXT_framebuffer_blit`: READ and DRAW bindings travel
+independently through command 217, and the WASM bridge uses WebGL2's native
+framebuffer blit for WineD3D Present.
+
+WineD3D also selects `GL_COLOR_ATTACHMENT0` as the read buffer and `GL_BACK`
+as the default draw buffer around that blit. The desktop `glReadBuffer()` and
+single-target `glDrawBuffer()` entry points are stubs in gl4es, so the WASM
+bridge forwards them directly to WebGL2. Present blits log both FBO bindings,
+their status, and source/destination center pixels under `[v86gl:fbo-blit]`.
+The guest bridge also records each FBO's texture/renderbuffer attachments.
+`[v86gl:fbo-source-pair]` compares the WebGL attachment object, mip level,
+cube face, layer, and center pixel selected by Present against the framebuffer
+that most recently received a draw. This diagnostic is read-only; it never
+substitutes the last drawn framebuffer when WineD3D selects a different black
+surface.
+
+The allocation trace additionally records each attached guest texture or
+renderbuffer's original `internalformat`, external `format`, `type`, and
+dimensions. `[v86gl:fbo-cap]` reports synchronous FBO status for WineD3D's
+common RGB8, RGBA8, RGB5, and RGB565 capability probes. The triangle sample
+reports its actual `D3DDISPLAYMODE` after `GetAdapterDisplayMode()`. Together
+these distinguish a genuine format-classification failure from a later
+renderbuffer-to-texture location synchronization failure.
+
+`GL_VENDOR` and `GL_RENDERER` identify the bridge as
+`VMware, Inc. / SVGA3D; v86 WebGL2 bridge`. WineD3D 1.7.52 maps these strings
+to its virtual SVGA3D adapter. Do not replace them with an unknown private
+vendor string: WineD3D maps unknown vendors to NVIDIA, and its GL 2.1 /
+shader-model-2 fallback selects a GeForce FX 5800. That triggers WineD3D's
+GeForce 5 NPOT-disable quirk even though this WebGL2 bridge implements and
+advertises full NPOT textures. A 640x480 FBO backbuffer then falls through to
+a renderbuffer and leaves the texture read by the non-MSAA Present path stale.
+
+By default, a process with `wined3d.dll` loaded receives `GL 1.5`, no GLSL/ARB
+program extensions, and no FBO extension. Native OpenGL processes continue to
+receive the OpenGL 2.1 profile. Set `V86GL_CAPS_PROFILE` before launching a
+guest program to override the automatic choice:
+
+```bat
+set V86GL_CAPS_PROFILE=gl15
+d3d8_triangle_test.exe
+
+set V86GL_CAPS_PROFILE=gl15-arb
+d3d8_triangle_test.exe
+
+set V86GL_CAPS_PROFILE=gl21-no-fbo
+d3d8_triangle_test.exe
+
+set V86GL_CAPS_PROFILE=gl21-fbo-ffp
+d3d8_triangle_test.exe
+
+set V86GL_CAPS_PROFILE=gl21
+d3d8_triangle_test.exe
+```
+
+Use `gl15` for the fixed-function/backbuffer smoke test, `gl15-arb` to add the
+WineD3D ARB vertex/fragment program backend without enabling FBO,
+`gl21-no-fbo` to keep OpenGL 2.1 + GLSL 1.20 while forcing WineD3D's backbuffer
+path, `gl21-fbo-ffp` to keep GLSL + FBO + framebuffer blit while hiding ARB
+assembly programs, and `gl21` for the full GLSL + FBO + ARB-program profile.
+The first proxy checkpoint records the selected profile.
+
 For a host-only smoke test, open:
 
 ```text
@@ -852,6 +969,6 @@ configuration.
   BAR at that address until the driver is upgraded to use PnP PCI resources.
 - The fixed-pipeline matrix stack, depth test, shading mode, face-culling, blending/alpha/scissor state, 1D/2D/3D and compressed textures, multitexture, lighting, and client arrays above are forwarded to gl4es. It is still not a WineD3D implementation and does not provide OpenGL 1.5+ programmable-pipeline compatibility.
 - `glReadPixels` performs a synchronous PCI DMA readback. The host writes the result into the response area of the submitted guest-RAM command record before the IOCTL returns. It currently requires the browser-side gl4es renderer to be ready and supports the pixel formats accepted by the proxy's pack-state validation.
-- `SwapBuffers` is exported by `gdi32.dll`, not `opengl32.dll`; normal apps that import `SwapBuffers` from `gdi32.dll` are not intercepted by this DLL. This toy bridge presents on `glFlush`, `glFinish`, `wglSwapLayerBuffers`, and the nonstandard helper export `wglSwapBuffers`.
+- `SwapBuffers` is exported by `gdi32.dll`, not `opengl32.dll`; normal apps that import it directly are not intercepted by this DLL. WineD3D 1.7.52 deliberately resolves the nonstandard `opengl32.dll!wglSwapBuffers` helper with `GetProcAddress()`, so its D3D8 Present path is intercepted. `glFlush` and `glFinish` only flush/complete the offscreen back buffer and do not expose it; `wglSwapLayerBuffers` and `wglSwapBuffers` are the explicit presentation boundaries.
 - The driver exposes one shared buffer, so only one guest process can own the
   transport at a time.

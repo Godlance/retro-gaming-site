@@ -35,6 +35,7 @@ EXPORTS
     wglGetSwapIntervalEXT@0
     wglAddSwapHintRectWIN@16
     glAddSwapHintRectWIN@16
+    v86glTraceCheckpoint@12
 
     glGetString@4
     glGetError@0
@@ -705,6 +706,9 @@ EXPORTS
     glBindFramebuffer@8
     glCheckFramebufferStatusEXT@4
     glCheckFramebufferStatus@4
+    ; GL_EXT_framebuffer_blit.
+    glBlitFramebufferEXT@40
+    glBlitFramebuffer@40
     glDeleteFramebuffersEXT@8
     glDeleteFramebuffers@8
     glFramebufferRenderbufferEXT@16

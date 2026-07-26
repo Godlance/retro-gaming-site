@@ -137,6 +137,7 @@ function makeModule(name, modules) {
         },
         _v86glPresent() {
             calls.push(["present"]);
+            return 1;
         },
     };
     modules.push(module);
@@ -306,6 +307,7 @@ async function main() {
                      Array.from(finalImagePixels));
 
     bridge.destroyContext();
+    await bridge.contextRebuildPromise;
     assert.equal(bridge.stateJournal.length, 0,
                  "destroying the live context must not retain deleted resources");
     const moduleCountAfterDestroy = modules.length;

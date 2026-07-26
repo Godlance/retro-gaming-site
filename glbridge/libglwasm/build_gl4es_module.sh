@@ -228,6 +228,7 @@ emcc gl4es_bridge.c \
     "_v86gl_glDeleteFramebuffersMapped",
     "_v86gl_glBindFramebufferMapped",
     "_v86gl_glCheckFramebufferStatusMapped",
+    "_v86gl_glBlitFramebuffer",
     "_v86gl_glFramebufferTextureMapped",
     "_v86gl_glFramebufferRenderbufferMapped",
     "_v86gl_glGenRenderbuffersMapped",

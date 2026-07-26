@@ -2,6 +2,7 @@
 // Keep these names stable; the browser bridge calls v86gl_gl* functions.
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,15 @@
 #include <gl4eshint.h>
 #include "gl/init.h"
 #include "glx/hardext.h"
+
+/* Internal gl4es CPU pixel conversion is linked from libGL.a.  Declare the
+ * narrow interface here instead of including gles.h through pixel.h, which
+ * redefines public GL constants already supplied by GL/gl.h. */
+extern bool pixel_convert(const GLvoid* src, GLvoid** dst,
+                          GLuint width, GLuint height,
+                          GLenum src_format, GLenum src_type,
+                          GLenum dst_format, GLenum dst_type,
+                          GLuint stride, GLuint align);
 
 #ifdef __EMSCRIPTEN__
 extern void emscripten_glUniformMatrix2x3fv(GLint location, GLsizei count,
@@ -62,6 +72,9 @@ extern void emscripten_glCopyTexSubImage3D(GLenum target, GLint level,
                                            GLint xoffset, GLint yoffset,
                                            GLint zoffset, GLint x, GLint y,
                                            GLsizei width, GLsizei height);
+extern void emscripten_glReadPixels(GLint x, GLint y, GLsizei width,
+                                   GLsizei height, GLenum format, GLenum type,
+                                   void* pixels);
 extern void emscripten_glPixelStorei(GLenum pname, GLint param);
 extern void emscripten_glTexParameteri(GLenum target, GLenum pname,
                                       GLint param);
@@ -78,6 +91,15 @@ extern void emscripten_glFramebufferRenderbuffer(GLenum target, GLenum attachmen
                                                  GLuint renderbuffer);
 extern void emscripten_glRenderbufferStorage(GLenum target, GLenum internalformat,
                                              GLsizei width, GLsizei height);
+extern void emscripten_glBindFramebuffer(GLenum target, GLuint framebuffer);
+extern GLenum emscripten_glCheckFramebufferStatus(GLenum target);
+extern void emscripten_glReadBuffer(GLenum mode);
+extern void emscripten_glDrawBuffers(GLsizei n, const GLenum* bufs);
+extern void emscripten_glBlitFramebuffer(GLint srcX0, GLint srcY0,
+                                         GLint srcX1, GLint srcY1,
+                                         GLint dstX0, GLint dstY0,
+                                         GLint dstX1, GLint dstY1,
+                                         GLbitfield mask, GLenum filter);
 #endif
 
 extern void glActiveTexture(GLenum texture);
@@ -245,6 +267,11 @@ extern void glGenFramebuffers(GLsizei n, GLuint* framebuffers);
 extern void glDeleteFramebuffers(GLsizei n, const GLuint* framebuffers);
 extern void glBindFramebuffer(GLenum target, GLuint framebuffer);
 extern GLenum glCheckFramebufferStatus(GLenum target);
+extern void glBlitFramebuffer(GLint srcX0, GLint srcY0,
+                              GLint srcX1, GLint srcY1,
+                              GLint dstX0, GLint dstY0,
+                              GLint dstX1, GLint dstY1,
+                              GLbitfield mask, GLenum filter);
 extern void glFramebufferTexture1D(GLenum target, GLenum attachment,
                                    GLenum textarget, GLuint texture, GLint level);
 extern void glFramebufferTexture2D(GLenum target, GLenum attachment,
@@ -391,6 +418,11 @@ extern void gl4es_glProgramLocalParameters4fvEXT(GLenum target, GLuint index,
 #define GL_UNPACK_SKIP_IMAGES 0x806D
 #define GL_UNPACK_IMAGE_HEIGHT 0x806E
 #endif
+#ifndef GL_PACK_ROW_LENGTH
+#define GL_PACK_ROW_LENGTH 0x0D02
+#define GL_PACK_SKIP_ROWS 0x0D03
+#define GL_PACK_SKIP_PIXELS 0x0D04
+#endif
 
 static int32_t g_surface_x;
 static int32_t g_surface_y;
@@ -405,6 +437,10 @@ static GLint g_unpack_skip_rows;
 static GLint g_unpack_skip_pixels;
 static GLint g_unpack_image_height;
 static GLint g_unpack_skip_images;
+static GLint g_pack_alignment = 4;
+static GLint g_pack_row_length;
+static GLint g_pack_skip_rows;
+static GLint g_pack_skip_pixels;
 
 typedef struct {
     GLint alignment;
@@ -869,6 +905,30 @@ EM_JS(void, v86gl_install_webgl2_volume_compat, (), {
         return state.rawGenerateMipmap(target);
     };
     ctx.shaderSource = function(shader, source) {
+        /* Desktop GLSL 1.20 permits gl_FragData[0] with the draw-buffers
+         * extension. WineD3D 1.7.x uses exactly index zero for its FBO
+         * capability probe. Emscripten feeds this hook either GLSL ES 1.00 or
+         * 3.00 source, so lower the equivalent spelling to the output form for
+         * that version. Non-zero or dynamic indices remain untouched, so we
+         * do not accidentally advertise MRT support. */
+        if (typeof source === "string" &&
+                /\\bgl_FragData\\s*\\[\\s*0\\s*\\]/.test(source)) {
+            if (/^\\s*#version\\s+300\\s+es\\b/m.test(source)) {
+                const outputName = "_v86gl_FragData0";
+                source = source.replace(
+                    /\\bgl_FragData\\s*\\[\\s*0\\s*\\]/g,
+                    outputName);
+                source = source.replace(
+                    /\\bvoid\\s+main\\b/,
+                    "layout(location = 0) out vec4 " + outputName +
+                        ";\\n$&");
+            } else {
+                source = source.replace(
+                    /\\bgl_FragData\\s*\\[\\s*0\\s*\\]/g,
+                    "gl_FragColor");
+            }
+        }
+
         /* gl4es's GLES2 shader converter historically lowers the 3D ARB
          * sampler name to sampler2D. Emscripten then correctly rewrites
          * texture3D() to texture(), but the sampler/vec3 pair no longer has
@@ -948,6 +1008,193 @@ EM_JS(int, v86gl_configure_offscreen_depth_stencil, (), {
     return complete ? 1 : 0;
 });
 
+/* Observe the framebuffer at the actual draw boundary.  The WineD3D triangle
+ * covers the viewport centre, so one synchronous pixel is enough to
+ * distinguish a shader/vertex failure from a later Present failure.  Use the
+ * raw WebGL object currently bound for drawing instead of trusting either
+ * gl4es' desktop shadow state or the guest-side FBO name. */
+EM_JS(void, v86gl_trace_draw_framebuffer,
+      (GLuint expected_framebuffer, GLenum mode, GLsizei count), {
+    const gl = GLctx;
+    if (!gl || !expected_framebuffer) return;
+
+    const viewport = gl.getParameter(gl.VIEWPORT);
+    if (!viewport || viewport[2] < 256 || viewport[3] < 192) return;
+
+    const traceCount = (gl.__v86glLargeFboDrawTraceCount || 0) + 1;
+    gl.__v86glLargeFboDrawTraceCount = traceCount;
+    if (traceCount > 16) return;
+
+    const expectedObject = GL.framebuffers[expected_framebuffer];
+    const drawObject = gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING);
+    const previousReadObject = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING);
+    const pixel = new Uint8Array(4);
+    let status = 0;
+    let readBuffer = gl.NONE;
+    let sampleBuffer = gl.NONE;
+    let sampled = false;
+
+    try {
+        if (drawObject) {
+            gl.bindFramebuffer(gl.READ_FRAMEBUFFER, drawObject);
+            status = gl.checkFramebufferStatus(gl.READ_FRAMEBUFFER);
+            readBuffer = gl.getParameter(gl.READ_BUFFER);
+            sampleBuffer = readBuffer;
+            if (sampleBuffer === gl.NONE) {
+                sampleBuffer = gl.COLOR_ATTACHMENT0;
+                gl.readBuffer(sampleBuffer);
+            }
+            if (status === gl.FRAMEBUFFER_COMPLETE) {
+                const x = viewport[0] + (viewport[2] >> 1);
+                const y = viewport[1] + (viewport[3] >> 1);
+                gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+                sampled = true;
+            }
+            if (sampleBuffer !== readBuffer) {
+                gl.readBuffer(readBuffer);
+            }
+        }
+    } finally {
+        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, previousReadObject);
+    }
+
+    console.info("[v86gl:fbo-draw] host " + JSON.stringify({
+        count: traceCount,
+        expectedFramebuffer: expected_framebuffer >>> 0,
+        bindingMatches: !!expectedObject && drawObject === expectedObject,
+        mode: "0x" + (mode >>> 0).toString(16),
+        vertexCount: count | 0,
+        viewport: Array.from(viewport),
+        status: "0x" + (status >>> 0).toString(16),
+        readBuffer: "0x" + (readBuffer >>> 0).toString(16),
+        sampleBuffer: "0x" + (sampleBuffer >>> 0).toString(16),
+        sampled,
+        center: Array.from(pixel),
+    }));
+});
+
+/* Compare the colour source WineD3D selected for Present with the framebuffer
+ * that most recently received a draw.  A complete but black Present source can
+ * otherwise look like a shader or blit failure.  Attachment object identity,
+ * mip level, cube face and array/3D layer distinguish a genuine shared surface
+ * from two independent WineD3D surface locations. */
+EM_JS(void, v86gl_trace_present_source_pair,
+      (GLuint requested_framebuffer, GLuint last_draw_framebuffer,
+       GLint sample_x, GLint sample_y), {
+    const gl = GLctx;
+    if (!gl || !requested_framebuffer || !last_draw_framebuffer) return;
+
+    const requestedObject = GL.framebuffers[requested_framebuffer];
+    const lastDrawObject = GL.framebuffers[last_draw_framebuffer];
+    if (!requestedObject || !lastDrawObject) return;
+
+    const previousReadObject = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING);
+
+    function mappedObjectName(type, object) {
+        if (!object) return 0;
+        if (type === gl.TEXTURE && GL.textures) {
+            return GL.textures.indexOf(object);
+        }
+        if (type === gl.RENDERBUFFER && GL.renderbuffers) {
+            return GL.renderbuffers.indexOf(object);
+        }
+        return -1;
+    }
+
+    function inspect(framebuffer, object) {
+        const result = {
+            framebuffer: framebuffer >>> 0,
+            status: "0x0",
+            readBuffer: "0x0",
+            sampleBuffer: "0x0",
+            attachmentType: "0x0",
+            attachmentObject: 0,
+            textureLevel: 0,
+            cubeMapFace: "0x0",
+            textureLayer: 0,
+            sampled: false,
+            center: [0, 0, 0, 0],
+        };
+        const pixel = new Uint8Array(4);
+        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, object);
+        const status = gl.checkFramebufferStatus(gl.READ_FRAMEBUFFER);
+        const originalReadBuffer = gl.getParameter(gl.READ_BUFFER);
+        let sampleBuffer = originalReadBuffer;
+        let attachmentObject = null;
+        let attachmentType = gl.NONE;
+        result.status = "0x" + (status >>> 0).toString(16);
+        result.readBuffer =
+            "0x" + (originalReadBuffer >>> 0).toString(16);
+        if (sampleBuffer === gl.NONE) {
+            sampleBuffer = gl.COLOR_ATTACHMENT0;
+            gl.readBuffer(sampleBuffer);
+        }
+        result.sampleBuffer =
+            "0x" + (sampleBuffer >>> 0).toString(16);
+        if (status === gl.FRAMEBUFFER_COMPLETE) {
+            attachmentType = gl.getFramebufferAttachmentParameter(
+                gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+                gl.FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE);
+            attachmentObject = gl.getFramebufferAttachmentParameter(
+                gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+                gl.FRAMEBUFFER_ATTACHMENT_OBJECT_NAME);
+            result.attachmentType =
+                "0x" + (attachmentType >>> 0).toString(16);
+            result.attachmentObject =
+                mappedObjectName(attachmentType, attachmentObject);
+            if (attachmentType === gl.TEXTURE) {
+                result.textureLevel =
+                    gl.getFramebufferAttachmentParameter(
+                        gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+                        gl.FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL) | 0;
+                result.cubeMapFace = "0x" +
+                    (gl.getFramebufferAttachmentParameter(
+                        gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+                        gl.FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE) >>> 0)
+                        .toString(16);
+                result.textureLayer =
+                    gl.getFramebufferAttachmentParameter(
+                        gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+                        gl.FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER) | 0;
+            }
+            gl.readPixels(sample_x, sample_y, 1, 1,
+                          gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+            result.sampled = true;
+            result.center = Array.from(pixel);
+        }
+        if (sampleBuffer !== originalReadBuffer) {
+            gl.readBuffer(originalReadBuffer);
+        }
+        result.rawAttachmentObject = attachmentObject;
+        return result;
+    }
+
+    let requested;
+    let lastDraw;
+    try {
+        requested = inspect(requested_framebuffer, requestedObject);
+        lastDraw = inspect(last_draw_framebuffer, lastDrawObject);
+    } finally {
+        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, previousReadObject);
+    }
+
+    const sameAttachmentObject =
+        requested.rawAttachmentObject === lastDraw.rawAttachmentObject &&
+        !!requested.rawAttachmentObject;
+    delete requested.rawAttachmentObject;
+    delete lastDraw.rawAttachmentObject;
+    console.info("[v86gl:fbo-source-pair] host " + JSON.stringify({
+        requestedFramebuffer: requested_framebuffer >>> 0,
+        lastDrawFramebuffer: last_draw_framebuffer >>> 0,
+        sameFramebuffer:
+            (requested_framebuffer >>> 0) ===
+            (last_draw_framebuffer >>> 0),
+        sameAttachmentObject,
+        requested,
+        lastDraw,
+    }));
+});
+
 EM_JS(void, v86gl_prepare_webgl2_volume_texture, (GLuint texture, GLuint unit), {
     const ctx = GLctx;
     const state = ctx && ctx.__v86glVolumeCompat;
@@ -958,6 +1205,71 @@ EM_JS(void, v86gl_prepare_webgl2_volume_texture, (GLuint texture, GLuint unit), 
     state.redirected[unit] = true;
     state.rawActiveTexture(ctx.TEXTURE0 + unit);
     state.rawBindTexture(ctx.TEXTURE_3D, object);
+});
+
+/* gl4es deliberately defers some desktop texture binds until an operation
+ * needs the object.  The mapped FBO path below bypasses gl4es and calls WebGL
+ * directly, where a WebGLTexture must already have been bound once to its
+ * target.  Temporarily bind the mapped object with the raw WebGL entry point
+ * and restore both the previous binding and active unit.  Target assignment
+ * persists, while gl4es's deferred binding bookkeeping remains untouched. */
+EM_JS(int, v86gl_initialize_webgl_texture_target,
+      (GLuint texture, GLenum guest_target, GLuint unit), {
+    const ctx = GLctx;
+    const object = ctx && GL.textures[texture];
+    const compat = ctx && ctx.__v86glVolumeCompat;
+    if (!ctx || !object) return 0;
+
+    let target;
+    let binding;
+    switch (guest_target) {
+    case 0x0de0: /* GL_TEXTURE_1D */
+    case 0x0de1: /* GL_TEXTURE_2D */
+    case 0x84f5: /* GL_TEXTURE_RECTANGLE_ARB */
+        target = ctx.TEXTURE_2D;
+        binding = ctx.TEXTURE_BINDING_2D;
+        break;
+    case 0x8513: /* GL_TEXTURE_CUBE_MAP */
+    case 0x8515: /* GL_TEXTURE_CUBE_MAP_POSITIVE_X */
+    case 0x8516: /* GL_TEXTURE_CUBE_MAP_NEGATIVE_X */
+    case 0x8517: /* GL_TEXTURE_CUBE_MAP_POSITIVE_Y */
+    case 0x8518: /* GL_TEXTURE_CUBE_MAP_NEGATIVE_Y */
+    case 0x8519: /* GL_TEXTURE_CUBE_MAP_POSITIVE_Z */
+    case 0x851a: /* GL_TEXTURE_CUBE_MAP_NEGATIVE_Z */
+        target = ctx.TEXTURE_CUBE_MAP;
+        binding = ctx.TEXTURE_BINDING_CUBE_MAP;
+        break;
+    case 0x806f: /* GL_TEXTURE_3D */
+        target = ctx.TEXTURE_3D;
+        binding = ctx.TEXTURE_BINDING_3D;
+        break;
+    default:
+        return 0;
+    }
+
+    const rawActive = compat ? compat.rawActiveTexture :
+        ctx.activeTexture.bind(ctx);
+    const rawBind = compat ? compat.rawBindTexture :
+        ctx.bindTexture.bind(ctx);
+    const previousActive = ctx.getParameter(ctx.ACTIVE_TEXTURE);
+    let previousBinding = null;
+    let selectedUnit = false;
+    let initialized = false;
+    try {
+        rawActive(ctx.TEXTURE0 + unit);
+        selectedUnit = true;
+        previousBinding = ctx.getParameter(binding);
+        rawBind(target, object);
+        initialized = true;
+    } catch (_err) {
+        initialized = false;
+    } finally {
+        if (selectedUnit) {
+            try { rawBind(target, previousBinding); } catch (_err) {}
+            try { rawActive(previousActive); } catch (_err) {}
+        }
+    }
+    return initialized ? 1 : 0;
 });
 #endif
 
@@ -1019,6 +1331,9 @@ static V86GLNameMap g_shaders[V86GL_MAX_SHADERS];
 static uint32_t g_shader_count;
 static V86GLNameMap g_framebuffers[V86GL_MAX_FRAMEBUFFERS];
 static uint32_t g_framebuffer_count;
+static GLuint g_bound_read_framebuffer_host;
+static GLuint g_bound_draw_framebuffer_host;
+static GLuint g_last_draw_framebuffer_host;
 static V86GLNameMap g_renderbuffers[V86GL_MAX_RENDERBUFFERS];
 static uint32_t g_renderbuffer_count;
 static V86GLNameMap g_queries[V86GL_MAX_QUERIES];
@@ -1674,6 +1989,9 @@ static void v86gl_reset_gl2_maps(void) {
     g_attrib_locations = NULL;
     g_attrib_location_capacity = 0;
     g_framebuffer_count = 0;
+    g_bound_read_framebuffer_host = 0;
+    g_bound_draw_framebuffer_host = 0;
+    g_last_draw_framebuffer_host = 0;
     g_renderbuffer_count = 0;
     g_query_count = 0;
     g_buffer_count = 0;
@@ -1828,6 +2146,11 @@ EMSCRIPTEN_KEEPALIVE
 void v86gl_glClear(GLbitfield mask) {
     if (!v86gl_ensure_ready()) return;
     glClear(mask);
+#ifdef __EMSCRIPTEN__
+    if (mask & GL_COLOR_BUFFER_BIT) {
+        g_last_draw_framebuffer_host = g_bound_draw_framebuffer_host;
+    }
+#endif
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -1867,9 +2190,10 @@ void v86gl_glFlush(void) {
 }
 
 EMSCRIPTEN_KEEPALIVE
-void v86gl_glFinish(void) {
-    if (!v86gl_ensure_ready()) return;
+int v86gl_glFinish(void) {
+    if (!v86gl_ensure_ready()) return 0;
     glFinish();
+    return 1;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -2051,19 +2375,159 @@ void v86gl_glPopClientAttrib(void) {
 EMSCRIPTEN_KEEPALIVE
 void v86gl_glDrawBuffer(GLenum mode) {
     if (!v86gl_ensure_ready()) return;
+#ifdef __EMSCRIPTEN__
+    if (!g_bound_draw_framebuffer_host) {
+        switch (mode) {
+        case GL_FRONT:
+        case GL_FRONT_LEFT:
+        case GL_FRONT_RIGHT:
+        case GL_BACK:
+        case GL_BACK_LEFT:
+        case GL_BACK_RIGHT:
+        case GL_LEFT:
+        case GL_RIGHT:
+        case GL_FRONT_AND_BACK:
+            mode = GL_BACK;
+            break;
+        default:
+            break;
+        }
+    }
+    /* glDrawBuffer is a desktop-only entry point and is an intentional no-op
+     * stub in gl4es.  WineD3D uses it to select the destination attachment
+     * before rendering and again to select GL_BACK before Present. */
+    emscripten_glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
+                                 g_bound_draw_framebuffer_host);
+    emscripten_glDrawBuffers(1, &mode);
+#else
     glDrawBuffer(mode);
+#endif
 }
 
 EMSCRIPTEN_KEEPALIVE
 void v86gl_glReadBuffer(GLenum mode) {
     if (!v86gl_ensure_ready()) return;
+#ifdef __EMSCRIPTEN__
+    if (!g_bound_read_framebuffer_host) {
+        switch (mode) {
+        case GL_FRONT:
+        case GL_FRONT_LEFT:
+        case GL_FRONT_RIGHT:
+        case GL_BACK:
+        case GL_BACK_LEFT:
+        case GL_BACK_RIGHT:
+        case GL_LEFT:
+        case GL_RIGHT:
+            mode = GL_BACK;
+            break;
+        default:
+            break;
+        }
+    }
+    /* Like glDrawBuffer above, gl4es' desktop glReadBuffer is a no-op stub.
+     * WebGL2 exposes the required state natively. */
+    emscripten_glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                                 g_bound_read_framebuffer_host);
+    emscripten_glReadBuffer(mode);
+#else
     glReadBuffer(mode);
+#endif
+}
+
+static int v86gl_color_readback_info(GLenum format, GLenum type,
+                                     uint32_t* pixel_bytes,
+                                     GLenum* conversion_type,
+                                     int* reverse_16bit_fields) {
+    *reverse_16bit_fields = 0;
+    *conversion_type = type;
+
+    switch (format) {
+    case GL_RED:
+    case GL_ALPHA:
+    case GL_LUMINANCE:
+        if (type == GL_UNSIGNED_BYTE) {
+            *pixel_bytes = 1;
+            return 1;
+        }
+        return 0;
+    case GL_RG:
+    case GL_LUMINANCE_ALPHA:
+        if (type == GL_UNSIGNED_BYTE) {
+            *pixel_bytes = 2;
+            return 1;
+        }
+        return 0;
+    case GL_RGB:
+    case GL_BGR:
+        if (type == GL_UNSIGNED_BYTE) {
+            *pixel_bytes = 3;
+            return 1;
+        }
+        if (type == GL_UNSIGNED_SHORT_5_6_5) {
+            *pixel_bytes = 2;
+            return 1;
+        }
+        if (type == GL_UNSIGNED_SHORT_5_6_5_REV) {
+            *pixel_bytes = 2;
+            *conversion_type = GL_UNSIGNED_SHORT_5_6_5;
+            *reverse_16bit_fields = 565;
+            return 1;
+        }
+        return 0;
+    case GL_RGBA:
+    case GL_BGRA:
+        if (type == GL_UNSIGNED_BYTE ||
+                type == GL_UNSIGNED_INT_8_8_8_8 ||
+                type == GL_UNSIGNED_INT_8_8_8_8_REV) {
+            *pixel_bytes = 4;
+            return 1;
+        }
+        if (type == GL_UNSIGNED_SHORT_4_4_4_4 ||
+                type == GL_UNSIGNED_SHORT_5_5_5_1 ||
+                type == GL_UNSIGNED_SHORT_1_5_5_5_REV) {
+            *pixel_bytes = 2;
+            return 1;
+        }
+        if (type == GL_UNSIGNED_SHORT_4_4_4_4_REV) {
+            *pixel_bytes = 2;
+            *conversion_type = GL_UNSIGNED_SHORT_4_4_4_4;
+            *reverse_16bit_fields = 4444;
+            return 1;
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static void v86gl_reverse_packed_16bit_fields(void* pixels,
+                                              uint64_t pixel_count,
+                                              int layout) {
+    uint16_t* packed = (uint16_t*)pixels;
+    uint64_t index;
+
+    for (index = 0; index < pixel_count; index++) {
+        uint16_t value = packed[index];
+        if (layout == 565) {
+            packed[index] = (uint16_t)((value & 0x07e0u) |
+                    ((value & 0xf800u) >> 11) |
+                    ((value & 0x001fu) << 11));
+        } else {
+            packed[index] = (uint16_t)(((value & 0xf000u) >> 12) |
+                    ((value & 0x0f00u) >> 4) |
+                    ((value & 0x00f0u) << 4) |
+                    ((value & 0x000fu) << 12));
+        }
+    }
 }
 
 EMSCRIPTEN_KEEPALIVE
 int v86gl_glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height,
                        GLenum format, GLenum type, void* pixels) {
     unsigned int pending_errors;
+    uint32_t pixel_bytes;
+    GLenum conversion_type;
+    int reverse_16bit_fields;
 
     if (!pixels || width < 0 || height < 0 || !v86gl_ensure_ready()) {
         return 0;
@@ -2077,6 +2541,122 @@ int v86gl_glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height,
     for (pending_errors = 0; pending_errors < 16; pending_errors++) {
         if (glGetError() == GL_NO_ERROR) break;
     }
+
+    /* WebGL2 framebuffer readback only guarantees RGBA/UNSIGNED_BYTE for a
+     * normalized colour attachment. WineD3D probes several desktop packed
+     * tuples that WebGL rejects even though gl4es advertises them. Read the
+     * one portable native tuple, convert in Wasm, then apply the desktop PACK
+     * layout ourselves. Depth/stencil and unsupported colour tuples keep the
+     * gl4es fallback below so their validation and error behaviour is not
+     * changed here. */
+    if (v86gl_color_readback_info(format, type, &pixel_bytes,
+                                  &conversion_type,
+                                  &reverse_16bit_fields)) {
+        uint64_t tight_size = (uint64_t)(uint32_t)width *
+                (uint32_t)height * 4u;
+        uint64_t converted_size = (uint64_t)(uint32_t)width *
+                (uint32_t)height * pixel_bytes;
+        uint64_t row_pixels;
+        uint64_t row_bytes;
+        uint64_t row_stride;
+        uint64_t offset;
+        uint64_t destination_end;
+        uint8_t* tight;
+        void* converted = NULL;
+        uint32_t row;
+        GLenum error;
+
+        if (width == 0 || height == 0) {
+            return 1;
+        }
+        if ((g_pack_alignment != 1 && g_pack_alignment != 2 &&
+             g_pack_alignment != 4 && g_pack_alignment != 8) ||
+                g_pack_row_length < 0 || g_pack_skip_rows < 0 ||
+                g_pack_skip_pixels < 0 || tight_size > UINT32_MAX ||
+                converted_size > UINT32_MAX) {
+            return 0;
+        }
+
+        row_pixels = g_pack_row_length > 0
+                ? (uint32_t)g_pack_row_length : (uint32_t)width;
+        row_bytes = row_pixels * pixel_bytes;
+        row_stride = (row_bytes + (uint32_t)g_pack_alignment - 1u) &
+                ~((uint64_t)(uint32_t)g_pack_alignment - 1u);
+        offset = (uint64_t)(uint32_t)g_pack_skip_rows * row_stride +
+                (uint64_t)(uint32_t)g_pack_skip_pixels * pixel_bytes;
+        destination_end = offset + (uint64_t)((uint32_t)height - 1u) *
+                row_stride + (uint64_t)(uint32_t)width * pixel_bytes;
+        if (destination_end > UINT32_MAX) {
+            return 0;
+        }
+
+        tight = (uint8_t*)malloc((size_t)tight_size);
+        if (!tight) {
+            return 0;
+        }
+
+        /* Emscripten's typed-array readPixels overload receives the current
+         * WebGL PACK state. Read into a tight temporary with native PACK
+         * defaults, then apply the desktop guest layout ourselves. This keeps
+         * skipped bytes and padding untouched instead of depending on gl4es's
+         * GLES2 pixel-store lowering. */
+        glFlush();
+#ifdef __EMSCRIPTEN__
+        emscripten_glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        emscripten_glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+        emscripten_glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+        emscripten_glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+        emscripten_glReadPixels(x, y, width, height,
+                                GL_RGBA, GL_UNSIGNED_BYTE, tight);
+        emscripten_glPixelStorei(GL_PACK_ALIGNMENT, g_pack_alignment);
+        emscripten_glPixelStorei(GL_PACK_ROW_LENGTH, g_pack_row_length);
+        emscripten_glPixelStorei(GL_PACK_SKIP_ROWS, g_pack_skip_rows);
+        emscripten_glPixelStorei(GL_PACK_SKIP_PIXELS, g_pack_skip_pixels);
+#else
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+        glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+        glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+        glReadPixels(x, y, width, height, GL_RGBA, GL_UNSIGNED_BYTE, tight);
+        glPixelStorei(GL_PACK_ALIGNMENT, g_pack_alignment);
+        glPixelStorei(GL_PACK_ROW_LENGTH, g_pack_row_length);
+        glPixelStorei(GL_PACK_SKIP_ROWS, g_pack_skip_rows);
+        glPixelStorei(GL_PACK_SKIP_PIXELS, g_pack_skip_pixels);
+#endif
+        error = glGetError();
+        if (error == GL_NO_ERROR &&
+                format == GL_RGBA && type == GL_UNSIGNED_BYTE) {
+            converted = tight;
+            tight = NULL;
+        } else if (error == GL_NO_ERROR &&
+                !pixel_convert(tight, &converted,
+                               (GLuint)width, (GLuint)height,
+                               GL_RGBA, GL_UNSIGNED_BYTE,
+                               format, conversion_type, 0, 1)) {
+            error = GL_INVALID_OPERATION;
+        }
+
+        if (error == GL_NO_ERROR && reverse_16bit_fields) {
+            v86gl_reverse_packed_16bit_fields(
+                    converted,
+                    (uint64_t)(uint32_t)width * (uint32_t)height,
+                    reverse_16bit_fields);
+        }
+
+        if (error == GL_NO_ERROR) {
+            for (row = 0; row < (uint32_t)height; row++) {
+                uint8_t* output = (uint8_t*)pixels + offset +
+                        (uint64_t)row * row_stride;
+                const uint8_t* input = (const uint8_t*)converted +
+                        (uint64_t)row * (uint32_t)width * pixel_bytes;
+                memcpy(output, input, (size_t)(uint32_t)width * pixel_bytes);
+            }
+        }
+        free(tight);
+        free(converted);
+        return error == GL_NO_ERROR;
+    }
+
     glReadPixels(x, y, width, height, format, type, pixels);
     return glGetError() == GL_NO_ERROR;
 }
@@ -2729,9 +3309,31 @@ void v86gl_glPixelStorei(GLenum pname, GLint param) {
     case GL_UNPACK_SKIP_PIXELS: g_unpack_skip_pixels = param; break;
     case GL_UNPACK_IMAGE_HEIGHT: g_unpack_image_height = param; break;
     case GL_UNPACK_SKIP_IMAGES: g_unpack_skip_images = param; break;
+    case GL_PACK_ALIGNMENT:
+        if (param == 1 || param == 2 || param == 4 || param == 8)
+            g_pack_alignment = param;
+        break;
+    case GL_PACK_ROW_LENGTH:
+        if (param >= 0) g_pack_row_length = param;
+        break;
+    case GL_PACK_SKIP_ROWS:
+        if (param >= 0) g_pack_skip_rows = param;
+        break;
+    case GL_PACK_SKIP_PIXELS:
+        if (param >= 0) g_pack_skip_pixels = param;
+        break;
     default: break;
     }
     glPixelStorei(pname, param);
+#ifdef __EMSCRIPTEN__
+    /* gl4es targets GLES2 and may not forward desktop/WebGL2 PACK row and
+     * skip parameters. Keep the native WebGL state in sync for all other
+     * readback tuples as well. */
+    if (pname == GL_PACK_ALIGNMENT || pname == GL_PACK_ROW_LENGTH ||
+            pname == GL_PACK_SKIP_ROWS || pname == GL_PACK_SKIP_PIXELS) {
+        emscripten_glPixelStorei(pname, param);
+    }
+#endif
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -3256,7 +3858,13 @@ EMSCRIPTEN_KEEPALIVE
 void v86gl_glDrawBuffers(GLsizei n, const GLenum* bufs) {
     if (!v86gl_ensure_ready()) return;
     if (n > 0 && !bufs) return;
+#ifdef __EMSCRIPTEN__
+    emscripten_glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
+                                 g_bound_draw_framebuffer_host);
+    emscripten_glDrawBuffers(n, bufs);
+#else
     glDrawBuffers(n, bufs);
+#endif
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -4146,22 +4754,136 @@ void v86gl_glDeleteFramebuffersMapped(GLsizei n, const GLuint* guest_names) {
     for (i = 0; i < n; i++) {
         GLuint host = v86gl_host_framebuffer(guest_names[i]);
         if (host) {
+            if (g_bound_read_framebuffer_host == host)
+                g_bound_read_framebuffer_host = 0;
+            if (g_bound_draw_framebuffer_host == host)
+                g_bound_draw_framebuffer_host = 0;
             glDeleteFramebuffers(1, &host);
             v86gl_forget_name(g_framebuffers, &g_framebuffer_count, guest_names[i]);
         }
     }
+#ifdef __EMSCRIPTEN__
+    emscripten_glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                                 g_bound_read_framebuffer_host);
+    emscripten_glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
+                                 g_bound_draw_framebuffer_host);
+#endif
 }
 
 EMSCRIPTEN_KEEPALIVE
 void v86gl_glBindFramebufferMapped(GLenum target, GLuint guest_framebuffer) {
+    GLuint host_framebuffer;
+
     if (!v86gl_ensure_ready()) return;
-    glBindFramebuffer(target, v86gl_host_framebuffer(guest_framebuffer));
+    host_framebuffer = v86gl_host_framebuffer(guest_framebuffer);
+    glBindFramebuffer(target, host_framebuffer);
+
+    if (target == GL_FRAMEBUFFER) {
+        g_bound_read_framebuffer_host = host_framebuffer;
+        g_bound_draw_framebuffer_host = host_framebuffer;
+    } else if (target == GL_READ_FRAMEBUFFER) {
+        g_bound_read_framebuffer_host = host_framebuffer;
+    } else if (target == GL_DRAW_FRAMEBUFFER) {
+        g_bound_draw_framebuffer_host = host_framebuffer;
+    }
+
+#ifdef __EMSCRIPTEN__
+    /* gl4es tracks separate READ/DRAW objects but its GLES2 compatibility
+     * bind maps DRAW to GL_FRAMEBUFFER and intentionally defers READ. Restore
+     * the actual WebGL2 bindings after updating gl4es' shadow state. */
+    emscripten_glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                                 g_bound_read_framebuffer_host);
+    emscripten_glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
+                                 g_bound_draw_framebuffer_host);
+#endif
 }
 
 EMSCRIPTEN_KEEPALIVE
 GLenum v86gl_glCheckFramebufferStatusMapped(GLenum target) {
     if (!v86gl_ensure_ready()) return 0;
+#ifdef __EMSCRIPTEN__
+    emscripten_glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                                 g_bound_read_framebuffer_host);
+    emscripten_glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
+                                 g_bound_draw_framebuffer_host);
+    return emscripten_glCheckFramebufferStatus(target);
+#else
     return glCheckFramebufferStatus(target);
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE
+void v86gl_glBlitFramebuffer(GLint srcX0, GLint srcY0,
+                             GLint srcX1, GLint srcY1,
+                             GLint dstX0, GLint dstY0,
+                             GLint dstX1, GLint dstY1,
+                             GLbitfield mask, GLenum filter) {
+    if (!v86gl_ensure_ready()) return;
+#ifdef __EMSCRIPTEN__
+    GLubyte src_pixel[4] = {0, 0, 0, 0};
+    GLubyte dst_pixel[4] = {0, 0, 0, 0};
+    GLenum read_status;
+    GLenum draw_status;
+    GLint src_x = (srcX0 + srcX1) / 2;
+    GLint src_y = (srcY0 + srcY1) / 2;
+    GLint dst_x = (dstX0 + dstX1) / 2;
+    GLint dst_y = (dstY0 + dstY1) / 2;
+    int trace_present =
+        g_bound_draw_framebuffer_host == 0 &&
+        (mask & GL_COLOR_BUFFER_BIT) != 0;
+
+    /* Use WebGL2's native blit. The gl4es fallback renders a textured quad,
+     * which is precisely the WineD3D Present path this command replaces. */
+    emscripten_glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                                 g_bound_read_framebuffer_host);
+    emscripten_glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
+                                 g_bound_draw_framebuffer_host);
+    read_status =
+        emscripten_glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+    draw_status =
+        emscripten_glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+    if (trace_present) {
+        v86gl_trace_present_source_pair(
+            g_bound_read_framebuffer_host,
+            g_last_draw_framebuffer_host,
+            src_x, src_y);
+        emscripten_glReadPixels(src_x, src_y, 1, 1,
+                                GL_RGBA, GL_UNSIGNED_BYTE, src_pixel);
+    }
+    emscripten_glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1,
+                                 dstX0, dstY0, dstX1, dstY1,
+                                 mask, filter);
+    if (trace_present) {
+        /* Read back the committed destination before explicit swap.  Restore
+         * the source READ binding and WineD3D's expected attachment selector
+         * afterwards so diagnostics do not perturb subsequent presents.
+         * Emscripten maps framebuffer name 0 to an internal offscreen FBO;
+         * its raw WebGL read selector is COLOR_ATTACHMENT0, not GL_BACK. */
+        emscripten_glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                                     g_bound_draw_framebuffer_host);
+        emscripten_glReadBuffer(GL_COLOR_ATTACHMENT0);
+        emscripten_glReadPixels(dst_x, dst_y, 1, 1,
+                                GL_RGBA, GL_UNSIGNED_BYTE, dst_pixel);
+        emscripten_glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                                     g_bound_read_framebuffer_host);
+        emscripten_glReadBuffer(
+            g_bound_read_framebuffer_host ? GL_COLOR_ATTACHMENT0 : GL_BACK);
+        printf("[v86gl:fbo-blit] host read=%u draw=%u "
+               "src=(%d,%d)-(%d,%d) dst=(%d,%d)-(%d,%d) "
+               "status=0x%04x/0x%04x src_center=%u,%u,%u,%u "
+               "dst_center=%u,%u,%u,%u\n",
+               g_bound_read_framebuffer_host,
+               g_bound_draw_framebuffer_host,
+               srcX0, srcY0, srcX1, srcY1,
+               dstX0, dstY0, dstX1, dstY1,
+               read_status, draw_status,
+               src_pixel[0], src_pixel[1], src_pixel[2], src_pixel[3],
+               dst_pixel[0], dst_pixel[1], dst_pixel[2], dst_pixel[3]);
+    }
+#else
+    glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1,
+                      dstX0, dstY0, dstX1, dstY1, mask, filter);
+#endif
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -4177,6 +4899,14 @@ void v86gl_glFramebufferTextureMapped(GLenum target, GLenum attachment,
      * gl4es' legacy FBO wrapper rejects valid WebGL renderbuffer/attachment
      * enums on this path before they reach the driver. Proxy-side state owns
      * desktop attachment reflection, so no gl4es attachment cache is needed. */
+    if (host_texture && !v86gl_initialize_webgl_texture_target(
+            host_texture, textarget, g_active_texture_unit)) {
+        return;
+    }
+    emscripten_glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                                 g_bound_read_framebuffer_host);
+    emscripten_glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
+                                 g_bound_draw_framebuffer_host);
     if (textarget == GL_TEXTURE_3D) {
         emscripten_glFramebufferTextureLayer(target, attachment, host_texture,
                                              level, zoffset);
@@ -4204,6 +4934,10 @@ void v86gl_glFramebufferRenderbufferMapped(GLenum target, GLenum attachment,
                                            GLuint guest_renderbuffer) {
     if (!v86gl_ensure_ready()) return;
 #ifdef __EMSCRIPTEN__
+    emscripten_glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                                 g_bound_read_framebuffer_host);
+    emscripten_glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
+                                 g_bound_draw_framebuffer_host);
     emscripten_glFramebufferRenderbuffer(
         target, attachment, renderbuffertarget,
         v86gl_host_renderbuffer(guest_renderbuffer));
@@ -4612,10 +5346,22 @@ static void v86gl_setup_generic_attribs(GLsizei attrib_count, const int32_t* val
     }
 }
 
+static void v86gl_after_draw(GLenum mode, GLsizei count) {
+#ifdef __EMSCRIPTEN__
+    g_last_draw_framebuffer_host = g_bound_draw_framebuffer_host;
+    v86gl_trace_draw_framebuffer(
+        g_last_draw_framebuffer_host, mode, count);
+#else
+    (void)mode;
+    (void)count;
+#endif
+}
+
 EMSCRIPTEN_KEEPALIVE
 void v86gl_glDrawArraysDirect(GLenum mode, GLint first, GLsizei count) {
     if (!v86gl_ensure_ready()) return;
     glDrawArrays(mode, first, count);
+    v86gl_after_draw(mode, count);
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -4626,6 +5372,7 @@ void v86gl_glDrawElementsDirect(GLenum mode, GLuint start, GLuint end,
     (void)end;
     if (!v86gl_ensure_ready()) return;
     glDrawElements(mode, count, type, (const void*)index_offset);
+    v86gl_after_draw(mode, count);
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -4635,6 +5382,7 @@ void v86gl_glDrawRangeElementsDirect(GLenum mode, GLuint start, GLuint end,
     if (!v86gl_ensure_ready()) return;
     glDrawRangeElements(mode, start, end, count, type,
                         (const void*)index_offset);
+    v86gl_after_draw(mode, count);
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -4650,6 +5398,7 @@ void v86gl_glMultiDrawArraysDirect(GLenum mode, GLsizei primcount,
         GLsizei count = pairs[i * 2 + 1];
         if (count > 0) {
             glDrawArrays(mode, first, count);
+            v86gl_after_draw(mode, count);
         }
     }
 }
@@ -4668,6 +5417,7 @@ void v86gl_glMultiDrawElementsDirect(GLenum mode, GLenum type,
         uintptr_t index_offset = (uintptr_t)(uint32_t)pairs[i * 2 + 1];
         if (count > 0) {
             glDrawElements(mode, count, type, (const void*)index_offset);
+            v86gl_after_draw(mode, count);
         }
     }
 }
@@ -4688,6 +5438,7 @@ void v86gl_glDrawArraysPacked(GLenum mode, GLsizei count,
                               texcoord_size, texcoord_type, texcoord_stride, texcoord_data,
                               normal_type, normal_stride, normal_data);
     glDrawArrays(mode, 0, count);
+    v86gl_after_draw(mode, count);
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -4700,6 +5451,7 @@ void v86gl_glDrawArraysPackedMT(GLenum mode, GLsizei count,
     v86gl_setup_client_arrays_mt(tex_unit_count, restore_client_active,
                                  has_secondary_color, has_fog_coord, array_meta);
     glDrawArrays(mode, 0, count);
+    v86gl_after_draw(mode, count);
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -4715,6 +5467,7 @@ void v86gl_glDrawArraysPackedGL2(GLenum mode, GLsizei count,
                                  has_secondary_color, has_fog_coord, array_meta);
     v86gl_setup_generic_attribs(generic_attrib_count, generic_attrib_meta);
     glDrawArrays(mode, 0, count);
+    v86gl_after_draw(mode, count);
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -4733,6 +5486,7 @@ void v86gl_glDrawElementsPacked(GLenum mode, GLsizei count, GLenum type, const v
                               texcoord_size, texcoord_type, texcoord_stride, texcoord_data,
                               normal_type, normal_stride, normal_data);
     glDrawElements(mode, count, type, indices);
+    v86gl_after_draw(mode, count);
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -4745,6 +5499,7 @@ void v86gl_glDrawElementsPackedMT(GLenum mode, GLsizei count, GLenum type, const
     v86gl_setup_client_arrays_mt(tex_unit_count, restore_client_active,
                                  has_secondary_color, has_fog_coord, array_meta);
     glDrawElements(mode, count, type, indices);
+    v86gl_after_draw(mode, count);
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -4762,4 +5517,5 @@ void v86gl_glDrawElementsPackedGL2(GLenum mode, GLsizei count, GLenum type,
                                  has_secondary_color, has_fog_coord, array_meta);
     v86gl_setup_generic_attribs(generic_attrib_count, generic_attrib_meta);
     glDrawElements(mode, count, type, indices);
+    v86gl_after_draw(mode, count);
 }

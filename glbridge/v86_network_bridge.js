@@ -6,8 +6,9 @@
 (function(global) {
     "use strict";
 
-    const V86GL_BRIDGE_VERSION = "cube2-skinning-fix-20260718";
+    const V86GL_BRIDGE_VERSION = "d3d8-fbo-allocation-trace-v5-20260726";
     global.V86GL_BRIDGE_VERSION = V86GL_BRIDGE_VERSION;
+    console.info("[v86gl] bridge version", V86GL_BRIDGE_VERSION);
 
     const OP_MAKE_CURRENT = 1;
     const OP_VIEWPORT = 2;
@@ -30,7 +31,13 @@
     const V86GL_CTRL_MAKE_CURRENT = 0xFFF0;
     const V86GL_CTRL_RELEASE_CURRENT = 0xFFF1;
     const V86GL_CTRL_DESTROY_CONTEXT = 0xFFF2;
+    const V86GL_CTRL_TEST_TRACE = 0xFFF3;
     const V86GL_EXTENDED_RECORD_SIZE = 0xFFFF;
+    const V86GL_TEST_TRACE_PHASE_CALLING = 1;
+    const V86GL_TEST_TRACE_PHASE_RETURNED = 2;
+    const V86GL_TEST_TRACE_PHASE_PASS = 3;
+    const V86GL_TEST_TRACE_PHASE_FAIL = 4;
+    const V86GL_TEST_TRACE_PHASE_TEXT = 5;
 
     const GLFN_VIEWPORT = 1;
     const GLFN_CLEAR_COLOR = 2;
@@ -248,6 +255,7 @@
     const GLFN_INVALIDATE_PROGRAM_LOCATIONS = 214;
     const GLFN_COPY_TEX_SUB_IMAGE_3D = 215;
     const GLFN_QUERY_OBJECT_BATCH = 216;
+    const GLFN_BLIT_FRAMEBUFFER = 217;
 
     // Private capability query shared with opengl32_proxy.c. Optional desktop
     // extensions are derived from the live WebGL2 context instead of gl4es's
@@ -522,6 +530,7 @@
         [GLFN_INVALIDATE_PROGRAM_LOCATIONS]: "invalidateProgramLocations",
         [GLFN_COPY_TEX_SUB_IMAGE_3D]: "glCopyTexSubImage3D",
         [GLFN_QUERY_OBJECT_BATCH]: "glGetQueryObject*(batch)",
+        [GLFN_BLIT_FRAMEBUFFER]: "glBlitFramebuffer",
     };
 
     const DRAWABLE_GL_FUNCTIONS = new Set([
@@ -543,6 +552,7 @@
         GLFN_DRAW_RANGE_ELEMENTS_DIRECT,
         GLFN_MULTI_DRAW_ARRAYS_DIRECT,
         GLFN_MULTI_DRAW_ELEMENTS_DIRECT,
+        GLFN_BLIT_FRAMEBUFFER,
     ]);
 
     // A v86 snapshot contains guest RAM and the PCI registers, but the gl4es
@@ -602,6 +612,7 @@
         GLFN_QUERY_ERROR,
         GLFN_QUERY_UNIFORM,
         GLFN_QUERY_OBJECT_BATCH,
+        GLFN_BLIT_FRAMEBUFFER,
         GLFN_DRAW_ARRAYS_DIRECT,
         GLFN_DRAW_ELEMENTS_DIRECT,
         GLFN_DRAW_RANGE_ELEMENTS_DIRECT,
@@ -637,6 +648,21 @@
         ]);
         return new DataView(b.buffer).getFloat64(0, true);
     }
+    function decodeUTF8(bytes) {
+        if (typeof TextDecoder !== "undefined") {
+            try {
+                return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+            } catch (_err) {
+                /* Fall through to the byte-preserving decoder below. */
+            }
+        }
+
+        let text = "";
+        for (let i = 0; i < bytes.length; i++) {
+            text += String.fromCharCode(bytes[i]);
+        }
+        return text;
+    }
 
     class Gl4esRenderer {
         constructor(canvas, module, options) {
@@ -650,6 +676,115 @@
             this.activeTexture = 0x84C0; // GL_TEXTURE0
             this.clientActiveTexture = 0x84C0; // GL_TEXTURE0
             this.boundTextures = new Map();
+            this.textureImageStates = new Map();
+            this.boundRenderbuffer = 0;
+            this.renderbufferStorageStates = new Map();
+            this.boundReadFramebuffer = 0;
+            this.boundDrawFramebuffer = 0;
+            this.readBufferMode = 0x0405; // GL_BACK
+            this.drawBufferMode = 0x0405; // GL_BACK
+            this.fboBlitTraceCount = 0;
+            this.fboStatusTraceCount = 0;
+            this.lastDrawFramebuffer = 0;
+            this.framebufferBufferStates = new Map();
+            this.framebufferBufferStates.set(0, {
+                readBuffer: 0x0405, // GL_BACK
+                drawBuffers: [0x0405],
+                attachments: Object.create(null),
+            });
+            this.framebufferHistory = [];
+        }
+
+        framebufferBufferState(framebuffer) {
+            framebuffer >>>= 0;
+            let state = this.framebufferBufferStates.get(framebuffer);
+            if (!state) {
+                state = {
+                    readBuffer: framebuffer ? 0x8CE0 : 0x0405,
+                    drawBuffers: [framebuffer ? 0x8CE0 : 0x0405],
+                    attachments: Object.create(null),
+                };
+                this.framebufferBufferStates.set(framebuffer, state);
+            }
+            return state;
+        }
+
+        framebufferAttachmentTargets(target) {
+            let framebuffers;
+            if (target === 0x8CA8) { // GL_READ_FRAMEBUFFER
+                framebuffers = [this.boundReadFramebuffer];
+            } else if (target === 0x8CA9) { // GL_DRAW_FRAMEBUFFER
+                framebuffers = [this.boundDrawFramebuffer];
+            } else {
+                framebuffers = [
+                    this.boundReadFramebuffer,
+                    this.boundDrawFramebuffer,
+                ];
+            }
+            return Array.from(new Set(framebuffers.map(
+                framebuffer => framebuffer >>> 0)));
+        }
+
+        recordFramebufferAttachment(target, attachment, value) {
+            const attachmentKey = "0x" + (attachment >>> 0).toString(16);
+            const framebuffers = this.framebufferAttachmentTargets(target);
+            const {kind: attachmentKind, ...attachmentValue} = value;
+            for (const framebuffer of framebuffers) {
+                const attachments =
+                    this.framebufferBufferState(framebuffer).attachments;
+                if (value.object) {
+                    attachments[attachmentKey] = {...value};
+                } else {
+                    delete attachments[attachmentKey];
+                }
+            }
+            this.recordFramebufferEvent("attachment", {
+                target: "0x" + (target >>> 0).toString(16),
+                attachment: attachmentKey,
+                framebuffers,
+                attachmentKind,
+                ...attachmentValue,
+            });
+        }
+
+        recordFramebufferEvent(kind, details) {
+            this.framebufferHistory.push({
+                kind,
+                readFramebuffer: this.boundReadFramebuffer >>> 0,
+                drawFramebuffer: this.boundDrawFramebuffer >>> 0,
+                ...(details || {}),
+            });
+            if (this.framebufferHistory.length > 64) {
+                this.framebufferHistory.shift();
+            }
+        }
+
+        textureBindingTarget(target) {
+            if (target >= 0x8515 && target <= 0x851A) {
+                return 0x8513; // GL_TEXTURE_CUBE_MAP
+            }
+            return target >>> 0;
+        }
+
+        boundTextureForTarget(target) {
+            const bindingTarget = this.textureBindingTarget(target);
+            return (this.boundTextures.get(
+                this.activeTexture + ":" + bindingTarget) || 0) >>> 0;
+        }
+
+        textureImageKey(texture, target, level) {
+            return (texture >>> 0) + ":" + (target >>> 0) + ":" + (level | 0);
+        }
+
+        textureImageState(texture, target, level) {
+            const exact = this.textureImageStates.get(
+                this.textureImageKey(texture, target, level));
+            if (exact) {
+                return exact;
+            }
+            const bindingTarget = this.textureBindingTarget(target);
+            return this.textureImageStates.get(
+                this.textureImageKey(texture, bindingTarget, level)) || null;
         }
 
         getHostWebGL2Context() {
@@ -896,6 +1031,9 @@
             }
 
             try {
+                /* Preserve bytes covered only by PACK_SKIP, row padding, or
+                 * a wider PACK_ROW_LENGTH. OpenGL leaves them untouched. */
+                heap.set(output, ptr);
                 if (!callback(ptr)) {
                     return false;
                 }
@@ -1023,7 +1161,17 @@
                 this.callGL("Flush", [], []);
                 break;
             case GLFN_FINISH:
-                this.callGL("Finish", [], []);
+                {
+                    const ok = this.callGLReturn("Finish", [], []) !== 0;
+                    /* Payload-less records remain compatible with older
+                     * proxies.  New proxies include a synchronous status word
+                     * that DeviceIoControl observes before returning.  The
+                     * bridge export returns zero if its renderer is not ready. */
+                    if (p.length >= 4) {
+                        writeU32(p, 0, ok ? V86GL_SYNC_QUERY_STATUS_OK :
+                            V86GL_SYNC_QUERY_STATUS_FAILED);
+                    }
+                }
                 break;
             case GLFN_MATRIX_MODE:
                 this.matrixMode = u32(p, 0);
@@ -1353,17 +1501,76 @@
                 this.callTextureNameArray("DeleteFramebuffersMapped", p);
                 break;
             case GLFN_BIND_FRAMEBUFFER:
-                this.callGL("BindFramebufferMapped", [u32(p, 0), u32(p, 4)], ["number", "number"]);
+                {
+                    const target = u32(p, 0);
+                    const framebuffer = u32(p, 4);
+                    if (target === 0x8D40) { // GL_FRAMEBUFFER
+                        this.boundReadFramebuffer = framebuffer;
+                        this.boundDrawFramebuffer = framebuffer;
+                    } else if (target === 0x8CA8) { // GL_READ_FRAMEBUFFER
+                        this.boundReadFramebuffer = framebuffer;
+                    } else if (target === 0x8CA9) { // GL_DRAW_FRAMEBUFFER
+                        this.boundDrawFramebuffer = framebuffer;
+                    }
+                    this.callGL("BindFramebufferMapped", [
+                        target, framebuffer,
+                    ], ["number", "number"]);
+                    this.framebufferBufferState(this.boundReadFramebuffer);
+                    this.framebufferBufferState(this.boundDrawFramebuffer);
+                    this.recordFramebufferEvent("bind", {
+                        target: "0x" + target.toString(16),
+                        framebuffer,
+                    });
+                }
                 break;
             case GLFN_FRAMEBUFFER_TEXTURE:
-                this.callGL("FramebufferTextureMapped", [
-                    u32(p, 0), u32(p, 4), u32(p, 8), u32(p, 12), i32(p, 16), i32(p, 20),
-                ], ["number", "number", "number", "number", "number", "number"]);
+                {
+                    const target = u32(p, 0);
+                    const attachment = u32(p, 4);
+                    const textarget = u32(p, 8);
+                    const texture = u32(p, 12);
+                    const level = i32(p, 16);
+                    const zoffset = i32(p, 20);
+                    const ok = this.callGL("FramebufferTextureMapped", [
+                        target, attachment, textarget, texture, level, zoffset,
+                    ], ["number", "number", "number", "number", "number", "number"]);
+                    if (ok) {
+                        this.recordFramebufferAttachment(
+                            target, attachment, {
+                                kind: texture ? "texture" : "none",
+                                object: texture,
+                                textarget: "0x" + textarget.toString(16),
+                                level,
+                                zoffset,
+                                allocation: texture ?
+                                    this.textureImageState(
+                                        texture, textarget, level) : null,
+                            });
+                    }
+                }
                 break;
             case GLFN_FRAMEBUFFER_RENDERBUFFER:
-                this.callGL("FramebufferRenderbufferMapped", [
-                    u32(p, 0), u32(p, 4), u32(p, 8), u32(p, 12),
-                ], ["number", "number", "number", "number"]);
+                {
+                    const target = u32(p, 0);
+                    const attachment = u32(p, 4);
+                    const renderbufferTarget = u32(p, 8);
+                    const renderbuffer = u32(p, 12);
+                    const ok = this.callGL("FramebufferRenderbufferMapped", [
+                        target, attachment, renderbufferTarget, renderbuffer,
+                    ], ["number", "number", "number", "number"]);
+                    if (ok) {
+                        this.recordFramebufferAttachment(
+                            target, attachment, {
+                                kind: renderbuffer ? "renderbuffer" : "none",
+                                object: renderbuffer,
+                                renderbufferTarget: "0x" +
+                                    renderbufferTarget.toString(16),
+                                allocation: renderbuffer ?
+                                    (this.renderbufferStorageStates.get(
+                                        renderbuffer >>> 0) || null) : null,
+                            });
+                    }
+                }
                 break;
             case GLFN_GEN_RENDERBUFFERS:
                 this.callTextureNameArray("GenRenderbuffersMapped", p);
@@ -1372,12 +1579,31 @@
                 this.callTextureNameArray("DeleteRenderbuffersMapped", p);
                 break;
             case GLFN_BIND_RENDERBUFFER:
-                this.callGL("BindRenderbufferMapped", [u32(p, 0), u32(p, 4)], ["number", "number"]);
+                this.boundRenderbuffer = u32(p, 4);
+                this.callGL("BindRenderbufferMapped", [
+                    u32(p, 0), this.boundRenderbuffer,
+                ], ["number", "number"]);
                 break;
             case GLFN_RENDERBUFFER_STORAGE:
-                this.callGL("RenderbufferStorageMapped", [
-                    u32(p, 0), u32(p, 4), i32(p, 8), i32(p, 12),
-                ], ["number", "number", "number", "number"]);
+                {
+                    const target = u32(p, 0);
+                    const internalformat = u32(p, 4);
+                    const width = i32(p, 8);
+                    const height = i32(p, 12);
+                    const ok = this.callGL("RenderbufferStorageMapped", [
+                        target, internalformat, width, height,
+                    ], ["number", "number", "number", "number"]);
+                    if (ok && this.boundRenderbuffer) {
+                        this.renderbufferStorageStates.set(
+                            this.boundRenderbuffer >>> 0, {
+                                target: "0x" + target.toString(16),
+                                internalformat: "0x" +
+                                    internalformat.toString(16),
+                                width,
+                                height,
+                            });
+                    }
+                }
                 break;
             case GLFN_QUERY_OBJECT_IV:
                 this.callQueryObjectIV(p);
@@ -1390,6 +1616,53 @@
                 break;
             case GLFN_CHECK_FRAMEBUFFER_STATUS:
                 this.callCheckFramebufferStatus(p);
+                break;
+            case GLFN_BLIT_FRAMEBUFFER:
+                if (p.length >= 40) {
+                    this.fboBlitTraceCount++;
+                    if (this.boundDrawFramebuffer === 0 ||
+                            this.fboBlitTraceCount <= 8) {
+                        console.info("[v86gl:fbo-blit] guest " +
+                            JSON.stringify({
+                            count: this.fboBlitTraceCount,
+                            readFramebuffer: this.boundReadFramebuffer,
+                            drawFramebuffer: this.boundDrawFramebuffer,
+                            lastDrawFramebuffer: this.lastDrawFramebuffer,
+                            readBuffer: "0x" +
+                                this.readBufferMode.toString(16),
+                            drawBuffer: "0x" +
+                                this.drawBufferMode.toString(16),
+                            sourceBufferState: {
+                                ...this.framebufferBufferState(
+                                    this.boundReadFramebuffer),
+                            },
+                            destinationBufferState: {
+                                ...this.framebufferBufferState(
+                                    this.boundDrawFramebuffer),
+                            },
+                            recentFramebufferEvents:
+                                this.framebufferHistory.slice(-24),
+                            src: [
+                                i32(p, 0), i32(p, 4),
+                                i32(p, 8), i32(p, 12),
+                            ],
+                            dst: [
+                                i32(p, 16), i32(p, 20),
+                                i32(p, 24), i32(p, 28),
+                            ],
+                            mask: "0x" + u32(p, 32).toString(16),
+                            filter: "0x" + u32(p, 36).toString(16),
+                        }));
+                    }
+                    this.callGL("BlitFramebuffer", [
+                        i32(p, 0), i32(p, 4), i32(p, 8), i32(p, 12),
+                        i32(p, 16), i32(p, 20), i32(p, 24), i32(p, 28),
+                        u32(p, 32), u32(p, 36),
+                    ], [
+                        "number", "number", "number", "number", "number",
+                        "number", "number", "number", "number", "number",
+                    ]);
+                }
                 break;
             case GLFN_QUERY_ACTIVE:
                 this.callQueryActive(p);
@@ -1696,10 +1969,24 @@
                 this.callGL("PopClientAttrib", [], []);
                 break;
             case GLFN_DRAW_BUFFER:
-                this.callGL("DrawBuffer", [u32(p, 0)], ["number"]);
+                this.drawBufferMode = u32(p, 0);
+                this.framebufferBufferState(
+                    this.boundDrawFramebuffer).drawBuffers =
+                    [this.drawBufferMode];
+                this.recordFramebufferEvent("drawBuffer", {
+                    buffers: ["0x" + this.drawBufferMode.toString(16)],
+                });
+                this.callGL("DrawBuffer", [this.drawBufferMode], ["number"]);
                 break;
             case GLFN_READ_BUFFER:
-                this.callGL("ReadBuffer", [u32(p, 0)], ["number"]);
+                this.readBufferMode = u32(p, 0);
+                this.framebufferBufferState(
+                    this.boundReadFramebuffer).readBuffer =
+                    this.readBufferMode;
+                this.recordFramebufferEvent("readBuffer", {
+                    buffer: "0x" + this.readBufferMode.toString(16),
+                });
+                this.callGL("ReadBuffer", [this.readBufferMode], ["number"]);
                 break;
             case GLFN_COPY_TEX_IMAGE_2D:
                 this.callGL("CopyTexImage2D", [
@@ -1744,7 +2031,9 @@
         }
 
         noteTextureBind(target, texture) {
-            this.boundTextures.set(this.activeTexture + ":" + target, texture);
+            this.boundTextures.set(
+                this.activeTexture + ":" + this.textureBindingTarget(target),
+                texture);
         }
 
 
@@ -1900,12 +2189,37 @@
             if (dataSize > p.length - 36) {
                 return false;
             }
+            const target = u32(p, 0);
+            const level = i32(p, 4);
+            const internalformat = i32(p, 8);
+            const width = i32(p, 12);
+            const height = i32(p, 16);
+            const border = i32(p, 20);
+            const format = u32(p, 24);
+            const type = u32(p, 28);
             const bytes = dataSize ? p.slice(36, 36 + dataSize) : null;
-            return this.withHeapBytes(bytes, ptr =>
+            const ok = this.withHeapBytes(bytes, ptr =>
                 this.callGL("TexImage2D", [
-                    u32(p, 0), i32(p, 4), i32(p, 8), i32(p, 12), i32(p, 16),
-                    i32(p, 20), u32(p, 24), u32(p, 28), ptr,
+                    target, level, internalformat, width, height,
+                    border, format, type, ptr,
                 ], ["number", "number", "number", "number", "number", "number", "number", "number", "number"]));
+            const texture = this.boundTextureForTarget(target);
+            if (ok && texture) {
+                this.textureImageStates.set(
+                    this.textureImageKey(texture, target, level), {
+                        target: "0x" + target.toString(16),
+                        level,
+                        internalformat: "0x" +
+                            (internalformat >>> 0).toString(16),
+                        width,
+                        height,
+                        border,
+                        format: "0x" + format.toString(16),
+                        type: "0x" + type.toString(16),
+                        dataSize,
+                    });
+            }
+            return ok;
         }
 
         callTexImage1D(p) {
@@ -2182,6 +2496,13 @@
                 buffers.push(u32(p, 4 + i * 4));
             }
 
+            this.drawBufferMode = buffers.length ? buffers[0] : 0;
+            this.framebufferBufferState(
+                this.boundDrawFramebuffer).drawBuffers = buffers.slice();
+            this.recordFramebufferEvent("drawBuffers", {
+                buffers: buffers.map(
+                    buffer => "0x" + buffer.toString(16)),
+            });
             return this.withHeapU32(buffers, ptr =>
                 this.callGL("DrawBuffers", [count, ptr], ["number", "number"]));
         }
@@ -2779,13 +3100,31 @@
                 return false;
             }
 
+            const target = u32(p, 0);
             const result = this.callGLReturn("CheckFramebufferStatusMapped", [
-                u32(p, 0),
+                target,
             ], ["number"]) >>> 0;
             const ok = result !== 0;
             writeU32(p, 4, ok ? V86GL_SYNC_QUERY_STATUS_OK : V86GL_SYNC_QUERY_STATUS_FAILED);
             if (ok) {
                 writeU32(p, 8, result);
+            }
+            const framebuffer = target === 0x8CA8 ?
+                this.boundReadFramebuffer : this.boundDrawFramebuffer;
+            const state = this.framebufferBufferState(framebuffer);
+            const color = state.attachments["0x8ce0"];
+            const allocation = color && color.allocation;
+            if (allocation && this.fboStatusTraceCount < 32 &&
+                    ["0x8050", "0x8051", "0x8058", "0x8d62"]
+                        .includes(allocation.internalformat)) {
+                this.fboStatusTraceCount++;
+                console.info("[v86gl:fbo-cap] " + JSON.stringify({
+                    count: this.fboStatusTraceCount,
+                    framebuffer,
+                    target: "0x" + target.toString(16),
+                    status: "0x" + result.toString(16),
+                    color,
+                }));
             }
             return ok;
         }
@@ -3139,10 +3478,16 @@
         }
 
         present() {
-            if (!this.callOptional(["v86glPresent", "_v86glPresent"], [], [])) {
+            const result = this.callOptionalResult(
+                ["v86glPresent", "_v86glPresent"], [], []);
+            if (result.called) {
+                return result.value !== 0;
+            }
+
+            {
                 /* Compatibility with an older module during a rolling cache
                  * update.  New modules commit their explicit back buffer. */
-                this.callGL("Flush", [], []);
+                return this.callGL("Flush", [], []);
             }
         }
 
@@ -3170,6 +3515,26 @@
             ], args, argTypes);
             if (!ok) {
                 this.warnMissing("gl" + suffix);
+            }
+            if (ok && (/^(DrawArrays|DrawElements|DrawRangeElements|MultiDraw)/
+                    .test(suffix))) {
+                this.lastDrawFramebuffer =
+                    this.boundDrawFramebuffer >>> 0;
+                const state = this.framebufferBufferState(
+                    this.boundDrawFramebuffer);
+                this.recordFramebufferEvent("draw", {
+                    call: suffix,
+                    drawBuffers: state.drawBuffers.map(
+                        buffer => "0x" + buffer.toString(16)),
+                });
+            } else if (ok && suffix === "Clear") {
+                const state = this.framebufferBufferState(
+                    this.boundDrawFramebuffer);
+                this.recordFramebufferEvent("clear", {
+                    mask: "0x" + ((args && args[0]) >>> 0).toString(16),
+                    drawBuffers: state.drawBuffers.map(
+                        buffer => "0x" + buffer.toString(16)),
+                });
             }
             return ok;
         }
@@ -3281,6 +3646,48 @@
             return false;
         }
 
+        callOptionalResult(names, args, argTypes) {
+            const module = this.module;
+            if (!module) {
+                return { called: true, value: 0 };
+            }
+
+            for (let i = 0; i < names.length; i++) {
+                const fn = module[names[i]];
+                if (typeof fn === "function") {
+                    try {
+                        const value = fn.apply(module, args);
+                        /* Older wrappers exposed v86glPresent as void.  Keep
+                         * those rolling-cache builds usable; current modules
+                         * return an explicit numeric commit status. */
+                        return {
+                            called: true,
+                            value: value === undefined ? 1 : Number(value) || 0,
+                        };
+                    } catch (err) {
+                        console.error("[v86gl] gl4es export threw", names[i], err);
+                        return { called: true, value: 0 };
+                    }
+                }
+            }
+
+            if (typeof module.ccall === "function") {
+                const cName = names[0].charAt(0) === "_" ? names[0].slice(1) : names[0];
+                try {
+                    return {
+                        called: true,
+                        value: Number(module.ccall(
+                            cName, "number", argTypes || [], args || [])) || 0,
+                    };
+                } catch (err) {
+                    console.error("[v86gl] gl4es ccall threw", cName, err);
+                    return { called: true, value: 0 };
+                }
+            }
+
+            return { called: false, value: 0 };
+        }
+
         warnMissing(name) {
             if (this.missing[name]) {
                 return;
@@ -3304,16 +3711,22 @@
             this.chunkedCalls = Object.create(null);
             this.frameStates = Object.create(null);
             this.lastPresentedFrameId = 0;
+            this.lastGuestTestTrace = null;
+            this.guestTestTraceHistory = [];
             this.surface = { hwnd: 0, x: 0, y: 0, width: 0, height: 0 };
             this.container = canvas.parentElement;
             this.screenCanvas = this.findScreenCanvas();
             this.renderer = null;
             this.rendererGeneration = 0;
             this.frameDrawableSeen = false;
+            this.hasPresentedDrawable = false;
+            this.presentTraceCount = 0;
             this.overlayVisible = false;
             this.overlayHideTimer = 0;
             this.contextCurrent = false;
             this.contextDestroySeen = false;
+            this.rendererRebuildInProgress = false;
+            this.contextRebuildPromise = Promise.resolve();
             this.stateJournal = [];
             this.stateJournalBytes = 0;
             this.stateJournalOverflow = false;
@@ -4082,6 +4495,7 @@
             this.frameStates = Object.create(null);
             this.lastPresentedFrameId = 0;
             this.frameDrawableSeen = false;
+            this.hasPresentedDrawable = false;
             this.cancelOverlayHide();
         }
 
@@ -4309,6 +4723,81 @@
             }
         }
 
+        handleGuestTestTrace(args, source, frameId) {
+            if (args.length < 12) {
+                console.warn("[v86gl:guest-test] truncated checkpoint header", {
+                    payloadBytes: args.length,
+                    source: source || "",
+                });
+                return false;
+            }
+
+            const phase = u32(args, 0);
+            const hr = u32(args, 4);
+            const textSize = u32(args, 8);
+            if (textSize > args.length - 12) {
+                console.warn("[v86gl:guest-test] truncated checkpoint text", {
+                    declaredBytes: textSize,
+                    availableBytes: args.length - 12,
+                    source: source || "",
+                });
+                return false;
+            }
+
+            const phaseNames = {
+                [V86GL_TEST_TRACE_PHASE_CALLING]: "CALLING",
+                [V86GL_TEST_TRACE_PHASE_RETURNED]: "RETURNED",
+                [V86GL_TEST_TRACE_PHASE_PASS]: "PASS",
+                [V86GL_TEST_TRACE_PHASE_FAIL]: "FAIL",
+                [V86GL_TEST_TRACE_PHASE_TEXT]: "TEXT",
+            };
+            const phaseName = phaseNames[phase] || "PHASE_" + phase;
+            const hrHex = "0x" + hr.toString(16).padStart(8, "0").toUpperCase();
+            const trace = {
+                phase,
+                phaseName,
+                hr,
+                hrSigned: hr | 0,
+                hrHex,
+                text: decodeUTF8(args.subarray(12, 12 + textSize)),
+                source: source || "",
+                frameId: frameId >>> 0,
+            };
+
+            this.lastGuestTestTrace = trace;
+            this.guestTestTraceHistory.push(trace);
+            if (this.guestTestTraceHistory.length > 256) {
+                this.guestTestTraceHistory.shift();
+            }
+
+            const log = "[v86gl:guest-test] " + phaseName + " " +
+                hrHex + (trace.text ? " " + trace.text : "");
+            if (phase === V86GL_TEST_TRACE_PHASE_FAIL) {
+                console.error(log, trace);
+            } else {
+                console.info(log, trace);
+            }
+
+            if (typeof this.options.onGuestTestTrace === "function") {
+                try {
+                    this.options.onGuestTestTrace(trace);
+                } catch (err) {
+                    console.error("[v86gl:guest-test] callback threw", err);
+                }
+            }
+            if (typeof global.dispatchEvent === "function" &&
+                typeof global.CustomEvent === "function") {
+                try {
+                    global.dispatchEvent(new global.CustomEvent(
+                        "v86gl-guest-test", { detail: trace }));
+                } catch (_err) {
+                    /* Custom event delivery is optional diagnostic sugar. */
+                }
+            }
+
+            return true;
+        }
+
         executeGLCommands(p, source, frameId) {
             let offset = 0;
             let commands = 0;
@@ -4354,6 +4843,11 @@
                     continue;
                 }
 
+                if (fn === V86GL_CTRL_TEST_TRACE) {
+                    this.handleGuestTestTrace(args, source, commandFrameId);
+                    continue;
+                }
+
                 this.noteDrawableFunction(fn, commandFrameId);
                 this.callRenderer(fn, args);
             }
@@ -4390,10 +4884,33 @@
             }
 
             if (event.flags & 1) {
-                if (frameId) {
-                    this.presentFrame(frameId);
-                } else {
+                const state = frameId ? this.frameStates[frameId] : null;
+                const drawable = frameId ? !!(state && state.drawable) :
+                    this.frameDrawableSeen;
+                const tracePresent = ++this.presentTraceCount <= 4;
+                if (tracePresent) {
+                    console.info("[v86gl:present] enter", {
+                        frameId,
+                        submitCount: event.submitCount >>> 0,
+                        commandCount: event.commandCount >>> 0,
+                        commandBytes: bytes.length,
+                        drawable,
+                        canvasWidth: this.canvas.width >>> 0,
+                        canvasHeight: this.canvas.height >>> 0,
+                    });
+                }
+
+                const committed = frameId ? this.presentFrame(frameId) :
                     this.present();
+                if (tracePresent || !committed) {
+                    const log = committed ? console.info : console.error;
+                    log.call(console, "[v86gl:present] " +
+                        (committed ? "committed" : "FAILED"), {
+                        frameId,
+                        committed,
+                        drawable,
+                        overlayVisible: this.overlayVisible,
+                    });
                 }
             }
         }
@@ -4705,7 +5222,9 @@
 
         presentFrame(frameId) {
             const state = this.frameStates[frameId];
-            this.present(!!(state && state.drawable));
+            if (!this.present(!!(state && state.drawable))) {
+                return false;
+            }
             this.lastPresentedFrameId = frameId;
 
             for (const key in this.frameStates) {
@@ -4714,26 +5233,39 @@
                     delete this.frameStates[key];
                 }
             }
+            return true;
         }
 
         present(drawable) {
-            this.requireRenderer().present();
             if (drawable === undefined) {
                 drawable = this.frameDrawableSeen;
             }
+            if (!this.requireRenderer().present()) {
+                return false;
+            }
             this.frameDrawableSeen = false;
             if (drawable) {
+                this.hasPresentedDrawable = true;
+                this.showOverlayCanvas();
+            } else if (this.hasPresentedDrawable) {
+                /* Swapping an empty command batch preserves the already
+                 * committed front buffer.  Do not hide a valid D3D frame. */
                 this.showOverlayCanvas();
             } else {
                 this.positionCanvas();
                 this.scheduleOverlayHide(180);
             }
+            return true;
         }
 
         releaseCurrent() {
             this.requireRenderer().releaseCurrent();
             this.contextCurrent = false;
-            this.scheduleOverlayHide(120);
+            if (this.hasPresentedDrawable) {
+                this.showOverlayCanvas();
+            } else {
+                this.scheduleOverlayHide(120);
+            }
         }
 
         replaceOverlayCanvas() {
@@ -4775,33 +5307,83 @@
         }
 
         destroyContext() {
-            /* The final wglDeleteContext and process teardown can both describe
-             * the same guest lifecycle. Do not destroy a freshly pre-created
-             * renderer twice; the next MAKE_CURRENT starts a new lifecycle. */
+            /* WineD3D creates and destroys a capability-probe WGL context in
+             * Direct3DCreate8(), then creates the real device context. A fresh
+             * gl4es module is asynchronous, while PCI synchronous queries write
+             * their result directly into the guest's reusable DMA buffer. Stop
+             * v86 before dropping the old renderer and resume it only after the
+             * replacement is installed; queuing those queries would copy the
+             * DMA bytes and permanently lose their result. */
             if (this.contextDestroySeen) {
-                return;
+                return this.contextRebuildPromise;
             }
             this.contextDestroySeen = true;
-            const oldRenderer = this.renderer;
-            this.renderer = null;
-            if (oldRenderer) {
-                oldRenderer.destroy();
+            this.rendererRebuildInProgress = true;
+
+            const emulator = this.emulator;
+            const canPause = emulator &&
+                typeof emulator.is_running === "function" &&
+                typeof emulator.stop === "function" &&
+                typeof emulator.run === "function";
+            const resumeAfterRebuild = !!(canPause && emulator.is_running());
+            let stopped = Promise.resolve();
+            if (resumeAfterRebuild) {
+                try {
+                    /* V86.stop() requests the CPU stop synchronously and its
+                     * promise resolves once the current execution slice exits. */
+                    stopped = Promise.resolve(emulator.stop());
+                } catch (err) {
+                    stopped = Promise.reject(err);
+                }
             }
-            this.chunkedCalls = Object.create(null);
-            this.frameStates = Object.create(null);
-            this.lastPresentedFrameId = 0;
-            this.frameDrawableSeen = false;
-            this.contextCurrent = false;
-            this.resetStateJournal();
-            this.hideOverlayCanvas();
-            this.replaceOverlayCanvas();
 
             const generation = ++this.rendererGeneration;
-            try {
-                this.setRendererModule(this.createFreshRenderer(), generation);
-            } catch (err) {
-                console.error("[v86gl] could not recreate gl4es after context destruction", err);
-            }
+            this.contextRebuildPromise = stopped.then(() => {
+                if (generation !== this.rendererGeneration) {
+                    return null;
+                }
+
+                /* stop() is asynchronous in real v86. Keep the old renderer
+                 * installed until the current CPU slice has actually ended;
+                 * otherwise a synchronous query arriving at that boundary is
+                 * either thrown away or queued against a copied DMA buffer. */
+                const oldRenderer = this.renderer;
+                this.renderer = null;
+                if (oldRenderer) {
+                    oldRenderer.destroy();
+                }
+                this.chunkedCalls = Object.create(null);
+                this.frameStates = Object.create(null);
+                this.lastPresentedFrameId = 0;
+                this.frameDrawableSeen = false;
+                this.hasPresentedDrawable = false;
+                this.contextCurrent = false;
+                this.resetStateJournal();
+                this.hideOverlayCanvas();
+                this.replaceOverlayCanvas();
+
+                return this.setRendererModule(
+                    this.createFreshRenderer(), generation);
+            }).then(async () => {
+                if (generation !== this.rendererGeneration) {
+                    this.rendererRebuildInProgress = false;
+                    return null;
+                }
+                if (!this.renderer) {
+                    throw new Error("fresh gl4es renderer was superseded during WGL rebuild");
+                }
+                this.rendererRebuildInProgress = false;
+                if (resumeAfterRebuild) {
+                    await emulator.run();
+                }
+                return this.renderer;
+            }).catch(err => {
+                this.rendererRebuildInProgress = false;
+                this.contextDestroySeen = false;
+                console.error("[v86gl] could not complete WGL renderer rebuild", err);
+                return null;
+            });
+            return this.contextRebuildPromise;
         }
     }
 

@@ -15,6 +15,17 @@
 #define TEST_CLIENT_WIDTH  640
 #define TEST_CLIENT_HEIGHT 480
 #define TEST_FVF (D3DFVF_XYZRHW | D3DFVF_DIFFUSE)
+#define V86GL_TEST_TRACE_PHASE_CALLING  1
+#define V86GL_TEST_TRACE_PHASE_RETURNED 2
+#define V86GL_TEST_TRACE_PHASE_PASS     3
+#define V86GL_TEST_TRACE_PHASE_FAIL     4
+#define V86GL_TEST_TRACE_PHASE_TEXT     5
+#define TRACE_STATUS_EXPORT_MISSING     0
+#define TRACE_STATUS_SENT               1
+#define TRACE_STATUS_SEND_FAILED        2
+
+typedef BOOL (WINAPI *V86GLTraceCheckpointProc)(DWORD phase, HRESULT hr,
+        const char *text);
 
 typedef struct TestVertex
 {
@@ -38,6 +49,33 @@ static IDirect3DDevice8 *g_device;
 static IDirect3DVertexBuffer8 *g_vertex_buffer;
 static HWND g_window;
 static const char *g_failed_stage = "unknown stage";
+static V86GLTraceCheckpointProc g_trace_checkpoint;
+static int g_trace_delivery_status = TRACE_STATUS_EXPORT_MISSING;
+static BOOL g_teardown_started;
+static BOOL g_releasing_d3d8;
+
+static int send_trace_checkpoint(DWORD phase, HRESULT hr, const char *text)
+{
+    if (!g_trace_checkpoint)
+    {
+        HMODULE module = GetModuleHandleA("opengl32.dll");
+
+        if (!module)
+            module = LoadLibraryA("opengl32.dll");
+        if (module)
+            g_trace_checkpoint = (V86GLTraceCheckpointProc)GetProcAddress(module,
+                    "v86glTraceCheckpoint");
+    }
+
+    if (!g_trace_checkpoint)
+        g_trace_delivery_status = TRACE_STATUS_EXPORT_MISSING;
+    else if (g_trace_checkpoint(phase, hr, text))
+        g_trace_delivery_status = TRACE_STATUS_SENT;
+    else
+        g_trace_delivery_status = TRACE_STATUS_SEND_FAILED;
+
+    return g_trace_delivery_status;
+}
 
 static void trace_text(const char *text)
 {
@@ -53,15 +91,37 @@ static void trace_hresult(const char *stage, HRESULT hr)
     wsprintfA(line, "[d3d8-triangle] %s -> 0x%08lX\r\n",
             stage, (unsigned long)hr);
     OutputDebugStringA(line);
+    send_trace_checkpoint(V86GL_TEST_TRACE_PHASE_RETURNED, hr, stage);
 }
 
 static void set_result_title(HWND hwnd, const char *stage, HRESULT hr)
 {
     char title[192];
+    const char *trace_status = "";
 
-    wsprintfA(title, "D3D8 triangle: %s (0x%08lX)",
-            stage, (unsigned long)hr);
+    if (g_trace_delivery_status == TRACE_STATUS_EXPORT_MISSING)
+        trace_status = " [TRACE EXPORT MISSING]";
+    else if (g_trace_delivery_status == TRACE_STATUS_SEND_FAILED)
+        trace_status = " [TRACE SEND FAILED]";
+    wsprintfA(title, "D3D8 triangle%s: %s (0x%08lX)",
+            trace_status, stage, (unsigned long)hr);
     SetWindowTextA(hwnd, title);
+}
+
+static LONG WINAPI unhandled_exception_filter(EXCEPTION_POINTERS *exception)
+{
+    DWORD code = exception && exception->ExceptionRecord ?
+            exception->ExceptionRecord->ExceptionCode : 0xE0000001u;
+    char line[192];
+
+    wsprintfA(line, "UNHANDLED 0x%08lX during %s",
+            (unsigned long)code, g_failed_stage);
+    trace_text(line);
+    send_trace_checkpoint(V86GL_TEST_TRACE_PHASE_FAIL,
+            (HRESULT)code, line);
+    if (g_window && !g_teardown_started)
+        set_result_title(g_window, line, (HRESULT)code);
+    return EXCEPTION_EXECUTE_HANDLER;
 }
 
 /*
@@ -73,10 +133,16 @@ static void set_result_title(HWND hwnd, const char *stage, HRESULT hr)
 static void begin_stage(const char *stage)
 {
     char title[192];
+    const char *trace_status = "";
 
     g_failed_stage = stage;
     trace_text(stage);
-    wsprintfA(title, "D3D8 triangle: calling %s", stage);
+    send_trace_checkpoint(V86GL_TEST_TRACE_PHASE_CALLING, S_OK, stage);
+    if (g_trace_delivery_status == TRACE_STATUS_EXPORT_MISSING)
+        trace_status = " [TRACE EXPORT MISSING]";
+    else if (g_trace_delivery_status == TRACE_STATUS_SEND_FAILED)
+        trace_status = " [TRACE SEND FAILED]";
+    wsprintfA(title, "D3D8 triangle%s: calling %s", trace_status, stage);
     if (g_window)
     {
         SetWindowTextA(g_window, title);
@@ -89,28 +155,74 @@ static HRESULT failed(const char *stage, HRESULT hr)
 {
     g_failed_stage = stage;
     trace_hresult(stage, hr);
+    send_trace_checkpoint(V86GL_TEST_TRACE_PHASE_FAIL, hr, stage);
     return hr;
+}
+
+/*
+ * Do not update or redraw the window while it is processing WM_DESTROY.
+ * Apart from being unnecessary, sending more window messages from teardown
+ * makes a fault in WineD3D's Release path re-entrant and obscures the original
+ * failing call. These checkpoints are intentionally transport-only.
+ */
+static void begin_teardown_stage(const char *stage)
+{
+    g_failed_stage = stage;
+    trace_text(stage);
+    send_trace_checkpoint(V86GL_TEST_TRACE_PHASE_CALLING, S_OK, stage);
+}
+
+static void trace_release_result(const char *stage, ULONG refcount)
+{
+    trace_hresult(stage, (HRESULT)refcount);
 }
 
 static void release_d3d8(void)
 {
+    ULONG refcount;
+
+    if (g_releasing_d3d8)
+        return;
+
+    g_teardown_started = TRUE;
+    g_releasing_d3d8 = TRUE;
+
     if (g_vertex_buffer)
     {
-        IDirect3DVertexBuffer8_Release(g_vertex_buffer);
+        IDirect3DVertexBuffer8 *vertex_buffer = g_vertex_buffer;
+
+        /* Clear the global before the external call so a nested window message
+         * cannot release the same COM object twice. */
         g_vertex_buffer = NULL;
+        begin_teardown_stage("23 VertexBuffer::Release");
+        refcount = IDirect3DVertexBuffer8_Release(vertex_buffer);
+        trace_release_result("VertexBuffer::Release", refcount);
     }
 
     if (g_device)
     {
-        IDirect3DDevice8_Release(g_device);
+        IDirect3DDevice8 *device = g_device;
+
         g_device = NULL;
+        begin_teardown_stage("24 Device::Release");
+        refcount = IDirect3DDevice8_Release(device);
+        trace_release_result("Device::Release", refcount);
     }
 
     if (g_d3d)
     {
-        IDirect3D8_Release(g_d3d);
+        IDirect3D8 *d3d = g_d3d;
+
         g_d3d = NULL;
+        begin_teardown_stage("25 Direct3D8::Release");
+        refcount = IDirect3D8_Release(d3d);
+        trace_release_result("Direct3D8::Release", refcount);
     }
+
+    begin_teardown_stage("26 teardown complete");
+    send_trace_checkpoint(V86GL_TEST_TRACE_PHASE_RETURNED, S_OK,
+            "teardown complete");
+    g_releasing_d3d8 = FALSE;
 }
 
 static HRESULT create_device(HWND hwnd)
@@ -123,10 +235,9 @@ static HRESULT create_device(HWND hwnd)
     g_d3d = Direct3DCreate8(D3D_SDK_VERSION);
     if (!g_d3d)
     {
-        trace_text("Direct3DCreate8 returned NULL");
-        g_failed_stage = "Direct3DCreate8 returned NULL";
-        return E_FAIL;
+        return failed("Direct3DCreate8 returned NULL", E_FAIL);
     }
+    trace_hresult("Direct3DCreate8", D3D_OK);
     trace_text("Direct3DCreate8 returned an interface");
 
     ZeroMemory(&mode, sizeof(mode));
@@ -135,6 +246,17 @@ static HRESULT create_device(HWND hwnd)
     trace_hresult("GetAdapterDisplayMode", hr);
     if (FAILED(hr))
         return failed("GetAdapterDisplayMode", hr);
+    {
+        char mode_line[128];
+
+        wsprintfA(mode_line,
+                "display mode %lux%lu @ %lu Hz format=%lu (0x%08lX)",
+                (unsigned long)mode.Width, (unsigned long)mode.Height,
+                (unsigned long)mode.RefreshRate, (unsigned long)mode.Format,
+                (unsigned long)mode.Format);
+        trace_text(mode_line);
+        send_trace_checkpoint(V86GL_TEST_TRACE_PHASE_TEXT, S_OK, mode_line);
+    }
 
     begin_stage("03 CheckDeviceType");
     hr = IDirect3D8_CheckDeviceType(g_d3d, D3DADAPTER_DEFAULT,
@@ -308,6 +430,8 @@ static HRESULT render_triangle(HWND hwnd)
         return failed("Present", hr);
 
     set_result_title(hwnd, "Present S_OK - expected RGB triangle", hr);
+    send_trace_checkpoint(V86GL_TEST_TRACE_PHASE_PASS, hr,
+            "22 Present S_OK - expected RGB triangle");
     return hr;
 }
 
@@ -343,6 +467,9 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam,
         }
 
         case WM_DESTROY:
+            /* The HWND is already being destroyed. Prevent the exception
+             * reporter from calling SetWindowTextA() recursively on it. */
+            g_window = NULL;
             release_d3d8();
             PostQuitMessage(0);
             return 0;
@@ -386,6 +513,10 @@ static int run_test(HINSTANCE instance, int show_command)
 
     g_window = hwnd;
 
+    SetUnhandledExceptionFilter(unhandled_exception_filter);
+    send_trace_checkpoint(V86GL_TEST_TRACE_PHASE_TEXT, S_OK,
+            "d3d8_triangle_test trace-v9-fbo-allocation-20260726");
+
     ShowWindow(hwnd, show_command);
     UpdateWindow(hwnd);
 
@@ -412,5 +543,7 @@ static int run_test(HINSTANCE instance, int show_command)
 void WINAPI WinMainCRTStartup(void)
 {
     int result = run_test(GetModuleHandleA(NULL), SW_SHOWDEFAULT);
+
+    begin_teardown_stage("27 ExitProcess");
     ExitProcess((UINT)result);
 }

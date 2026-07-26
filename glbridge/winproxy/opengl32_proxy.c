@@ -71,6 +71,7 @@ void APIENTRY glTranslatef(GLfloat x, GLfloat y, GLfloat z);
 #define V86GL_HOST_CAP_ANISOTROPY        0x00000008u
 #define GL_COLOR_BUFFER_BIT   0x00004000
 #define GL_DEPTH_BUFFER_BIT   0x00000100
+#define GL_STENCIL_BUFFER_BIT 0x00000400
 #define GL_NEVER              0x0200
 #define GL_LESS               0x0201
 #define GL_EQUAL              0x0202
@@ -752,7 +753,11 @@ void APIENTRY glTranslatef(GLfloat x, GLfloat y, GLfloat z);
 #define GL_MAX_TEXTURE_IMAGE_UNITS_ARB 0x8872
 #define GL_MAX_RENDERBUFFER_SIZE_EXT 0x84E8
 #define GL_FRAMEBUFFER_BINDING_EXT 0x8CA6
+#define GL_DRAW_FRAMEBUFFER_BINDING_EXT GL_FRAMEBUFFER_BINDING_EXT
 #define GL_RENDERBUFFER_BINDING_EXT 0x8CA7
+#define GL_READ_FRAMEBUFFER_EXT 0x8CA8
+#define GL_DRAW_FRAMEBUFFER_EXT 0x8CA9
+#define GL_READ_FRAMEBUFFER_BINDING_EXT 0x8CAA
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE_EXT 0x8CD0
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_EXT 0x8CD1
 #define GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL_EXT 0x8CD2
@@ -791,8 +796,12 @@ void APIENTRY glTranslatef(GLfloat x, GLfloat y, GLfloat z);
 #define GL_UNSIGNED_INT_24_8_EXT GL_UNSIGNED_INT_24_8
 #define GL_DEPTH24_STENCIL8_EXT GL_DEPTH24_STENCIL8
 #define GL_FRAMEBUFFER        GL_FRAMEBUFFER_EXT
+#define GL_READ_FRAMEBUFFER   GL_READ_FRAMEBUFFER_EXT
+#define GL_DRAW_FRAMEBUFFER   GL_DRAW_FRAMEBUFFER_EXT
 #define GL_RENDERBUFFER       GL_RENDERBUFFER_EXT
 #define GL_FRAMEBUFFER_BINDING GL_FRAMEBUFFER_BINDING_EXT
+#define GL_DRAW_FRAMEBUFFER_BINDING GL_DRAW_FRAMEBUFFER_BINDING_EXT
+#define GL_READ_FRAMEBUFFER_BINDING GL_READ_FRAMEBUFFER_BINDING_EXT
 #define GL_RENDERBUFFER_BINDING GL_RENDERBUFFER_BINDING_EXT
 #define GL_FRAMEBUFFER_COMPLETE GL_FRAMEBUFFER_COMPLETE_EXT
 #define GL_COLOR_ATTACHMENT0  GL_COLOR_ATTACHMENT0_EXT
@@ -816,7 +825,12 @@ void APIENTRY glTranslatef(GLfloat x, GLfloat y, GLfloat z);
 #define V86GL_CTRL_MAKE_CURRENT 0xFFF0u
 #define V86GL_CTRL_RELEASE_CURRENT 0xFFF1u
 #define V86GL_CTRL_DESTROY_CONTEXT 0xFFF2u
+#define V86GL_CTRL_TEST_TRACE 0xFFF3u
 #define V86GL_EXTENDED_RECORD_SIZE 0xFFFFu
+#define V86GL_TEST_TRACE_HEADER_SIZE 12u
+#define V86GL_TEST_TRACE_MAX_TEXT 512u
+#define V86GL_TEST_TRACE_PHASE_PASS 3u
+#define V86GL_TEST_TRACE_PHASE_TEXT 5u
 #define V86GL_READ_PIXELS_HEADER_SIZE 32u
 #define V86GL_READ_PIXELS_STATUS_PENDING 0u
 #define V86GL_READ_PIXELS_STATUS_OK 1u
@@ -1069,6 +1083,7 @@ enum {
     GLFN_INVALIDATE_PROGRAM_LOCATIONS = 214,
     GLFN_COPY_TEX_SUB_IMAGE_3D = 215,
     GLFN_QUERY_OBJECT_BATCH = 216,
+    GLFN_BLIT_FRAMEBUFFER = 217,
 };
 
 static HANDLE g_v86gl = INVALID_HANDLE_VALUE;
@@ -1089,6 +1104,10 @@ static uint32_t g_last_surface_width = 0;
 static uint32_t g_last_surface_height = 0;
 static BOOL g_have_last_surface = FALSE;
 static BOOL g_context_destroy_sent = FALSE;
+static BOOL g_renderer_lifecycle_started = FALSE;
+static BOOL g_proxy_hello_sent = FALSE;
+static BOOL g_first_present_trace_sent = FALSE;
+static BOOL g_guest_test_passed = FALSE;
 #define V86GL_MAX_WGL_CONTEXTS 32
 typedef struct {
     BOOL used;
@@ -1120,7 +1139,8 @@ static GLuint g_array_buffer_binding = 0;
 static GLuint g_element_array_buffer_binding = 0;
 static GLuint g_pixel_pack_buffer_binding = 0;
 static GLuint g_pixel_unpack_buffer_binding = 0;
-static GLuint g_framebuffer_binding = 0;
+static GLuint g_draw_framebuffer_binding = 0;
+static GLuint g_read_framebuffer_binding = 0;
 static GLuint g_renderbuffer_binding = 0;
 static GLuint g_next_list_id = 1;
 static GLuint g_list_base = 0;
@@ -1277,10 +1297,166 @@ static void v86gl_error(const char* format, ...) {
     va_end(args);
 }
 
+typedef enum V86GLCapsProfile {
+    V86GL_CAPS_PROFILE_UNRESOLVED = 0,
+    V86GL_CAPS_PROFILE_WINED3D_GL15 = 1,
+    V86GL_CAPS_PROFILE_WINED3D_ARB = 2,
+    V86GL_CAPS_PROFILE_GL21_NO_FBO = 3,
+    V86GL_CAPS_PROFILE_GL21_FBO_FFP = 4,
+    V86GL_CAPS_PROFILE_GL21 = 5
+} V86GLCapsProfile;
+
+static V86GLCapsProfile g_caps_profile = V86GL_CAPS_PROFILE_UNRESOLVED;
+
+/*
+ * WineD3D 1.7.52 changes several independent backends from the advertised GL
+ * contract.  A 2.1 + GLSL + FBO profile selects its generated-GLSL fixed
+ * function pipeline and FBO swapchain blit. Keep that contract separate from
+ * the WebGL2/gl4es implementation used behind the proxy so each WineD3D
+ * backend can still be tested independently.
+ *
+ * V86GL_CAPS_PROFILE may override automatic selection:
+ *   gl15          - fixed function + backbuffer (safest WineD3D baseline)
+ *   gl15-arb      - GL 1.5 + ARB vertex/fragment programs, still no FBO
+ *   gl21-no-fbo   - GLSL 1.20 backend + backbuffer, isolates GLSL from FBO
+ *   gl21-fbo-ffp  - GLSL + FBO, but no ARB programs; isolates the FBO blitter
+ *   gl21          - current native OpenGL 2.1 + FBO profile
+ */
+static V86GLCapsProfile current_caps_profile(void) {
+    char value[32];
+    DWORD length;
+
+    if (g_caps_profile != V86GL_CAPS_PROFILE_UNRESOLVED) {
+        return g_caps_profile;
+    }
+
+    length = GetEnvironmentVariableA("V86GL_CAPS_PROFILE", value,
+                                     (DWORD)sizeof(value));
+    if (length && length < sizeof(value)) {
+        if (!lstrcmpiA(value, "gl15") ||
+            !lstrcmpiA(value, "safe") ||
+            !lstrcmpiA(value, "wined3d")) {
+            g_caps_profile = V86GL_CAPS_PROFILE_WINED3D_GL15;
+            return g_caps_profile;
+        }
+        if (!lstrcmpiA(value, "gl15-arb") ||
+            !lstrcmpiA(value, "arb")) {
+            g_caps_profile = V86GL_CAPS_PROFILE_WINED3D_ARB;
+            return g_caps_profile;
+        }
+        if (!lstrcmpiA(value, "gl21-no-fbo") ||
+            !lstrcmpiA(value, "glsl21-no-fbo") ||
+            !lstrcmpiA(value, "gl21-backbuffer")) {
+            g_caps_profile = V86GL_CAPS_PROFILE_GL21_NO_FBO;
+            return g_caps_profile;
+        }
+        if (!lstrcmpiA(value, "gl21-fbo-ffp") ||
+            !lstrcmpiA(value, "gl21-no-arb")) {
+            g_caps_profile = V86GL_CAPS_PROFILE_GL21_FBO_FFP;
+            return g_caps_profile;
+        }
+        if (!lstrcmpiA(value, "gl21") ||
+            !lstrcmpiA(value, "native")) {
+            g_caps_profile = V86GL_CAPS_PROFILE_GL21;
+            return g_caps_profile;
+        }
+    }
+
+    /* Direct3DCreate8 loads wined3d.dll before it creates the capability-probe
+     * WGL context.  Native OpenGL games do not load it, so they retain the 2.1
+     * profile required by Cube 2. */
+    g_caps_profile = GetModuleHandleA("wined3d.dll") ?
+        V86GL_CAPS_PROFILE_WINED3D_GL15 :
+        V86GL_CAPS_PROFILE_GL21;
+    return g_caps_profile;
+}
+
+static BOOL caps_profile_is_gl21(V86GLCapsProfile profile) {
+    return profile == V86GL_CAPS_PROFILE_GL21_NO_FBO ||
+           profile == V86GL_CAPS_PROFILE_GL21_FBO_FFP ||
+           profile == V86GL_CAPS_PROFILE_GL21;
+}
+
+static const char* caps_profile_trace_text(void) {
+    switch (current_caps_profile()) {
+    case V86GL_CAPS_PROFILE_WINED3D_GL15:
+        return "opengl32 proxy trace-v10 gpu=svga3d arb-frag-params=28 caps=wined3d-gl15 no-fbo no-shaders";
+    case V86GL_CAPS_PROFILE_WINED3D_ARB:
+        return "opengl32 proxy trace-v10 gpu=svga3d arb-frag-params=28 caps=wined3d-gl15-arb no-fbo";
+    case V86GL_CAPS_PROFILE_GL21_NO_FBO:
+        return "opengl32 proxy trace-v10 gpu=svga3d arb-frag-params=28 caps=gl21-no-fbo glsl120 backbuffer";
+    case V86GL_CAPS_PROFILE_GL21_FBO_FFP:
+        return "opengl32 proxy trace-v10 gpu=svga3d arb-frag-params=28 caps=gl21-fbo-ffp glsl120 fbo-blit no-arb-program";
+    case V86GL_CAPS_PROFILE_GL21:
+    default:
+        return "opengl32 proxy trace-v10 gpu=svga3d arb-frag-params=28 caps=gl21 fbo-blit";
+    }
+}
+
+/*
+ * This is the capability contract used by the historical D3D8 triangle
+ * baseline (commit 78f0218): GL 1.5 fixed function, without GLSL, ARB program
+ * backends, or framebuffer objects.  Hiding FBO is intentional; WineD3D then
+ * changes its default ORM_FBO setting to ORM_BACKBUFFER.
+ */
+static const char g_gl_extensions_wined3d_gl15[] =
+    "GL_ARB_multitexture "
+    "GL_ARB_texture_env_combine "
+    "GL_EXT_vertex_array "
+    "GL_EXT_packed_pixels "
+    "GL_EXT_rescale_normal "
+    "GL_EXT_secondary_color "
+    "GL_EXT_separate_specular_color "
+    "GL_EXT_texture_edge_clamp "
+    "GL_EXT_texture3D "
+    "GL_SGIS_texture_lod "
+    "GL_EXT_blend_color "
+    "GL_EXT_blend_subtract "
+    "GL_EXT_blend_minmax "
+    "GL_ARB_texture_cube_map "
+    "GL_ARB_multisample "
+    "GL_ARB_texture_env_dot3 "
+    "GL_ARB_draw_buffers "
+    "GL_ARB_texture_border_clamp "
+    "GL_ARB_transpose_matrix "
+    "GL_NV_blend_square "
+    "GL_ARB_shadow "
+    "GL_EXT_fog_coord "
+    "GL_EXT_multi_draw_arrays "
+    "GL_ARB_point_parameters "
+    "GL_EXT_blend_equation_separate "
+    "GL_EXT_blend_func_separate "
+    "GL_EXT_stencil_wrap "
+    "GL_EXT_stencil_two_side "
+    "GL_ARB_texture_env_crossbar "
+    "GL_ARB_texture_mirrored_repeat "
+    "GL_WIN_swap_hint "
+    "GL_ARB_point_sprite "
+    "GL_ARB_vertex_buffer_object "
+    "GL_ARB_pixel_buffer_object "
+    "GL_EXT_pixel_buffer_object "
+    "GL_ARB_occlusion_query "
+    "GL_ARB_depth_texture "
+    "GL_EXT_packed_depth_stencil "
+    "GL_EXT_texture_sRGB "
+    "GL_ARB_texture_float "
+    "GL_ARB_half_float_pixel "
+    "GL_EXT_texture_compression_s3tc "
+    "GL_EXT_shadow_funcs "
+    "GL_ARB_texture_non_power_of_two "
+    "GL_EXT_bgra "
+    "GL_EXT_compiled_vertex_array "
+    "GL_EXT_draw_range_elements "
+    "GL_EXT_texture_env_add "
+    "GL_EXT_texture_env_combine "
+    "GL_EXT_texture_filter_anisotropic "
+    "GL_EXT_texture_lod_bias "
+    "GL_EXT_texture_object";
+
 /* These extensions are implemented by the proxy/gl4es bridge itself or are
  * guaranteed by the required WebGL2 context.  Host-optional features are
  * appended to g_gl_extensions after a synchronous capability snapshot. */
-static const char g_gl_extensions_base[] =
+static const char g_gl_extensions_gl21_base[] =
     "GL_ARB_multitexture "
     "GL_ARB_texture_env_combine "
     "GL_EXT_vertex_array "
@@ -1323,7 +1499,6 @@ static const char g_gl_extensions_base[] =
      * reflection and error paths through the browser bridge. */
     "GL_ARB_vertex_program "
     "GL_ARB_fragment_program "
-    "GL_EXT_framebuffer_object "
     "GL_ARB_depth_texture "
     "GL_EXT_packed_depth_stencil "
     "GL_EXT_texture_sRGB "
@@ -2030,6 +2205,25 @@ static TextureObjectState* find_texture_state(GLuint name, GLenum target, BOOL c
     return texture_state_defaults(free_state, name, target);
 }
 
+/* Unlike find_texture_state(), this lookup never promotes a name returned by
+ * glGenTextures() into a texture object by assigning its first target.  OpenGL
+ * creates the object on first bind; FBO validation and glIsTexture() need to
+ * observe that distinction without changing it. */
+static TextureObjectState* lookup_texture_state(GLuint name) {
+    uint32_t i;
+
+    if (!name) {
+        return NULL;
+    }
+    for (i = 0; i < V86GL_MAX_TEXTURE_STATES; i++) {
+        TextureObjectState* state = &g_texture_states[i];
+        if (state->used && state->name == name) {
+            return state;
+        }
+    }
+    return NULL;
+}
+
 static void delete_texture_state(GLuint name) {
     uint32_t i;
     uint32_t unit;
@@ -2457,7 +2651,8 @@ static void free_gl2_state(void) {
     g_current_program = 0;
     g_current_vertex_program_arb = 0;
     g_current_fragment_program_arb = 0;
-    g_framebuffer_binding = 0;
+    g_draw_framebuffer_binding = 0;
+    g_read_framebuffer_binding = 0;
     g_renderbuffer_binding = 0;
 }
 
@@ -2661,9 +2856,8 @@ static void delete_framebuffer_state(GLuint name) {
         return;
     }
     ZeroMemory(state, sizeof(*state));
-    if (g_framebuffer_binding == name) {
-        g_framebuffer_binding = 0;
-    }
+    if (g_draw_framebuffer_binding == name) g_draw_framebuffer_binding = 0;
+    if (g_read_framebuffer_binding == name) g_read_framebuffer_binding = 0;
 }
 
 static void delete_renderbuffer_state(GLuint name) {
@@ -2694,7 +2888,9 @@ static void delete_renderbuffer_state(GLuint name) {
 }
 
 static BOOL valid_framebuffer_target(GLenum target) {
-    return target == GL_FRAMEBUFFER_EXT;
+    return target == GL_FRAMEBUFFER_EXT ||
+           target == GL_READ_FRAMEBUFFER_EXT ||
+           target == GL_DRAW_FRAMEBUFFER_EXT;
 }
 
 static BOOL valid_renderbuffer_target(GLenum target) {
@@ -2721,22 +2917,41 @@ static uint32_t framebuffer_attachment_index(GLenum attachment) {
     return V86GL_MAX_COLOR_ATTACHMENTS + 1u;
 }
 
-static FramebufferAttachmentState* bound_framebuffer_attachment(GLenum attachment,
+static GLuint framebuffer_binding_for_target(GLenum target) {
+    return target == GL_READ_FRAMEBUFFER_EXT ?
+        g_read_framebuffer_binding : g_draw_framebuffer_binding;
+}
+
+static void set_framebuffer_binding_for_target(GLenum target, GLuint framebuffer) {
+    if (target == GL_FRAMEBUFFER_EXT) {
+        g_draw_framebuffer_binding = framebuffer;
+        g_read_framebuffer_binding = framebuffer;
+    } else if (target == GL_READ_FRAMEBUFFER_EXT) {
+        g_read_framebuffer_binding = framebuffer;
+    } else {
+        g_draw_framebuffer_binding = framebuffer;
+    }
+}
+
+static FramebufferAttachmentState* bound_framebuffer_attachment(GLenum target,
+                                                               GLenum attachment,
                                                                BOOL create) {
     FramebufferObjectState* framebuffer;
     FramebufferAttachmentState* state;
+    GLuint binding;
     uint32_t index;
 
     if (!valid_framebuffer_attachment(attachment)) {
         v86gl_set_error(GL_INVALID_ENUM);
         return NULL;
     }
-    if (!g_framebuffer_binding) {
+    binding = framebuffer_binding_for_target(target);
+    if (!binding) {
         v86gl_set_error(GL_INVALID_OPERATION);
         return NULL;
     }
 
-    framebuffer = find_framebuffer_state(g_framebuffer_binding, create);
+    framebuffer = find_framebuffer_state(binding, create);
     if (!framebuffer) {
         v86gl_set_error(create ? GL_OUT_OF_MEMORY : GL_INVALID_OPERATION);
         return NULL;
@@ -2750,16 +2965,19 @@ static FramebufferAttachmentState* bound_framebuffer_attachment(GLenum attachmen
     return state;
 }
 
-static GLenum cached_framebuffer_status(void) {
+static GLenum texture_binding_target(GLenum target);
+
+static GLenum cached_framebuffer_status(GLenum target) {
     FramebufferObjectState* framebuffer;
+    GLuint binding = framebuffer_binding_for_target(target);
     uint32_t i;
     BOOL has_attachment = FALSE;
 
-    if (!g_framebuffer_binding) {
+    if (!binding) {
         return GL_FRAMEBUFFER_COMPLETE_EXT;
     }
 
-    framebuffer = find_framebuffer_state(g_framebuffer_binding, FALSE);
+    framebuffer = find_framebuffer_state(binding, FALSE);
     if (!framebuffer) {
         return GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT_EXT;
     }
@@ -2770,9 +2988,15 @@ static GLenum cached_framebuffer_status(void) {
             continue;
         }
         has_attachment = TRUE;
-        if (attachment->object_type == GL_TEXTURE &&
-            !find_texture_state(attachment->object_name, attachment->texture_target, FALSE)) {
-            return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT_EXT;
+        if (attachment->object_type == GL_TEXTURE) {
+            TextureObjectState* texture =
+                lookup_texture_state(attachment->object_name);
+            GLenum binding_target =
+                texture_binding_target(attachment->texture_target);
+            if (!texture || !texture->target ||
+                    texture->target != binding_target) {
+                return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT_EXT;
+            }
         }
         if (attachment->object_type == GL_RENDERBUFFER_EXT &&
             !find_renderbuffer_state(attachment->object_name, FALSE)) {
@@ -3573,7 +3797,8 @@ static int emit_pci_batch(BOOL force_present) {
         return 0;
     }
 
-    v86gl_trace("submit <- sys accepted frame=%lu", (unsigned long)desc->frame_id);
+    v86gl_trace("submit <- sys accepted frame=%lu",
+                (unsigned long)desc->frame_id);
     reset_pci_stream();
     return 1;
 }
@@ -3661,6 +3886,71 @@ static int emit_pci_record(uint16_t fn, const void* args, uint32_t args_size, BO
     return 1;
 }
 
+static int emit_test_trace_record(DWORD phase, HRESULT hr, const char* text,
+                                  BOOL flush_after) {
+    uint8_t* payload;
+    uint32_t text_size = 0;
+    uint32_t payload_size;
+    int emitted;
+
+    if (text) {
+        while (text_size < V86GL_TEST_TRACE_MAX_TEXT && text[text_size]) {
+            text_size++;
+        }
+    }
+
+    payload_size = V86GL_TEST_TRACE_HEADER_SIZE + text_size;
+    payload = (uint8_t*)HeapAlloc(GetProcessHeap(), 0, payload_size);
+    if (!payload) {
+        return 0;
+    }
+
+    write_u32le(payload + 0, (uint32_t)phase);
+    write_u32le(payload + 4, (uint32_t)hr);
+    write_u32le(payload + 8, text_size);
+    if (text_size) {
+        CopyMemory(payload + V86GL_TEST_TRACE_HEADER_SIZE, text, text_size);
+    }
+
+    emitted = emit_pci_record(V86GL_CTRL_TEST_TRACE, payload, payload_size,
+                              flush_after);
+    HeapFree(GetProcessHeap(), 0, payload);
+    return emitted;
+}
+
+/*
+ * Test-only diagnostic entry point.  D3D samples resolve this dynamically
+ * from opengl32.dll, so production applications acquire no extra import and
+ * an older/system opengl32.dll remains usable.  Every checkpoint is flushed
+ * synchronously: a CALLING record therefore reaches the browser before the
+ * sample enters a D3D method that may block.
+ *
+ * Payload (little endian): phase u32, HRESULT bits u32, text byte count u32,
+ * followed by non-NUL-terminated ASCII/UTF-8 bytes.
+ */
+__declspec(dllexport)
+BOOL APIENTRY v86glTraceCheckpoint(DWORD phase, HRESULT hr, const char* text) {
+    GLenum saved_gl_error = g_error;
+    DWORD saved_last_error = GetLastError();
+    int emitted;
+
+    emitted = emit_test_trace_record(phase, hr, text, TRUE);
+    if (emitted && phase == V86GL_TEST_TRACE_PHASE_PASS) {
+        g_guest_test_passed = TRUE;
+    }
+
+    /* Instrumentation must not change glGetError() or Win32 last-error state. */
+    g_error = saved_gl_error;
+    SetLastError(saved_last_error);
+    return emitted ? TRUE : FALSE;
+}
+
+static void trace_guest_teardown(const char* text) {
+    if (g_guest_test_passed) {
+        v86glTraceCheckpoint(V86GL_TEST_TRACE_PHASE_TEXT, S_OK, text);
+    }
+}
+
 static int emit_read_pixels(GLint x, GLint y, GLsizei width, GLsizei height,
                             GLenum format, GLenum type, uint32_t data_size,
                             GLvoid* pixels) {
@@ -3706,7 +3996,10 @@ static int emit_read_pixels(GLint x, GLint y, GLsizei width, GLsizei height,
     }
 
     CopyMemory(args, &request, sizeof(request));
-    ZeroMemory(args + sizeof(request), data_size);
+    /* glReadPixels does not modify bytes skipped by PACK_SKIP_* or row
+     * padding. Seed the response with the caller's destination so the host
+     * can update only actual pixels without clobbering those bytes. */
+    CopyMemory(args + sizeof(request), pixels, data_size);
 
     if (!emit_pci_batch(FALSE) ||
         read_u32le(args + 28) != V86GL_READ_PIXELS_STATUS_OK) {
@@ -4773,16 +5066,41 @@ static int emit_display_list_stream(const uint8_t* data, uint32_t size) {
     return 1;
 }
 
-static void emit_frame(void) {
+static BOOL emit_frame(const char* first_present_marker) {
+    BOOL trace_first_present = !g_first_present_trace_sent;
+    BOOL submitted;
+    GLenum saved_gl_error = g_error;
+
+    if (trace_first_present) {
+        g_first_present_trace_sent = TRUE;
+        /* Keep the enter marker in the force-present descriptor.  It reaches
+         * the browser immediately before commit_frame(), so a frozen/failed
+         * commit still leaves an unambiguous final checkpoint. */
+        emit_test_trace_record(V86GL_TEST_TRACE_PHASE_TEXT, S_OK,
+                first_present_marker, FALSE);
+    }
+
     v86gl_trace("present requested frame=%lu queuedCommands=%lu queuedBytes=%lu",
                 (unsigned long)g_frame_id,
                 (unsigned long)g_dma_command_count,
                 (unsigned long)g_dma_size);
-    emit_pci_batch(TRUE);
-    g_frame_id++;
-    if (!g_frame_id) {
-        g_frame_id = 1;
+    submitted = emit_pci_batch(TRUE) ? TRUE : FALSE;
+    if (submitted) {
+        g_frame_id++;
+        if (!g_frame_id) {
+            g_frame_id = 1;
+        }
     }
+
+    g_error = saved_gl_error;
+    if (trace_first_present) {
+        v86glTraceCheckpoint(V86GL_TEST_TRACE_PHASE_TEXT,
+                submitted ? S_OK : E_FAIL,
+                submitted ?
+                    "opengl32 proxy first Present submit returned OK" :
+                    "opengl32 proxy first Present submit returned FAILED");
+    }
+    return submitted;
 }
 
 static void emit_current_surface(HWND hwnd) {
@@ -4853,9 +5171,11 @@ static void restore_window_proc(void) {
 }
 
 static void emit_destroy_context_once(void) {
-    /* The browser bridge replaces both the canvas and the WebGL context.
-     * Optional extensions must be re-probed if this DLL later creates and
-     * binds another WGL context in the same process. */
+    /* This is a guest-process teardown, not merely a transition between WGL
+     * contexts. WineD3D destroys its capability-probe context and immediately
+     * creates the device context from Direct3DCreate8/CreateDevice. Rebuilding
+     * the asynchronous WASM module at that boundary loses synchronous queries
+     * issued by the new context and also splits the proxy/host object state. */
     g_gl_extensions_profile_valid = FALSE;
     if (g_context_destroy_sent) {
         return;
@@ -4880,12 +5200,9 @@ static LRESULT CALLBACK vgl_window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         g_original_wndproc = NULL;
         g_have_last_surface = FALSE;
 
-        /* A drawable can disappear while one or more WGL contexts remain
-         * alive and are later rebound to another window.  Keep the shared
-         * browser renderer until the last context is explicitly deleted. */
-        if (!g_wgl_context_count) {
-            emit_destroy_context_once();
-        }
+        /* A drawable can disappear while a WGL context is later rebound to a
+         * different window. Keep the process renderer alive; DllMain sends the
+         * teardown notification when opengl32.dll actually unloads. */
     }
 
     if (original) {
@@ -5720,7 +6037,11 @@ static int read_framebuffer_tight(GLint x, GLint y, GLsizei width, GLsizei heigh
     }
 
     if (packed_offset || packed_stride != row_bytes || packed_size != tight_size) {
-        packed = (uint8_t*)HeapAlloc(GetProcessHeap(), 0, packed_size);
+        /* emit_read_pixels() preserves PACK padding by seeding the DMA reply
+         * from this buffer. Do not expose uninitialised guest heap bytes to
+         * the browser while doing an internal tight readback. */
+        packed = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                     packed_size);
         if (!packed) {
             v86gl_set_error(GL_OUT_OF_MEMORY);
             return 0;
@@ -5739,6 +6060,75 @@ static int read_framebuffer_tight(GLint x, GLint y, GLsizei width, GLsizei heigh
         HeapFree(GetProcessHeap(), 0, packed);
     }
     return ok;
+}
+
+/* Refresh a texture level from the currently bound colour FBO when that
+ * exact level is its attachment. WebGL has no glGetTexImage, but WineD3D's
+ * capability probes read a texture immediately after drawing to its bound
+ * FBO. Returning the upload-only CPU cache here makes match_fbo_tex_update()
+ * report a nonexistent driver bug and selects the wrong render-target path. */
+static int refresh_bound_fbo_texture_cache(TextureObjectState* texture,
+                                           GLenum target, GLint level,
+                                           TextureLevelState* state,
+                                           GLenum format, GLenum type) {
+    FramebufferObjectState* framebuffer;
+    FramebufferAttachmentState* attachment;
+    uint32_t slice_size;
+    uint32_t slice_index = 0;
+    uint8_t* tight;
+
+    if (!texture || !state || !g_draw_framebuffer_binding) {
+        return 0;
+    }
+    framebuffer = find_framebuffer_state(g_draw_framebuffer_binding, FALSE);
+    if (!framebuffer) {
+        return 0;
+    }
+    attachment = &framebuffer->attachments[0]; /* GL_COLOR_ATTACHMENT0 */
+    if (attachment->object_type != GL_TEXTURE ||
+        attachment->object_name != texture->name ||
+        attachment->texture_target != target ||
+        attachment->texture_level != level) {
+        return 0;
+    }
+    if (target == GL_TEXTURE_3D) {
+        if (attachment->texture_zoffset < 0 ||
+            attachment->texture_zoffset >= state->depth) {
+            v86gl_set_error(GL_INVALID_OPERATION);
+            return -1;
+        }
+        slice_index = (uint32_t)attachment->texture_zoffset;
+    }
+
+    slice_size = gl_pixel_tight_span(state->width, state->height, format, type);
+    if (!slice_size || slice_size > state->data_size ||
+        (uint64_t)slice_index * slice_size + slice_size > state->data_size) {
+        v86gl_set_error(GL_INVALID_OPERATION);
+        return -1;
+    }
+    tight = (uint8_t*)HeapAlloc(GetProcessHeap(), 0, slice_size);
+    if (!tight) {
+        v86gl_set_error(GL_OUT_OF_MEMORY);
+        return -1;
+    }
+    if (!read_framebuffer_tight(0, 0, state->width, state->height,
+                                format, type, tight, slice_size)) {
+        HeapFree(GetProcessHeap(), 0, tight);
+        v86gl_set_error(GL_INVALID_OPERATION);
+        return -1;
+    }
+    if (!state->data) {
+        state->data = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                          state->data_size);
+        if (!state->data) {
+            HeapFree(GetProcessHeap(), 0, tight);
+            v86gl_set_error(GL_OUT_OF_MEMORY);
+            return -1;
+        }
+    }
+    CopyMemory(state->data + slice_index * slice_size, tight, slice_size);
+    HeapFree(GetProcessHeap(), 0, tight);
+    return 1;
 }
 
 typedef struct TextureSubImageCapture {
@@ -6312,7 +6702,7 @@ BOOL WINAPI DllMain
 
     if (reason == DLL_PROCESS_DETACH) {
         v86gl_trace("unloading");
-        if (g_wgl_context_count) {
+        if (g_renderer_lifecycle_started) {
             emit_destroy_context_once();
         }
         restore_window_proc();
@@ -6587,9 +6977,14 @@ __declspec(dllexport)
 BOOL APIENTRY wglDeleteContext(HGLRC ctx) {
     V86GLWGLContext* context;
 
-    if (!validate_wgl_context(ctx, &context)) return FALSE;
+    trace_guest_teardown("opengl32 proxy wglDeleteContext enter");
+    if (!validate_wgl_context(ctx, &context)) {
+        trace_guest_teardown("opengl32 proxy wglDeleteContext invalid");
+        return FALSE;
+    }
     if (context->owner_thread || g_current_ctx == ctx) {
         SetLastError(ERROR_BUSY);
+        trace_guest_teardown("opengl32 proxy wglDeleteContext busy");
         return FALSE;
     }
     ZeroMemory(context, sizeof(*context));
@@ -6597,13 +6992,13 @@ BOOL APIENTRY wglDeleteContext(HGLRC ctx) {
     v86gl_trace("delete context frame=%lu", (unsigned long)g_frame_id);
     if (!g_wgl_context_count) {
         restore_window_proc();
-        emit_destroy_context_once();
-        /* The browser destroys every mapped WebGL query with the final
-         * renderer.  Do not let guest-side availability/polling cache entries
-         * survive into a later WGL context in the same process. */
+        /* WineD3D's caps context and device context are consecutive users of
+         * one process renderer. Clear transient query polling state without
+         * asynchronously destroying the renderer between them. */
         reset_query_object_state();
     }
     SetLastError(ERROR_SUCCESS);
+    trace_guest_teardown("opengl32 proxy wglDeleteContext returned");
     return TRUE;
 }
 
@@ -6615,8 +7010,10 @@ BOOL APIENTRY wglMakeCurrent(HDC hdc, HGLRC ctx) {
 
     if (!hdc && !ctx) {
         V86GLWGLContext* current = find_wgl_context(g_current_ctx);
+        trace_guest_teardown("opengl32 proxy wglMakeCurrent release enter");
         if (current && current->owner_thread != thread_id) {
             SetLastError(ERROR_SUCCESS);
+            trace_guest_teardown("opengl32 proxy wglMakeCurrent release foreign");
             return TRUE;
         }
         v86gl_trace("release current context");
@@ -6627,6 +7024,7 @@ BOOL APIENTRY wglMakeCurrent(HDC hdc, HGLRC ctx) {
         g_have_last_surface = FALSE;
         emit_pci_record(V86GL_CTRL_RELEASE_CURRENT, NULL, 0, TRUE);
         SetLastError(ERROR_SUCCESS);
+        trace_guest_teardown("opengl32 proxy wglMakeCurrent release returned");
         return TRUE;
     }
     if (!hdc || !ctx) {
@@ -6647,8 +7045,14 @@ BOOL APIENTRY wglMakeCurrent(HDC hdc, HGLRC ctx) {
 
     HWND hwnd = hdc ? WindowFromDC(hdc) : NULL;
     g_context_destroy_sent = FALSE;
+    g_renderer_lifecycle_started = TRUE;
     hook_window(hwnd);
     emit_current_surface(hwnd);
+    if (!g_proxy_hello_sent && v86glTraceCheckpoint(
+            V86GL_TEST_TRACE_PHASE_TEXT, S_OK,
+            caps_profile_trace_text())) {
+        g_proxy_hello_sent = TRUE;
+    }
     SetLastError(ERROR_SUCCESS);
     return TRUE;
 }
@@ -6688,27 +7092,33 @@ BOOL APIENTRY wglShareLists(HGLRC a, HGLRC b) {
 
 __declspec(dllexport)
 BOOL APIENTRY wglSwapLayerBuffers(HDC hdc, UINT planes) {
+    BOOL submitted;
     (void)hdc;
     (void)planes;
     v86gl_trace("wglSwapLayerBuffers");
-    emit_frame();
-    return TRUE;
+    submitted = emit_frame("opengl32 proxy wglSwapLayerBuffers enter");
+    SetLastError(submitted ? ERROR_SUCCESS : ERROR_GEN_FAILURE);
+    return submitted;
 }
 
 __declspec(dllexport)
 BOOL APIENTRY wglSwapBuffers(HDC hdc) {
+    BOOL submitted;
     (void)hdc;
     v86gl_trace("wglSwapBuffers");
-    emit_frame();
-    return TRUE;
+    submitted = emit_frame("opengl32 proxy wglSwapBuffers enter");
+    SetLastError(submitted ? ERROR_SUCCESS : ERROR_GEN_FAILURE);
+    return submitted;
 }
 
 __declspec(dllexport)
 DWORD APIENTRY wglSwapMultipleBuffers(UINT count, const WGLSWAP* swaps) {
     (void)swaps;
-    if (count) {
-        emit_frame();
+    if (count && !emit_frame("opengl32 proxy wglSwapMultipleBuffers enter")) {
+        SetLastError(ERROR_GEN_FAILURE);
+        return 0;
     }
+    SetLastError(ERROR_SUCCESS);
     return count;
 }
 
@@ -6947,7 +7357,55 @@ static void append_gl_extension(const char* extension) {
                (SIZE_T)extension_length + 1u);
 }
 
+static void remove_gl_extension(const char* extension) {
+    char* cursor = g_gl_extensions;
+    SIZE_T extension_length;
+
+    if (!extension || !extension[0]) {
+        return;
+    }
+    extension_length = (SIZE_T)lstrlenA(extension);
+
+    while (*cursor) {
+        char* token_start = cursor;
+        char* token_end = token_start;
+        SIZE_T token_length;
+        SIZE_T i;
+        BOOL matches = TRUE;
+
+        while (*token_end && *token_end != ' ') {
+            token_end++;
+        }
+        token_length = (SIZE_T)(token_end - token_start);
+        if (token_length == extension_length) {
+            for (i = 0; i < extension_length; i++) {
+                if (token_start[i] != extension[i]) {
+                    matches = FALSE;
+                    break;
+                }
+            }
+        } else {
+            matches = FALSE;
+        }
+        if (matches) {
+            char* remove_end = *token_end ? token_end + 1 : token_end;
+
+            if (!*token_end && token_start > g_gl_extensions) {
+                token_start--;
+            }
+            do {
+                *token_start++ = *remove_end;
+            } while (*remove_end++);
+            return;
+        }
+        cursor = *token_end ? token_end + 1 : token_end;
+    }
+}
+
 static const char* current_gl_extensions(void) {
+    V86GLCapsProfile profile = current_caps_profile();
+    const char* base = caps_profile_is_gl21(profile) ?
+        g_gl_extensions_gl21_base : g_gl_extensions_wined3d_gl15;
     GLint host_caps = 0;
     const GLint float_caps =
         (GLint)(V86GL_HOST_CAP_WEBGL2 |
@@ -6958,8 +7416,36 @@ static const char* current_gl_extensions(void) {
         return g_gl_extensions;
     }
 
-    CopyMemory(g_gl_extensions, g_gl_extensions_base,
-               sizeof(g_gl_extensions_base));
+    CopyMemory(g_gl_extensions, base, (SIZE_T)lstrlenA(base) + 1u);
+
+    if (profile == V86GL_CAPS_PROFILE_GL21 ||
+        profile == V86GL_CAPS_PROFILE_GL21_FBO_FFP) {
+        /* GL 2.1 does not include framebuffer objects in core. Advertise the
+         * extension only in the FBO profiles; gl21-no-fbo therefore selects
+         * WineD3D's backbuffer path without changing its GLSL backend. */
+        append_gl_extension("GL_EXT_framebuffer_object");
+        append_gl_extension("GL_EXT_framebuffer_blit");
+    }
+
+    if (profile == V86GL_CAPS_PROFILE_GL21_FBO_FFP) {
+        /* Keep GLSL/FBO/framebuffer-blit enabled while hiding the independent
+         * ARB assembly shader backend. */
+        remove_gl_extension("GL_ARB_vertex_program");
+        remove_gl_extension("GL_ARB_fragment_program");
+    }
+
+    if (profile == V86GL_CAPS_PROFILE_WINED3D_ARB) {
+        append_gl_extension("GL_ARB_vertex_program");
+        append_gl_extension("GL_ARB_fragment_program");
+        g_gl_extensions_profile_valid = TRUE;
+        return g_gl_extensions;
+    }
+
+    if (!caps_profile_is_gl21(profile)) {
+        g_gl_extensions_profile_valid = TRUE;
+        return g_gl_extensions;
+    }
+
     if (!emit_query_integer(V86GL_QUERY_HOST_CAPABILITIES, &host_caps)) {
         /* Renderer startup can briefly lag the guest.  Return the conservative
          * bridge-guaranteed profile now and retry on the next GL_EXTENSIONS
@@ -6990,11 +7476,30 @@ const GLubyte* APIENTRY glGetString(GLenum name) {
     }
 
     switch (name) {
-    case GL_VENDOR:     return (const GLubyte*)"v86";
-    case GL_RENDERER:   return (const GLubyte*)"v86 fake OpenGL over PCI DMA";
-    case GL_VERSION:    return (const GLubyte*)"2.1 v86gl (gl4es/WebGL2)";
+    /*
+     * WineD3D 1.7.52 treats an unknown GL vendor as NVIDIA. With the GL 2.1 /
+     * shader-model-2 capability set it then selects a GeForce FX 5800 and
+     * applies its "Geforce 5 NP2 disable" quirk. That is incorrect for this
+     * WebGL2 bridge, which has full NPOT support, and makes a 640x480 D3D8
+     * backbuffer fall through from GL_TEXTURE_2D to an unsupported rectangle
+     * texture and finally to a renderbuffer. Identify the adapter as the
+     * virtual SVGA3D family Wine already knows instead of impersonating
+     * physical hardware or returning an unknown vendor.
+     */
+    case GL_VENDOR:
+        return (const GLubyte*)"VMware, Inc.";
+    case GL_RENDERER:
+        return (const GLubyte*)"SVGA3D; v86 WebGL2 bridge";
+    case GL_VERSION:
+        return caps_profile_is_gl21(current_caps_profile()) ?
+            (const GLubyte*)"2.1 v86gl (gl4es/WebGL2)" :
+            (const GLubyte*)"1.5 v86gl (WineD3D backbuffer profile)";
     case GL_SHADING_LANGUAGE_VERSION:
-        return (const GLubyte*)"1.20 v86gl";
+        if (caps_profile_is_gl21(current_caps_profile())) {
+            return (const GLubyte*)"1.20 v86gl";
+        }
+        v86gl_set_error(GL_INVALID_ENUM);
+        return NULL;
     case GL_EXTENSIONS:
         return (const GLubyte*)current_gl_extensions();
     case GL_PROGRAM_ERROR_STRING_ARB:
@@ -7010,7 +7515,10 @@ const GLubyte* APIENTRY glGetString(GLenum name) {
 
 __declspec(dllexport)
 GLenum APIENTRY glGetError(void) {
-    GLenum e = g_error;
+    GLenum e;
+
+    trace_guest_teardown("opengl32 proxy glGetError enter");
+    e = g_error;
     g_error = 0;
     if (e == GL_NO_ERROR) {
         GLenum backend_error = GL_NO_ERROR;
@@ -7024,6 +7532,7 @@ GLenum APIENTRY glGetError(void) {
                     (unsigned long)g_frame_id,
                     (unsigned long)g_dma_command_count);
     }
+    trace_guest_teardown("opengl32 proxy glGetError returned");
     return e;
 }
 
@@ -7392,7 +7901,10 @@ void APIENTRY glGetIntegerv(GLenum pname, GLint* params) {
         params[0] = (GLint)g_pixel_unpack_buffer_binding;
         break;
     case GL_FRAMEBUFFER_BINDING_EXT:
-        params[0] = (GLint)g_framebuffer_binding;
+        params[0] = (GLint)g_draw_framebuffer_binding;
+        break;
+    case GL_READ_FRAMEBUFFER_BINDING_EXT:
+        params[0] = (GLint)g_read_framebuffer_binding;
         break;
     case GL_RENDERBUFFER_BINDING_EXT:
         params[0] = (GLint)g_renderbuffer_binding;
@@ -8057,7 +8569,22 @@ void APIENTRY glFlush(void) {
 
 __declspec(dllexport)
 void APIENTRY glFinish(void) {
-    emit_gl_call(GLFN_FINISH, NULL, 0);
+    uint8_t* args;
+
+    /* glFinish is a guest-visible completion point, not just another queued
+     * command.  Include a status word in the DMA record and submit the batch
+     * synchronously so WineD3D cannot continue after a missing/failed host
+     * export.  The mapped DMA storage remains valid after emit_pci_batch()
+     * resets the stream counters, just like the synchronous query helpers. */
+    if (!reserve_pci_record(GLFN_FINISH, NULL, sizeof(uint32_t), &args)) {
+        return;
+    }
+    write_u32le(args, V86GL_SYNC_QUERY_STATUS_PENDING);
+
+    if (!emit_pci_batch(FALSE) ||
+        read_u32le(args) != V86GL_SYNC_QUERY_STATUS_OK) {
+        v86gl_set_error(GL_INVALID_OPERATION);
+    }
 }
 
 __declspec(dllexport)
@@ -8644,7 +9171,14 @@ static BOOL valid_arb_program_target(GLenum target) {
 }
 
 static GLuint arb_program_parameter_limit(GLenum target) {
-    return target == GL_VERTEX_PROGRAM_ARB ? 96u : 24u;
+    /*
+     * WineD3D 1.7.52's ARB fixed-function fragment pipeline uses
+     * program.env[27].  The gl4es backend stores 28 fragment environment and
+     * local parameters, so expose and validate the same limit end-to-end.
+     * Returning the ARB minimum of 24 here corrupts WineD3D's 24-byte
+     * pshader_const_dirty allocation during the first fixed-function draw.
+     */
+    return target == GL_VERTEX_PROGRAM_ARB ? 96u : 28u;
 }
 
 static void emit_arb_program_parameter_fv(uint32_t parameter_kind, GLenum target,
@@ -8816,15 +9350,19 @@ void APIENTRY glBindProgramARB(GLenum target, GLuint program) {
 void APIENTRY glDeleteProgramsARB(GLsizei n, const GLuint* programs) {
     GLsizei i;
 
+    trace_guest_teardown("opengl32 proxy glDeleteProgramsARB enter");
     if (n < 0) {
         v86gl_set_error(GL_INVALID_VALUE);
+        trace_guest_teardown("opengl32 proxy glDeleteProgramsARB invalid count");
         return;
     }
     if (!n) {
+        trace_guest_teardown("opengl32 proxy glDeleteProgramsARB empty");
         return;
     }
     if (!programs) {
         v86gl_set_error(GL_INVALID_VALUE);
+        trace_guest_teardown("opengl32 proxy glDeleteProgramsARB null names");
         return;
     }
 
@@ -8838,6 +9376,7 @@ void APIENTRY glDeleteProgramsARB(GLsizei n, const GLuint* programs) {
         delete_arb_program_state(programs[i]);
     }
     emit_arb_program_name_array(GLFN_DELETE_PROGRAMS_ARB, n, programs);
+    trace_guest_teardown("opengl32 proxy glDeleteProgramsARB returned");
 }
 
 void APIENTRY glGenProgramsARB(GLsizei n, GLuint* programs) {
@@ -11117,7 +11656,7 @@ void APIENTRY glBindFramebufferEXT(GLenum target, GLuint framebuffer) {
         v86gl_set_error(GL_OUT_OF_MEMORY);
         return;
     }
-    g_framebuffer_binding = framebuffer;
+    set_framebuffer_binding_for_target(target, framebuffer);
     payload.target = (uint32_t)target;
     payload.framebuffer = framebuffer;
     emit_gl_call(GLFN_BIND_FRAMEBUFFER, &payload, sizeof(payload));
@@ -11142,7 +11681,7 @@ GLenum APIENTRY glCheckFramebufferStatusEXT(GLenum target) {
         v86gl_set_error(GL_INVALID_ENUM);
         return GL_FRAMEBUFFER_UNSUPPORTED_EXT;
     }
-    result = cached_framebuffer_status();
+    result = cached_framebuffer_status(target);
     if (emit_check_framebuffer_status(target, &result)) {
         return result;
     }
@@ -11153,10 +11692,61 @@ GLenum APIENTRY glCheckFramebufferStatus(GLenum target) {
     return glCheckFramebufferStatusEXT(target);
 }
 
+void APIENTRY glBlitFramebufferEXT(GLint srcX0, GLint srcY0,
+                                   GLint srcX1, GLint srcY1,
+                                   GLint dstX0, GLint dstY0,
+                                   GLint dstX1, GLint dstY1,
+                                   GLbitfield mask, GLenum filter) {
+    struct {
+        int32_t src_x0, src_y0, src_x1, src_y1;
+        int32_t dst_x0, dst_y0, dst_x1, dst_y1;
+        uint32_t mask, filter;
+    } payload;
+    const GLbitfield valid_mask =
+        GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
+
+    if (mask & ~valid_mask) {
+        v86gl_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (filter != GL_NEAREST && filter != GL_LINEAR) {
+        v86gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if ((mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) &&
+        filter != GL_NEAREST) {
+        v86gl_set_error(GL_INVALID_OPERATION);
+        return;
+    }
+
+    payload.src_x0 = srcX0;
+    payload.src_y0 = srcY0;
+    payload.src_x1 = srcX1;
+    payload.src_y1 = srcY1;
+    payload.dst_x0 = dstX0;
+    payload.dst_y0 = dstY0;
+    payload.dst_x1 = dstX1;
+    payload.dst_y1 = dstY1;
+    payload.mask = (uint32_t)mask;
+    payload.filter = (uint32_t)filter;
+    emit_gl_call(GLFN_BLIT_FRAMEBUFFER, &payload, sizeof(payload));
+}
+
+void APIENTRY glBlitFramebuffer(GLint srcX0, GLint srcY0,
+                                GLint srcX1, GLint srcY1,
+                                GLint dstX0, GLint dstY0,
+                                GLint dstX1, GLint dstY1,
+                                GLbitfield mask, GLenum filter) {
+    glBlitFramebufferEXT(srcX0, srcY0, srcX1, srcY1,
+                         dstX0, dstY0, dstX1, dstY1, mask, filter);
+}
+
 static void framebuffer_texture_ext(GLenum target, GLenum attachment,
                                     GLenum textarget, GLuint texture,
                                     GLint level, GLint zoffset) {
     FramebufferAttachmentState* state;
+    TextureObjectState* texture_state;
+    GLenum binding_target;
     struct {
         uint32_t target;
         uint32_t attachment;
@@ -11174,7 +11764,31 @@ static void framebuffer_texture_ext(GLenum target, GLenum attachment,
         v86gl_set_error(GL_INVALID_VALUE);
         return;
     }
-    state = bound_framebuffer_attachment(attachment, TRUE);
+    switch (textarget) {
+    case GL_TEXTURE_1D:
+    case GL_TEXTURE_2D:
+    case GL_TEXTURE_3D:
+    case GL_TEXTURE_CUBE_MAP_POSITIVE_X:
+    case GL_TEXTURE_CUBE_MAP_NEGATIVE_X:
+    case GL_TEXTURE_CUBE_MAP_POSITIVE_Y:
+    case GL_TEXTURE_CUBE_MAP_NEGATIVE_Y:
+    case GL_TEXTURE_CUBE_MAP_POSITIVE_Z:
+    case GL_TEXTURE_CUBE_MAP_NEGATIVE_Z:
+        break;
+    default:
+        v86gl_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    binding_target = texture_binding_target(textarget);
+    if (texture) {
+        texture_state = lookup_texture_state(texture);
+        if (!texture_state || !texture_state->target ||
+                texture_state->target != binding_target) {
+            v86gl_set_error(GL_INVALID_OPERATION);
+            return;
+        }
+    }
+    state = bound_framebuffer_attachment(target, attachment, TRUE);
     if (!state) return;
 
     state->object_type = texture ? GL_TEXTURE : 0;
@@ -11245,7 +11859,7 @@ void APIENTRY glFramebufferRenderbufferEXT(GLenum target, GLenum attachment,
         v86gl_set_error(GL_INVALID_ENUM);
         return;
     }
-    state = bound_framebuffer_attachment(attachment, TRUE);
+    state = bound_framebuffer_attachment(target, attachment, TRUE);
     if (!state) return;
 
     state->object_type = renderbuffer ? GL_RENDERBUFFER_EXT : 0;
@@ -11275,7 +11889,7 @@ void APIENTRY glGetFramebufferAttachmentParameterivEXT(GLenum target,
 
     if (!params) return;
     if (!valid_framebuffer_target(target)) { v86gl_set_error(GL_INVALID_ENUM); return; }
-    state = bound_framebuffer_attachment(attachment, FALSE);
+    state = bound_framebuffer_attachment(target, attachment, FALSE);
     if (!state || !state->object_type) {
         params[0] = pname == GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE_EXT ? GL_NONE : 0;
         return;
@@ -16380,6 +16994,7 @@ void APIENTRY glGetTexGendv(GLenum coord, GLenum pname, GLdouble* params) {
 
 __declspec(dllexport)
 void APIENTRY glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid* pixels) {
+    TextureObjectState* texture;
     TextureLevelState* state;
     uint32_t pixel_bytes;
     uint32_t destination_span;
@@ -16393,6 +17008,8 @@ void APIENTRY glGetTexImage(GLenum target, GLint level, GLenum format, GLenum ty
     GLsizei row;
     GLvoid* destination;
 
+    texture = bound_texture_state(target, FALSE);
+    if (!texture) return;
     state = texture_level_state(target, level, FALSE);
     if (!state) return;
     if (!state->defined) {
@@ -16419,10 +17036,13 @@ void APIENTRY glGetTexImage(GLenum target, GLint level, GLenum format, GLenum ty
         v86gl_set_error(GL_INVALID_ENUM);
         return;
     }
+    if (refresh_bound_fbo_texture_cache(texture, target, level, state,
+                                        format, type) < 0) {
+        return;
+    }
     destination_offset = (uint32_t)destination_offset_64;
     destination = pack_pixel_pointer(pixels, destination_span);
     if (!destination) return;
-    ZeroMemory(destination, destination_span);
     if (!state->data) return;
     row_bytes = (uint32_t)state->width * pixel_bytes;
     source_size = (uint64_t)(uint32_t)state->width * (uint32_t)state->height *
@@ -16602,18 +17222,12 @@ void APIENTRY glGetPointerv(GLenum pname, GLvoid** params) {
 
 __declspec(dllexport)
 GLboolean APIENTRY glIsTexture(GLuint texture) {
-    uint32_t i;
+    TextureObjectState* state;
     if (!texture) {
         return GL_FALSE;
     }
-
-    for (i = 0; i < V86GL_MAX_TEXTURE_STATES; i++) {
-        if (g_texture_states[i].used && g_texture_states[i].name == texture) {
-            return GL_TRUE;
-        }
-    }
-
-    return GL_FALSE;
+    state = lookup_texture_state(texture);
+    return state && state->target ? GL_TRUE : GL_FALSE;
 }
 
 __declspec(dllexport)

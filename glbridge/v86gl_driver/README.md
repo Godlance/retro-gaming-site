@@ -114,3 +114,8 @@ with **Capture Kernel** enabled. A successful submit includes the same
 then reads `STATUS`, `LAST_FRAME`, `LAST_BYTES`, and `ERROR` back from the PCI
 device. This makes a missing/failed transition visible without a kernel
 debugger.
+
+`V86GLDMADesc.reserved0` and `reserved1` remain reserved and must be zero.
+The PRESENT flag asks the synchronous browser listener to issue the explicit
+WebGL commit. It does not claim that the browser compositor has already
+displayed the canvas, so no Present-completion extension is defined.
