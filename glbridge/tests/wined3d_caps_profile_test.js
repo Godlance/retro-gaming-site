@@ -89,7 +89,8 @@ assert.match(proxy, /opengl32 proxy glGetError enter/);
 assert.match(proxy, /opengl32 proxy wglDeleteContext enter/);
 assert.match(proxy,
     /arb_program_parameter_limit\(GLenum target\)[\s\S]*GL_VERTEX_PROGRAM_ARB \? 96u : 28u/);
-assert.match(proxy, /trace-v10 gpu=svga3d arb-frag-params=28/);
+assert.match(proxy,
+    /trace-v11 wgl-thread-bindings gpu=svga3d arb-frag-params=28/);
 
 assert.equal(proxy.includes("V86GL_PRESENT_STATUS_"), false,
     "proxy must not depend on a synthetic PCI Present-completion status");

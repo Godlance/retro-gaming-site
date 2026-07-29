@@ -1094,8 +1094,6 @@ static uint32_t g_dma_capacity = 0;
 static uint32_t g_dma_size = 0;
 static uint32_t g_dma_command_count = 0;
 static HINSTANCE g_instance = NULL;
-static HDC    g_current_dc = NULL;
-static HGLRC  g_current_ctx = NULL;
 static HWND   g_current_hwnd = NULL;
 static WNDPROC g_original_wndproc = NULL;
 static int32_t g_last_surface_x = 0;
@@ -1112,15 +1110,22 @@ static BOOL g_guest_test_passed = FALSE;
 typedef struct {
     BOOL used;
     DWORD owner_thread;
+    HANDLE owner_handle;
+    HDC current_dc;
+    HWND current_hwnd;
     BOOL ever_current;
     uint32_t share_group;
 } V86GLWGLContext;
 static V86GLWGLContext g_wgl_contexts[V86GL_MAX_WGL_CONTEXTS];
 static uint32_t g_wgl_context_count = 0;
 static uint32_t g_next_share_group = 1;
+static CRITICAL_SECTION g_wgl_context_lock;
+static BOOL g_wgl_context_lock_initialized = FALSE;
 static V86GLWGLContext* find_wgl_context(HGLRC handle);
-static void release_thread_current_context(DWORD thread_id);
-static void force_release_current_context(void);
+static V86GLWGLContext* find_thread_current_context(DWORD thread_id);
+static BOOL release_thread_current_context(DWORD thread_id,
+                                           HWND* replacement_hwnd);
+static void force_release_window_contexts(HWND hwnd);
 static uint32_t g_frame_id = 1;
 static GLuint g_next_texture_id = 1;
 static GLuint g_next_buffer_id = 1;
@@ -1380,16 +1385,16 @@ static BOOL caps_profile_is_gl21(V86GLCapsProfile profile) {
 static const char* caps_profile_trace_text(void) {
     switch (current_caps_profile()) {
     case V86GL_CAPS_PROFILE_WINED3D_GL15:
-        return "opengl32 proxy trace-v10 gpu=svga3d arb-frag-params=28 caps=wined3d-gl15 no-fbo no-shaders";
+        return "opengl32 proxy trace-v11 wgl-thread-bindings gpu=svga3d arb-frag-params=28 caps=wined3d-gl15 no-fbo no-shaders";
     case V86GL_CAPS_PROFILE_WINED3D_ARB:
-        return "opengl32 proxy trace-v10 gpu=svga3d arb-frag-params=28 caps=wined3d-gl15-arb no-fbo";
+        return "opengl32 proxy trace-v11 wgl-thread-bindings gpu=svga3d arb-frag-params=28 caps=wined3d-gl15-arb no-fbo";
     case V86GL_CAPS_PROFILE_GL21_NO_FBO:
-        return "opengl32 proxy trace-v10 gpu=svga3d arb-frag-params=28 caps=gl21-no-fbo glsl120 backbuffer";
+        return "opengl32 proxy trace-v11 wgl-thread-bindings gpu=svga3d arb-frag-params=28 caps=gl21-no-fbo glsl120 backbuffer";
     case V86GL_CAPS_PROFILE_GL21_FBO_FFP:
-        return "opengl32 proxy trace-v10 gpu=svga3d arb-frag-params=28 caps=gl21-fbo-ffp glsl120 fbo-blit no-arb-program";
+        return "opengl32 proxy trace-v11 wgl-thread-bindings gpu=svga3d arb-frag-params=28 caps=gl21-fbo-ffp glsl120 fbo-blit no-arb-program";
     case V86GL_CAPS_PROFILE_GL21:
     default:
-        return "opengl32 proxy trace-v10 gpu=svga3d arb-frag-params=28 caps=gl21 fbo-blit";
+        return "opengl32 proxy trace-v11 wgl-thread-bindings gpu=svga3d arb-frag-params=28 caps=gl21 fbo-blit";
     }
 }
 
@@ -5194,7 +5199,7 @@ static LRESULT CALLBACK vgl_window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     }
 
     if (msg == WM_NCDESTROY && hwnd == g_current_hwnd) {
-        force_release_current_context();
+        force_release_window_contexts(hwnd);
         emit_pci_record(V86GL_CTRL_RELEASE_CURRENT, NULL, 0, TRUE);
         g_current_hwnd = NULL;
         g_original_wndproc = NULL;
@@ -6697,10 +6702,14 @@ BOOL WINAPI DllMain
 
     if (reason == DLL_PROCESS_ATTACH) {
         g_instance = hinst;
+        InitializeCriticalSection(&g_wgl_context_lock);
+        g_wgl_context_lock_initialized = TRUE;
         v86gl_trace("loaded");
     }
 
     if (reason == DLL_PROCESS_DETACH) {
+        uint32_t i;
+
         v86gl_trace("unloading");
         if (g_renderer_lifecycle_started) {
             emit_destroy_context_once();
@@ -6710,6 +6719,18 @@ BOOL WINAPI DllMain
         free_display_lists();
         free_gl2_state();
         close_v86gl();
+        if (g_wgl_context_lock_initialized) {
+            EnterCriticalSection(&g_wgl_context_lock);
+            for (i = 0; i < V86GL_MAX_WGL_CONTEXTS; i++) {
+                if (g_wgl_contexts[i].owner_handle) {
+                    CloseHandle(g_wgl_contexts[i].owner_handle);
+                    g_wgl_contexts[i].owner_handle = NULL;
+                }
+            }
+            LeaveCriticalSection(&g_wgl_context_lock);
+            DeleteCriticalSection(&g_wgl_context_lock);
+            g_wgl_context_lock_initialized = FALSE;
+        }
     }
 
     return TRUE;
@@ -6718,11 +6739,13 @@ BOOL WINAPI DllMain
 __declspec(dllexport)
 HGLRC APIENTRY wglCreateContext(HDC hdc) {
     uint32_t i;
+    HGLRC result = NULL;
 
     if (!hdc) {
         SetLastError(ERROR_INVALID_HANDLE);
         return NULL;
     }
+    EnterCriticalSection(&g_wgl_context_lock);
     for (i = 0; i < V86GL_MAX_WGL_CONTEXTS; i++) {
         V86GLWGLContext* context = &g_wgl_contexts[i];
         if (context->used) continue;
@@ -6732,11 +6755,12 @@ HGLRC APIENTRY wglCreateContext(HDC hdc) {
         if (!g_next_share_group) g_next_share_group = 1;
         g_wgl_context_count++;
         g_context_destroy_sent = FALSE;
-        SetLastError(ERROR_SUCCESS);
-        return (HGLRC)context;
+        result = (HGLRC)context;
+        break;
     }
-    SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-    return NULL;
+    LeaveCriticalSection(&g_wgl_context_lock);
+    SetLastError(result ? ERROR_SUCCESS : ERROR_NOT_ENOUGH_MEMORY);
+    return result;
 }
 
 static V86GLWGLContext* find_wgl_context(HGLRC handle) {
@@ -6760,34 +6784,86 @@ static BOOL validate_wgl_context(HGLRC handle, V86GLWGLContext** out) {
     return TRUE;
 }
 
-static void release_thread_current_context(DWORD thread_id) {
-    V86GLWGLContext* current = find_wgl_context(g_current_ctx);
-    if (current && current->owner_thread == thread_id) {
-        current->owner_thread = 0;
+static void clear_wgl_context_binding(V86GLWGLContext* context) {
+    if (!context) return;
+    if (context->owner_handle) {
+        CloseHandle(context->owner_handle);
+        context->owner_handle = NULL;
     }
-    g_current_dc = NULL;
-    g_current_ctx = NULL;
+    context->owner_thread = 0;
+    context->current_dc = NULL;
+    context->current_hwnd = NULL;
 }
 
-static void force_release_current_context(void) {
-    V86GLWGLContext* current = find_wgl_context(g_current_ctx);
-    if (current) {
-        current->owner_thread = 0;
+static void reap_terminated_wgl_contexts(void) {
+    uint32_t i;
+
+    for (i = 0; i < V86GL_MAX_WGL_CONTEXTS; i++) {
+        V86GLWGLContext* context = &g_wgl_contexts[i];
+        if (!context->used || !context->owner_thread ||
+            !context->owner_handle) continue;
+        if (WaitForSingleObject(context->owner_handle, 0) ==
+            WAIT_OBJECT_0) {
+            clear_wgl_context_binding(context);
+        }
     }
-    g_current_dc = NULL;
-    g_current_ctx = NULL;
+}
+
+static V86GLWGLContext* find_thread_current_context(DWORD thread_id) {
+    uint32_t i;
+
+    for (i = 0; i < V86GL_MAX_WGL_CONTEXTS; i++) {
+        V86GLWGLContext* context = &g_wgl_contexts[i];
+        if (context->used && context->owner_thread == thread_id) {
+            return context;
+        }
+    }
+    return NULL;
+}
+
+static V86GLWGLContext* find_any_current_context(void) {
+    uint32_t i;
+
+    for (i = 0; i < V86GL_MAX_WGL_CONTEXTS; i++) {
+        V86GLWGLContext* context = &g_wgl_contexts[i];
+        if (context->used && context->owner_thread) return context;
+    }
+    return NULL;
+}
+
+static BOOL release_thread_current_context(DWORD thread_id,
+                                           HWND* replacement_hwnd) {
+    V86GLWGLContext* current = find_thread_current_context(thread_id);
+    V86GLWGLContext* replacement;
+
+    if (replacement_hwnd) *replacement_hwnd = NULL;
+    if (!current) return FALSE;
+    clear_wgl_context_binding(current);
+    replacement = find_any_current_context();
+    if (replacement_hwnd && replacement) {
+        *replacement_hwnd = replacement->current_hwnd;
+    }
+    return TRUE;
+}
+
+static void force_release_window_contexts(HWND hwnd) {
+    uint32_t i;
+
+    if (!g_wgl_context_lock_initialized) return;
+    EnterCriticalSection(&g_wgl_context_lock);
+    reap_terminated_wgl_contexts();
+    for (i = 0; i < V86GL_MAX_WGL_CONTEXTS; i++) {
+        V86GLWGLContext* context = &g_wgl_contexts[i];
+        if (context->used && context->owner_thread &&
+            context->current_hwnd == hwnd) {
+            clear_wgl_context_binding(context);
+        }
+    }
+    LeaveCriticalSection(&g_wgl_context_lock);
 }
 
 static BOOL can_bind_wgl_context(V86GLWGLContext* context, DWORD thread_id) {
-    V86GLWGLContext* global_current = find_wgl_context(g_current_ctx);
     if (context->owner_thread && context->owner_thread != thread_id) {
-        SetLastError(ERROR_BUSY);
-        return FALSE;
-    }
-    /* The browser renderer has one actual current WebGL context. Serialize
-     * it even when the guest calls WGL from multiple threads. */
-    if (global_current && global_current != context &&
-        global_current->owner_thread && global_current->owner_thread != thread_id) {
         SetLastError(ERROR_BUSY);
         return FALSE;
     }
@@ -6965,7 +7041,14 @@ HGLRC APIENTRY wglCreateLayerContext(HDC hdc, int layer) {
 
 __declspec(dllexport)
 BOOL APIENTRY wglCopyContext(HGLRC src, HGLRC dst, UINT mask) {
-    if (!validate_wgl_context(src, NULL) || !validate_wgl_context(dst, NULL)) {
+    BOOL valid;
+
+    EnterCriticalSection(&g_wgl_context_lock);
+    reap_terminated_wgl_contexts();
+    valid = validate_wgl_context(src, NULL) &&
+            validate_wgl_context(dst, NULL);
+    LeaveCriticalSection(&g_wgl_context_lock);
+    if (!valid) {
         return FALSE;
     }
     (void)mask;
@@ -6976,21 +7059,28 @@ BOOL APIENTRY wglCopyContext(HGLRC src, HGLRC dst, UINT mask) {
 __declspec(dllexport)
 BOOL APIENTRY wglDeleteContext(HGLRC ctx) {
     V86GLWGLContext* context;
+    BOOL last_context = FALSE;
 
     trace_guest_teardown("opengl32 proxy wglDeleteContext enter");
+    EnterCriticalSection(&g_wgl_context_lock);
+    reap_terminated_wgl_contexts();
     if (!validate_wgl_context(ctx, &context)) {
+        LeaveCriticalSection(&g_wgl_context_lock);
         trace_guest_teardown("opengl32 proxy wglDeleteContext invalid");
         return FALSE;
     }
-    if (context->owner_thread || g_current_ctx == ctx) {
+    if (context->owner_thread) {
         SetLastError(ERROR_BUSY);
+        LeaveCriticalSection(&g_wgl_context_lock);
         trace_guest_teardown("opengl32 proxy wglDeleteContext busy");
         return FALSE;
     }
     ZeroMemory(context, sizeof(*context));
     if (g_wgl_context_count) g_wgl_context_count--;
     v86gl_trace("delete context frame=%lu", (unsigned long)g_frame_id);
-    if (!g_wgl_context_count) {
+    last_context = !g_wgl_context_count;
+    LeaveCriticalSection(&g_wgl_context_lock);
+    if (last_context) {
         restore_window_proc();
         /* WineD3D's caps context and device context are consecutive users of
          * one process renderer. Clear transient query polling state without
@@ -7006,23 +7096,31 @@ __declspec(dllexport)
 BOOL APIENTRY wglMakeCurrent(HDC hdc, HGLRC ctx) {
     DWORD thread_id = GetCurrentThreadId();
     V86GLWGLContext* context;
-    HGLRC previous = g_current_ctx;
+    V86GLWGLContext* previous;
+    HWND replacement_hwnd = NULL;
+    HWND hwnd;
+    BOOL released;
 
     if (!hdc && !ctx) {
-        V86GLWGLContext* current = find_wgl_context(g_current_ctx);
         trace_guest_teardown("opengl32 proxy wglMakeCurrent release enter");
-        if (current && current->owner_thread != thread_id) {
-            SetLastError(ERROR_SUCCESS);
-            trace_guest_teardown("opengl32 proxy wglMakeCurrent release foreign");
-            return TRUE;
-        }
+        EnterCriticalSection(&g_wgl_context_lock);
+        reap_terminated_wgl_contexts();
+        released = release_thread_current_context(thread_id,
+                                                  &replacement_hwnd);
+        LeaveCriticalSection(&g_wgl_context_lock);
         v86gl_trace("release current context");
         /* Keep the window hook installed: an unbound context may be rebound
          * on the same surface, and WM_NCDESTROY must still tear down the
          * browser overlay if the guest exits while it is unbound. */
-        release_thread_current_context(thread_id);
-        g_have_last_surface = FALSE;
-        emit_pci_record(V86GL_CTRL_RELEASE_CURRENT, NULL, 0, TRUE);
+        if (released) {
+            g_have_last_surface = FALSE;
+            if (replacement_hwnd) {
+                hook_window(replacement_hwnd);
+                emit_current_surface(replacement_hwnd);
+            } else {
+                emit_pci_record(V86GL_CTRL_RELEASE_CURRENT, NULL, 0, TRUE);
+            }
+        }
         SetLastError(ERROR_SUCCESS);
         trace_guest_teardown("opengl32 proxy wglMakeCurrent release returned");
         return TRUE;
@@ -7031,19 +7129,29 @@ BOOL APIENTRY wglMakeCurrent(HDC hdc, HGLRC ctx) {
         SetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
     }
+    EnterCriticalSection(&g_wgl_context_lock);
+    reap_terminated_wgl_contexts();
     if (!validate_wgl_context(ctx, &context) ||
-        !can_bind_wgl_context(context, thread_id)) return FALSE;
+        !can_bind_wgl_context(context, thread_id)) {
+        LeaveCriticalSection(&g_wgl_context_lock);
+        return FALSE;
+    }
 
-    if (previous != ctx) {
-        release_thread_current_context(thread_id);
+    previous = find_thread_current_context(thread_id);
+    if (previous != context) {
+        if (previous) clear_wgl_context_binding(previous);
         g_have_last_surface = FALSE;
     }
     context->owner_thread = thread_id;
+    if (!context->owner_handle) {
+        context->owner_handle = OpenThread(SYNCHRONIZE, FALSE, thread_id);
+    }
+    context->current_dc = hdc;
+    hwnd = WindowFromDC(hdc);
+    context->current_hwnd = hwnd;
     context->ever_current = TRUE;
-    g_current_dc = hdc;
-    g_current_ctx = ctx;
+    LeaveCriticalSection(&g_wgl_context_lock);
 
-    HWND hwnd = hdc ? WindowFromDC(hdc) : NULL;
     g_context_destroy_sent = FALSE;
     g_renderer_lifecycle_started = TRUE;
     hook_window(hwnd);
@@ -7059,14 +7167,28 @@ BOOL APIENTRY wglMakeCurrent(HDC hdc, HGLRC ctx) {
 
 __declspec(dllexport)
 HGLRC APIENTRY wglGetCurrentContext(void) {
-    V86GLWGLContext* context = find_wgl_context(g_current_ctx);
-    return context && context->owner_thread == GetCurrentThreadId() ?
-        g_current_ctx : NULL;
+    V86GLWGLContext* context;
+    HGLRC result;
+
+    EnterCriticalSection(&g_wgl_context_lock);
+    reap_terminated_wgl_contexts();
+    context = find_thread_current_context(GetCurrentThreadId());
+    result = context ? (HGLRC)context : NULL;
+    LeaveCriticalSection(&g_wgl_context_lock);
+    return result;
 }
 
 __declspec(dllexport)
 HDC APIENTRY wglGetCurrentDC(void) {
-    return wglGetCurrentContext() ? g_current_dc : NULL;
+    V86GLWGLContext* context;
+    HDC result;
+
+    EnterCriticalSection(&g_wgl_context_lock);
+    reap_terminated_wgl_contexts();
+    context = find_thread_current_context(GetCurrentThreadId());
+    result = context ? context->current_dc : NULL;
+    LeaveCriticalSection(&g_wgl_context_lock);
+    return result;
 }
 
 __declspec(dllexport)
@@ -7074,18 +7196,23 @@ BOOL APIENTRY wglShareLists(HGLRC a, HGLRC b) {
     V86GLWGLContext* first;
     V86GLWGLContext* second;
 
+    EnterCriticalSection(&g_wgl_context_lock);
+    reap_terminated_wgl_contexts();
     if (!validate_wgl_context(a, &first) ||
         !validate_wgl_context(b, &second) || a == b) {
         if (a == b) SetLastError(ERROR_INVALID_PARAMETER);
+        LeaveCriticalSection(&g_wgl_context_lock);
         return FALSE;
     }
     if (second->ever_current) {
         SetLastError(ERROR_BUSY);
+        LeaveCriticalSection(&g_wgl_context_lock);
         return FALSE;
     }
     /* Object names already live in the single browser-side share group. Keep
      * the guest-visible grouping metadata for validation and future splitting. */
     second->share_group = first->share_group;
+    LeaveCriticalSection(&g_wgl_context_lock);
     SetLastError(ERROR_SUCCESS);
     return TRUE;
 }

@@ -349,6 +349,11 @@ i686-w64-mingw32-gcc -mwindows -Os -s \
 
 i686-w64-mingw32-gcc -mwindows -Os -s \
   -nostdlib -Wl,--subsystem,windows:5.01 -Wl,-e,_WinMainCRTStartup@0 \
+  -o d3d8_maple_gr2d_test.exe d3d8_maple_gr2d_test.c \
+  -ld3d8 -lgdi32 -luser32 -lkernel32
+
+i686-w64-mingw32-gcc -mwindows -Os -s \
+  -nostdlib -Wl,--subsystem,windows:5.01 -Wl,-e,_WinMainCRTStartup@0 \
   -o gl_triangle_test.exe gl_triangle_test.c \
   -lopengl32 -lgdi32 -luser32 -lkernel32
 
@@ -375,6 +380,11 @@ i686-w64-mingw32-gcc -mwindows -Os -s \
 i686-w64-mingw32-gcc -mwindows -Os -s \
   -nostdlib -Wl,--subsystem,windows:5.01 -Wl,-e,_WinMainCRTStartup@0 \
   -o gl_fog_material_test.exe gl_fog_material_test.c \
+  -lopengl32 -lgdi32 -luser32 -lkernel32
+
+i686-w64-mingw32-gcc -mwindows -Os -s \
+  -nostdlib -Wl,--subsystem,windows:5.01 -Wl,-e,_WinMainCRTStartup@0 \
+  -o gl_wgl_thread_current_test.exe gl_wgl_thread_current_test.c \
   -lopengl32 -lgdi32 -luser32 -lkernel32
 
 i686-w64-mingw32-gcc -mwindows -Os -s -nostdlib -Wl,--subsystem,windows:5.01 -Wl,-e,_WinMainCRTStartup@0 -o gl_test_depth_clear_poison.exe gl_test_depth_clear_poison.c -lopengl32 -lgdi32 -luser32 -lkernel32
@@ -412,12 +422,14 @@ d3d8_raster_stencil_test.exe
 d3d8_stateblock_test.exe
 d3d8_reset_lifecycle_test.exe
 d3d8_caps_audit_test.exe
+d3d8_maple_gr2d_test.exe
 gl_triangle_test.exe
 gl_rotate_cube_test.exe
 gl_client_arrays_test.exe
 gl_blend_ui_test.exe
 gl_query_multitexture_test.exe
 gl_fog_material_test.exe
+gl_wgl_thread_current_test.exe
 ```
 
 Run `d3d8_clear_test.exe` first. It deliberately imports only `d3d8.dll` and
@@ -466,7 +478,7 @@ even when WineD3D blocks or Chrome has stopped printing ordinary WebGL errors:
 ```
 
 The proxy independently emits a profile checkpoint such as
-`TEXT ... opengl32 proxy trace-v10 gpu=svga3d arb-frag-params=28 caps=wined3d-gl15 no-fbo no-shaders` on its
+`TEXT ... opengl32 proxy trace-v11 wgl-thread-bindings gpu=svga3d arb-frag-params=28 caps=wined3d-gl15 no-fbo no-shaders` on its
 first successful `wglMakeCurrent`, and the sample emits
 `TEXT ... d3d8_triangle_test trace-v9-fbo-allocation-20260726`. Missing one of
 these lines identifies which guest artifact is stale. If the export cannot be
@@ -812,6 +824,31 @@ state are compacted to the newest payload, while mipmap generation and other
 content dependencies form conservative compaction barriers. Raw copy
 operations that cannot be captured remain intentionally non-reconstructible.
 
+For the MapleStory v83 startup path, run `d3d8_maple_gr2d_test.exe`. It logs
+every adapter mode, keeps the 800x600 modes, and performs Gr2D's A4R4G4B4,
+A8R8G8B8, R5G6B5, and DXT3 probes on every candidate. A mode remains valid
+when either A4R4G4B4 or A8R8G8B8 is supported. The probe also mirrors Gr2D's
+R5G6B5 preference, refresh-rate selection, texture-format choice, and device
+creation order: flags `0x46` (FPU preserve, multithreaded, hardware vertex
+processing) followed by `0x26` (software vertex processing fallback). Every
+stage and HRESULT is written under the `[d3d8-maple-gr2d]` debug prefix; the
+window title reports the final result.
+
+MapleStory opens its login socket before the expensive Gr2D/WZ initialization
+finishes. On the v86/WebGL pipeline that initialization can exceed the login
+server's keepalive deadline even though the TCP connection and v83 hello
+succeeded. See [MAPLESTORY_V83.md](MAPLESTORY_V83.md) for the packet timing,
+the immediate server-side timeout change, and the longer-term client/proxy
+fixes. The generic "disconnected from the login server" dialog alone is not
+evidence of a failed connection.
+
+Run `gl_wgl_thread_current_test.exe` before MapleStory. It keeps one HGLRC
+current on the main thread while a second shared HGLRC is made current on a
+worker thread, matching WineD3D 1.7.52's `D3DCREATE_MULTITHREADED` context
+lifetime. Both threads must retain their own `wglGetCurrentContext` /
+`wglGetCurrentDC` result, and releasing the worker context must not release the
+main-thread binding.
+
 The OpenGL-only diagnostics can then be run with `gl_triangle_test.exe`,
 `gl_rotate_cube_test.exe`, or
 `gl_client_arrays_test.exe`, `gl_blend_ui_test.exe`, or
@@ -972,3 +1009,11 @@ configuration.
 - `SwapBuffers` is exported by `gdi32.dll`, not `opengl32.dll`; normal apps that import it directly are not intercepted by this DLL. WineD3D 1.7.52 deliberately resolves the nonstandard `opengl32.dll!wglSwapBuffers` helper with `GetProcAddress()`, so its D3D8 Present path is intercepted. `glFlush` and `glFinish` only flush/complete the offscreen back buffer and do not expose it; `wglSwapLayerBuffers` and `wglSwapBuffers` are the explicit presentation boundaries.
 - The driver exposes one shared buffer, so only one guest process can own the
   transport at a time.
+- WGL current context/DC bindings are tracked per guest thread so WineD3D
+  1.7.52 can create its shared per-thread contexts. This fixes WGL ownership,
+  but it is not full context virtualization: the GL command stream, nonshared
+  shadow state, surface selection, and browser renderer are still
+  process-global. When WineD3D alternates between two HGLRCs, even serialized
+  calls can observe state left by the other context. Per-HGLRC state
+  save/restore and HDC-aware presentation are still required; concurrent
+  native OpenGL calls from multiple guest threads remain unsupported.
