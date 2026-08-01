@@ -3,7 +3,7 @@
 <title>OpenGL FBO blit browser test: running</title>
 <canvas id="v86gl_canvas" width="64" height="64"></canvas>
 <pre id="result">running</pre>
-<script src="../libglwasm/gl4es.js?v=d3d8-fbo-allocation-trace-v5-20260726"></script>
+<script src="../libglwasm/gl4es.js?v=webgl-clean-v1-20260801"></script>
 <script>
 (async () => {
     "use strict";
@@ -28,7 +28,7 @@
     const module = await createV86GL4ES({
         canvas: document.getElementById("v86gl_canvas"),
         locateFile(path) {
-            return `../libglwasm/${path}?v=d3d8-fbo-allocation-trace-v5-20260726`;
+            return `../libglwasm/${path}?v=webgl-clean-v1-20260801`;
         },
     });
 

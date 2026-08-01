@@ -403,6 +403,10 @@ function startEmulator9xMultiDisk(gameId) {
         if (glCanvas) {
             glCanvas.style.display = "none";
         }
+        const d3d8Canvas = document.getElementById("d3d8_webgpu_canvas");
+        if (d3d8Canvas) {
+            d3d8Canvas.style.display = "none";
+        }
     }
 
     emulator = new V86({
@@ -448,6 +452,7 @@ function startEmulator9xMultiDisk(gameId) {
 
 function attachEmulatorListeners(emulator) {
     const glCanvas = document.getElementById("v86gl_canvas");
+    const d3d8Canvas = document.getElementById("d3d8_webgpu_canvas");
     let glCanvasObserver = null;
 
     function syncGLCanvasPosition() {
@@ -467,10 +472,12 @@ function attachEmulatorListeners(emulator) {
         try {
             v86gl = installV86GLBridge(emulator, glCanvas, {
                 gl4es: window.GL4ES,
+                d3d8Canvas: d3d8Canvas,
             });
             window.v86gl = v86gl;
 
-            const screenCanvas = document.querySelector("#screen_container canvas:not(#v86gl_canvas)");
+            const screenCanvas = document.querySelector(
+                "#screen_container canvas:not(#v86gl_canvas):not(#d3d8_webgpu_canvas)");
             if (screenCanvas && typeof ResizeObserver === "function") {
                 glCanvasObserver = new ResizeObserver(function() {
                     requestAnimationFrame(syncGLCanvasPosition);

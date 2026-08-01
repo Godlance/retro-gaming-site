@@ -113,7 +113,11 @@ function main() {
     const emulator = {
         add_listener() {},
     };
-    const bridge = globalThis.installV86GLNetworkBridge(emulator, canvas, { gl4es: module });
+    const bridge = globalThis.installV86GLNetworkBridge(emulator, canvas, {
+        gl4es: module,
+        packedArenaInitialBytes: 128 * 1024,
+        packedArenaMaxBytes: 256 * 1024,
+    });
     const payload = eightStageDrawElementsPayload(Buffer.alloc(70000, 0x5A));
 
     bridge.renderer.glCall(GLFN_DRAW_ELEMENTS, payload);
@@ -121,7 +125,11 @@ function main() {
     assert.equal(drawSeen, true, "packed draw must reach gl4es after wasm memory growth");
     assert.ok(growthCount >= 1, "test must force WebAssembly.Memory.grow");
     assert.equal(initialHeap.byteLength, 0, "the pre-growth HEAPU8 view must be detached");
-    assert.equal(freed.length, 11, "all eight-stage packed arrays and metadata allocations must be freed");
+    assert.equal(freed.length, 0,
+        "the persistent packed arena must remain allocated between draws");
+    bridge.renderer.destroy();
+    assert.equal(freed.filter(Boolean).length, 1,
+        "destroy must release the persistent packed arena");
     console.log("v86_network_bridge_memory_growth_test: ok");
 }
 

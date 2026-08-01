@@ -50,11 +50,8 @@ assert.match(proxy,
     /GetModuleHandleA\("wined3d\.dll"\)[\s\S]*V86GL_CAPS_PROFILE_WINED3D_GL15/);
 assert.match(proxy, /GetEnvironmentVariableA\("V86GL_CAPS_PROFILE"/);
 assert.match(proxy, /"1\.5 v86gl \(WineD3D backbuffer profile\)"/);
-assert.match(proxy, /caps=wined3d-gl15 no-fbo no-shaders/);
 assert.match(proxy, /"gl21-no-fbo"/);
-assert.match(proxy, /caps=gl21-no-fbo glsl120 backbuffer/);
 assert.match(proxy, /"gl21-fbo-ffp"/);
-assert.match(proxy, /caps=gl21-fbo-ffp glsl120 fbo-blit no-arb-program/);
 assert.match(proxy,
     /profile == V86GL_CAPS_PROFILE_GL21 \|\|[\s\S]*V86GL_CAPS_PROFILE_GL21_FBO_FFP[\s\S]*append_gl_extension\("GL_EXT_framebuffer_object"\)/);
 assert.match(proxy, /append_gl_extension\("GL_EXT_framebuffer_blit"\)/);
@@ -84,13 +81,12 @@ assert.match(sample,
     /g_vertex_buffer = NULL;[\s\S]*IDirect3DVertexBuffer8_Release\(vertex_buffer\)/);
 assert.match(sample,
     /g_device = NULL;[\s\S]*IDirect3DDevice8_Release\(device\)/);
-assert.match(proxy, /opengl32 proxy glDeleteProgramsARB enter/);
-assert.match(proxy, /opengl32 proxy glGetError enter/);
-assert.match(proxy, /opengl32 proxy wglDeleteContext enter/);
 assert.match(proxy,
     /arb_program_parameter_limit\(GLenum target\)[\s\S]*GL_VERTEX_PROGRAM_ARB \? 96u : 28u/);
-assert.match(proxy,
-    /trace-v11 wgl-thread-bindings gpu=svga3d arb-frag-params=28/);
+assert.equal(proxy.includes("v86glTraceCheckpoint"), false,
+    "test-only PCI checkpoints must stay out of the production proxy");
+assert.equal(sample.includes("TRACE EXPORT MISSING"), false,
+    "triangle title must report only D3D8 results");
 
 assert.equal(proxy.includes("V86GL_PRESENT_STATUS_"), false,
     "proxy must not depend on a synthetic PCI Present-completion status");

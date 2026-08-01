@@ -825,12 +825,7 @@ void APIENTRY glTranslatef(GLfloat x, GLfloat y, GLfloat z);
 #define V86GL_CTRL_MAKE_CURRENT 0xFFF0u
 #define V86GL_CTRL_RELEASE_CURRENT 0xFFF1u
 #define V86GL_CTRL_DESTROY_CONTEXT 0xFFF2u
-#define V86GL_CTRL_TEST_TRACE 0xFFF3u
 #define V86GL_EXTENDED_RECORD_SIZE 0xFFFFu
-#define V86GL_TEST_TRACE_HEADER_SIZE 12u
-#define V86GL_TEST_TRACE_MAX_TEXT 512u
-#define V86GL_TEST_TRACE_PHASE_PASS 3u
-#define V86GL_TEST_TRACE_PHASE_TEXT 5u
 #define V86GL_READ_PIXELS_HEADER_SIZE 32u
 #define V86GL_READ_PIXELS_STATUS_PENDING 0u
 #define V86GL_READ_PIXELS_STATUS_OK 1u
@@ -1103,9 +1098,6 @@ static uint32_t g_last_surface_height = 0;
 static BOOL g_have_last_surface = FALSE;
 static BOOL g_context_destroy_sent = FALSE;
 static BOOL g_renderer_lifecycle_started = FALSE;
-static BOOL g_proxy_hello_sent = FALSE;
-static BOOL g_first_present_trace_sent = FALSE;
-static BOOL g_guest_test_passed = FALSE;
 #define V86GL_MAX_WGL_CONTEXTS 32
 typedef struct {
     BOOL used;
@@ -1380,22 +1372,6 @@ static BOOL caps_profile_is_gl21(V86GLCapsProfile profile) {
     return profile == V86GL_CAPS_PROFILE_GL21_NO_FBO ||
            profile == V86GL_CAPS_PROFILE_GL21_FBO_FFP ||
            profile == V86GL_CAPS_PROFILE_GL21;
-}
-
-static const char* caps_profile_trace_text(void) {
-    switch (current_caps_profile()) {
-    case V86GL_CAPS_PROFILE_WINED3D_GL15:
-        return "opengl32 proxy trace-v11 wgl-thread-bindings gpu=svga3d arb-frag-params=28 caps=wined3d-gl15 no-fbo no-shaders";
-    case V86GL_CAPS_PROFILE_WINED3D_ARB:
-        return "opengl32 proxy trace-v11 wgl-thread-bindings gpu=svga3d arb-frag-params=28 caps=wined3d-gl15-arb no-fbo";
-    case V86GL_CAPS_PROFILE_GL21_NO_FBO:
-        return "opengl32 proxy trace-v11 wgl-thread-bindings gpu=svga3d arb-frag-params=28 caps=gl21-no-fbo glsl120 backbuffer";
-    case V86GL_CAPS_PROFILE_GL21_FBO_FFP:
-        return "opengl32 proxy trace-v11 wgl-thread-bindings gpu=svga3d arb-frag-params=28 caps=gl21-fbo-ffp glsl120 fbo-blit no-arb-program";
-    case V86GL_CAPS_PROFILE_GL21:
-    default:
-        return "opengl32 proxy trace-v11 wgl-thread-bindings gpu=svga3d arb-frag-params=28 caps=gl21 fbo-blit";
-    }
 }
 
 /*
@@ -3891,71 +3867,6 @@ static int emit_pci_record(uint16_t fn, const void* args, uint32_t args_size, BO
     return 1;
 }
 
-static int emit_test_trace_record(DWORD phase, HRESULT hr, const char* text,
-                                  BOOL flush_after) {
-    uint8_t* payload;
-    uint32_t text_size = 0;
-    uint32_t payload_size;
-    int emitted;
-
-    if (text) {
-        while (text_size < V86GL_TEST_TRACE_MAX_TEXT && text[text_size]) {
-            text_size++;
-        }
-    }
-
-    payload_size = V86GL_TEST_TRACE_HEADER_SIZE + text_size;
-    payload = (uint8_t*)HeapAlloc(GetProcessHeap(), 0, payload_size);
-    if (!payload) {
-        return 0;
-    }
-
-    write_u32le(payload + 0, (uint32_t)phase);
-    write_u32le(payload + 4, (uint32_t)hr);
-    write_u32le(payload + 8, text_size);
-    if (text_size) {
-        CopyMemory(payload + V86GL_TEST_TRACE_HEADER_SIZE, text, text_size);
-    }
-
-    emitted = emit_pci_record(V86GL_CTRL_TEST_TRACE, payload, payload_size,
-                              flush_after);
-    HeapFree(GetProcessHeap(), 0, payload);
-    return emitted;
-}
-
-/*
- * Test-only diagnostic entry point.  D3D samples resolve this dynamically
- * from opengl32.dll, so production applications acquire no extra import and
- * an older/system opengl32.dll remains usable.  Every checkpoint is flushed
- * synchronously: a CALLING record therefore reaches the browser before the
- * sample enters a D3D method that may block.
- *
- * Payload (little endian): phase u32, HRESULT bits u32, text byte count u32,
- * followed by non-NUL-terminated ASCII/UTF-8 bytes.
- */
-__declspec(dllexport)
-BOOL APIENTRY v86glTraceCheckpoint(DWORD phase, HRESULT hr, const char* text) {
-    GLenum saved_gl_error = g_error;
-    DWORD saved_last_error = GetLastError();
-    int emitted;
-
-    emitted = emit_test_trace_record(phase, hr, text, TRUE);
-    if (emitted && phase == V86GL_TEST_TRACE_PHASE_PASS) {
-        g_guest_test_passed = TRUE;
-    }
-
-    /* Instrumentation must not change glGetError() or Win32 last-error state. */
-    g_error = saved_gl_error;
-    SetLastError(saved_last_error);
-    return emitted ? TRUE : FALSE;
-}
-
-static void trace_guest_teardown(const char* text) {
-    if (g_guest_test_passed) {
-        v86glTraceCheckpoint(V86GL_TEST_TRACE_PHASE_TEXT, S_OK, text);
-    }
-}
-
 static int emit_read_pixels(GLint x, GLint y, GLsizei width, GLsizei height,
                             GLenum format, GLenum type, uint32_t data_size,
                             GLvoid* pixels) {
@@ -5120,19 +5031,9 @@ static int emit_display_list_stream(const uint8_t* data, uint32_t size) {
     return 1;
 }
 
-static BOOL emit_frame(const char* first_present_marker) {
-    BOOL trace_first_present = !g_first_present_trace_sent;
+static BOOL emit_frame(void) {
     BOOL submitted;
     GLenum saved_gl_error = g_error;
-
-    if (trace_first_present) {
-        g_first_present_trace_sent = TRUE;
-        /* Keep the enter marker in the force-present descriptor.  It reaches
-         * the browser immediately before commit_frame(), so a frozen/failed
-         * commit still leaves an unambiguous final checkpoint. */
-        emit_test_trace_record(V86GL_TEST_TRACE_PHASE_TEXT, S_OK,
-                first_present_marker, FALSE);
-    }
 
     v86gl_trace("present requested frame=%lu queuedCommands=%lu queuedBytes=%lu",
                 (unsigned long)g_frame_id,
@@ -5147,13 +5048,6 @@ static BOOL emit_frame(const char* first_present_marker) {
     }
 
     g_error = saved_gl_error;
-    if (trace_first_present) {
-        v86glTraceCheckpoint(V86GL_TEST_TRACE_PHASE_TEXT,
-                submitted ? S_OK : E_FAIL,
-                submitted ?
-                    "opengl32 proxy first Present submit returned OK" :
-                    "opengl32 proxy first Present submit returned FAILED");
-    }
     return submitted;
 }
 
@@ -7110,18 +7004,15 @@ BOOL APIENTRY wglDeleteContext(HGLRC ctx) {
     V86GLWGLContext* context;
     BOOL last_context = FALSE;
 
-    trace_guest_teardown("opengl32 proxy wglDeleteContext enter");
     EnterCriticalSection(&g_wgl_context_lock);
     reap_terminated_wgl_contexts();
     if (!validate_wgl_context(ctx, &context)) {
         LeaveCriticalSection(&g_wgl_context_lock);
-        trace_guest_teardown("opengl32 proxy wglDeleteContext invalid");
         return FALSE;
     }
     if (context->owner_thread) {
         SetLastError(ERROR_BUSY);
         LeaveCriticalSection(&g_wgl_context_lock);
-        trace_guest_teardown("opengl32 proxy wglDeleteContext busy");
         return FALSE;
     }
     ZeroMemory(context, sizeof(*context));
@@ -7137,7 +7028,6 @@ BOOL APIENTRY wglDeleteContext(HGLRC ctx) {
         reset_query_object_state();
     }
     SetLastError(ERROR_SUCCESS);
-    trace_guest_teardown("opengl32 proxy wglDeleteContext returned");
     return TRUE;
 }
 
@@ -7151,7 +7041,6 @@ BOOL APIENTRY wglMakeCurrent(HDC hdc, HGLRC ctx) {
     BOOL released;
 
     if (!hdc && !ctx) {
-        trace_guest_teardown("opengl32 proxy wglMakeCurrent release enter");
         EnterCriticalSection(&g_wgl_context_lock);
         reap_terminated_wgl_contexts();
         released = release_thread_current_context(thread_id,
@@ -7171,7 +7060,6 @@ BOOL APIENTRY wglMakeCurrent(HDC hdc, HGLRC ctx) {
             }
         }
         SetLastError(ERROR_SUCCESS);
-        trace_guest_teardown("opengl32 proxy wglMakeCurrent release returned");
         return TRUE;
     }
     if (!hdc || !ctx) {
@@ -7205,11 +7093,6 @@ BOOL APIENTRY wglMakeCurrent(HDC hdc, HGLRC ctx) {
     g_renderer_lifecycle_started = TRUE;
     hook_window(hwnd);
     emit_current_surface(hwnd);
-    if (!g_proxy_hello_sent && v86glTraceCheckpoint(
-            V86GL_TEST_TRACE_PHASE_TEXT, S_OK,
-            caps_profile_trace_text())) {
-        g_proxy_hello_sent = TRUE;
-    }
     SetLastError(ERROR_SUCCESS);
     return TRUE;
 }
@@ -7272,7 +7155,7 @@ BOOL APIENTRY wglSwapLayerBuffers(HDC hdc, UINT planes) {
     (void)hdc;
     (void)planes;
     v86gl_trace("wglSwapLayerBuffers");
-    submitted = emit_frame("opengl32 proxy wglSwapLayerBuffers enter");
+    submitted = emit_frame();
     SetLastError(submitted ? ERROR_SUCCESS : ERROR_GEN_FAILURE);
     return submitted;
 }
@@ -7282,7 +7165,7 @@ BOOL APIENTRY wglSwapBuffers(HDC hdc) {
     BOOL submitted;
     (void)hdc;
     v86gl_trace("wglSwapBuffers");
-    submitted = emit_frame("opengl32 proxy wglSwapBuffers enter");
+    submitted = emit_frame();
     SetLastError(submitted ? ERROR_SUCCESS : ERROR_GEN_FAILURE);
     return submitted;
 }
@@ -7290,7 +7173,7 @@ BOOL APIENTRY wglSwapBuffers(HDC hdc) {
 __declspec(dllexport)
 DWORD APIENTRY wglSwapMultipleBuffers(UINT count, const WGLSWAP* swaps) {
     (void)swaps;
-    if (count && !emit_frame("opengl32 proxy wglSwapMultipleBuffers enter")) {
+    if (count && !emit_frame()) {
         SetLastError(ERROR_GEN_FAILURE);
         return 0;
     }
@@ -7693,7 +7576,6 @@ __declspec(dllexport)
 GLenum APIENTRY glGetError(void) {
     GLenum e;
 
-    trace_guest_teardown("opengl32 proxy glGetError enter");
     e = g_error;
     g_error = 0;
     if (e == GL_NO_ERROR) {
@@ -7708,7 +7590,6 @@ GLenum APIENTRY glGetError(void) {
                     (unsigned long)g_frame_id,
                     (unsigned long)g_dma_command_count);
     }
-    trace_guest_teardown("opengl32 proxy glGetError returned");
     return e;
 }
 
@@ -9526,19 +9407,15 @@ void APIENTRY glBindProgramARB(GLenum target, GLuint program) {
 void APIENTRY glDeleteProgramsARB(GLsizei n, const GLuint* programs) {
     GLsizei i;
 
-    trace_guest_teardown("opengl32 proxy glDeleteProgramsARB enter");
     if (n < 0) {
         v86gl_set_error(GL_INVALID_VALUE);
-        trace_guest_teardown("opengl32 proxy glDeleteProgramsARB invalid count");
         return;
     }
     if (!n) {
-        trace_guest_teardown("opengl32 proxy glDeleteProgramsARB empty");
         return;
     }
     if (!programs) {
         v86gl_set_error(GL_INVALID_VALUE);
-        trace_guest_teardown("opengl32 proxy glDeleteProgramsARB null names");
         return;
     }
 
@@ -9552,7 +9429,6 @@ void APIENTRY glDeleteProgramsARB(GLsizei n, const GLuint* programs) {
         delete_arb_program_state(programs[i]);
     }
     emit_arb_program_name_array(GLFN_DELETE_PROGRAMS_ARB, n, programs);
-    trace_guest_teardown("opengl32 proxy glDeleteProgramsARB returned");
 }
 
 void APIENTRY glGenProgramsARB(GLsizei n, GLuint* programs) {

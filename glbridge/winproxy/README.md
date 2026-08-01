@@ -466,31 +466,12 @@ its HRESULT independently. Before each call, the window title is changed to
 `D3D8 triangle: calling NN API-name`; if WineD3D blocks, the title therefore
 identifies the exact call that did not return.
 
-When this proxy is installed, the sample also resolves the optional
-`v86glTraceCheckpoint` export dynamically. It synchronously sends every
-CALLING/RETURNED/PASS/FAIL record through PCI without adding a static
-`opengl32.dll` import. The browser console therefore reports the exact boundary
-even when WineD3D blocks or Chrome has stopped printing ordinary WebGL errors:
-
-```text
-[v86gl:guest-test] CALLING 0x00000000 20 DrawPrimitive
-[v86gl:guest-test] FAIL 0x8876086C DrawPrimitive
-```
-
-The proxy independently emits a profile checkpoint such as
-`TEXT ... opengl32 proxy trace-v11 wgl-thread-bindings gpu=svga3d arb-frag-params=28 caps=wined3d-gl15 no-fbo no-shaders` on its
-first successful `wglMakeCurrent`, and the sample emits
-`TEXT ... d3d8_triangle_test trace-v9-fbo-allocation-20260726`. Missing one of
-these lines identifies which guest artifact is stale. If the export cannot be
-resolved or its PCI send fails, the sample keeps retrying and adds
-`[TRACE EXPORT MISSING]` or `[TRACE SEND FAILED]` to the window title.
-
-After a successful Present, closing the sample emits distinct checkpoints for
+After a successful Present, closing the sample runs distinct teardown stages
+and writes their results through `OutputDebugString`:
 `23 VertexBuffer::Release`, `24 Device::Release`, `25 Direct3D8::Release`,
-`26 teardown complete`, and `27 ExitProcess`. This prevents an exception during
-WineD3D cleanup from being misreported as a failure in the already-completed
-Present call. The proxy additionally traces post-PASS ARB program deletion and
-WGL context release/deletion boundaries.
+`26 teardown complete`, and `27 ExitProcess`. This keeps an exception during
+WineD3D cleanup distinguishable from a failure in the already-completed
+Present call without adding synchronous PCI diagnostic submissions.
 
 After the coloured triangle succeeds, run `d3d8_texture_test.exe`. It adds a
 single-level 64x64 managed `D3DFMT_A8R8G8B8` texture and exercises:
@@ -936,22 +917,9 @@ framebuffer blit for WineD3D Present.
 WineD3D also selects `GL_COLOR_ATTACHMENT0` as the read buffer and `GL_BACK`
 as the default draw buffer around that blit. The desktop `glReadBuffer()` and
 single-target `glDrawBuffer()` entry points are stubs in gl4es, so the WASM
-bridge forwards them directly to WebGL2. Present blits log both FBO bindings,
-their status, and source/destination center pixels under `[v86gl:fbo-blit]`.
-The guest bridge also records each FBO's texture/renderbuffer attachments.
-`[v86gl:fbo-source-pair]` compares the WebGL attachment object, mip level,
-cube face, layer, and center pixel selected by Present against the framebuffer
-that most recently received a draw. This diagnostic is read-only; it never
-substitutes the last drawn framebuffer when WineD3D selects a different black
-surface.
-
-The allocation trace additionally records each attached guest texture or
-renderbuffer's original `internalformat`, external `format`, `type`, and
-dimensions. `[v86gl:fbo-cap]` reports synchronous FBO status for WineD3D's
-common RGB8, RGBA8, RGB5, and RGB565 capability probes. The triangle sample
-reports its actual `D3DDISPLAYMODE` after `GetAdapterDisplayMode()`. Together
-these distinguish a genuine format-classification failure from a later
-renderbuffer-to-texture location synchronization failure.
+bridge forwards them directly to WebGL2. The Present path performs only the
+native framebuffer blit; it does not issue diagnostic `readPixels`, attachment
+queries, or per-frame FBO history logging.
 
 `GL_VENDOR` and `GL_RENDERER` identify the bridge as
 `VMware, Inc. / SVGA3D; v86 WebGL2 bridge`. WineD3D 1.7.52 maps these strings

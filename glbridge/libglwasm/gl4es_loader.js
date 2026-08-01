@@ -1,7 +1,7 @@
 (function(global) {
     "use strict";
 
-    const GL4ES_ASSET_VERSION = "d3d8-fbo-allocation-trace-v5-20260726";
+    const GL4ES_ASSET_VERSION = "webgl-clean-v1-20260801";
     console.info("[v86gl] gl4es asset version", GL4ES_ASSET_VERSION);
     const factory = global.createV86GL4ES;
     if (typeof factory !== "function") {

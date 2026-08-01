@@ -6,7 +6,7 @@
 (function(global) {
     "use strict";
 
-    const V86GL_BRIDGE_VERSION = "d3d8-fbo-allocation-trace-v5-20260726-packed-arena-v1-packed-blob-v1-wasm-batch-v1";
+    const V86GL_BRIDGE_VERSION = "webgl-clean-v1-20260801-packed-arena-v1-packed-blob-v1-wasm-batch-v1-d8wg-m1-20260801";
     global.V86GL_BRIDGE_VERSION = V86GL_BRIDGE_VERSION;
     console.info("[v86gl] bridge version", V86GL_BRIDGE_VERSION);
 
@@ -31,7 +31,7 @@
     const V86GL_CTRL_MAKE_CURRENT = 0xFFF0;
     const V86GL_CTRL_RELEASE_CURRENT = 0xFFF1;
     const V86GL_CTRL_DESTROY_CONTEXT = 0xFFF2;
-    const V86GL_CTRL_TEST_TRACE = 0xFFF3;
+    const V86GL_CTRL_D3D8_BATCH = 0xFFE0;
     const V86GL_EXTENDED_RECORD_SIZE = 0xFFFF;
     const DEFAULT_WASM_BATCH_ARENA_INITIAL_BYTES = 1024 * 1024;
     const DEFAULT_WASM_BATCH_ARENA_MAX_BYTES = 64 * 1024 * 1024;
@@ -40,12 +40,6 @@
     const V86GL_WASM_BATCH_STATUS_UNSUPPORTED = 1;
     const V86GL_WASM_BATCH_STATUS_MALFORMED = 2;
     const V86GL_WASM_BATCH_STATUS_REJECTED = 3;
-    const V86GL_TEST_TRACE_PHASE_CALLING = 1;
-    const V86GL_TEST_TRACE_PHASE_RETURNED = 2;
-    const V86GL_TEST_TRACE_PHASE_PASS = 3;
-    const V86GL_TEST_TRACE_PHASE_FAIL = 4;
-    const V86GL_TEST_TRACE_PHASE_TEXT = 5;
-
     const GLFN_VIEWPORT = 1;
     const GLFN_CLEAR_COLOR = 2;
     const GLFN_CLEAR = 3;
@@ -658,22 +652,6 @@
         ]);
         return new DataView(b.buffer).getFloat64(0, true);
     }
-    function decodeUTF8(bytes) {
-        if (typeof TextDecoder !== "undefined") {
-            try {
-                return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-            } catch (_err) {
-                /* Fall through to the byte-preserving decoder below. */
-            }
-        }
-
-        let text = "";
-        for (let i = 0; i < bytes.length; i++) {
-            text += String.fromCharCode(bytes[i]);
-        }
-        return text;
-    }
-
     class Gl4esRenderer {
         constructor(canvas, module, options) {
             this.canvas = canvas;
@@ -685,24 +663,6 @@
             this.matrixMode = 0x1700; // GL_MODELVIEW
             this.activeTexture = 0x84C0; // GL_TEXTURE0
             this.clientActiveTexture = 0x84C0; // GL_TEXTURE0
-            this.boundTextures = new Map();
-            this.textureImageStates = new Map();
-            this.boundRenderbuffer = 0;
-            this.renderbufferStorageStates = new Map();
-            this.boundReadFramebuffer = 0;
-            this.boundDrawFramebuffer = 0;
-            this.readBufferMode = 0x0405; // GL_BACK
-            this.drawBufferMode = 0x0405; // GL_BACK
-            this.fboBlitTraceCount = 0;
-            this.fboStatusTraceCount = 0;
-            this.lastDrawFramebuffer = 0;
-            this.framebufferBufferStates = new Map();
-            this.framebufferBufferStates.set(0, {
-                readBuffer: 0x0405, // GL_BACK
-                drawBuffers: [0x0405],
-                attachments: Object.create(null),
-            });
-            this.framebufferHistory = [];
             const configuredBatchInitialBytes =
                 Number(this.options.wasmBatchInitialBytes);
             const configuredBatchMaxBytes =
@@ -738,98 +698,6 @@
             this.packedArenaCapacity = 0;
             this.packedArenaOffset = 0;
             this.packedArenaActive = false;
-        }
-
-        framebufferBufferState(framebuffer) {
-            framebuffer >>>= 0;
-            let state = this.framebufferBufferStates.get(framebuffer);
-            if (!state) {
-                state = {
-                    readBuffer: framebuffer ? 0x8CE0 : 0x0405,
-                    drawBuffers: [framebuffer ? 0x8CE0 : 0x0405],
-                    attachments: Object.create(null),
-                };
-                this.framebufferBufferStates.set(framebuffer, state);
-            }
-            return state;
-        }
-
-        framebufferAttachmentTargets(target) {
-            let framebuffers;
-            if (target === 0x8CA8) { // GL_READ_FRAMEBUFFER
-                framebuffers = [this.boundReadFramebuffer];
-            } else if (target === 0x8CA9) { // GL_DRAW_FRAMEBUFFER
-                framebuffers = [this.boundDrawFramebuffer];
-            } else {
-                framebuffers = [
-                    this.boundReadFramebuffer,
-                    this.boundDrawFramebuffer,
-                ];
-            }
-            return Array.from(new Set(framebuffers.map(
-                framebuffer => framebuffer >>> 0)));
-        }
-
-        recordFramebufferAttachment(target, attachment, value) {
-            const attachmentKey = "0x" + (attachment >>> 0).toString(16);
-            const framebuffers = this.framebufferAttachmentTargets(target);
-            const {kind: attachmentKind, ...attachmentValue} = value;
-            for (const framebuffer of framebuffers) {
-                const attachments =
-                    this.framebufferBufferState(framebuffer).attachments;
-                if (value.object) {
-                    attachments[attachmentKey] = {...value};
-                } else {
-                    delete attachments[attachmentKey];
-                }
-            }
-            this.recordFramebufferEvent("attachment", {
-                target: "0x" + (target >>> 0).toString(16),
-                attachment: attachmentKey,
-                framebuffers,
-                attachmentKind,
-                ...attachmentValue,
-            });
-        }
-
-        recordFramebufferEvent(kind, details) {
-            this.framebufferHistory.push({
-                kind,
-                readFramebuffer: this.boundReadFramebuffer >>> 0,
-                drawFramebuffer: this.boundDrawFramebuffer >>> 0,
-                ...(details || {}),
-            });
-            if (this.framebufferHistory.length > 64) {
-                this.framebufferHistory.shift();
-            }
-        }
-
-        textureBindingTarget(target) {
-            if (target >= 0x8515 && target <= 0x851A) {
-                return 0x8513; // GL_TEXTURE_CUBE_MAP
-            }
-            return target >>> 0;
-        }
-
-        boundTextureForTarget(target) {
-            const bindingTarget = this.textureBindingTarget(target);
-            return (this.boundTextures.get(
-                this.activeTexture + ":" + bindingTarget) || 0) >>> 0;
-        }
-
-        textureImageKey(texture, target, level) {
-            return (texture >>> 0) + ":" + (target >>> 0) + ":" + (level | 0);
-        }
-
-        textureImageState(texture, target, level) {
-            const exact = this.textureImageStates.get(
-                this.textureImageKey(texture, target, level));
-            if (exact) {
-                return exact;
-            }
-            const bindingTarget = this.textureBindingTarget(target);
-            return this.textureImageStates.get(
-                this.textureImageKey(texture, bindingTarget, level)) || null;
         }
 
         getHostWebGL2Context() {
@@ -1431,35 +1299,6 @@
             case GLFN_CLIENT_ACTIVE_TEXTURE:
                 if (p.length >= 4) this.clientActiveTexture = u32(p, 0);
                 break;
-            case GLFN_BIND_TEXTURE:
-                if (p.length >= 8) {
-                    this.noteTextureBind(u32(p, 0), u32(p, 4));
-                }
-                break;
-            case GLFN_CLEAR:
-                if (p.length >= 4) {
-                    const state = this.framebufferBufferState(
-                        this.boundDrawFramebuffer);
-                    this.recordFramebufferEvent("clear", {
-                        mask: "0x" + u32(p, 0).toString(16),
-                        drawBuffers: state.drawBuffers.map(
-                            buffer => "0x" + buffer.toString(16)),
-                    });
-                }
-                break;
-            case GLFN_DRAW_ARRAYS:
-            case GLFN_DRAW_ELEMENTS:
-            case GLFN_DRAW_ARRAYS_GL2:
-            case GLFN_DRAW_ELEMENTS_GL2:
-            case GLFN_DRAW_ARRAYS_DIRECT:
-            case GLFN_DRAW_ELEMENTS_DIRECT:
-            case GLFN_DRAW_RANGE_ELEMENTS_DIRECT:
-                this.lastDrawFramebuffer =
-                    this.boundDrawFramebuffer >>> 0;
-                if (typeof this.notePackedBlobDraw === "function") {
-                    this.notePackedBlobDraw("WasmBatch");
-                }
-                break;
             }
         }
 
@@ -1577,7 +1416,6 @@
                 this.callTextureNameArray("DeleteTextures", p);
                 break;
             case GLFN_BIND_TEXTURE:
-                this.noteTextureBind(u32(p, 0), u32(p, 4));
                 this.callGL("BindTexture", [u32(p, 0), u32(p, 4)], ["number", "number"]);
                 break;
             case GLFN_TEX_IMAGE_2D:
@@ -1843,76 +1681,20 @@
                 this.callTextureNameArray("DeleteFramebuffersMapped", p);
                 break;
             case GLFN_BIND_FRAMEBUFFER:
-                {
-                    const target = u32(p, 0);
-                    const framebuffer = u32(p, 4);
-                    if (target === 0x8D40) { // GL_FRAMEBUFFER
-                        this.boundReadFramebuffer = framebuffer;
-                        this.boundDrawFramebuffer = framebuffer;
-                    } else if (target === 0x8CA8) { // GL_READ_FRAMEBUFFER
-                        this.boundReadFramebuffer = framebuffer;
-                    } else if (target === 0x8CA9) { // GL_DRAW_FRAMEBUFFER
-                        this.boundDrawFramebuffer = framebuffer;
-                    }
-                    this.callGL("BindFramebufferMapped", [
-                        target, framebuffer,
-                    ], ["number", "number"]);
-                    this.framebufferBufferState(this.boundReadFramebuffer);
-                    this.framebufferBufferState(this.boundDrawFramebuffer);
-                    this.recordFramebufferEvent("bind", {
-                        target: "0x" + target.toString(16),
-                        framebuffer,
-                    });
-                }
+                this.callGL("BindFramebufferMapped", [
+                    u32(p, 0), u32(p, 4),
+                ], ["number", "number"]);
                 break;
             case GLFN_FRAMEBUFFER_TEXTURE:
-                {
-                    const target = u32(p, 0);
-                    const attachment = u32(p, 4);
-                    const textarget = u32(p, 8);
-                    const texture = u32(p, 12);
-                    const level = i32(p, 16);
-                    const zoffset = i32(p, 20);
-                    const ok = this.callGL("FramebufferTextureMapped", [
-                        target, attachment, textarget, texture, level, zoffset,
-                    ], ["number", "number", "number", "number", "number", "number"]);
-                    if (ok) {
-                        this.recordFramebufferAttachment(
-                            target, attachment, {
-                                kind: texture ? "texture" : "none",
-                                object: texture,
-                                textarget: "0x" + textarget.toString(16),
-                                level,
-                                zoffset,
-                                allocation: texture ?
-                                    this.textureImageState(
-                                        texture, textarget, level) : null,
-                            });
-                    }
-                }
+                this.callGL("FramebufferTextureMapped", [
+                    u32(p, 0), u32(p, 4), u32(p, 8), u32(p, 12),
+                    i32(p, 16), i32(p, 20),
+                ], ["number", "number", "number", "number", "number", "number"]);
                 break;
             case GLFN_FRAMEBUFFER_RENDERBUFFER:
-                {
-                    const target = u32(p, 0);
-                    const attachment = u32(p, 4);
-                    const renderbufferTarget = u32(p, 8);
-                    const renderbuffer = u32(p, 12);
-                    const ok = this.callGL("FramebufferRenderbufferMapped", [
-                        target, attachment, renderbufferTarget, renderbuffer,
-                    ], ["number", "number", "number", "number"]);
-                    if (ok) {
-                        this.recordFramebufferAttachment(
-                            target, attachment, {
-                                kind: renderbuffer ? "renderbuffer" : "none",
-                                object: renderbuffer,
-                                renderbufferTarget: "0x" +
-                                    renderbufferTarget.toString(16),
-                                allocation: renderbuffer ?
-                                    (this.renderbufferStorageStates.get(
-                                        renderbuffer >>> 0) || null) : null,
-                            });
-                    }
-                }
+                this.callGL("FramebufferRenderbufferMapped", [
+                    u32(p, 0), u32(p, 4), u32(p, 8), u32(p, 12),
+                ], ["number", "number", "number", "number"]);
                 break;
             case GLFN_GEN_RENDERBUFFERS:
                 this.callTextureNameArray("GenRenderbuffersMapped", p);
@@ -1921,31 +1703,14 @@
                 this.callTextureNameArray("DeleteRenderbuffersMapped", p);
                 break;
             case GLFN_BIND_RENDERBUFFER:
-                this.boundRenderbuffer = u32(p, 4);
                 this.callGL("BindRenderbufferMapped", [
-                    u32(p, 0), this.boundRenderbuffer,
+                    u32(p, 0), u32(p, 4),
                 ], ["number", "number"]);
                 break;
             case GLFN_RENDERBUFFER_STORAGE:
-                {
-                    const target = u32(p, 0);
-                    const internalformat = u32(p, 4);
-                    const width = i32(p, 8);
-                    const height = i32(p, 12);
-                    const ok = this.callGL("RenderbufferStorageMapped", [
-                        target, internalformat, width, height,
-                    ], ["number", "number", "number", "number"]);
-                    if (ok && this.boundRenderbuffer) {
-                        this.renderbufferStorageStates.set(
-                            this.boundRenderbuffer >>> 0, {
-                                target: "0x" + target.toString(16),
-                                internalformat: "0x" +
-                                    internalformat.toString(16),
-                                width,
-                                height,
-                            });
-                    }
-                }
+                this.callGL("RenderbufferStorageMapped", [
+                    u32(p, 0), u32(p, 4), i32(p, 8), i32(p, 12),
+                ], ["number", "number", "number", "number"]);
                 break;
             case GLFN_QUERY_OBJECT_IV:
                 this.callQueryObjectIV(p);
@@ -1961,41 +1726,6 @@
                 break;
             case GLFN_BLIT_FRAMEBUFFER:
                 if (p.length >= 40) {
-                    this.fboBlitTraceCount++;
-                    if (this.boundDrawFramebuffer === 0 ||
-                            this.fboBlitTraceCount <= 8) {
-                        console.info("[v86gl:fbo-blit] guest " +
-                            JSON.stringify({
-                            count: this.fboBlitTraceCount,
-                            readFramebuffer: this.boundReadFramebuffer,
-                            drawFramebuffer: this.boundDrawFramebuffer,
-                            lastDrawFramebuffer: this.lastDrawFramebuffer,
-                            readBuffer: "0x" +
-                                this.readBufferMode.toString(16),
-                            drawBuffer: "0x" +
-                                this.drawBufferMode.toString(16),
-                            sourceBufferState: {
-                                ...this.framebufferBufferState(
-                                    this.boundReadFramebuffer),
-                            },
-                            destinationBufferState: {
-                                ...this.framebufferBufferState(
-                                    this.boundDrawFramebuffer),
-                            },
-                            recentFramebufferEvents:
-                                this.framebufferHistory.slice(-24),
-                            src: [
-                                i32(p, 0), i32(p, 4),
-                                i32(p, 8), i32(p, 12),
-                            ],
-                            dst: [
-                                i32(p, 16), i32(p, 20),
-                                i32(p, 24), i32(p, 28),
-                            ],
-                            mask: "0x" + u32(p, 32).toString(16),
-                            filter: "0x" + u32(p, 36).toString(16),
-                        }));
-                    }
                     this.callGL("BlitFramebuffer", [
                         i32(p, 0), i32(p, 4), i32(p, 8), i32(p, 12),
                         i32(p, 16), i32(p, 20), i32(p, 24), i32(p, 28),
@@ -2311,24 +2041,10 @@
                 this.callGL("PopClientAttrib", [], []);
                 break;
             case GLFN_DRAW_BUFFER:
-                this.drawBufferMode = u32(p, 0);
-                this.framebufferBufferState(
-                    this.boundDrawFramebuffer).drawBuffers =
-                    [this.drawBufferMode];
-                this.recordFramebufferEvent("drawBuffer", {
-                    buffers: ["0x" + this.drawBufferMode.toString(16)],
-                });
-                this.callGL("DrawBuffer", [this.drawBufferMode], ["number"]);
+                this.callGL("DrawBuffer", [u32(p, 0)], ["number"]);
                 break;
             case GLFN_READ_BUFFER:
-                this.readBufferMode = u32(p, 0);
-                this.framebufferBufferState(
-                    this.boundReadFramebuffer).readBuffer =
-                    this.readBufferMode;
-                this.recordFramebufferEvent("readBuffer", {
-                    buffer: "0x" + this.readBufferMode.toString(16),
-                });
-                this.callGL("ReadBuffer", [this.readBufferMode], ["number"]);
+                this.callGL("ReadBuffer", [u32(p, 0)], ["number"]);
                 break;
             case GLFN_COPY_TEX_IMAGE_2D:
                 this.callGL("CopyTexImage2D", [
@@ -2371,13 +2087,6 @@
                 break;
             }
         }
-
-        noteTextureBind(target, texture) {
-            this.boundTextures.set(
-                this.activeTexture + ":" + this.textureBindingTarget(target),
-                texture);
-        }
-
 
         callMatrixf(suffix, p) {
             if (p.length < 64) {
@@ -2540,28 +2249,11 @@
             const format = u32(p, 24);
             const type = u32(p, 28);
             const bytes = dataSize ? p.slice(36, 36 + dataSize) : null;
-            const ok = this.withHeapBytes(bytes, ptr =>
+            return this.withHeapBytes(bytes, ptr =>
                 this.callGL("TexImage2D", [
                     target, level, internalformat, width, height,
                     border, format, type, ptr,
                 ], ["number", "number", "number", "number", "number", "number", "number", "number", "number"]));
-            const texture = this.boundTextureForTarget(target);
-            if (ok && texture) {
-                this.textureImageStates.set(
-                    this.textureImageKey(texture, target, level), {
-                        target: "0x" + target.toString(16),
-                        level,
-                        internalformat: "0x" +
-                            (internalformat >>> 0).toString(16),
-                        width,
-                        height,
-                        border,
-                        format: "0x" + format.toString(16),
-                        type: "0x" + type.toString(16),
-                        dataSize,
-                    });
-            }
-            return ok;
         }
 
         callTexImage1D(p) {
@@ -2838,13 +2530,6 @@
                 buffers.push(u32(p, 4 + i * 4));
             }
 
-            this.drawBufferMode = buffers.length ? buffers[0] : 0;
-            this.framebufferBufferState(
-                this.boundDrawFramebuffer).drawBuffers = buffers.slice();
-            this.recordFramebufferEvent("drawBuffers", {
-                buffers: buffers.map(
-                    buffer => "0x" + buffer.toString(16)),
-            });
             return this.withHeapU32(buffers, ptr =>
                 this.callGL("DrawBuffers", [count, ptr], ["number", "number"]));
         }
@@ -3451,23 +3136,6 @@
             if (ok) {
                 writeU32(p, 8, result);
             }
-            const framebuffer = target === 0x8CA8 ?
-                this.boundReadFramebuffer : this.boundDrawFramebuffer;
-            const state = this.framebufferBufferState(framebuffer);
-            const color = state.attachments["0x8ce0"];
-            const allocation = color && color.allocation;
-            if (allocation && this.fboStatusTraceCount < 32 &&
-                    ["0x8050", "0x8051", "0x8058", "0x8d62"]
-                        .includes(allocation.internalformat)) {
-                this.fboStatusTraceCount++;
-                console.info("[v86gl:fbo-cap] " + JSON.stringify({
-                    count: this.fboStatusTraceCount,
-                    framebuffer,
-                    target: "0x" + target.toString(16),
-                    status: "0x" + result.toString(16),
-                    color,
-                }));
-            }
             return ok;
         }
 
@@ -3633,19 +3301,6 @@
             return this.withHeapBytes(p, invoke);
         }
 
-        notePackedBlobDraw(suffix) {
-            this.lastDrawFramebuffer = this.boundDrawFramebuffer >>> 0;
-            if (this.options && this.options.enableFramebufferHistory !== false) {
-                const state = this.framebufferBufferState(
-                    this.boundDrawFramebuffer);
-                this.recordFramebufferEvent("draw", {
-                    call: suffix,
-                    drawBuffers: state.drawBuffers.map(
-                        buffer => "0x" + buffer.toString(16)),
-                });
-            }
-        }
-
         callDrawArrays(p) {
             if (p.length < 8) {
                 return false;
@@ -3653,7 +3308,6 @@
             const result = this.withPackedDrawBlob(
                 p, "DrawArraysPackedBlob", false);
             if (result && result.called && result.value !== 0) {
-                this.notePackedBlobDraw("DrawArraysPackedBlob");
                 return true;
             }
             return this.callDrawArraysLegacy(p);
@@ -3666,7 +3320,6 @@
             const result = this.withPackedDrawBlob(
                 p, "DrawElementsPackedBlob", false);
             if (result && result.called && result.value !== 0) {
-                this.notePackedBlobDraw("DrawElementsPackedBlob");
                 return true;
             }
             return this.callDrawElementsLegacy(p);
@@ -3679,7 +3332,6 @@
             const result = this.withPackedDrawBlob(
                 p, "DrawArraysPackedBlob", true);
             if (result && result.called && result.value !== 0) {
-                this.notePackedBlobDraw("DrawArraysPackedBlobGL2");
                 return true;
             }
             return this.callDrawArraysGL2Legacy(p);
@@ -3692,7 +3344,6 @@
             const result = this.withPackedDrawBlob(
                 p, "DrawElementsPackedBlob", true);
             if (result && result.called && result.value !== 0) {
-                this.notePackedBlobDraw("DrawElementsPackedBlobGL2");
                 return true;
             }
             return this.callDrawElementsGL2Legacy(p);
@@ -3975,26 +3626,6 @@
             if (!ok) {
                 this.warnMissing("gl" + suffix);
             }
-            if (ok && (/^(DrawArrays|DrawElements|DrawRangeElements|MultiDraw)/
-                    .test(suffix))) {
-                this.lastDrawFramebuffer =
-                    this.boundDrawFramebuffer >>> 0;
-                const state = this.framebufferBufferState(
-                    this.boundDrawFramebuffer);
-                this.recordFramebufferEvent("draw", {
-                    call: suffix,
-                    drawBuffers: state.drawBuffers.map(
-                        buffer => "0x" + buffer.toString(16)),
-                });
-            } else if (ok && suffix === "Clear") {
-                const state = this.framebufferBufferState(
-                    this.boundDrawFramebuffer);
-                this.recordFramebufferEvent("clear", {
-                    mask: "0x" + ((args && args[0]) >>> 0).toString(16),
-                    drawBuffers: state.drawBuffers.map(
-                        buffer => "0x" + buffer.toString(16)),
-                });
-            }
             return ok;
         }
 
@@ -4162,6 +3793,12 @@
             this.emulator = emulator;
             this.canvas = canvas;
             this.options = options || {};
+            this.d3d8Canvas = this.options.d3d8Canvas ||
+                (typeof document !== "undefined" ?
+                    document.getElementById("d3d8_webgpu_canvas") : null);
+            this.d3d8Executor = null;
+            this.d3d8Surface = { hwnd: 0, x: 0, y: 0, width: 0, height: 0 };
+            this.d3d8Visible = false;
             this.buf = [];
             this.pendingPackets = [];
             this.pendingPCIBatches = [];
@@ -4170,8 +3807,6 @@
             this.chunkedCalls = Object.create(null);
             this.frameStates = Object.create(null);
             this.lastPresentedFrameId = 0;
-            this.lastGuestTestTrace = null;
-            this.guestTestTraceHistory = [];
             this.surface = { hwnd: 0, x: 0, y: 0, width: 0, height: 0 };
             this.container = canvas.parentElement;
             this.screenCanvas = this.findScreenCanvas();
@@ -4179,7 +3814,6 @@
             this.rendererGeneration = 0;
             this.frameDrawableSeen = false;
             this.hasPresentedDrawable = false;
-            this.presentTraceCount = 0;
             this.overlayVisible = false;
             this.overlayHideTimer = 0;
             this.contextCurrent = false;
@@ -4204,10 +3838,41 @@
             this.activeRestoreOperation = 0;
             this.pendingStateRestore = Promise.resolve();
 
+            this.setD3D8ExecutorFromOptions();
             this.setRendererFromOptions();
             emulator.add_listener("v86gl-pci-frame", event => this.pushPCIBatch(event));
             emulator.add_listener("emulator-loaded", () => this.attachPCIStateHooks());
             this.attachPCIStateHooks();
+        }
+
+        setD3D8ExecutorFromOptions() {
+            if (this.options.d3d8Executor) {
+                this.d3d8Executor = this.options.d3d8Executor;
+                return;
+            }
+            const install = this.options.installD3D8WebGPUExecutor ||
+                global.installD3D8WebGPUExecutor;
+            if (!this.d3d8Canvas || typeof install !== "function") {
+                return;
+            }
+            const executorOptions = { ...(this.options.d3d8 || {}) };
+            const userSurface = executorOptions.onSurface;
+            const userPresent = executorOptions.onPresent;
+            executorOptions.onSurface = (surface, reason) => {
+                this.d3d8Surface = { ...this.d3d8Surface, ...surface };
+                this.positionD3D8Canvas();
+                if (typeof userSurface === "function") {
+                    userSurface(surface, reason);
+                }
+            };
+            executorOptions.onPresent = (surface, stats) => {
+                this.d3d8Surface = { ...this.d3d8Surface, ...surface };
+                this.showD3D8Canvas();
+                if (typeof userPresent === "function") {
+                    userPresent(surface, stats);
+                }
+            };
+            this.d3d8Executor = install(this.d3d8Canvas, executorOptions);
         }
 
         setRendererFromOptions() {
@@ -4276,7 +3941,8 @@
 
             const canvases = this.container.getElementsByTagName("canvas");
             for (let i = 0; i < canvases.length; i++) {
-                if (canvases[i] !== this.canvas) {
+                if (canvases[i] !== this.canvas &&
+                        canvases[i] !== this.d3d8Canvas) {
                     return canvases[i];
                 }
             }
@@ -5182,81 +4848,6 @@
             }
         }
 
-        handleGuestTestTrace(args, source, frameId) {
-            if (args.length < 12) {
-                console.warn("[v86gl:guest-test] truncated checkpoint header", {
-                    payloadBytes: args.length,
-                    source: source || "",
-                });
-                return false;
-            }
-
-            const phase = u32(args, 0);
-            const hr = u32(args, 4);
-            const textSize = u32(args, 8);
-            if (textSize > args.length - 12) {
-                console.warn("[v86gl:guest-test] truncated checkpoint text", {
-                    declaredBytes: textSize,
-                    availableBytes: args.length - 12,
-                    source: source || "",
-                });
-                return false;
-            }
-
-            const phaseNames = {
-                [V86GL_TEST_TRACE_PHASE_CALLING]: "CALLING",
-                [V86GL_TEST_TRACE_PHASE_RETURNED]: "RETURNED",
-                [V86GL_TEST_TRACE_PHASE_PASS]: "PASS",
-                [V86GL_TEST_TRACE_PHASE_FAIL]: "FAIL",
-                [V86GL_TEST_TRACE_PHASE_TEXT]: "TEXT",
-            };
-            const phaseName = phaseNames[phase] || "PHASE_" + phase;
-            const hrHex = "0x" + hr.toString(16).padStart(8, "0").toUpperCase();
-            const trace = {
-                phase,
-                phaseName,
-                hr,
-                hrSigned: hr | 0,
-                hrHex,
-                text: decodeUTF8(args.subarray(12, 12 + textSize)),
-                source: source || "",
-                frameId: frameId >>> 0,
-            };
-
-            this.lastGuestTestTrace = trace;
-            this.guestTestTraceHistory.push(trace);
-            if (this.guestTestTraceHistory.length > 256) {
-                this.guestTestTraceHistory.shift();
-            }
-
-            const log = "[v86gl:guest-test] " + phaseName + " " +
-                hrHex + (trace.text ? " " + trace.text : "");
-            if (phase === V86GL_TEST_TRACE_PHASE_FAIL) {
-                console.error(log, trace);
-            } else {
-                console.info(log, trace);
-            }
-
-            if (typeof this.options.onGuestTestTrace === "function") {
-                try {
-                    this.options.onGuestTestTrace(trace);
-                } catch (err) {
-                    console.error("[v86gl:guest-test] callback threw", err);
-                }
-            }
-            if (typeof global.dispatchEvent === "function" &&
-                typeof global.CustomEvent === "function") {
-                try {
-                    global.dispatchEvent(new global.CustomEvent(
-                        "v86gl-guest-test", { detail: trace }));
-                } catch (_err) {
-                    /* Custom event delivery is optional diagnostic sugar. */
-                }
-            }
-
-            return true;
-        }
-
         observeWasmBatchRecords(p, start, end, renderer,
                                 commandFrameId) {
             let offset = start;
@@ -5369,10 +4960,6 @@
                     this.destroyContext();
                     continue;
                 }
-                if (fn === V86GL_CTRL_TEST_TRACE) {
-                    this.handleGuestTestTrace(args, source, commandFrameId);
-                    continue;
-                }
                 this.noteDrawableFunction(fn, commandFrameId);
                 this.callRenderer(fn, args);
             }
@@ -5380,8 +4967,14 @@
         }
 
         pushPCIBatch(event) {
+            const incomingBytes = event.bytes instanceof Uint8Array ?
+                event.bytes : new Uint8Array(event.bytes || []);
+            if (this.isD3D8BatchStream(incomingBytes)) {
+                this.pushD3D8PCIBatch(event, incomingBytes);
+                return;
+            }
             if (!this.renderer || this.restoringState) {
-                const bytes = event.bytes instanceof Uint8Array ? event.bytes.slice() : new Uint8Array(event.bytes || []);
+                const bytes = incomingBytes.slice();
                 this.pendingPCIBatches.push({
                     ...event,
                     bytes,
@@ -5389,7 +4982,7 @@
                 return;
             }
 
-            const bytes = event.bytes instanceof Uint8Array ? event.bytes : new Uint8Array(event.bytes || []);
+            const bytes = incomingBytes;
             const frameId = event.frameId >>> 0;
             if (frameId && this.isStaleFrame(frameId)) {
                 return;
@@ -5408,35 +5001,45 @@
             }
 
             if (event.flags & 1) {
-                const state = frameId ? this.frameStates[frameId] : null;
-                const drawable = frameId ? !!(state && state.drawable) :
-                    this.frameDrawableSeen;
-                const tracePresent = ++this.presentTraceCount <= 4;
-                if (tracePresent) {
-                    console.info("[v86gl:present] enter", {
-                        frameId,
-                        submitCount: event.submitCount >>> 0,
-                        commandCount: event.commandCount >>> 0,
-                        commandBytes: bytes.length,
-                        drawable,
-                        canvasWidth: this.canvas.width >>> 0,
-                        canvasHeight: this.canvas.height >>> 0,
-                    });
-                }
-
                 const committed = frameId ? this.presentFrame(frameId) :
                     this.present();
-                if (tracePresent || !committed) {
-                    const log = committed ? console.info : console.error;
-                    log.call(console, "[v86gl:present] " +
-                        (committed ? "committed" : "FAILED"), {
+                if (!committed) {
+                    console.error("[v86gl:present] FAILED", {
                         frameId,
                         committed,
-                        drawable,
                         overlayVisible: this.overlayVisible,
                     });
                 }
             }
+        }
+
+        isD3D8BatchStream(bytes) {
+            return bytes.length >= 8 &&
+                u16(bytes, 0) === V86GL_CTRL_D3D8_BATCH &&
+                u16(bytes, 2) === V86GL_EXTENDED_RECORD_SIZE;
+        }
+
+        pushD3D8PCIBatch(event, bytes) {
+            if (!this.d3d8Executor ||
+                    typeof this.d3d8Executor.submit !== "function") {
+                console.error("[d3d8-webgpu] executor is unavailable; " +
+                    "load d3d8_executor.js and provide a WebGPU canvas");
+                return;
+            }
+            const payloadBytes = u32(bytes, 4);
+            if (payloadBytes > bytes.length - 8 || payloadBytes + 8 !== bytes.length) {
+                console.error("[d3d8-webgpu] malformed VGL2 D8WG envelope", {
+                    payloadBytes,
+                    availableBytes: bytes.length - 8,
+                    frameId: event.frameId >>> 0,
+                });
+                return;
+            }
+            this.d3d8Executor.submit(bytes.subarray(8), {
+                pciFrameId: event.frameId >>> 0,
+                submitCount: event.submitCount >>> 0,
+                descriptorCommandCount: event.commandCount >>> 0,
+            });
         }
 
         dispatchGLFramePacket(p, shouldPresent) {
@@ -5703,6 +5306,39 @@
 
             this.styleOverlayCanvas(this.canvas, left, top, width, height, shouldShow);
             this.canvas.style.visibility = shouldShow ? "visible" : "hidden";
+            if (this.d3d8Canvas) {
+                this.positionD3D8Canvas();
+            }
+        }
+
+        positionD3D8Canvas(visible) {
+            if (!this.d3d8Canvas) {
+                return;
+            }
+            const surface = this.d3d8Surface;
+            const w = surface.width || this.d3d8Canvas.width || 640;
+            const h = surface.height || this.d3d8Canvas.height || 480;
+            let left = surface.x || 0;
+            let top = surface.y || 0;
+            let width = w;
+            let height = h;
+            const shouldShow = visible === undefined ? this.d3d8Visible : !!visible;
+
+            if (this.container && this.screenCanvas &&
+                    this.screenCanvas.width && this.screenCanvas.height) {
+                const containerRect = this.container.getBoundingClientRect();
+                const screenRect = this.screenCanvas.getBoundingClientRect();
+                const scaleX = screenRect.width / this.screenCanvas.width;
+                const scaleY = screenRect.height / this.screenCanvas.height;
+                left = screenRect.left - containerRect.left + (surface.x || 0) * scaleX;
+                top = screenRect.top - containerRect.top + (surface.y || 0) * scaleY;
+                width = w * scaleX;
+                height = h * scaleY;
+            }
+
+            this.styleOverlayCanvas(this.d3d8Canvas, left, top,
+                width, height, shouldShow);
+            this.d3d8Canvas.style.visibility = shouldShow ? "visible" : "hidden";
         }
 
         cancelOverlayHide() {
@@ -5714,6 +5350,7 @@
 
         showOverlayCanvas() {
             this.cancelOverlayHide();
+            this.hideD3D8Canvas();
             this.overlayVisible = true;
             this.positionCanvas(true);
         }
@@ -5722,6 +5359,23 @@
             this.cancelOverlayHide();
             this.overlayVisible = false;
             this.positionCanvas(false);
+        }
+
+        showD3D8Canvas() {
+            this.cancelOverlayHide();
+            this.overlayVisible = false;
+            this.styleOverlayCanvas(this.canvas, 0, 0, 0, 0, false);
+            this.canvas.style.visibility = "hidden";
+            this.d3d8Visible = true;
+            this.positionD3D8Canvas(true);
+        }
+
+        hideD3D8Canvas() {
+            if (!this.d3d8Canvas) {
+                return;
+            }
+            this.d3d8Visible = false;
+            this.positionD3D8Canvas(false);
         }
 
         scheduleOverlayHide(delayMs) {

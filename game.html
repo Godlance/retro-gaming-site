@@ -77,6 +77,7 @@
                     <div class="text-screen"></div>
                     <canvas></canvas>
                     <canvas id="v86gl_canvas"></canvas>
+                    <canvas id="d3d8_webgpu_canvas"></canvas>
                     <div class="screen-placeholder" id="screen_placeholder">
                         <div class="pixel-loader" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
                         <strong>Waking up a classic PC…</strong>
@@ -104,10 +105,11 @@
         <a href="index.html">Browse all games</a>
     </footer>
 
-    <script src="libv86.js?v=d3d8-fbo-allocation-trace-v5-20260726"></script>
-    <script src="glbridge/libglwasm/gl4es.js?v=d3d8-fbo-allocation-trace-v5-20260726"></script>
-    <script src="glbridge/libglwasm/gl4es_loader.js?v=d3d8-fbo-allocation-trace-v5-20260726"></script>
-    <script src="glbridge/v86_network_bridge.js?v=d3d8-fbo-allocation-trace-v5-20260726"></script>
+    <script src="libv86.js?v=webgl-clean-v1-20260801"></script>
+    <script src="glbridge/libglwasm/gl4es.js?v=webgl-clean-v1-20260801"></script>
+    <script src="glbridge/libglwasm/gl4es_loader.js?v=webgl-clean-v1-20260801"></script>
+    <script src="glbridge/d3d8-webgpu/d3d8_executor.js?v=direct-webgpu-m1-20260801"></script>
+    <script src="glbridge/v86_network_bridge.js?v=direct-webgpu-m1-20260801"></script>
     <script src="game-assets.js?v=cube2-skinning-fix-20260718"></script>
     <script src="app.js?v=cube2-skinning-fix-20260718"></script>
 </body>

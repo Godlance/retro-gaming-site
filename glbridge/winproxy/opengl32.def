@@ -35,8 +35,6 @@ EXPORTS
     wglGetSwapIntervalEXT@0
     wglAddSwapHintRectWIN@16
     glAddSwapHintRectWIN@16
-    v86glTraceCheckpoint@12
-
     glGetString@4
     glGetError@0
     glGetIntegerv@8
