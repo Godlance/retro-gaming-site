@@ -441,6 +441,16 @@ static GLint g_pack_alignment = 4;
 static GLint g_pack_row_length;
 static GLint g_pack_skip_rows;
 static GLint g_pack_skip_pixels;
+static GLuint g_bound_array_buffer_host;
+static GLuint g_bound_element_array_buffer_host;
+static GLuint g_packed_stream_vbo;
+static GLuint g_packed_stream_ibo;
+static GLsizeiptr g_packed_stream_vbo_capacity;
+static GLsizeiptr g_packed_stream_ibo_capacity;
+static GLsizeiptr g_packed_stream_vbo_cursor;
+static GLsizeiptr g_packed_stream_ibo_cursor;
+static int g_packed_stream_vbo_needs_orphan = 1;
+static int g_packed_stream_ibo_needs_orphan = 1;
 
 typedef struct {
     GLint alignment;
@@ -1995,6 +2005,17 @@ static void v86gl_reset_gl2_maps(void) {
     g_renderbuffer_count = 0;
     g_query_count = 0;
     g_buffer_count = 0;
+
+    g_bound_array_buffer_host = 0;
+    g_bound_element_array_buffer_host = 0;
+    g_packed_stream_vbo = 0;
+    g_packed_stream_ibo = 0;
+    g_packed_stream_vbo_capacity = 0;
+    g_packed_stream_ibo_capacity = 0;
+    g_packed_stream_vbo_cursor = 0;
+    g_packed_stream_ibo_cursor = 0;
+    g_packed_stream_vbo_needs_orphan = 1;
+    g_packed_stream_ibo_needs_orphan = 1;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -2058,6 +2079,14 @@ EMSCRIPTEN_KEEPALIVE
 int v86glPresent(void) {
     if (!v86gl_ensure_ready()) return 0;
     glFlush();
+
+    /* Start a fresh transient-buffer segment on the next frame. The actual
+     * orphan happens lazily on the next packed draw, after this frame has
+     * already been flushed. */
+    g_packed_stream_vbo_cursor = 0;
+    g_packed_stream_ibo_cursor = 0;
+    g_packed_stream_vbo_needs_orphan = 1;
+    g_packed_stream_ibo_needs_orphan = 1;
 #ifdef __EMSCRIPTEN__
     if (!g_offscreen_valid) return 0;
     v86gl_push_volume_state();
@@ -2752,10 +2781,15 @@ void v86gl_glDeleteBuffersMapped(GLsizei n, const GLuint* guest_names) {
 
     if (!v86gl_ensure_ready()) return;
     if (n <= 0 || !guest_names) return;
-
     for (i = 0; i < n; i++) {
         GLuint host = v86gl_host_buffer(guest_names[i], 0);
         if (host) {
+            if (g_bound_array_buffer_host == host) {
+                g_bound_array_buffer_host = 0;
+            }
+            if (g_bound_element_array_buffer_host == host) {
+                g_bound_element_array_buffer_host = 0;
+            }
             glDeleteBuffers(1, &host);
             v86gl_forget_name(g_buffers, &g_buffer_count, guest_names[i]);
         }
@@ -2774,16 +2808,15 @@ void v86gl_glBindBufferMapped(GLenum target, GLuint guest_buffer) {
     GLuint host;
 
     if (!v86gl_ensure_ready()) return;
-
     /* The proxy always resolves GL_PIXEL_PACK_BUFFER/GL_PIXEL_UNPACK_BUFFER
      * offsets to real bytes before a record ever reaches the wire (see
      * unpack_pixel_pointer()/pack_pixel_pointer() in opengl32_proxy.c), so
      * every TexImage/TexSubImage/ReadPixels call below always receives a
      * real heap pointer. Forwarding the guest's bind would leave that target
      * bound on the real WebGL2 context, which then reinterprets those real
-     * pointers as byte offsets into the bound buffer instead -- corrupting
-     * every subsequent pixel transfer and leaving render-target textures
-     * with incomplete storage (this is what produced the repeated
+     * pointers as byte offsets into the bound buffer -- corrupting every
+     * subsequent pixel transfer and leaving render-target textures with
+     * incomplete storage (this is what produced the repeated
      * "Framebuffer is incomplete" errors seen after a guest PBO upload).
      * gl4es does not track these two targets either (see its own
      * "unhandled Buffer type" warning), so there is no functional reason to
@@ -2791,9 +2824,13 @@ void v86gl_glBindBufferMapped(GLenum target, GLuint guest_buffer) {
     if (target == GL_PIXEL_PACK_BUFFER || target == GL_PIXEL_UNPACK_BUFFER) {
         return;
     }
-
     host = guest_buffer ? v86gl_host_buffer(guest_buffer, 1) : 0;
     glBindBuffer(target, host);
+    if (target == GL_ARRAY_BUFFER) {
+        g_bound_array_buffer_host = host;
+    } else if (target == GL_ELEMENT_ARRAY_BUFFER) {
+        g_bound_element_array_buffer_host = host;
+    }
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -5422,6 +5459,664 @@ void v86gl_glMultiDrawElementsDirect(GLenum mode, GLenum type,
     }
 }
 
+#ifndef V86GL_USE_PACKED_STREAM_BUFFERS
+#define V86GL_USE_PACKED_STREAM_BUFFERS 1
+#endif
+
+#define V86GL_PACKED_STREAM_ALIGNMENT 16u
+#define V86GL_PACKED_STREAM_INITIAL_CAPACITY (64u * 1024u)
+
+static size_t v86gl_packed_component_size(GLenum type) {
+    switch (type) {
+        case GL_BYTE:
+        case GL_UNSIGNED_BYTE:
+            return 1u;
+        case GL_SHORT:
+        case GL_UNSIGNED_SHORT:
+            return 2u;
+        case GL_INT:
+        case GL_UNSIGNED_INT:
+        case GL_FLOAT:
+            return 4u;
+        case GL_DOUBLE:
+            return 8u;
+#ifdef GL_HALF_FLOAT
+        case GL_HALF_FLOAT:
+            return 2u;
+#endif
+#ifdef GL_FIXED
+        case GL_FIXED:
+            return 4u;
+#endif
+        default:
+            return 0u;
+    }
+}
+
+static size_t v86gl_packed_element_size(GLint size, GLenum type) {
+    size_t component_size;
+
+#ifdef GL_BGRA
+    if (size == GL_BGRA) {
+        size = 4;
+    }
+#endif
+    if (size <= 0) {
+        return 0u;
+    }
+
+#ifdef GL_UNSIGNED_INT_2_10_10_10_REV
+    if (type == GL_UNSIGNED_INT_2_10_10_10_REV) {
+        return 4u;
+    }
+#endif
+#ifdef GL_INT_2_10_10_10_REV
+    if (type == GL_INT_2_10_10_10_REV) {
+        return 4u;
+    }
+#endif
+    component_size = v86gl_packed_component_size(type);
+    if (!component_size || (uint64_t)(uint32_t)size * component_size > INT32_MAX) {
+        return 0u;
+    }
+    return (size_t)size * component_size;
+}
+
+static int v86gl_packed_array_span(GLint size, GLenum type, GLsizei stride,
+                                   uint32_t vertex_count, GLsizeiptr* span_out) {
+    size_t element_size;
+    uint64_t effective_stride;
+    uint64_t span;
+
+    if (!span_out || stride < 0) {
+        return 0;
+    }
+    *span_out = 0;
+    if (!vertex_count) {
+        return 1;
+    }
+    element_size = v86gl_packed_element_size(size, type);
+    if (!element_size) {
+        return 0;
+    }
+    effective_stride = stride > 0 ? (uint64_t)(uint32_t)stride :
+                                    (uint64_t)element_size;
+    span = (uint64_t)(vertex_count - 1u) * effective_stride + element_size;
+    if (span > INT32_MAX) {
+        return 0;
+    }
+    *span_out = (GLsizeiptr)span;
+    return 1;
+}
+
+static int v86gl_packed_append_span(GLsizeiptr* total, GLsizeiptr span) {
+    uint64_t aligned;
+    uint64_t next;
+
+    if (!total || span < 0) {
+        return 0;
+    }
+    if (!span) {
+        return 1;
+    }
+    aligned = ((uint64_t)(uint32_t)*total +
+               (V86GL_PACKED_STREAM_ALIGNMENT - 1u)) &
+              ~(uint64_t)(V86GL_PACKED_STREAM_ALIGNMENT - 1u);
+    next = aligned + (uint64_t)(uint32_t)span;
+    if (next > INT32_MAX) {
+        return 0;
+    }
+    *total = (GLsizeiptr)next;
+    return 1;
+}
+
+static int v86gl_packed_meta_total(const V86GLClientArrayMeta* meta,
+                                   uint32_t meta_count,
+                                   uint32_t vertex_count,
+                                   GLsizeiptr* total) {
+    uint32_t i;
+
+    if (!total) {
+        return 0;
+    }
+    for (i = 0; i < meta_count; i++) {
+        GLsizeiptr span = 0;
+        if (!meta[i].data || meta[i].size <= 0) {
+            continue;
+        }
+        if (!v86gl_packed_array_span(meta[i].size, meta[i].type,
+                                     meta[i].stride, vertex_count, &span) ||
+            !v86gl_packed_append_span(total, span)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int v86gl_packed_generic_total(GLsizei attrib_count,
+                                      const int32_t* values,
+                                      uint32_t vertex_count,
+                                      GLsizeiptr* total) {
+    GLsizei i;
+
+    if (!total) {
+        return 0;
+    }
+    if (!values || attrib_count <= 0) {
+        return 1;
+    }
+    if (attrib_count > V86GL_MAX_VERTEX_ATTRIBS) {
+        attrib_count = V86GL_MAX_VERTEX_ATTRIBS;
+    }
+    for (i = 0; i < attrib_count; i++) {
+        V86GLGenericAttribMeta meta =
+            v86gl_generic_attrib_meta_at(values, (uint32_t)i);
+        GLsizeiptr span = 0;
+        if (!meta.enabled || !meta.data || meta.size <= 0) {
+            continue;
+        }
+        if (!v86gl_packed_array_span(meta.size, meta.type, meta.stride,
+                                     vertex_count, &span) ||
+            !v86gl_packed_append_span(total, span)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static GLsizeiptr v86gl_packed_next_capacity(GLsizeiptr current,
+                                             GLsizeiptr required) {
+    uint64_t capacity;
+
+    if (required <= 0) {
+        return 0;
+    }
+    capacity = current > 0 ? (uint64_t)(uint32_t)current :
+                             V86GL_PACKED_STREAM_INITIAL_CAPACITY;
+    while (capacity < (uint64_t)(uint32_t)required) {
+        capacity <<= 1u;
+        if (capacity > INT32_MAX) {
+            capacity = (uint64_t)(uint32_t)required;
+            break;
+        }
+    }
+    return (GLsizeiptr)capacity;
+}
+
+static int v86gl_packed_reserve_buffer(GLenum target,
+                                       GLuint* buffer,
+                                       GLsizeiptr* capacity,
+                                       GLsizeiptr* cursor,
+                                       int* needs_orphan,
+                                       GLsizeiptr required,
+                                       GLintptr* base_out) {
+    uint64_t aligned;
+    uint64_t end;
+    GLsizeiptr new_capacity;
+
+    if (!buffer || !capacity || !cursor || !needs_orphan ||
+        !base_out || required < 0) {
+        return 0;
+    }
+    *base_out = 0;
+    if (!required) {
+        glBindBuffer(target, 0);
+        return 1;
+    }
+    if (!*buffer) {
+        glGenBuffers(1, buffer);
+        if (!*buffer) {
+            return 0;
+        }
+        *needs_orphan = 1;
+    }
+
+    aligned = ((uint64_t)(uint32_t)*cursor +
+               (V86GL_PACKED_STREAM_ALIGNMENT - 1u)) &
+              ~(uint64_t)(V86GL_PACKED_STREAM_ALIGNMENT - 1u);
+    end = aligned + (uint64_t)(uint32_t)required;
+    if (end > INT32_MAX) {
+        return 0;
+    }
+
+    glBindBuffer(target, *buffer);
+    if (*needs_orphan || end > (uint64_t)(uint32_t)*capacity) {
+        new_capacity = v86gl_packed_next_capacity(*capacity, required);
+        if (new_capacity < required) {
+            return 0;
+        }
+        *capacity = new_capacity;
+        glBufferData(target, *capacity, NULL, GL_STREAM_DRAW);
+        *cursor = 0;
+        aligned = 0;
+        end = (uint64_t)(uint32_t)required;
+        *needs_orphan = 0;
+    }
+
+    *base_out = (GLintptr)aligned;
+    *cursor = (GLsizeiptr)end;
+    return 1;
+}
+
+static int v86gl_packed_begin_stream(GLsizeiptr vertex_bytes,
+                                     GLsizeiptr index_bytes,
+                                     GLintptr* vertex_base_out,
+                                     GLintptr* index_base_out) {
+    if (!vertex_base_out || !index_base_out) {
+        return 0;
+    }
+    if (!v86gl_packed_reserve_buffer(
+            GL_ARRAY_BUFFER,
+            &g_packed_stream_vbo,
+            &g_packed_stream_vbo_capacity,
+            &g_packed_stream_vbo_cursor,
+            &g_packed_stream_vbo_needs_orphan,
+            vertex_bytes,
+            vertex_base_out)) {
+        return 0;
+    }
+    if (!v86gl_packed_reserve_buffer(
+            GL_ELEMENT_ARRAY_BUFFER,
+            &g_packed_stream_ibo,
+            &g_packed_stream_ibo_capacity,
+            &g_packed_stream_ibo_cursor,
+            &g_packed_stream_ibo_needs_orphan,
+            index_bytes,
+            index_base_out)) {
+        return 0;
+    }
+    return 1;
+}
+
+static void v86gl_packed_restore_guest_bindings(void) {
+    glBindBuffer(GL_ARRAY_BUFFER, g_bound_array_buffer_host);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_bound_element_array_buffer_host);
+}
+
+static int v86gl_packed_upload_meta(const V86GLClientArrayMeta* meta,
+                                    uint32_t vertex_count,
+                                    GLsizeiptr* cursor,
+                                    uintptr_t* offset_out) {
+    GLsizeiptr span = 0;
+    uint64_t aligned;
+
+    if (!meta || !cursor || !offset_out || !meta->data || meta->size <= 0) {
+        return 0;
+    }
+    if (!v86gl_packed_array_span(meta->size, meta->type, meta->stride,
+                                 vertex_count, &span)) {
+        return 0;
+    }
+    aligned = ((uint64_t)(uint32_t)*cursor +
+               (V86GL_PACKED_STREAM_ALIGNMENT - 1u)) &
+              ~(uint64_t)(V86GL_PACKED_STREAM_ALIGNMENT - 1u);
+    if (aligned + (uint64_t)(uint32_t)span > INT32_MAX) {
+        return 0;
+    }
+    glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)aligned, span, meta->data);
+    *offset_out = (uintptr_t)(uint32_t)aligned;
+    *cursor = (GLsizeiptr)(aligned + (uint64_t)(uint32_t)span);
+    return 1;
+}
+
+static int v86gl_packed_index_info(GLenum type, GLsizei count,
+                                   const void* indices,
+                                   GLsizeiptr* bytes_out,
+                                   uint32_t* vertex_count_out) {
+    uint64_t byte_count;
+    uint32_t max_index = 0;
+    GLsizei i;
+
+    if (!bytes_out || !vertex_count_out || count < 0) {
+        return 0;
+    }
+    *bytes_out = 0;
+    *vertex_count_out = 0;
+    if (!count) {
+        return 1;
+    }
+    if (!indices) {
+        return 0;
+    }
+
+    switch (type) {
+        case GL_UNSIGNED_BYTE: {
+            const uint8_t* values = (const uint8_t*)indices;
+            byte_count = (uint64_t)(uint32_t)count;
+            for (i = 0; i < count; i++) {
+                if (values[i] > max_index) {
+                    max_index = values[i];
+                }
+            }
+            break;
+        }
+        case GL_UNSIGNED_SHORT: {
+            const uint8_t* values = (const uint8_t*)indices;
+            byte_count = (uint64_t)(uint32_t)count * 2u;
+            for (i = 0; i < count; i++) {
+                uint16_t value;
+                memcpy(&value, values + (size_t)i * 2u, sizeof(value));
+                if ((uint32_t)value > max_index) {
+                    max_index = value;
+                }
+            }
+            break;
+        }
+        case GL_UNSIGNED_INT: {
+            const uint8_t* values = (const uint8_t*)indices;
+            byte_count = (uint64_t)(uint32_t)count * 4u;
+            for (i = 0; i < count; i++) {
+                uint32_t value;
+                memcpy(&value, values + (size_t)i * 4u, sizeof(value));
+                if (value > max_index) {
+                    max_index = value;
+                }
+            }
+            break;
+        }
+        default:
+            return 0;
+    }
+
+    if (byte_count > INT32_MAX || max_index == UINT32_MAX) {
+        return 0;
+    }
+    *bytes_out = (GLsizeiptr)byte_count;
+    *vertex_count_out = max_index + 1u;
+    return 1;
+}
+
+static int v86gl_packed_setup_simple_stream(
+    uint32_t vertex_count,
+    GLint vertex_size, GLenum vertex_type, GLsizei vertex_stride,
+    const void* vertex_data,
+    GLint color_size, GLenum color_type, GLsizei color_stride,
+    const void* color_data,
+    GLint texcoord_size, GLenum texcoord_type, GLsizei texcoord_stride,
+    const void* texcoord_data,
+    GLenum normal_type, GLsizei normal_stride, const void* normal_data,
+    GLsizeiptr* cursor) {
+    V86GLClientArrayMeta vertex = {
+        vertex_size, vertex_type, vertex_stride, vertex_data
+    };
+    V86GLClientArrayMeta color = {
+        color_size, color_type, color_stride, color_data
+    };
+    V86GLClientArrayMeta texcoord = {
+        texcoord_size, texcoord_type, texcoord_stride, texcoord_data
+    };
+    V86GLClientArrayMeta normal = {
+        3, normal_type, normal_stride, normal_data
+    };
+    uintptr_t offset;
+
+    if (vertex.data && vertex.size > 0) {
+        if (!v86gl_packed_upload_meta(&vertex, vertex_count, cursor, &offset)) {
+            return 0;
+        }
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glVertexPointer(vertex.size, vertex.type, vertex.stride,
+                        (const void*)offset);
+    } else {
+        glDisableClientState(GL_VERTEX_ARRAY);
+    }
+    if (color.data && color.size > 0) {
+        if (!v86gl_packed_upload_meta(&color, vertex_count, cursor, &offset)) {
+            return 0;
+        }
+        glEnableClientState(GL_COLOR_ARRAY);
+        glColorPointer(color.size, color.type, color.stride,
+                       (const void*)offset);
+    } else {
+        glDisableClientState(GL_COLOR_ARRAY);
+    }
+    if (texcoord.data && texcoord.size > 0) {
+        if (!v86gl_packed_upload_meta(&texcoord, vertex_count, cursor, &offset)) {
+            return 0;
+        }
+        glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+        glTexCoordPointer(texcoord.size, texcoord.type, texcoord.stride,
+                          (const void*)offset);
+    } else {
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    }
+    if (normal.data) {
+        if (!v86gl_packed_upload_meta(&normal, vertex_count, cursor, &offset)) {
+            return 0;
+        }
+        glEnableClientState(GL_NORMAL_ARRAY);
+        glNormalPointer(normal.type, normal.stride, (const void*)offset);
+    } else {
+        glDisableClientState(GL_NORMAL_ARRAY);
+    }
+    return 1;
+}
+
+static int v86gl_packed_simple_total(
+    uint32_t vertex_count,
+    GLint vertex_size, GLenum vertex_type, GLsizei vertex_stride,
+    const void* vertex_data,
+    GLint color_size, GLenum color_type, GLsizei color_stride,
+    const void* color_data,
+    GLint texcoord_size, GLenum texcoord_type, GLsizei texcoord_stride,
+    const void* texcoord_data,
+    GLenum normal_type, GLsizei normal_stride, const void* normal_data,
+    GLsizeiptr* total) {
+    V86GLClientArrayMeta meta[4];
+
+    meta[0].size = vertex_size;
+    meta[0].type = vertex_type;
+    meta[0].stride = vertex_stride;
+    meta[0].data = vertex_data;
+    meta[1].size = color_size;
+    meta[1].type = color_type;
+    meta[1].stride = color_stride;
+    meta[1].data = color_data;
+    meta[2].size = texcoord_size;
+    meta[2].type = texcoord_type;
+    meta[2].stride = texcoord_stride;
+    meta[2].data = texcoord_data;
+    meta[3].size = 3;
+    meta[3].type = normal_type;
+    meta[3].stride = normal_stride;
+    meta[3].data = normal_data;
+    return v86gl_packed_meta_total(meta, 4u, vertex_count, total);
+}
+
+static int v86gl_packed_mt_total(GLsizei tex_unit_count,
+                                 GLboolean has_secondary_color,
+                                 GLboolean has_fog_coord,
+                                 const int32_t* values,
+                                 uint32_t vertex_count,
+                                 GLsizeiptr* total) {
+    uint32_t meta_count;
+    uint32_t i;
+
+    if (!values || !total) {
+        return 0;
+    }
+    if (tex_unit_count < 0) {
+        return 0;
+    }
+    if (tex_unit_count > 8) {
+        tex_unit_count = 8;
+    }
+    meta_count = 3u + (uint32_t)tex_unit_count +
+                 (has_secondary_color ? 1u : 0u) +
+                 (has_fog_coord ? 1u : 0u);
+    for (i = 0; i < meta_count; i++) {
+        V86GLClientArrayMeta meta =
+            v86gl_client_array_meta_at(values, i);
+        GLsizeiptr span = 0;
+        if (!meta.data || meta.size <= 0) {
+            continue;
+        }
+        if (!v86gl_packed_array_span(meta.size, meta.type, meta.stride,
+                                     vertex_count, &span) ||
+            !v86gl_packed_append_span(total, span)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int v86gl_packed_setup_mt_stream(GLsizei tex_unit_count,
+                                        GLenum restore_client_active,
+                                        GLboolean has_secondary_color,
+                                        GLboolean has_fog_coord,
+                                        const int32_t* values,
+                                        uint32_t vertex_count,
+                                        GLsizeiptr* cursor) {
+    V86GLClientArrayMeta vertex;
+    V86GLClientArrayMeta color;
+    V86GLClientArrayMeta normal;
+    GLsizei i;
+    uintptr_t offset;
+
+    if (!values || !cursor || tex_unit_count < 0) {
+        return 0;
+    }
+    if (tex_unit_count > 8) {
+        tex_unit_count = 8;
+    }
+    vertex = v86gl_client_array_meta_at(values, 0);
+    color = v86gl_client_array_meta_at(values, 1);
+    normal = v86gl_client_array_meta_at(values, 2);
+
+    if (vertex.data && vertex.size > 0) {
+        if (!v86gl_packed_upload_meta(&vertex, vertex_count, cursor, &offset)) {
+            return 0;
+        }
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glVertexPointer(vertex.size, vertex.type, vertex.stride,
+                        (const void*)offset);
+    } else {
+        glDisableClientState(GL_VERTEX_ARRAY);
+    }
+    if (color.data && color.size > 0) {
+        if (!v86gl_packed_upload_meta(&color, vertex_count, cursor, &offset)) {
+            return 0;
+        }
+        glEnableClientState(GL_COLOR_ARRAY);
+        glColorPointer(color.size, color.type, color.stride,
+                       (const void*)offset);
+    } else {
+        glDisableClientState(GL_COLOR_ARRAY);
+    }
+    if (normal.data) {
+        if (!v86gl_packed_upload_meta(&normal, vertex_count, cursor, &offset)) {
+            return 0;
+        }
+        glEnableClientState(GL_NORMAL_ARRAY);
+        glNormalPointer(normal.type, normal.stride, (const void*)offset);
+    } else {
+        glDisableClientState(GL_NORMAL_ARRAY);
+    }
+
+    for (i = 0; i < tex_unit_count; i++) {
+        V86GLClientArrayMeta texcoord =
+            v86gl_client_array_meta_at(values, 3u + (uint32_t)i);
+        glClientActiveTexture((GLenum)(GL_TEXTURE0 + i));
+        if (texcoord.data && texcoord.size > 0) {
+            if (!v86gl_packed_upload_meta(
+                    &texcoord, vertex_count, cursor, &offset)) {
+                glClientActiveTexture(restore_client_active);
+                return 0;
+            }
+            glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+            glTexCoordPointer(texcoord.size, texcoord.type, texcoord.stride,
+                              (const void*)offset);
+        } else {
+            glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+        }
+    }
+    if (has_secondary_color) {
+        V86GLClientArrayMeta secondary =
+            v86gl_client_array_meta_at(values, 3u + (uint32_t)tex_unit_count);
+        if (secondary.data && secondary.size == 3) {
+            if (!v86gl_packed_upload_meta(
+                    &secondary, vertex_count, cursor, &offset)) {
+                glClientActiveTexture(restore_client_active);
+                return 0;
+            }
+            glEnableClientState(GL_SECONDARY_COLOR_ARRAY);
+            glSecondaryColorPointer(secondary.size, secondary.type,
+                                    secondary.stride, (const void*)offset);
+        } else {
+            glDisableClientState(GL_SECONDARY_COLOR_ARRAY);
+        }
+    } else {
+        glDisableClientState(GL_SECONDARY_COLOR_ARRAY);
+    }
+    if (has_fog_coord) {
+        V86GLClientArrayMeta fog_coord = v86gl_client_array_meta_at(
+            values, 3u + (uint32_t)tex_unit_count +
+                    (has_secondary_color ? 1u : 0u));
+        if (fog_coord.data && fog_coord.size == 1) {
+            if (!v86gl_packed_upload_meta(
+                    &fog_coord, vertex_count, cursor, &offset)) {
+                glClientActiveTexture(restore_client_active);
+                return 0;
+            }
+            glEnableClientState(GL_FOG_COORDINATE_ARRAY);
+            glFogCoordPointer(fog_coord.type, fog_coord.stride,
+                              (const void*)offset);
+        } else {
+            glDisableClientState(GL_FOG_COORDINATE_ARRAY);
+        }
+    } else {
+        glDisableClientState(GL_FOG_COORDINATE_ARRAY);
+    }
+    glClientActiveTexture(restore_client_active);
+    return 1;
+}
+
+static int v86gl_packed_setup_generic_stream(GLsizei attrib_count,
+                                             const int32_t* values,
+                                             uint32_t vertex_count,
+                                             GLsizeiptr* cursor) {
+    GLsizei i;
+
+    if (!values || attrib_count <= 0) {
+        return 1;
+    }
+    if (attrib_count > V86GL_MAX_VERTEX_ATTRIBS) {
+        attrib_count = V86GL_MAX_VERTEX_ATTRIBS;
+    }
+    for (i = 0; i < attrib_count; i++) {
+        V86GLGenericAttribMeta meta =
+            v86gl_generic_attrib_meta_at(values, (uint32_t)i);
+        GLint host_index = v86gl_host_attrib_index(meta.guest_index);
+        uintptr_t offset;
+        if (host_index < 0 || host_index >= V86GL_MAX_VERTEX_ATTRIBS) {
+            continue;
+        }
+        if (meta.enabled && meta.data && meta.size > 0) {
+            V86GLClientArrayMeta array_meta = {
+                meta.size, meta.type, meta.stride, meta.data
+            };
+            if (!v86gl_packed_upload_meta(
+                    &array_meta, vertex_count, cursor, &offset)) {
+                return 0;
+            }
+            glEnableVertexAttribArray((GLuint)host_index);
+            glVertexAttribPointer((GLuint)host_index, meta.size, meta.type,
+                                  meta.normalized, meta.stride,
+                                  (const void*)offset);
+        } else {
+            glDisableVertexAttribArray((GLuint)host_index);
+        }
+    }
+    return 1;
+}
+
+static void v86gl_packed_bind_client_fallback(int indexed) {
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    if (indexed) {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    }
+}
+
 EMSCRIPTEN_KEEPALIVE
 void v86gl_glDrawArraysPacked(GLenum mode, GLsizei count,
                               GLint vertex_size, GLenum vertex_type,
@@ -5433,11 +6128,42 @@ void v86gl_glDrawArraysPacked(GLenum mode, GLsizei count,
                               GLenum normal_type, GLsizei normal_stride,
                               const void* normal_data) {
     if (!v86gl_ensure_ready()) return;
+#if V86GL_USE_PACKED_STREAM_BUFFERS
+    if (count > 0) {
+        GLsizeiptr vertex_bytes = 0;
+        GLsizeiptr cursor;
+        GLintptr vertex_base = 0;
+        GLintptr index_base = 0;
+        if (v86gl_packed_simple_total(
+                (uint32_t)count,
+                vertex_size, vertex_type, vertex_stride, vertex_data,
+                color_size, color_type, color_stride, color_data,
+                texcoord_size, texcoord_type, texcoord_stride, texcoord_data,
+                normal_type, normal_stride, normal_data, &vertex_bytes) &&
+            v86gl_packed_begin_stream(
+                vertex_bytes, 0, &vertex_base, &index_base)) {
+            cursor = (GLsizeiptr)vertex_base;
+            if (v86gl_packed_setup_simple_stream(
+                    (uint32_t)count,
+                    vertex_size, vertex_type, vertex_stride, vertex_data,
+                    color_size, color_type, color_stride, color_data,
+                    texcoord_size, texcoord_type, texcoord_stride, texcoord_data,
+                    normal_type, normal_stride, normal_data, &cursor)) {
+                glDrawArrays(mode, 0, count);
+                v86gl_packed_restore_guest_bindings();
+                v86gl_after_draw(mode, count);
+                return;
+            }
+        }
+    }
+#endif
+    v86gl_packed_bind_client_fallback(0);
     v86gl_setup_client_arrays(vertex_size, vertex_type, vertex_stride, vertex_data,
                               color_size, color_type, color_stride, color_data,
                               texcoord_size, texcoord_type, texcoord_stride, texcoord_data,
                               normal_type, normal_stride, normal_data);
     glDrawArrays(mode, 0, count);
+    v86gl_packed_restore_guest_bindings();
     v86gl_after_draw(mode, count);
 }
 
@@ -5448,9 +6174,35 @@ void v86gl_glDrawArraysPackedMT(GLenum mode, GLsizei count,
                                 GLboolean has_fog_coord,
                                 const int32_t* array_meta) {
     if (!v86gl_ensure_ready()) return;
+#if V86GL_USE_PACKED_STREAM_BUFFERS
+    if (count > 0) {
+        GLsizeiptr vertex_bytes = 0;
+        GLsizeiptr cursor;
+        GLintptr vertex_base = 0;
+        GLintptr index_base = 0;
+        if (v86gl_packed_mt_total(
+                tex_unit_count, has_secondary_color, has_fog_coord,
+                array_meta, (uint32_t)count, &vertex_bytes) &&
+            v86gl_packed_begin_stream(
+                vertex_bytes, 0, &vertex_base, &index_base)) {
+            cursor = (GLsizeiptr)vertex_base;
+            if (v86gl_packed_setup_mt_stream(
+                    tex_unit_count, restore_client_active,
+                    has_secondary_color, has_fog_coord, array_meta,
+                    (uint32_t)count, &cursor)) {
+                glDrawArrays(mode, 0, count);
+                v86gl_packed_restore_guest_bindings();
+                v86gl_after_draw(mode, count);
+                return;
+            }
+        }
+    }
+#endif
+    v86gl_packed_bind_client_fallback(0);
     v86gl_setup_client_arrays_mt(tex_unit_count, restore_client_active,
                                  has_secondary_color, has_fog_coord, array_meta);
     glDrawArrays(mode, 0, count);
+    v86gl_packed_restore_guest_bindings();
     v86gl_after_draw(mode, count);
 }
 
@@ -5463,10 +6215,42 @@ void v86gl_glDrawArraysPackedGL2(GLenum mode, GLsizei count,
                                  GLsizei generic_attrib_count,
                                  const int32_t* generic_attrib_meta) {
     if (!v86gl_ensure_ready()) return;
+#if V86GL_USE_PACKED_STREAM_BUFFERS
+    if (count > 0) {
+        GLsizeiptr vertex_bytes = 0;
+        GLsizeiptr cursor;
+        GLintptr vertex_base = 0;
+        GLintptr index_base = 0;
+        if (v86gl_packed_mt_total(
+                tex_unit_count, has_secondary_color, has_fog_coord,
+                array_meta, (uint32_t)count, &vertex_bytes) &&
+            v86gl_packed_generic_total(
+                generic_attrib_count, generic_attrib_meta,
+                (uint32_t)count, &vertex_bytes) &&
+            v86gl_packed_begin_stream(
+                vertex_bytes, 0, &vertex_base, &index_base)) {
+            cursor = (GLsizeiptr)vertex_base;
+            if (v86gl_packed_setup_mt_stream(
+                    tex_unit_count, restore_client_active,
+                    has_secondary_color, has_fog_coord, array_meta,
+                    (uint32_t)count, &cursor) &&
+                v86gl_packed_setup_generic_stream(
+                    generic_attrib_count, generic_attrib_meta,
+                    (uint32_t)count, &cursor)) {
+                glDrawArrays(mode, 0, count);
+                v86gl_packed_restore_guest_bindings();
+                v86gl_after_draw(mode, count);
+                return;
+            }
+        }
+    }
+#endif
+    v86gl_packed_bind_client_fallback(0);
     v86gl_setup_client_arrays_mt(tex_unit_count, restore_client_active,
                                  has_secondary_color, has_fog_coord, array_meta);
     v86gl_setup_generic_attribs(generic_attrib_count, generic_attrib_meta);
     glDrawArrays(mode, 0, count);
+    v86gl_packed_restore_guest_bindings();
     v86gl_after_draw(mode, count);
 }
 
@@ -5481,11 +6265,49 @@ void v86gl_glDrawElementsPacked(GLenum mode, GLsizei count, GLenum type, const v
                                 GLenum normal_type, GLsizei normal_stride,
                                 const void* normal_data) {
     if (!v86gl_ensure_ready()) return;
+#if V86GL_USE_PACKED_STREAM_BUFFERS
+    if (count > 0) {
+        GLsizeiptr index_bytes = 0;
+        GLsizeiptr vertex_bytes = 0;
+        GLsizeiptr cursor;
+        GLintptr vertex_base = 0;
+        GLintptr index_base = 0;
+        uint32_t vertex_count = 0;
+        if (v86gl_packed_index_info(
+                type, count, indices, &index_bytes, &vertex_count) &&
+            v86gl_packed_simple_total(
+                vertex_count,
+                vertex_size, vertex_type, vertex_stride, vertex_data,
+                color_size, color_type, color_stride, color_data,
+                texcoord_size, texcoord_type, texcoord_stride, texcoord_data,
+                normal_type, normal_stride, normal_data, &vertex_bytes) &&
+            v86gl_packed_begin_stream(
+                vertex_bytes, index_bytes, &vertex_base, &index_base)) {
+            glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, index_base,
+                            index_bytes, indices);
+            cursor = (GLsizeiptr)vertex_base;
+            if (v86gl_packed_setup_simple_stream(
+                    vertex_count,
+                    vertex_size, vertex_type, vertex_stride, vertex_data,
+                    color_size, color_type, color_stride, color_data,
+                    texcoord_size, texcoord_type, texcoord_stride, texcoord_data,
+                    normal_type, normal_stride, normal_data, &cursor)) {
+                glDrawElements(mode, count, type,
+                               (const void*)(uintptr_t)(uint32_t)index_base);
+                v86gl_packed_restore_guest_bindings();
+                v86gl_after_draw(mode, count);
+                return;
+            }
+        }
+    }
+#endif
+    v86gl_packed_bind_client_fallback(1);
     v86gl_setup_client_arrays(vertex_size, vertex_type, vertex_stride, vertex_data,
                               color_size, color_type, color_stride, color_data,
                               texcoord_size, texcoord_type, texcoord_stride, texcoord_data,
                               normal_type, normal_stride, normal_data);
     glDrawElements(mode, count, type, indices);
+    v86gl_packed_restore_guest_bindings();
     v86gl_after_draw(mode, count);
 }
 
@@ -5496,9 +6318,42 @@ void v86gl_glDrawElementsPackedMT(GLenum mode, GLsizei count, GLenum type, const
                                   GLboolean has_fog_coord,
                                   const int32_t* array_meta) {
     if (!v86gl_ensure_ready()) return;
+#if V86GL_USE_PACKED_STREAM_BUFFERS
+    if (count > 0) {
+        GLsizeiptr index_bytes = 0;
+        GLsizeiptr vertex_bytes = 0;
+        GLsizeiptr cursor;
+        GLintptr vertex_base = 0;
+        GLintptr index_base = 0;
+        uint32_t vertex_count = 0;
+        if (v86gl_packed_index_info(
+                type, count, indices, &index_bytes, &vertex_count) &&
+            v86gl_packed_mt_total(
+                tex_unit_count, has_secondary_color, has_fog_coord,
+                array_meta, vertex_count, &vertex_bytes) &&
+            v86gl_packed_begin_stream(
+                vertex_bytes, index_bytes, &vertex_base, &index_base)) {
+            glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, index_base,
+                            index_bytes, indices);
+            cursor = (GLsizeiptr)vertex_base;
+            if (v86gl_packed_setup_mt_stream(
+                    tex_unit_count, restore_client_active,
+                    has_secondary_color, has_fog_coord, array_meta,
+                    vertex_count, &cursor)) {
+                glDrawElements(mode, count, type,
+                               (const void*)(uintptr_t)(uint32_t)index_base);
+                v86gl_packed_restore_guest_bindings();
+                v86gl_after_draw(mode, count);
+                return;
+            }
+        }
+    }
+#endif
+    v86gl_packed_bind_client_fallback(1);
     v86gl_setup_client_arrays_mt(tex_unit_count, restore_client_active,
                                  has_secondary_color, has_fog_coord, array_meta);
     glDrawElements(mode, count, type, indices);
+    v86gl_packed_restore_guest_bindings();
     v86gl_after_draw(mode, count);
 }
 
@@ -5513,9 +6368,48 @@ void v86gl_glDrawElementsPackedGL2(GLenum mode, GLsizei count, GLenum type,
                                    GLsizei generic_attrib_count,
                                    const int32_t* generic_attrib_meta) {
     if (!v86gl_ensure_ready()) return;
+#if V86GL_USE_PACKED_STREAM_BUFFERS
+    if (count > 0) {
+        GLsizeiptr index_bytes = 0;
+        GLsizeiptr vertex_bytes = 0;
+        GLsizeiptr cursor;
+        GLintptr vertex_base = 0;
+        GLintptr index_base = 0;
+        uint32_t vertex_count = 0;
+        if (v86gl_packed_index_info(
+                type, count, indices, &index_bytes, &vertex_count) &&
+            v86gl_packed_mt_total(
+                tex_unit_count, has_secondary_color, has_fog_coord,
+                array_meta, vertex_count, &vertex_bytes) &&
+            v86gl_packed_generic_total(
+                generic_attrib_count, generic_attrib_meta,
+                vertex_count, &vertex_bytes) &&
+            v86gl_packed_begin_stream(
+                vertex_bytes, index_bytes, &vertex_base, &index_base)) {
+            glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, index_base,
+                            index_bytes, indices);
+            cursor = (GLsizeiptr)vertex_base;
+            if (v86gl_packed_setup_mt_stream(
+                    tex_unit_count, restore_client_active,
+                    has_secondary_color, has_fog_coord, array_meta,
+                    vertex_count, &cursor) &&
+                v86gl_packed_setup_generic_stream(
+                    generic_attrib_count, generic_attrib_meta,
+                    vertex_count, &cursor)) {
+                glDrawElements(mode, count, type,
+                               (const void*)(uintptr_t)(uint32_t)index_base);
+                v86gl_packed_restore_guest_bindings();
+                v86gl_after_draw(mode, count);
+                return;
+            }
+        }
+    }
+#endif
+    v86gl_packed_bind_client_fallback(1);
     v86gl_setup_client_arrays_mt(tex_unit_count, restore_client_active,
                                  has_secondary_color, has_fog_coord, array_meta);
     v86gl_setup_generic_attribs(generic_attrib_count, generic_attrib_meta);
     glDrawElements(mode, count, type, indices);
+    v86gl_packed_restore_guest_bindings();
     v86gl_after_draw(mode, count);
 }
