@@ -6,7 +6,7 @@
 (function(global) {
     "use strict";
 
-    const V86GL_BRIDGE_VERSION = "d3d8-fbo-allocation-trace-v5-20260726-packed-arena-v1";
+    const V86GL_BRIDGE_VERSION = "d3d8-fbo-allocation-trace-v5-20260726-packed-arena-v1-packed-blob-v1";
     global.V86GL_BRIDGE_VERSION = V86GL_BRIDGE_VERSION;
     console.info("[v86gl] bridge version", V86GL_BRIDGE_VERSION);
 
@@ -3409,7 +3409,111 @@
                 this.genericAttribMetaValues(blocks, ptrs), callback);
         }
 
+        withPackedDrawBlob(p, suffix, gl2Layout) {
+            const invoke = ptr => this.callOptionalResult([
+                "v86gl_gl" + suffix,
+                "_v86gl_gl" + suffix,
+            ], [ptr, p.length, gl2Layout ? 1 : 0], [
+                "number", "number", "number",
+            ]);
+
+            /* Reuse the persistent packed arena when the preceding arena PR is
+             * present.  The callback is synchronous, so the blob remains valid
+             * for the complete C/WASM decode and draw. */
+            if (!this.packedArenaActive &&
+                    typeof this.ensurePackedArena === "function" &&
+                    typeof this.alignPackedArena === "function") {
+                const required = this.alignPackedArena(p.length);
+                if (required > 0 && this.ensurePackedArena(required)) {
+                    const heap = this.heapU8();
+                    const ptr = this.packedArenaPtr >>> 0;
+                    if (heap && ptr && ptr + p.length <= heap.length) {
+                        const oldOffset = this.packedArenaOffset || 0;
+                        this.packedArenaActive = true;
+                        this.packedArenaOffset = required;
+                        try {
+                            heap.set(p, ptr);
+                            return invoke(ptr);
+                        } finally {
+                            this.packedArenaOffset = oldOffset;
+                            this.packedArenaActive = false;
+                        }
+                    }
+                }
+            }
+
+            /* Compatibility with trees that have not yet applied the
+             * persistent-arena PR.  This still performs only one allocation
+             * and one contiguous HEAPU8.set() for the complete draw payload. */
+            return this.withHeapBytes(p, invoke);
+        }
+
+        notePackedBlobDraw(suffix) {
+            this.lastDrawFramebuffer = this.boundDrawFramebuffer >>> 0;
+            if (this.options && this.options.enableFramebufferHistory !== false) {
+                const state = this.framebufferBufferState(
+                    this.boundDrawFramebuffer);
+                this.recordFramebufferEvent("draw", {
+                    call: suffix,
+                    drawBuffers: state.drawBuffers.map(
+                        buffer => "0x" + buffer.toString(16)),
+                });
+            }
+        }
+
         callDrawArrays(p) {
+            if (p.length < 8) {
+                return false;
+            }
+            const result = this.withPackedDrawBlob(
+                p, "DrawArraysPackedBlob", false);
+            if (result && result.called && result.value !== 0) {
+                this.notePackedBlobDraw("DrawArraysPackedBlob");
+                return true;
+            }
+            return this.callDrawArraysLegacy(p);
+        }
+
+        callDrawElements(p) {
+            if (p.length < 16) {
+                return false;
+            }
+            const result = this.withPackedDrawBlob(
+                p, "DrawElementsPackedBlob", false);
+            if (result && result.called && result.value !== 0) {
+                this.notePackedBlobDraw("DrawElementsPackedBlob");
+                return true;
+            }
+            return this.callDrawElementsLegacy(p);
+        }
+
+        callDrawArraysGL2(p) {
+            if (p.length < 24) {
+                return false;
+            }
+            const result = this.withPackedDrawBlob(
+                p, "DrawArraysPackedBlob", true);
+            if (result && result.called && result.value !== 0) {
+                this.notePackedBlobDraw("DrawArraysPackedBlobGL2");
+                return true;
+            }
+            return this.callDrawArraysGL2Legacy(p);
+        }
+
+        callDrawElementsGL2(p) {
+            if (p.length < 32) {
+                return false;
+            }
+            const result = this.withPackedDrawBlob(
+                p, "DrawElementsPackedBlob", true);
+            if (result && result.called && result.value !== 0) {
+                this.notePackedBlobDraw("DrawElementsPackedBlobGL2");
+                return true;
+            }
+            return this.callDrawElementsGL2Legacy(p);
+        }
+
+        callDrawArraysLegacy(p) {
             if (p.length < 8) {
                 return false;
             }
@@ -3461,7 +3565,7 @@
                 ]));
         }
 
-        callDrawElements(p) {
+        callDrawElementsLegacy(p) {
             if (p.length < 16) {
                 return false;
             }
@@ -3532,7 +3636,7 @@
                 ]));
         }
 
-        callDrawArraysGL2(p) {
+        callDrawArraysGL2Legacy(p) {
             if (p.length < 24 || u32(p, 8) !== CLIENT_ARRAY_MT_MAGIC) {
                 return false;
             }
@@ -3578,7 +3682,7 @@
             });
         }
 
-        callDrawElementsGL2(p) {
+        callDrawElementsGL2Legacy(p) {
             if (p.length < 32 || u32(p, 16) !== CLIENT_ARRAY_MT_MAGIC) {
                 return false;
             }

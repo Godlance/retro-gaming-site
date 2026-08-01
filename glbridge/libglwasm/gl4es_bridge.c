@@ -6413,3 +6413,387 @@ void v86gl_glDrawElementsPackedGL2(GLenum mode, GLsizei count, GLenum type,
     v86gl_packed_restore_guest_bindings();
     v86gl_after_draw(mode, count);
 }
+
+/* Packed client-array blob fast path.
+ *
+ * The guest payload is already one contiguous little-endian record containing
+ * its draw header, optional index bytes, fixed client-array block headers/data,
+ * and optional generic-attrib block headers/data.  JavaScript copies that
+ * record to WASM once; these helpers validate it and translate data offsets to
+ * pointers into the same blob.  The established Packed/MT/GL2 entry points are
+ * then reused, so transient VBO/IBO implementations remain effective. */
+#define V86GL_PACKED_BLOB_LAYOUT_GL2 1u
+#define V86GL_PACKED_BLOB_MT_MAGIC 0x544D4143u
+#define V86GL_PACKED_BLOB_SECONDARY_COLOR_BIT 0x80000000u
+#define V86GL_PACKED_BLOB_FOG_COORD_BIT 0x40000000u
+#define V86GL_PACKED_BLOB_MAX_FIXED_ARRAYS (3u + 8u + 2u)
+#define V86GL_PACKED_BLOB_CLIENT_HEADER_SIZE 20u
+#define V86GL_PACKED_BLOB_GENERIC_HEADER_SIZE 28u
+
+static int v86gl_blob_read_u32(const uint8_t* blob, uint32_t blob_size,
+                               uint32_t offset, uint32_t* value) {
+    if (!blob || !value || offset > blob_size || blob_size - offset < 4u) {
+        return 0;
+    }
+    *value = (uint32_t)blob[offset] |
+             ((uint32_t)blob[offset + 1u] << 8u) |
+             ((uint32_t)blob[offset + 2u] << 16u) |
+             ((uint32_t)blob[offset + 3u] << 24u);
+    return 1;
+}
+
+static int v86gl_blob_read_i32(const uint8_t* blob, uint32_t blob_size,
+                               uint32_t offset, int32_t* value) {
+    uint32_t raw;
+    if (!value || !v86gl_blob_read_u32(blob, blob_size, offset, &raw)) {
+        return 0;
+    }
+    *value = (int32_t)raw;
+    return 1;
+}
+
+static int v86gl_blob_parse_client_arrays(const uint8_t* blob,
+                                          uint32_t blob_size,
+                                          uint32_t* offset,
+                                          uint32_t array_count,
+                                          int32_t* meta) {
+    uint32_t i;
+    if (!blob || !offset || !meta ||
+            array_count > V86GL_PACKED_BLOB_MAX_FIXED_ARRAYS) {
+        return 0;
+    }
+
+    for (i = 0; i < array_count; i++) {
+        uint32_t enabled;
+        int32_t size;
+        uint32_t type;
+        int32_t stride;
+        uint32_t data_size;
+        const uint8_t* data;
+
+        if (*offset > blob_size ||
+                blob_size - *offset < V86GL_PACKED_BLOB_CLIENT_HEADER_SIZE ||
+                !v86gl_blob_read_u32(blob, blob_size, *offset, &enabled) ||
+                !v86gl_blob_read_i32(blob, blob_size, *offset + 4u, &size) ||
+                !v86gl_blob_read_u32(blob, blob_size, *offset + 8u, &type) ||
+                !v86gl_blob_read_i32(blob, blob_size, *offset + 12u, &stride) ||
+                !v86gl_blob_read_u32(blob, blob_size, *offset + 16u,
+                                     &data_size)) {
+            return 0;
+        }
+        *offset += V86GL_PACKED_BLOB_CLIENT_HEADER_SIZE;
+        if (data_size > blob_size - *offset) {
+            return 0;
+        }
+        data = blob + *offset;
+        meta[i * 4u] = enabled ? size : 0;
+        meta[i * 4u + 1u] = enabled ? (int32_t)type : 0;
+        meta[i * 4u + 2u] = enabled ? stride : 0;
+        meta[i * 4u + 3u] = enabled && data_size ?
+            (int32_t)(uint32_t)(uintptr_t)data : 0;
+        *offset += data_size;
+    }
+    return 1;
+}
+
+static int v86gl_blob_parse_generic_attribs(const uint8_t* blob,
+                                            uint32_t blob_size,
+                                            uint32_t* offset,
+                                            uint32_t attrib_count,
+                                            int32_t* meta) {
+    uint32_t i;
+    if (!blob || !offset || !meta || attrib_count > V86GL_MAX_VERTEX_ATTRIBS) {
+        return 0;
+    }
+
+    for (i = 0; i < attrib_count; i++) {
+        uint32_t index;
+        uint32_t normalized;
+        uint32_t enabled;
+        int32_t size;
+        uint32_t type;
+        int32_t stride;
+        uint32_t data_size;
+        const uint8_t* data;
+
+        if (*offset > blob_size ||
+                blob_size - *offset < V86GL_PACKED_BLOB_GENERIC_HEADER_SIZE ||
+                !v86gl_blob_read_u32(blob, blob_size, *offset, &index) ||
+                !v86gl_blob_read_u32(blob, blob_size, *offset + 4u,
+                                     &normalized) ||
+                !v86gl_blob_read_u32(blob, blob_size, *offset + 8u, &enabled) ||
+                !v86gl_blob_read_i32(blob, blob_size, *offset + 12u, &size) ||
+                !v86gl_blob_read_u32(blob, blob_size, *offset + 16u, &type) ||
+                !v86gl_blob_read_i32(blob, blob_size, *offset + 20u, &stride) ||
+                !v86gl_blob_read_u32(blob, blob_size, *offset + 24u,
+                                     &data_size)) {
+            return 0;
+        }
+        *offset += V86GL_PACKED_BLOB_GENERIC_HEADER_SIZE;
+        if (data_size > blob_size - *offset) {
+            return 0;
+        }
+        data = blob + *offset;
+        meta[i * 7u] = (int32_t)index;
+        meta[i * 7u + 1u] = normalized ? 1 : 0;
+        meta[i * 7u + 2u] = enabled ? 1 : 0;
+        meta[i * 7u + 3u] = enabled ? size : 0;
+        meta[i * 7u + 4u] = enabled ? (int32_t)type : 0;
+        meta[i * 7u + 5u] = enabled ? stride : 0;
+        meta[i * 7u + 6u] = enabled && data_size ?
+            (int32_t)(uint32_t)(uintptr_t)data : 0;
+        *offset += data_size;
+    }
+    return 1;
+}
+
+static int v86gl_blob_fixed_layout(uint32_t encoded_tex_unit_count,
+                                   uint32_t* tex_unit_count,
+                                   GLboolean* has_secondary_color,
+                                   GLboolean* has_fog_coord,
+                                   uint32_t* fixed_count) {
+    uint32_t units = encoded_tex_unit_count &
+        ~(V86GL_PACKED_BLOB_SECONDARY_COLOR_BIT |
+          V86GL_PACKED_BLOB_FOG_COORD_BIT);
+    if (!tex_unit_count || !has_secondary_color || !has_fog_coord ||
+            !fixed_count || units > 8u) {
+        return 0;
+    }
+    *tex_unit_count = units;
+    *has_secondary_color =
+        (encoded_tex_unit_count & V86GL_PACKED_BLOB_SECONDARY_COLOR_BIT) ?
+        GL_TRUE : GL_FALSE;
+    *has_fog_coord =
+        (encoded_tex_unit_count & V86GL_PACKED_BLOB_FOG_COORD_BIT) ?
+        GL_TRUE : GL_FALSE;
+    *fixed_count = 3u + units +
+        (*has_secondary_color ? 1u : 0u) + (*has_fog_coord ? 1u : 0u);
+    return *fixed_count <= V86GL_PACKED_BLOB_MAX_FIXED_ARRAYS;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int v86gl_glDrawArraysPackedBlob(const uint8_t* blob, uint32_t blob_size,
+                                 uint32_t layout_flags) {
+    uint32_t mode;
+    int32_t count;
+    uint32_t offset;
+    uint32_t magic = 0;
+    int32_t fixed_meta[V86GL_PACKED_BLOB_MAX_FIXED_ARRAYS * 4u];
+
+    if (!blob || blob_size < 8u ||
+            !v86gl_blob_read_u32(blob, blob_size, 0u, &mode) ||
+            !v86gl_blob_read_i32(blob, blob_size, 4u, &count) || count < 0) {
+        return 0;
+    }
+
+    if (layout_flags & V86GL_PACKED_BLOB_LAYOUT_GL2) {
+        uint32_t encoded_tex_unit_count;
+        uint32_t tex_unit_count;
+        uint32_t client_active_texture;
+        uint32_t generic_attrib_count;
+        uint32_t fixed_count;
+        GLboolean has_secondary_color;
+        GLboolean has_fog_coord;
+        int32_t generic_meta[V86GL_MAX_VERTEX_ATTRIBS * 7u];
+
+        if (blob_size < 24u ||
+                !v86gl_blob_read_u32(blob, blob_size, 8u, &magic) ||
+                magic != V86GL_PACKED_BLOB_MT_MAGIC ||
+                !v86gl_blob_read_u32(blob, blob_size, 12u,
+                                     &encoded_tex_unit_count) ||
+                !v86gl_blob_read_u32(blob, blob_size, 16u,
+                                     &client_active_texture) ||
+                !v86gl_blob_read_u32(blob, blob_size, 20u,
+                                     &generic_attrib_count) ||
+                generic_attrib_count > V86GL_MAX_VERTEX_ATTRIBS ||
+                !v86gl_blob_fixed_layout(encoded_tex_unit_count,
+                    &tex_unit_count, &has_secondary_color, &has_fog_coord,
+                    &fixed_count)) {
+            return 0;
+        }
+        offset = 24u;
+        if (!v86gl_blob_parse_client_arrays(blob, blob_size, &offset,
+                                             fixed_count, fixed_meta) ||
+                !v86gl_blob_parse_generic_attribs(blob, blob_size, &offset,
+                                                  generic_attrib_count,
+                                                  generic_meta) ||
+                offset != blob_size) {
+            return 0;
+        }
+        v86gl_glDrawArraysPackedGL2((GLenum)mode, (GLsizei)count,
+            (GLsizei)tex_unit_count, (GLenum)client_active_texture,
+            has_secondary_color, has_fog_coord, fixed_meta,
+            (GLsizei)generic_attrib_count, generic_meta);
+        return 1;
+    }
+
+    if (blob_size >= 20u &&
+            v86gl_blob_read_u32(blob, blob_size, 8u, &magic) &&
+            magic == V86GL_PACKED_BLOB_MT_MAGIC) {
+        uint32_t encoded_tex_unit_count;
+        uint32_t tex_unit_count;
+        uint32_t client_active_texture;
+        uint32_t fixed_count;
+        GLboolean has_secondary_color;
+        GLboolean has_fog_coord;
+
+        if (!v86gl_blob_read_u32(blob, blob_size, 12u,
+                                 &encoded_tex_unit_count) ||
+                !v86gl_blob_read_u32(blob, blob_size, 16u,
+                                     &client_active_texture) ||
+                !v86gl_blob_fixed_layout(encoded_tex_unit_count,
+                    &tex_unit_count, &has_secondary_color, &has_fog_coord,
+                    &fixed_count)) {
+            return 0;
+        }
+        offset = 20u;
+        if (!v86gl_blob_parse_client_arrays(blob, blob_size, &offset,
+                                             fixed_count, fixed_meta) ||
+                offset != blob_size) {
+            return 0;
+        }
+        v86gl_glDrawArraysPackedMT((GLenum)mode, (GLsizei)count,
+            (GLsizei)tex_unit_count, (GLenum)client_active_texture,
+            has_secondary_color, has_fog_coord, fixed_meta);
+        return 1;
+    }
+
+    /* Legacy single-texture layout: vertex, color, texcoord, normal. */
+    offset = 8u;
+    if (!v86gl_blob_parse_client_arrays(blob, blob_size, &offset, 4u,
+                                         fixed_meta) || offset != blob_size) {
+        return 0;
+    }
+    v86gl_glDrawArraysPacked((GLenum)mode, (GLsizei)count,
+        fixed_meta[0], (GLenum)fixed_meta[1], fixed_meta[2],
+        (const void*)(uintptr_t)(uint32_t)fixed_meta[3],
+        fixed_meta[4], (GLenum)fixed_meta[5], fixed_meta[6],
+        (const void*)(uintptr_t)(uint32_t)fixed_meta[7],
+        fixed_meta[8], (GLenum)fixed_meta[9], fixed_meta[10],
+        (const void*)(uintptr_t)(uint32_t)fixed_meta[11],
+        (GLenum)fixed_meta[13], fixed_meta[14],
+        (const void*)(uintptr_t)(uint32_t)fixed_meta[15]);
+    return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int v86gl_glDrawElementsPackedBlob(const uint8_t* blob, uint32_t blob_size,
+                                   uint32_t layout_flags) {
+    uint32_t mode;
+    int32_t count;
+    uint32_t type;
+    uint32_t index_data_size;
+    uint32_t offset;
+    uint32_t magic = 0;
+    const void* indices;
+    int32_t fixed_meta[V86GL_PACKED_BLOB_MAX_FIXED_ARRAYS * 4u];
+
+    if (!blob || blob_size < 16u ||
+            !v86gl_blob_read_u32(blob, blob_size, 0u, &mode) ||
+            !v86gl_blob_read_i32(blob, blob_size, 4u, &count) || count < 0 ||
+            !v86gl_blob_read_u32(blob, blob_size, 8u, &type) ||
+            !v86gl_blob_read_u32(blob, blob_size, 12u, &index_data_size)) {
+        return 0;
+    }
+
+    if (layout_flags & V86GL_PACKED_BLOB_LAYOUT_GL2) {
+        uint32_t encoded_tex_unit_count;
+        uint32_t tex_unit_count;
+        uint32_t client_active_texture;
+        uint32_t generic_attrib_count;
+        uint32_t fixed_count;
+        GLboolean has_secondary_color;
+        GLboolean has_fog_coord;
+        int32_t generic_meta[V86GL_MAX_VERTEX_ATTRIBS * 7u];
+
+        if (blob_size < 32u ||
+                !v86gl_blob_read_u32(blob, blob_size, 16u, &magic) ||
+                magic != V86GL_PACKED_BLOB_MT_MAGIC ||
+                !v86gl_blob_read_u32(blob, blob_size, 20u,
+                                     &encoded_tex_unit_count) ||
+                !v86gl_blob_read_u32(blob, blob_size, 24u,
+                                     &client_active_texture) ||
+                !v86gl_blob_read_u32(blob, blob_size, 28u,
+                                     &generic_attrib_count) ||
+                generic_attrib_count > V86GL_MAX_VERTEX_ATTRIBS ||
+                index_data_size > blob_size - 32u ||
+                !v86gl_blob_fixed_layout(encoded_tex_unit_count,
+                    &tex_unit_count, &has_secondary_color, &has_fog_coord,
+                    &fixed_count)) {
+            return 0;
+        }
+        indices = blob + 32u;
+        offset = 32u + index_data_size;
+        if (!v86gl_blob_parse_client_arrays(blob, blob_size, &offset,
+                                             fixed_count, fixed_meta) ||
+                !v86gl_blob_parse_generic_attribs(blob, blob_size, &offset,
+                                                  generic_attrib_count,
+                                                  generic_meta) ||
+                offset != blob_size) {
+            return 0;
+        }
+        v86gl_glDrawElementsPackedGL2((GLenum)mode, (GLsizei)count,
+            (GLenum)type, indices, (GLsizei)tex_unit_count,
+            (GLenum)client_active_texture, has_secondary_color,
+            has_fog_coord, fixed_meta, (GLsizei)generic_attrib_count,
+            generic_meta);
+        return 1;
+    }
+
+    if (blob_size >= 28u &&
+            v86gl_blob_read_u32(blob, blob_size, 16u, &magic) &&
+            magic == V86GL_PACKED_BLOB_MT_MAGIC) {
+        uint32_t encoded_tex_unit_count;
+        uint32_t tex_unit_count;
+        uint32_t client_active_texture;
+        uint32_t fixed_count;
+        GLboolean has_secondary_color;
+        GLboolean has_fog_coord;
+
+        if (!v86gl_blob_read_u32(blob, blob_size, 20u,
+                                 &encoded_tex_unit_count) ||
+                !v86gl_blob_read_u32(blob, blob_size, 24u,
+                                     &client_active_texture) ||
+                index_data_size > blob_size - 28u ||
+                !v86gl_blob_fixed_layout(encoded_tex_unit_count,
+                    &tex_unit_count, &has_secondary_color, &has_fog_coord,
+                    &fixed_count)) {
+            return 0;
+        }
+        indices = blob + 28u;
+        offset = 28u + index_data_size;
+        if (!v86gl_blob_parse_client_arrays(blob, blob_size, &offset,
+                                             fixed_count, fixed_meta) ||
+                offset != blob_size) {
+            return 0;
+        }
+        v86gl_glDrawElementsPackedMT((GLenum)mode, (GLsizei)count,
+            (GLenum)type, indices, (GLsizei)tex_unit_count,
+            (GLenum)client_active_texture, has_secondary_color,
+            has_fog_coord, fixed_meta);
+        return 1;
+    }
+
+    /* Legacy single-texture layout. */
+    if (index_data_size > blob_size - 16u) {
+        return 0;
+    }
+    indices = blob + 16u;
+    offset = 16u + index_data_size;
+    if (!v86gl_blob_parse_client_arrays(blob, blob_size, &offset, 4u,
+                                         fixed_meta) || offset != blob_size) {
+        return 0;
+    }
+    v86gl_glDrawElementsPacked((GLenum)mode, (GLsizei)count, (GLenum)type,
+        indices,
+        fixed_meta[0], (GLenum)fixed_meta[1], fixed_meta[2],
+        (const void*)(uintptr_t)(uint32_t)fixed_meta[3],
+        fixed_meta[4], (GLenum)fixed_meta[5], fixed_meta[6],
+        (const void*)(uintptr_t)(uint32_t)fixed_meta[7],
+        fixed_meta[8], (GLenum)fixed_meta[9], fixed_meta[10],
+        (const void*)(uintptr_t)(uint32_t)fixed_meta[11],
+        (GLenum)fixed_meta[13], fixed_meta[14],
+        (const void*)(uintptr_t)(uint32_t)fixed_meta[15]);
+    return 1;
+}
+
