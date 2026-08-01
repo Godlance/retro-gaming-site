@@ -49,6 +49,7 @@ bridge.lastPresentedFrameId = 999;
 const d8wg = Buffer.alloc(32);
 d8wg.writeUInt32LE(0x47573844, 0);
 d8wg.writeUInt16LE(1, 4);
+d8wg.writeUInt16LE(2, 6);
 const envelope = Buffer.alloc(8 + d8wg.length);
 envelope.writeUInt16LE(0xFFE0, 0);
 envelope.writeUInt16LE(0xFFFF, 2);
@@ -72,11 +73,33 @@ assert.deepEqual(routed[0].metadata, {
     descriptorCommandCount: 1,
 });
 
-d3d8Options.onSurface({ hwnd: 0x1234, x: 10, y: 20, width: 640, height: 480 }, "create");
-d3d8Options.onPresent({ hwnd: 0x1234, x: 10, y: 20, width: 640, height: 480 }, {});
+d3d8Options.onSurface({ hwnd: 0x1234, x: 10, y: 20, width: 640,
+    height: 480, displayWidth: 640, displayHeight: 480, visible: true }, "create");
+d3d8Options.onPresent({ hwnd: 0x1234, x: 10, y: 20, width: 640,
+    height: 480, displayWidth: 640, displayHeight: 480, visible: true }, {});
 assert.equal(d3d8Canvas.style.display, "block");
 assert.equal(d3d8Canvas.style.visibility, "visible");
 assert.equal(canvas.style.display, "none");
+
+d3d8Options.onSurface({ hwnd: 0x1234, x: 30, y: 40, width: 640,
+    height: 480, displayWidth: 800, displayHeight: 600, visible: true }, "move");
+assert.equal(d3d8Canvas.style.left, "30px");
+assert.equal(d3d8Canvas.style.top, "40px");
+assert.equal(d3d8Canvas.style.width, "800px");
+assert.equal(d3d8Canvas.style.height, "600px");
+
+d3d8Options.onSurface({ hwnd: 0x1234, x: 0, y: 0, width: 640,
+    height: 480, displayWidth: 800, displayHeight: 600, visible: false }, "hide");
+assert.equal(d3d8Canvas.style.display, "none");
+assert.equal(d3d8Canvas.style.visibility, "hidden");
+d3d8Options.onPresent({ hwnd: 0x1234, x: 30, y: 40, width: 640,
+    height: 480, displayWidth: 800, displayHeight: 600, visible: true }, {});
+assert.equal(d3d8Canvas.style.display, "block");
+
+d3d8Options.onDestroy({ hwnd: 0x1234, x: 30, y: 40, width: 640,
+    height: 480, displayWidth: 800, displayHeight: 600, visible: true }, "device");
+assert.equal(d3d8Canvas.style.display, "none");
+assert.equal(d3d8Canvas.style.visibility, "hidden");
 
 bridge.showOverlayCanvas();
 assert.equal(d3d8Canvas.style.display, "none");

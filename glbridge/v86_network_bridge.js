@@ -6,7 +6,7 @@
 (function(global) {
     "use strict";
 
-    const V86GL_BRIDGE_VERSION = "webgl-clean-v1-20260801-packed-arena-v1-packed-blob-v1-wasm-batch-v1-d8wg-m1-20260801";
+    const V86GL_BRIDGE_VERSION = "webgl-clean-v1-20260801-packed-arena-v1-packed-blob-v1-wasm-batch-v1-d8wg-m2-lifecycle-20260801";
     global.V86GL_BRIDGE_VERSION = V86GL_BRIDGE_VERSION;
     console.info("[v86gl] bridge version", V86GL_BRIDGE_VERSION);
 
@@ -3858,18 +3858,35 @@
             const executorOptions = { ...(this.options.d3d8 || {}) };
             const userSurface = executorOptions.onSurface;
             const userPresent = executorOptions.onPresent;
+            const userDestroy = executorOptions.onDestroy;
             executorOptions.onSurface = (surface, reason) => {
                 this.d3d8Surface = { ...this.d3d8Surface, ...surface };
-                this.positionD3D8Canvas();
+                if (reason === "hide" || surface.visible === false) {
+                    this.hideD3D8Canvas();
+                } else {
+                    this.positionD3D8Canvas();
+                }
                 if (typeof userSurface === "function") {
                     userSurface(surface, reason);
                 }
             };
             executorOptions.onPresent = (surface, stats) => {
                 this.d3d8Surface = { ...this.d3d8Surface, ...surface };
-                this.showD3D8Canvas();
+                if (surface.visible === false) {
+                    this.hideD3D8Canvas();
+                } else {
+                    this.showD3D8Canvas();
+                }
                 if (typeof userPresent === "function") {
                     userPresent(surface, stats);
+                }
+            };
+            executorOptions.onDestroy = (surface, reason) => {
+                this.d3d8Surface = { ...this.d3d8Surface, ...surface,
+                    visible: false };
+                this.hideD3D8Canvas();
+                if (typeof userDestroy === "function") {
+                    userDestroy(surface, reason);
                 }
             };
             this.d3d8Executor = install(this.d3d8Canvas, executorOptions);
@@ -5316,8 +5333,10 @@
                 return;
             }
             const surface = this.d3d8Surface;
-            const w = surface.width || this.d3d8Canvas.width || 640;
-            const h = surface.height || this.d3d8Canvas.height || 480;
+            const w = surface.displayWidth || surface.width ||
+                this.d3d8Canvas.width || 640;
+            const h = surface.displayHeight || surface.height ||
+                this.d3d8Canvas.height || 480;
             let left = surface.x || 0;
             let top = surface.y || 0;
             let width = w;

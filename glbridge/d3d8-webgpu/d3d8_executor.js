@@ -10,6 +10,7 @@
 
     const D8WG_MAGIC = 0x47573844; // "D8WG"
     const D8WG_VERSION_MAJOR = 1;
+    const D8WG_VERSION_MINOR = 2;
     const D8WG_BATCH_HEADER_BYTES = 32;
     const D8WG_COMMAND_HEADER_BYTES = 16;
 
@@ -20,16 +21,24 @@
     const OP_CLEAR = 5;
     const OP_BEGIN_SCENE = 6;
     const OP_END_SCENE = 7;
+    const OP_UPDATE_SURFACE = 8;
     const OP_CREATE_BUFFER = 0x100;
     const OP_UPDATE_BUFFER = 0x101;
     const OP_DESTROY_RESOURCE = 0x103;
     const OP_SET_RENDER_STATE = 0x200;
     const OP_SET_TEXTURE_STAGE_STATE = 0x201;
     const OP_SET_STREAM_SOURCE = 0x208;
+    const OP_SET_INDICES = 0x209;
     const OP_SET_VERTEX_FORMAT = 0x20A;
     const OP_DRAW_PRIMITIVE = 0x300;
+    const OP_DRAW_INDEXED_PRIMITIVE = 0x301;
+    const OP_DRAW_PRIMITIVE_UP = 0x302;
+    const OP_DRAW_INDEXED_PRIMITIVE_UP = 0x303;
 
     const RESOURCE_BUFFER_VERTEX = 1;
+    const RESOURCE_BUFFER_INDEX = 2;
+    const D3DFMT_INDEX16 = 101;
+    const D3DFMT_INDEX32 = 102;
     const D3DCLEAR_TARGET = 0x1;
     const D3DFVF_POSITION_MASK = 0x00E;
     const D3DFVF_XYZRHW = 0x004;
@@ -43,7 +52,9 @@
     const D3DCULL_NONE = 1;
     const D3DCULL_CCW = 3;
 
+    const BUFFER_USAGE_COPY_SRC = 0x04;
     const BUFFER_USAGE_COPY_DST = 0x08;
+    const BUFFER_USAGE_INDEX = 0x10;
     const BUFFER_USAGE_VERTEX = 0x20;
     const BUFFER_USAGE_UNIFORM = 0x40;
 
@@ -85,11 +96,38 @@
         case 3: return { topology: "line-strip", vertices: primitiveCount + 1 };
         case 4: return { topology: "triangle-list", vertices: primitiveCount * 3 };
         case 5: return { topology: "triangle-strip", vertices: primitiveCount + 2 };
-        // WebGPU has no triangle-fan topology. A later milestone converts it
-        // into a generated index buffer instead of reporting false success.
-        case 6: return null;
+        case 6: return {
+            topology: "triangle-list",
+            vertices: primitiveCount + 2,
+            fan: true,
+            convertedIndices: primitiveCount * 3,
+        };
         default: return null;
         }
+    }
+
+    function indexFormatInfo(format) {
+        if ((format >>> 0) === D3DFMT_INDEX16) {
+            return { webgpu: "uint16", bytes: 2, ArrayType: Uint16Array };
+        }
+        if ((format >>> 0) === D3DFMT_INDEX32) {
+            return { webgpu: "uint32", bytes: 4, ArrayType: Uint32Array };
+        }
+        return null;
+    }
+
+    function checkedDataRange(bytes, offset, byteCount, label) {
+        if (offset > bytes.length || byteCount > bytes.length - offset) {
+            throw new Error(label + " range is outside its D8WG batch");
+        }
+        return bytes.subarray(offset, offset + byteCount);
+    }
+
+    function padded4(data) {
+        if ((data.byteLength & 3) === 0) return data;
+        const result = new Uint8Array(align4(data.byteLength));
+        result.set(data);
+        return result;
     }
 
     function freshDeviceState(handle, surface) {
@@ -116,6 +154,7 @@
             renderStates,
             textureStageStates,
             streams: Array.from({ length: 16 }, () => ({ handle: 0, stride: 0 })),
+            indices: { handle: 0, baseVertex: 0 },
             fvf: 0,
             inScene: false,
             uniformBuffer: null,
@@ -190,7 +229,12 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
                 commands: 0,
                 presents: 0,
                 drawCalls: 0,
+                indexedDrawCalls: 0,
+                upDrawCalls: 0,
+                fanConversions: 0,
                 uploadBytes: 0,
+                transientUploadBytes: 0,
+                transientBufferCreations: 0,
                 pipelineCreations: 0,
                 malformedBatches: 0,
                 unsupportedCommands: 0,
@@ -275,6 +319,9 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
                 y: i32(bytes, offset + 12),
                 width,
                 height,
+                displayWidth: width,
+                displayHeight: height,
+                visible: true,
                 format: u32(bytes, offset + 24),
                 windowed: !!u32(bytes, offset + 28),
                 behaviorFlags: u32(bytes, offset + 32),
@@ -320,6 +367,33 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
             }
         }
 
+        updateSurface(bytes, payloadOffset, state, reason) {
+            const width = u32(bytes, payloadOffset + 16);
+            const height = u32(bytes, payloadOffset + 20);
+            const visible = width !== 0 && height !== 0;
+            const hwnd = u32(bytes, payloadOffset + 4);
+            const x = i32(bytes, payloadOffset + 8);
+            const y = i32(bytes, payloadOffset + 12);
+            const changed = state.surface.hwnd !== hwnd ||
+                state.surface.x !== x || state.surface.y !== y ||
+                state.surface.visible !== visible ||
+                (visible && (state.surface.displayWidth !== width ||
+                    state.surface.displayHeight !== height));
+            state.surface = {
+                ...state.surface,
+                hwnd,
+                x,
+                y,
+                displayWidth: visible ? width : state.surface.displayWidth,
+                displayHeight: visible ? height : state.surface.displayHeight,
+                visible,
+            };
+            if (changed && typeof this.options.onSurface === "function") {
+                this.options.onSurface(state.surface, visible ? reason : "hide");
+            }
+            return visible;
+        }
+
         endPass() {
             if (this.frame && this.frame.pass) {
                 this.frame.pass.end();
@@ -343,6 +417,7 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
                     view,
                     pass: null,
                     fresh: true,
+                    transientBuffers: [],
                 };
             }
             if (clearValue !== undefined) {
@@ -367,9 +442,20 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
         finishFrame(notify) {
             if (!this.frame) return false;
             const state = this.frame.state;
+            const transientBuffers = this.frame.transientBuffers;
             this.endPass();
             this.device.queue.submit([this.frame.encoder.finish()]);
             this.frame = null;
+            if (transientBuffers.length) {
+                const destroy = () => {
+                    for (const buffer of transientBuffers) buffer.destroy();
+                };
+                if (typeof this.device.queue.onSubmittedWorkDone === "function") {
+                    this.device.queue.onSubmittedWorkDone().then(destroy, destroy);
+                } else {
+                    destroy();
+                }
+            }
             if (notify) {
                 this.stats.presents++;
                 if (typeof this.options.onPresent === "function") {
@@ -387,15 +473,27 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
             }
             const state = this.devices.get(handle);
             if (state) {
+                if (this.frame && this.frame.deviceHandle === handle) {
+                    const transientBuffers = this.frame.transientBuffers;
+                    this.endPass();
+                    this.frame = null;
+                    for (const buffer of transientBuffers) buffer.destroy();
+                }
                 if (state.uniformBuffer) state.uniformBuffer.destroy();
                 this.devices.delete(handle);
+                if (typeof this.options.onDestroy === "function") {
+                    this.options.onDestroy(state.surface, "device");
+                }
             }
         }
 
-        pipelineFor(state, topology, stride) {
+        pipelineFor(state, topology, stride, indexFormat) {
             const cull = state.renderStates[D3DRS_CULLMODE] >>> 0;
             const blend = state.renderStates[D3DRS_ALPHABLENDENABLE] >>> 0;
-            const key = [this.format, topology, state.fvf >>> 0, stride >>> 0,
+            const stripIndexFormat = topology.endsWith("-strip") ?
+                indexFormat : undefined;
+            const key = [this.format, topology, stripIndexFormat || "none",
+                state.fvf >>> 0, stride >>> 0,
                 cull, blend,
                 state.renderStates[D3DRS_SRCBLEND] >>> 0,
                 state.renderStates[D3DRS_DESTBLEND] >>> 0].join(":");
@@ -428,6 +526,8 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
                 },
                 primitive: {
                     topology,
+                    ...(stripIndexFormat ?
+                        { stripIndexFormat } : {}),
                     cullMode: cull === D3DCULL_NONE ? "none" : "back",
                     // The screen-space Y conversion flips winding.
                     frontFace: cull === D3DCULL_CCW ? "cw" : "ccw",
@@ -449,6 +549,70 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
             return group;
         }
 
+        validateGeometryState(state, stride) {
+            if ((state.fvf & D3DFVF_POSITION_MASK) !== D3DFVF_XYZRHW ||
+                (state.fvf & D3DFVF_DIFFUSE) === 0 || state.fvf !== MILESTONE_FVF) {
+                this.warnOnce("fvf-" + state.fvf,
+                    "unsupported FVF in the WebGPU geometry milestone",
+                    "0x" + state.fvf.toString(16));
+                this.stats.unsupportedCommands++;
+                return false;
+            }
+            if (stride < 20) {
+                throw new Error("XYZRHW|DIFFUSE stride is smaller than 20 bytes");
+            }
+            return true;
+        }
+
+        createTransientBuffer(data, usage, label) {
+            if (!this.frame) throw new Error("transient buffer created outside a frame");
+            const upload = padded4(data);
+            const buffer = this.device.createBuffer({
+                label,
+                size: Math.max(4, upload.byteLength),
+                usage: usage | BUFFER_USAGE_COPY_DST,
+            });
+            this.device.queue.writeBuffer(buffer, 0, upload);
+            this.frame.transientBuffers.push(buffer);
+            this.stats.transientUploadBytes += data.byteLength;
+            this.stats.transientBufferCreations++;
+            return buffer;
+        }
+
+        sequentialFanIndices(vertexCount) {
+            const use32 = vertexCount > 0xFFFF;
+            const values = use32 ? new Uint32Array((vertexCount - 2) * 3) :
+                new Uint16Array((vertexCount - 2) * 3);
+            let output = 0;
+            for (let vertex = 1; vertex + 1 < vertexCount; vertex++) {
+                values[output++] = 0;
+                values[output++] = vertex;
+                values[output++] = vertex + 1;
+            }
+            this.stats.fanConversions++;
+            return { data: new Uint8Array(values.buffer),
+                format: use32 ? "uint32" : "uint16", count: values.length };
+        }
+
+        convertFanIndices(source, formatInfo, indexCount) {
+            const values = new formatInfo.ArrayType((indexCount - 2) * 3);
+            const view = new DataView(source.buffer, source.byteOffset,
+                source.byteLength);
+            const read = formatInfo.bytes === 2 ?
+                offset => view.getUint16(offset, true) :
+                offset => view.getUint32(offset, true);
+            const centre = read(0);
+            let output = 0;
+            for (let index = 1; index + 1 < indexCount; index++) {
+                values[output++] = centre;
+                values[output++] = read(index * formatInfo.bytes);
+                values[output++] = read((index + 1) * formatInfo.bytes);
+            }
+            this.stats.fanConversions++;
+            return { data: new Uint8Array(values.buffer),
+                format: formatInfo.webgpu, count: values.length };
+        }
+
         drawPrimitive(bytes, payloadOffset) {
             const state = this.devices.get(u32(bytes, payloadOffset));
             if (!state) throw new Error("draw references an unknown D3D8 device");
@@ -460,30 +624,199 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
                 this.stats.unsupportedCommands++;
                 return;
             }
-            if ((state.fvf & D3DFVF_POSITION_MASK) !== D3DFVF_XYZRHW ||
-                (state.fvf & D3DFVF_DIFFUSE) === 0 || state.fvf !== MILESTONE_FVF) {
-                this.warnOnce("fvf-" + state.fvf,
-                    "unsupported FVF in first WebGPU milestone",
-                    "0x" + state.fvf.toString(16));
-                this.stats.unsupportedCommands++;
-                return;
-            }
             const stream = state.streams[0];
             const resource = this.resources.get(stream.handle);
             if (!resource || resource.kind !== RESOURCE_BUFFER_VERTEX) {
                 throw new Error("draw references an unknown vertex buffer");
             }
-            if (stream.stride < 20) {
-                throw new Error("XYZRHW|DIFFUSE stride is smaller than 20 bytes");
+            if (!this.validateGeometryState(state, stream.stride)) return;
+            const startVertex = u32(bytes, payloadOffset + 8);
+            const availableVertices = Math.floor(resource.byteCount / stream.stride);
+            if (startVertex > availableVertices ||
+                primitive.vertices > availableVertices - startVertex) {
+                throw new Error("draw vertex range exceeds its buffer");
             }
-            const pipeline = this.pipelineFor(state, primitive.topology, stream.stride);
+            const pipeline = this.pipelineFor(state, primitive.topology,
+                stream.stride);
             if (!pipeline) return;
             const pass = this.ensureFrame(state);
             pass.setPipeline(pipeline);
             pass.setBindGroup(0, this.bindGroupFor(state, pipeline));
             pass.setVertexBuffer(0, resource.gpuBuffer);
-            pass.draw(primitive.vertices, 1, u32(bytes, payloadOffset + 8), 0);
+            if (primitive.fan) {
+                const fan = this.sequentialFanIndices(primitive.vertices);
+                const indexBuffer = this.createTransientBuffer(fan.data,
+                    BUFFER_USAGE_INDEX, "D3D8 triangle fan indices");
+                pass.setIndexBuffer(indexBuffer, fan.format);
+                pass.drawIndexed(fan.count, 1, 0, startVertex, 0);
+            } else {
+                pass.draw(primitive.vertices, 1, startVertex, 0);
+            }
             this.stats.drawCalls++;
+        }
+
+        drawIndexedPrimitive(bytes, payloadOffset) {
+            const state = this.devices.get(u32(bytes, payloadOffset));
+            if (!state) throw new Error("indexed draw references an unknown device");
+            const primitive = primitiveInfo(u32(bytes, payloadOffset + 4),
+                u32(bytes, payloadOffset + 20));
+            if (!primitive) throw new Error("invalid indexed primitive topology");
+            const stream = state.streams[0];
+            const vertexResource = this.resources.get(stream.handle);
+            if (!vertexResource || vertexResource.kind !== RESOURCE_BUFFER_VERTEX) {
+                throw new Error("indexed draw references an unknown vertex buffer");
+            }
+            const indexResource = this.resources.get(state.indices.handle);
+            if (!indexResource || indexResource.kind !== RESOURCE_BUFFER_INDEX) {
+                throw new Error("indexed draw references an unknown index buffer");
+            }
+            const formatInfo = indexFormatInfo(indexResource.format);
+            if (!formatInfo) throw new Error("indexed draw uses an invalid index format");
+            if (!this.validateGeometryState(state, stream.stride)) return;
+            const startIndex = u32(bytes, payloadOffset + 16);
+            const availableIndices = Math.floor(indexResource.byteCount /
+                formatInfo.bytes);
+            if (startIndex > availableIndices ||
+                primitive.vertices > availableIndices - startIndex) {
+                throw new Error("indexed draw range exceeds its index buffer");
+            }
+            const minVertex = u32(bytes, payloadOffset + 8);
+            const vertexCount = u32(bytes, payloadOffset + 12);
+            const availableVertices = Math.floor(vertexResource.byteCount /
+                stream.stride);
+            if (state.indices.baseVertex > 0x7FFFFFFF ||
+                state.indices.baseVertex + minVertex > availableVertices ||
+                vertexCount > availableVertices -
+                    (state.indices.baseVertex + minVertex)) {
+                throw new Error("indexed draw range exceeds its vertex buffer");
+            }
+            const pipeline = this.pipelineFor(state, primitive.topology,
+                stream.stride, primitive.fan ? undefined : formatInfo.webgpu);
+            if (!pipeline) return;
+            const pass = this.ensureFrame(state);
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, this.bindGroupFor(state, pipeline));
+            pass.setVertexBuffer(0, vertexResource.gpuBuffer);
+            if (primitive.fan) {
+                const sourceOffset = startIndex * formatInfo.bytes;
+                const sourceBytes = primitive.vertices * formatInfo.bytes;
+                if (sourceOffset > indexResource.byteCount ||
+                    sourceBytes > indexResource.byteCount - sourceOffset) {
+                    throw new Error("triangle fan index range exceeds its buffer");
+                }
+                const fan = this.convertFanIndices(indexResource.shadow.subarray(
+                    sourceOffset, sourceOffset + sourceBytes), formatInfo,
+                    primitive.vertices);
+                const indexBuffer = this.createTransientBuffer(fan.data,
+                    BUFFER_USAGE_INDEX, "D3D8 converted indexed fan");
+                pass.setIndexBuffer(indexBuffer, fan.format);
+                pass.drawIndexed(fan.count, 1, 0, state.indices.baseVertex, 0);
+            } else {
+                pass.setIndexBuffer(indexResource.gpuBuffer, formatInfo.webgpu);
+                pass.drawIndexed(primitive.vertices, 1, startIndex,
+                    state.indices.baseVertex, 0);
+            }
+            this.stats.drawCalls++;
+            this.stats.indexedDrawCalls++;
+        }
+
+        drawPrimitiveUP(bytes, payloadOffset) {
+            const state = this.devices.get(u32(bytes, payloadOffset));
+            if (!state) throw new Error("UP draw references an unknown device");
+            const primitive = primitiveInfo(u32(bytes, payloadOffset + 4),
+                u32(bytes, payloadOffset + 8));
+            if (!primitive) throw new Error("invalid UP primitive topology");
+            const stride = u32(bytes, payloadOffset + 12);
+            const vertexCount = u32(bytes, payloadOffset + 16);
+            const vertexBytes = u32(bytes, payloadOffset + 20);
+            if (!stride || vertexCount !== primitive.vertices ||
+                vertexCount > Math.floor(0xFFFFFFFF / stride) ||
+                vertexCount * stride !== vertexBytes) {
+                throw new Error("DRAW_PRIMITIVE_UP size metadata mismatch");
+            }
+            if (!this.validateGeometryState(state, stride)) return;
+            const data = checkedDataRange(bytes, u32(bytes, payloadOffset + 24),
+                vertexBytes, "DRAW_PRIMITIVE_UP vertex data");
+            const pipeline = this.pipelineFor(state, primitive.topology, stride);
+            if (!pipeline) return;
+            const pass = this.ensureFrame(state);
+            const vertexBuffer = this.createTransientBuffer(data,
+                BUFFER_USAGE_VERTEX, "D3D8 DrawPrimitiveUP vertices");
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, this.bindGroupFor(state, pipeline));
+            pass.setVertexBuffer(0, vertexBuffer);
+            if (primitive.fan) {
+                const fan = this.sequentialFanIndices(vertexCount);
+                const indexBuffer = this.createTransientBuffer(fan.data,
+                    BUFFER_USAGE_INDEX, "D3D8 UP triangle fan indices");
+                pass.setIndexBuffer(indexBuffer, fan.format);
+                pass.drawIndexed(fan.count, 1, 0, 0, 0);
+            } else {
+                pass.draw(vertexCount, 1, 0, 0);
+            }
+            this.stats.drawCalls++;
+            this.stats.upDrawCalls++;
+            state.streams[0] = { handle: 0, stride: 0 };
+        }
+
+        drawIndexedPrimitiveUP(bytes, payloadOffset) {
+            const state = this.devices.get(u32(bytes, payloadOffset));
+            if (!state) throw new Error("indexed UP draw references an unknown device");
+            const primitive = primitiveInfo(u32(bytes, payloadOffset + 4),
+                u32(bytes, payloadOffset + 16));
+            if (!primitive) throw new Error("invalid indexed UP topology");
+            const formatInfo = indexFormatInfo(u32(bytes, payloadOffset + 20));
+            if (!formatInfo) throw new Error("invalid indexed UP format");
+            const stride = u32(bytes, payloadOffset + 24);
+            const indexCount = u32(bytes, payloadOffset + 28);
+            const indexBytes = u32(bytes, payloadOffset + 32);
+            const vertexBytes = u32(bytes, payloadOffset + 36);
+            if (!stride || indexCount !== primitive.vertices ||
+                indexCount > Math.floor(0xFFFFFFFF / formatInfo.bytes) ||
+                indexCount * formatInfo.bytes !== indexBytes ||
+                vertexBytes % stride !== 0) {
+                throw new Error("DRAW_INDEXED_PRIMITIVE_UP size metadata mismatch");
+            }
+            const minVertex = u32(bytes, payloadOffset + 8);
+            const vertexCount = u32(bytes, payloadOffset + 12);
+            if (minVertex > 0xFFFFFFFF - vertexCount ||
+                minVertex + vertexCount > Math.floor(0xFFFFFFFF / stride) ||
+                (minVertex + vertexCount) * stride !== vertexBytes) {
+                throw new Error("DRAW_INDEXED_PRIMITIVE_UP vertex range mismatch");
+            }
+            if (!this.validateGeometryState(state, stride)) return;
+            let indexData = checkedDataRange(bytes,
+                u32(bytes, payloadOffset + 40), indexBytes,
+                "DRAW_INDEXED_PRIMITIVE_UP index data");
+            const vertexData = checkedDataRange(bytes,
+                u32(bytes, payloadOffset + 44), vertexBytes,
+                "DRAW_INDEXED_PRIMITIVE_UP vertex data");
+            const pipeline = this.pipelineFor(state, primitive.topology, stride,
+                primitive.fan ? undefined : formatInfo.webgpu);
+            if (!pipeline) return;
+            const pass = this.ensureFrame(state);
+            const vertexBuffer = this.createTransientBuffer(vertexData,
+                BUFFER_USAGE_VERTEX, "D3D8 DrawIndexedPrimitiveUP vertices");
+            let drawIndexCount = indexCount;
+            let webgpuFormat = formatInfo.webgpu;
+            if (primitive.fan) {
+                const fan = this.convertFanIndices(indexData, formatInfo, indexCount);
+                indexData = fan.data;
+                drawIndexCount = fan.count;
+                webgpuFormat = fan.format;
+            }
+            const indexBuffer = this.createTransientBuffer(indexData,
+                BUFFER_USAGE_INDEX, "D3D8 DrawIndexedPrimitiveUP indices");
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, this.bindGroupFor(state, pipeline));
+            pass.setVertexBuffer(0, vertexBuffer);
+            pass.setIndexBuffer(indexBuffer, webgpuFormat);
+            pass.drawIndexed(drawIndexCount, 1, 0, 0, 0);
+            this.stats.drawCalls++;
+            this.stats.indexedDrawCalls++;
+            this.stats.upDrawCalls++;
+            state.streams[0] = { handle: 0, stride: 0 };
+            state.indices = { handle: 0, baseVertex: 0 };
         }
 
         executeCommand(bytes, commandOffset, opcode, payloadOffset,
@@ -502,9 +835,22 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
                 if (commandEnd - payloadOffset < 36) throw new Error("short RESET");
                 this.createOrResetDevice(bytes, payloadOffset, true);
                 break;
+            case OP_UPDATE_SURFACE: {
+                if (commandEnd - payloadOffset < 24) {
+                    throw new Error("short UPDATE_SURFACE");
+                }
+                const state = this.devices.get(u32(bytes, payloadOffset));
+                if (!state) {
+                    throw new Error("UPDATE_SURFACE references an unknown device");
+                }
+                this.updateSurface(bytes, payloadOffset, state, "move");
+                break;
+            }
             case OP_PRESENT: {
+                if (commandEnd - payloadOffset < 24) throw new Error("short PRESENT");
                 const state = this.devices.get(u32(bytes, payloadOffset));
                 if (!state) throw new Error("PRESENT references an unknown device");
+                this.updateSurface(bytes, payloadOffset, state, "present");
                 this.ensureFrame(state);
                 this.finishFrame(true);
                 break;
@@ -542,20 +888,29 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
                 const handle = u32(bytes, payloadOffset + 4);
                 const kind = u32(bytes, payloadOffset + 8);
                 const byteCount = u32(bytes, payloadOffset + 12);
-                if (kind !== RESOURCE_BUFFER_VERTEX) {
+                if (kind !== RESOURCE_BUFFER_VERTEX &&
+                    kind !== RESOURCE_BUFFER_INDEX) {
                     throw new Error("unknown D8WG buffer kind " + kind);
+                }
+                const format = u32(bytes, payloadOffset + 20);
+                if (kind === RESOURCE_BUFFER_INDEX && !indexFormatInfo(format)) {
+                    throw new Error("invalid D8WG index buffer format " + format);
                 }
                 this.destroyResource(handle);
                 this.resources.set(handle, {
                     handle,
                     kind,
                     byteCount,
-                    fvf: u32(bytes, payloadOffset + 20),
+                    fvf: kind === RESOURCE_BUFFER_VERTEX ? format : 0,
+                    format: kind === RESOURCE_BUFFER_INDEX ? format : 0,
                     shadow: new Uint8Array(align4(byteCount)),
                     gpuBuffer: this.device.createBuffer({
-                        label: "D3D8 vertex buffer " + handle.toString(16),
+                        label: "D3D8 " + (kind === RESOURCE_BUFFER_VERTEX ?
+                            "vertex" : "index") + " buffer " + handle.toString(16),
                         size: Math.max(4, align4(byteCount)),
-                        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+                        usage: (kind === RESOURCE_BUFFER_VERTEX ?
+                            BUFFER_USAGE_VERTEX : BUFFER_USAGE_INDEX) |
+                            BUFFER_USAGE_COPY_DST,
                     }),
                 });
                 break;
@@ -577,12 +932,24 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
                 const alignedStart = destination & ~3;
                 const alignedEnd = align4(destination + byteCount);
                 const source = resource.shadow.subarray(alignedStart, alignedEnd);
-                this.device.queue.writeBuffer(resource.gpuBuffer,
-                    alignedStart, source);
+                if (source.byteLength && this.frame) {
+                    this.endPass();
+                    const staging = this.createTransientBuffer(source,
+                        BUFFER_USAGE_COPY_SRC,
+                        "D3D8 ordered buffer upload staging");
+                    this.frame.encoder.copyBufferToBuffer(staging, 0,
+                        resource.gpuBuffer, alignedStart, source.byteLength);
+                } else if (source.byteLength) {
+                    this.device.queue.writeBuffer(resource.gpuBuffer,
+                        alignedStart, source);
+                }
                 this.stats.uploadBytes += byteCount;
                 break;
             }
             case OP_DESTROY_RESOURCE:
+                if (commandEnd - payloadOffset < 8) {
+                    throw new Error("short DESTROY_RESOURCE");
+                }
                 this.destroyResource(u32(bytes, payloadOffset));
                 break;
             case OP_SET_RENDER_STATE: {
@@ -616,6 +983,16 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
                 };
                 break;
             }
+            case OP_SET_INDICES: {
+                if (commandEnd - payloadOffset < 16) throw new Error("short SET_INDICES");
+                const state = this.devices.get(u32(bytes, payloadOffset));
+                if (!state) throw new Error("invalid SET_INDICES device");
+                state.indices = {
+                    handle: u32(bytes, payloadOffset + 4),
+                    baseVertex: u32(bytes, payloadOffset + 8),
+                };
+                break;
+            }
             case OP_SET_VERTEX_FORMAT: {
                 const state = this.devices.get(u32(bytes, payloadOffset));
                 if (!state) throw new Error("invalid SET_VERTEX_FORMAT");
@@ -623,7 +1000,26 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
                 break;
             }
             case OP_DRAW_PRIMITIVE:
+                if (commandEnd - payloadOffset < 16) throw new Error("short DRAW_PRIMITIVE");
                 this.drawPrimitive(bytes, payloadOffset);
+                break;
+            case OP_DRAW_INDEXED_PRIMITIVE:
+                if (commandEnd - payloadOffset < 24) {
+                    throw new Error("short DRAW_INDEXED_PRIMITIVE");
+                }
+                this.drawIndexedPrimitive(bytes, payloadOffset);
+                break;
+            case OP_DRAW_PRIMITIVE_UP:
+                if (commandEnd - payloadOffset < 32) {
+                    throw new Error("short DRAW_PRIMITIVE_UP");
+                }
+                this.drawPrimitiveUP(bytes, payloadOffset);
+                break;
+            case OP_DRAW_INDEXED_PRIMITIVE_UP:
+                if (commandEnd - payloadOffset < 48) {
+                    throw new Error("short DRAW_INDEXED_PRIMITIVE_UP");
+                }
+                this.drawIndexedPrimitiveUP(bytes, payloadOffset);
                 break;
             default:
                 this.warnOnce("opcode-" + opcode,
@@ -646,6 +1042,10 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
             if (u16(bytes, 4) !== D8WG_VERSION_MAJOR) {
                 this.stats.malformedBatches++;
                 throw new Error("unsupported D8WG major version " + u16(bytes, 4));
+            }
+            if (u16(bytes, 6) !== D8WG_VERSION_MINOR) {
+                this.stats.malformedBatches++;
+                throw new Error("unsupported D8WG minor version " + u16(bytes, 6));
             }
             const expectedCount = u32(bytes, 16);
             const commandBytes = u32(bytes, 20);
@@ -703,6 +1103,7 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
             D3D8WebGPUExecutor,
             D8WG_MAGIC,
             D8WG_VERSION_MAJOR,
+            D8WG_VERSION_MINOR,
             D8WG_BATCH_HEADER_BYTES,
             D8WG_COMMAND_HEADER_BYTES,
         };

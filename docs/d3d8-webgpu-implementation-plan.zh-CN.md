@@ -1489,13 +1489,13 @@ WebGPU 对象和 AudioWorklet 状态不能直接序列化进 v86 save state。
 
 ## 20. 当前仓库状态与下一步建议
 
-当前仓库已经存在 D8WG/M1 方向的原型文件和架构说明，但应把它视为“可验证的实现草案”，不是跳过阶段 0 与协议评审的理由。继续写 texture、fixed-function 或 DirectSound 代码之前，建议按以下顺序推进：
+截至 2026-08-01，仓库已经完成 D8WG v1.2/M2 Geometry 与窗口生命周期修正：真实 XP triangle 和 `d3d8_geometry_test.exe` 均已通过，协议和 host executor 已扩展到 VB/IB、indexed draw、UP draw 与 triangle-fan 转换。v1.2 还会在 Win32 窗口移动、缩放、显示状态变化时独立同步 WebGPU overlay；设备释放或窗口销毁时立即隐藏 overlay，不再依赖下一次 `Present` 或进程退出兜底提交。继续写 texture、fixed-function 或 DirectSound 代码之前，建议按以下顺序推进：
 
 1. 暂停扩大代码范围，先评审本文的架构边界和阶段顺序。
 2. 完成阶段 0：固定 MapleStory 场景，采集旧路径基线和 API 使用面。
-3. 对现有 D8WG header/parser 做协议 v1 审计，建立 C↔JS golden fixtures 和 malformed tests。
-4. 将当前原型功能逐项放回阶段 1/2 的退出条件中验证，尤其确认不是“返回成功但未绘制”。
-5. 只有 Clear、geometry、batch counters 和回退路径全部过关后，再进入 Maple Gr2D texture/alpha 阶段。
+3. 持续维护 D8WG header/parser 的协议一致性测试、C 结构尺寸断言和 malformed batch 测试。
+4. 在 XP 回归 `d3d8_geometry_test.exe` 的拖动、最小化、恢复和关闭窗口生命周期，确认 overlay 无错位、无残留。
+5. 只有 Clear、geometry、窗口生命周期、batch counters 和回退路径全部过关后，再进入 Maple Gr2D texture/alpha 阶段。
 6. 第一次完整通过 `d3d8_maple_gr2d_test` 后，立即做真实 Maple A/B profile，再决定优先补兼容功能还是先优化 hot path。
 7. 图形首次可玩后再启动 DirectSound PR；音频独立验收后才禁用 Maple 的 SB16。
 
