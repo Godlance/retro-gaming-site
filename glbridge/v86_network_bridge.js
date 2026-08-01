@@ -6,7 +6,7 @@
 (function(global) {
     "use strict";
 
-    const V86GL_BRIDGE_VERSION = "d3d8-fbo-allocation-trace-v5-20260726";
+    const V86GL_BRIDGE_VERSION = "d3d8-fbo-allocation-trace-v5-20260726-packed-arena-v1";
     global.V86GL_BRIDGE_VERSION = V86GL_BRIDGE_VERSION;
     console.info("[v86gl] bridge version", V86GL_BRIDGE_VERSION);
 
@@ -569,6 +569,9 @@
     const STATE_JOURNAL_CONTEXT_CURRENT = 1;
     const PCI_STATE_JOURNAL_INDEX = 8;
     const DEFAULT_MAX_STATE_JOURNAL_BYTES = 512 * 1024 * 1024;
+    const V86GL_PACKED_ARENA_ALIGNMENT = 16;
+    const DEFAULT_PACKED_ARENA_INITIAL_BYTES = 1024 * 1024;
+    const DEFAULT_PACKED_ARENA_MAX_BYTES = 64 * 1024 * 1024;
     const GL_TEXTURE0 = 0x84C0;
     const GL_TEXTURE_2D = 0x0DE1;
     const GL_UNPACK_SWAP_BYTES = 0x0CF0;
@@ -693,6 +696,24 @@
                 attachments: Object.create(null),
             });
             this.framebufferHistory = [];
+            const configuredInitialArenaBytes =
+                Number(this.options.packedArenaInitialBytes);
+            const configuredMaxArenaBytes =
+                Number(this.options.packedArenaMaxBytes);
+            this.packedArenaInitialBytes = Number.isFinite(
+                configuredInitialArenaBytes) && configuredInitialArenaBytes > 0 ?
+                Math.floor(configuredInitialArenaBytes) :
+                DEFAULT_PACKED_ARENA_INITIAL_BYTES;
+            this.packedArenaMaxBytes = Number.isFinite(
+                configuredMaxArenaBytes) && configuredMaxArenaBytes > 0 ?
+                Math.floor(configuredMaxArenaBytes) :
+                DEFAULT_PACKED_ARENA_MAX_BYTES;
+            this.packedArenaMaxBytes = Math.max(
+                this.packedArenaInitialBytes, this.packedArenaMaxBytes);
+            this.packedArenaPtr = 0;
+            this.packedArenaCapacity = 0;
+            this.packedArenaOffset = 0;
+            this.packedArenaActive = false;
         }
 
         framebufferBufferState(framebuffer) {
@@ -1081,10 +1102,62 @@
             return this.withHeapBytes(bytes, callback);
         }
 
-        withHeapBlocks(blocks, callback) {
+        alignPackedArena(value) {
+            if (!Number.isSafeInteger(value) || value < 0) {
+                return -1;
+            }
+            return Math.ceil(value / V86GL_PACKED_ARENA_ALIGNMENT) *
+                V86GL_PACKED_ARENA_ALIGNMENT;
+        }
+
+        ensurePackedArena(requiredBytes) {
+            requiredBytes = this.alignPackedArena(requiredBytes);
+            if (requiredBytes <= 0 ||
+                requiredBytes > this.packedArenaMaxBytes) {
+                return false;
+            }
+            if (this.packedArenaPtr &&
+                this.packedArenaCapacity >= requiredBytes) {
+                return true;
+            }
+
+            let capacity = this.alignPackedArena(
+                Math.max(this.packedArenaInitialBytes,
+                    this.packedArenaCapacity || 0));
+            if (capacity <= 0) {
+                return false;
+            }
+            while (capacity < requiredBytes) {
+                const next = Math.min(
+                    this.packedArenaMaxBytes,
+                    Math.max(requiredBytes, capacity * 2));
+                if (next <= capacity) {
+                    return false;
+                }
+                capacity = this.alignPackedArena(next);
+                if (capacity <= 0) {
+                    return false;
+                }
+            }
+
+            const ptr = this.malloc(capacity);
+            const heap = this.heapU8();
+            if (!ptr || !heap || ptr + capacity > heap.length) {
+                this.free(ptr);
+                return false;
+            }
+
+            const oldPtr = this.packedArenaPtr;
+            this.packedArenaPtr = ptr;
+            this.packedArenaCapacity = capacity;
+            this.packedArenaOffset = 0;
+            this.free(oldPtr);
+            return true;
+        }
+
+        withHeapBlocksAllocated(blocks, callback) {
             const ptrs = new Array(blocks.length).fill(0);
             const allocated = [];
-
             try {
                 for (let i = 0; i < blocks.length; i++) {
                     const block = blocks[i];
@@ -1096,28 +1169,112 @@
                     if (!ptr) {
                         return false;
                     }
-
-                    // ALLOW_MEMORY_GROWTH lets malloc replace the wasm memory
-                    // buffer.  A HEAPU8 captured before malloc is then a
-                    // detached TypedArray, which used to abort Warcraft III's
-                    // large multi-array glDrawElements calls while its smaller
-                    // UI draws continued to work.  Reacquire the view after
-                    // every allocation because any one of them can grow it.
                     allocated.push(ptr);
                     const heap = this.heapU8();
                     if (!heap || ptr + block.bytes.length > heap.length) {
                         return false;
                     }
-
                     heap.set(block.bytes, ptr);
                     ptrs[i] = ptr;
                 }
-
                 return callback(ptrs);
             } finally {
                 for (let i = 0; i < allocated.length; i++) {
                     this.free(allocated[i]);
                 }
+            }
+        }
+
+        withPackedArenaI32(values, callback) {
+            if (!this.packedArenaActive || !values || !values.length) {
+                return this.withHeapI32(values || [], callback);
+            }
+
+            const byteLength = values.length * 4;
+            const offset = this.alignPackedArena(this.packedArenaOffset);
+            if (offset < 0 ||
+                offset + byteLength > this.packedArenaCapacity) {
+                return this.withHeapI32(values, callback);
+            }
+
+            const ptr = this.packedArenaPtr + offset;
+            const heap = this.heapU8();
+            if (!heap || ptr + byteLength > heap.length) {
+                return this.withHeapI32(values, callback);
+            }
+
+            const previousOffset = this.packedArenaOffset;
+            this.packedArenaOffset = offset + byteLength;
+            for (let i = 0; i < values.length; i++) {
+                writeU32(heap, ptr + i * 4, values[i] >>> 0);
+            }
+            try {
+                return callback(ptr);
+            } finally {
+                this.packedArenaOffset = previousOffset;
+            }
+        }
+
+        withHeapBlocks(blocks, callback) {
+            if (this.packedArenaActive) {
+                return this.withHeapBlocksAllocated(blocks, callback);
+            }
+
+            const ptrs = new Array(blocks.length).fill(0);
+            const offsets = new Array(blocks.length).fill(-1);
+            let dataBytes = 0;
+
+            for (let i = 0; i < blocks.length; i++) {
+                const block = blocks[i];
+                if (!block || !block.bytes || !block.bytes.length) {
+                    continue;
+                }
+
+                dataBytes = this.alignPackedArena(dataBytes);
+                if (dataBytes < 0 ||
+                    !Number.isSafeInteger(block.bytes.length) ||
+                    block.bytes.length > this.packedArenaMaxBytes - dataBytes) {
+                    return this.withHeapBlocksAllocated(blocks, callback);
+                }
+                offsets[i] = dataBytes;
+                dataBytes += block.bytes.length;
+            }
+
+            const metadataReserve = blocks.length * 32 + 64;
+            const metadataOffset = this.alignPackedArena(dataBytes);
+            if (metadataOffset < 0 ||
+                metadataReserve > this.packedArenaMaxBytes - metadataOffset) {
+                return this.withHeapBlocksAllocated(blocks, callback);
+            }
+            const requiredBytes = metadataOffset + metadataReserve;
+            if (!this.ensurePackedArena(requiredBytes)) {
+                return this.withHeapBlocksAllocated(blocks, callback);
+            }
+
+            const heap = this.heapU8();
+            if (!heap ||
+                this.packedArenaPtr + requiredBytes > heap.length) {
+                return this.withHeapBlocksAllocated(blocks, callback);
+            }
+
+            for (let i = 0; i < blocks.length; i++) {
+                const offset = offsets[i];
+                if (offset < 0) {
+                    continue;
+                }
+                const block = blocks[i];
+                const ptr = this.packedArenaPtr + offset;
+                heap.set(block.bytes, ptr);
+                ptrs[i] = ptr;
+            }
+
+            this.packedArenaActive = true;
+            this.packedArenaOffset = metadataOffset;
+            try {
+                return callback(ptrs);
+            } finally {
+                this.packedArenaOffset = 0;
+                this.packedArenaActive = false;
             }
         }
 
@@ -3153,7 +3310,7 @@
                     size: enabled ? size : 0,
                     type: enabled ? type : 0,
                     stride: enabled ? stride : 0,
-                    bytes: enabled && dataSize ? p.slice(offset, offset + dataSize) : null,
+                    bytes: enabled && dataSize ? p.subarray(offset, offset + dataSize) : null,
                 });
                 offset += dataSize;
             }
@@ -3189,7 +3346,7 @@
                     size: enabled ? size : 0,
                     type: enabled ? type : 0,
                     stride: enabled ? stride : 0,
-                    bytes: enabled && dataSize ? p.slice(offset, offset + dataSize) : null,
+                    bytes: enabled && dataSize ? p.subarray(offset, offset + dataSize) : null,
                 });
                 offset += dataSize;
             }
@@ -3226,7 +3383,8 @@
         }
 
         withClientArrayMeta(blocks, ptrs, callback) {
-            return this.withHeapI32(this.clientArrayMetaValues(blocks, ptrs), callback);
+            return this.withPackedArenaI32(
+                this.clientArrayMetaValues(blocks, ptrs), callback);
         }
 
         genericAttribMetaValues(blocks, ptrs) {
@@ -3247,7 +3405,8 @@
         }
 
         withGenericAttribMeta(blocks, ptrs, callback) {
-            return this.withHeapI32(this.genericAttribMetaValues(blocks, ptrs), callback);
+            return this.withPackedArenaI32(
+                this.genericAttribMetaValues(blocks, ptrs), callback);
         }
 
         callDrawArrays(p) {
@@ -3313,7 +3472,7 @@
                     return false;
                 }
 
-                const indexBlock = { bytes: indexDataSize ? p.slice(28, 28 + indexDataSize) : null };
+                const indexBlock = { bytes: indexDataSize ? p.subarray(28, 28 + indexDataSize) : null };
                 const mode = u32(p, 0);
                 const count = i32(p, 4);
                 const indexType = u32(p, 8);
@@ -3350,7 +3509,7 @@
                 return false;
             }
 
-            const indexBlock = { bytes: indexDataSize ? p.slice(16, 16 + indexDataSize) : null };
+            const indexBlock = { bytes: indexDataSize ? p.subarray(16, 16 + indexDataSize) : null };
             const parsed = this.parseClientArrayBlocks(p, 16 + indexDataSize, 4);
             if (!parsed) {
                 return false;
@@ -3444,7 +3603,7 @@
             }
 
             const indexBlock = {
-                bytes: indexDataSize ? p.slice(32, 32 + indexDataSize) : null,
+                bytes: indexDataSize ? p.subarray(32, 32 + indexDataSize) : null,
             };
             const fixedCount = 3 + texUnitCount + (hasSecondaryColor ? 1 : 0) + (hasFogCoord ? 1 : 0);
             const fixed = this.parseClientArrayBlocks(p, 32 + indexDataSize, fixedCount);
@@ -3500,6 +3659,12 @@
                 "v86glDestroyRenderer",
                 "_v86glDestroyRenderer",
             ], [], []);
+            const packedArenaPtr = this.packedArenaPtr;
+            this.packedArenaPtr = 0;
+            this.packedArenaCapacity = 0;
+            this.packedArenaOffset = 0;
+            this.packedArenaActive = false;
+            this.free(packedArenaPtr);
             this.module = null;
             return destroyed;
         }
