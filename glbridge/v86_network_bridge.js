@@ -6,7 +6,7 @@
 (function(global) {
     "use strict";
 
-    const V86GL_BRIDGE_VERSION = "webgl-clean-v1-20260801-packed-arena-v1-packed-blob-v1-wasm-batch-v1-d8wg-m2-lifecycle-20260801";
+    const V86GL_BRIDGE_VERSION = "webgl-clean-v1-20260801-packed-arena-v1-packed-blob-v1-wasm-batch-v1-d8wg-m3-gr2d-20260801";
     global.V86GL_BRIDGE_VERSION = V86GL_BRIDGE_VERSION;
     console.info("[v86gl] bridge version", V86GL_BRIDGE_VERSION);
 

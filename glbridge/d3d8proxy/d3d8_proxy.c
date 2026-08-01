@@ -5,10 +5,10 @@
  * COM/state/resource semantics in the guest, batches high-level commands in
  * the existing v86gl.sys DMA arena, and sends one D8WG stream to WebGPU.
  *
- * The geometry milestone implements Clear/Present plus XYZRHW|DIFFUSE vertex
- * and index buffers, regular/UP draws, and triangle-fan conversion. Methods
- * outside that advertised subset return D3DERR_INVALIDCALL rather than
- * silently pretending that rendering succeeded.
+ * The Maple 2D milestone implements Clear/Present, XYZRHW fixed-function
+ * geometry, Texture/Surface uploads, two texture stages, alpha, viewport, and
+ * dynamic-resource submission. Later fixed-function and programmable paths
+ * return D3DERR_INVALIDCALL rather than pretending that rendering succeeded.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -31,6 +31,20 @@ typedef struct D8Direct3D D8Direct3D;
 typedef struct D8Device D8Device;
 typedef struct D8VertexBuffer D8VertexBuffer;
 typedef struct D8IndexBuffer D8IndexBuffer;
+typedef struct D8Texture D8Texture;
+typedef struct D8Surface D8Surface;
+
+typedef struct D8TextureLevel {
+    BYTE *shadow;
+    UINT width;
+    UINT height;
+    UINT row_pitch;
+    UINT row_count;
+    UINT byte_count;
+    RECT lock_rect;
+    DWORD lock_flags;
+    BOOL locked;
+} D8TextureLevel;
 
 typedef struct D8StreamBinding {
     D8VertexBuffer *buffer;
@@ -56,6 +70,7 @@ struct D8Device {
                                       [D8WG_MAX_TEXTURE_STAGE_STATES];
     D8StreamBinding streams[D8WG_MAX_STREAMS];
     D8IndexBuffer *index_buffer;
+    D8Texture *textures[D8WG_MAX_TEXTURE_STAGES];
     UINT base_vertex_index;
     DWORD vertex_shader;
     BOOL in_scene;
@@ -80,6 +95,7 @@ struct D8VertexBuffer {
     DWORD priority;
     UINT lock_offset;
     UINT lock_size;
+    DWORD lock_flags;
     BOOL locked;
 };
 
@@ -96,7 +112,31 @@ struct D8IndexBuffer {
     DWORD priority;
     UINT lock_offset;
     UINT lock_size;
+    DWORD lock_flags;
     BOOL locked;
+};
+
+struct D8Texture {
+    IDirect3DTexture8 iface;
+    LONG refcount;
+    D8Device *device;
+    uint32_t handle;
+    UINT width;
+    UINT height;
+    UINT level_count;
+    DWORD usage;
+    D3DFORMAT format;
+    D3DPOOL pool;
+    DWORD priority;
+    DWORD lod;
+    D8TextureLevel *levels;
+};
+
+struct D8Surface {
+    IDirect3DSurface8 iface;
+    LONG refcount;
+    D8Texture *texture;
+    UINT level;
 };
 
 static HANDLE g_transport = INVALID_HANDLE_VALUE;
@@ -115,6 +155,8 @@ static IDirect3D8Vtbl g_d3d_vtbl;
 static IDirect3DDevice8Vtbl g_device_vtbl;
 static IDirect3DVertexBuffer8Vtbl g_vb_vtbl;
 static IDirect3DIndexBuffer8Vtbl g_ib_vtbl;
+static IDirect3DTexture8Vtbl g_texture_vtbl;
+static IDirect3DSurface8Vtbl g_surface_vtbl;
 
 static D8Direct3D *d3d_from_iface(IDirect3D8 *iface)
 {
@@ -134,6 +176,16 @@ static D8VertexBuffer *vb_from_iface(IDirect3DVertexBuffer8 *iface)
 static D8IndexBuffer *ib_from_iface(IDirect3DIndexBuffer8 *iface)
 {
     return (D8IndexBuffer *)iface;
+}
+
+static D8Texture *texture_from_iface(IDirect3DTexture8 *iface)
+{
+    return (D8Texture *)iface;
+}
+
+static D8Surface *surface_from_iface(IDirect3DSurface8 *iface)
+{
+    return (D8Surface *)iface;
 }
 
 static void d8wg_log(const char *text)
@@ -355,7 +407,7 @@ static BOOL emit_command(uint16_t opcode, const void *payload,
 }
 
 static BOOL emit_buffer_update(uint32_t handle, uint32_t destination_offset,
-        const void *data, uint32_t byte_count)
+        const void *data, uint32_t byte_count, uint32_t lock_flags)
 {
     D8WGUpdateBuffer update;
     D8WGCommandHeader *command;
@@ -363,6 +415,7 @@ static BOOL emit_buffer_update(uint32_t handle, uint32_t destination_offset,
     uint8_t *blob;
     BOOL result;
 
+    ZeroMemory(&update, sizeof(update));
     EnterCriticalSection(&g_transport_lock);
     result = reserve_command_locked(D8WG_OP_UPDATE_BUFFER,
             sizeof(update), byte_count, &command, &payload, &blob);
@@ -371,6 +424,7 @@ static BOOL emit_buffer_update(uint32_t handle, uint32_t destination_offset,
         update.destination_offset = destination_offset;
         update.byte_count = byte_count;
         update.data_offset = (uint32_t)((uint8_t *)blob - batch_base());
+        update.lock_flags = lock_flags;
         CopyMemory(payload, &update, sizeof(update));
         if (byte_count)
             CopyMemory(blob, data, byte_count);
@@ -439,6 +493,117 @@ static BOOL multiply_u32(UINT left, UINT right, UINT *result)
         return FALSE;
     *result = left * right;
     return TRUE;
+}
+
+static BOOL texture_format_layout(D3DFORMAT format, UINT *block_width,
+        UINT *block_height, UINT *block_bytes)
+{
+    *block_width = 1;
+    *block_height = 1;
+    switch (format) {
+    case D3DFMT_A8R8G8B8:
+    case D3DFMT_X8R8G8B8:
+        *block_bytes = 4;
+        return TRUE;
+    case D3DFMT_R5G6B5:
+    case D3DFMT_X1R5G5B5:
+    case D3DFMT_A1R5G5B5:
+    case D3DFMT_A4R4G4B4:
+        *block_bytes = 2;
+        return TRUE;
+    case D3DFMT_L8:
+    case D3DFMT_A8:
+        *block_bytes = 1;
+        return TRUE;
+    case D3DFMT_DXT1:
+        *block_width = 4;
+        *block_height = 4;
+        *block_bytes = 8;
+        return TRUE;
+    case D3DFMT_DXT3:
+    case D3DFMT_DXT5:
+        *block_width = 4;
+        *block_height = 4;
+        *block_bytes = 16;
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static BOOL texture_level_layout(D3DFORMAT format, UINT width, UINT height,
+        UINT *row_pitch, UINT *row_count, UINT *byte_count)
+{
+    UINT block_width;
+    UINT block_height;
+    UINT block_bytes;
+    UINT columns;
+
+    if (!texture_format_layout(format, &block_width, &block_height,
+            &block_bytes))
+        return FALSE;
+    columns = (width + block_width - 1u) / block_width;
+    *row_count = (height + block_height - 1u) / block_height;
+    return multiply_u32(columns, block_bytes, row_pitch)
+            && multiply_u32(*row_pitch, *row_count, byte_count);
+}
+
+static BOOL emit_texture_update(D8Texture *texture, UINT level,
+        const RECT *rect)
+{
+    D8TextureLevel *level_data = &texture->levels[level];
+    D8WGUpdateTexture update;
+    UINT block_width;
+    UINT block_height;
+    UINT block_bytes;
+    UINT block_x;
+    UINT block_y;
+    UINT row_bytes;
+    UINT row_count;
+    UINT data_bytes;
+    UINT row;
+    uint8_t *payload;
+    uint8_t *blob;
+    BOOL result;
+
+    if (!texture_format_layout(texture->format, &block_width, &block_height,
+            &block_bytes))
+        return FALSE;
+    block_x = (UINT)rect->left / block_width;
+    block_y = (UINT)rect->top / block_height;
+    if (!multiply_u32(((UINT)(rect->right - rect->left)
+            + block_width - 1u) / block_width, block_bytes, &row_bytes))
+        return FALSE;
+    row_count = ((UINT)(rect->bottom - rect->top)
+            + block_height - 1u) / block_height;
+    if (!multiply_u32(row_bytes, row_count, &data_bytes))
+        return FALSE;
+
+    ZeroMemory(&update, sizeof(update));
+    update.resource_handle = texture->handle;
+    update.level = level;
+    update.x = (uint32_t)rect->left;
+    update.y = (uint32_t)rect->top;
+    update.width = (uint32_t)(rect->right - rect->left);
+    update.height = (uint32_t)(rect->bottom - rect->top);
+    update.row_pitch = row_bytes;
+    update.data_bytes = data_bytes;
+
+    EnterCriticalSection(&g_transport_lock);
+    result = reserve_command_locked(D8WG_OP_UPDATE_TEXTURE,
+            sizeof(update), data_bytes, NULL, &payload, &blob);
+    if (result) {
+        update.data_offset = (uint32_t)(blob - batch_base());
+        CopyMemory(payload, &update, sizeof(update));
+        for (row = 0; row < row_count; ++row) {
+            CopyMemory(blob + row * row_bytes,
+                    level_data->shadow
+                    + (block_y + row) * level_data->row_pitch
+                    + block_x * block_bytes, row_bytes);
+        }
+    }
+    LeaveCriticalSection(&g_transport_lock);
+    return result;
 }
 
 static BOOL primitive_element_count(D3DPRIMITIVETYPE type,
@@ -735,6 +900,19 @@ static void fill_caps(D3DCAPS8 *caps)
     caps->TextureAddressCaps = D3DPTADDRESSCAPS_WRAP
             | D3DPTADDRESSCAPS_MIRROR
             | D3DPTADDRESSCAPS_CLAMP;
+    caps->TextureOpCaps = D3DTEXOPCAPS_DISABLE
+            | D3DTEXOPCAPS_SELECTARG1 | D3DTEXOPCAPS_SELECTARG2
+            | D3DTEXOPCAPS_MODULATE | D3DTEXOPCAPS_MODULATE2X
+            | D3DTEXOPCAPS_MODULATE4X | D3DTEXOPCAPS_ADD
+            | D3DTEXOPCAPS_ADDSIGNED | D3DTEXOPCAPS_ADDSIGNED2X
+            | D3DTEXOPCAPS_SUBTRACT | D3DTEXOPCAPS_ADDSMOOTH
+            | D3DTEXOPCAPS_BLENDDIFFUSEALPHA
+            | D3DTEXOPCAPS_BLENDTEXTUREALPHA
+            | D3DTEXOPCAPS_BLENDFACTORALPHA
+            | D3DTEXOPCAPS_BLENDTEXTUREALPHAPM
+            | D3DTEXOPCAPS_BLENDCURRENTALPHA
+            | D3DTEXOPCAPS_DOTPRODUCT3 | D3DTEXOPCAPS_MULTIPLYADD
+            | D3DTEXOPCAPS_LERP;
     caps->VolumeTextureAddressCaps = caps->TextureAddressCaps;
     caps->MaxTextureWidth = 4096;
     caps->MaxTextureHeight = 4096;
@@ -751,8 +929,9 @@ static void fill_caps(D3DCAPS8 *caps)
     caps->MaxVertexShaderConst = 96;
     caps->PixelShaderVersion = 0;
     caps->MaxPixelShaderValue = 8.0f;
-    caps->MaxTextureBlendStages = D8WG_MAX_TEXTURE_STAGES;
-    caps->MaxSimultaneousTextures = D8WG_MAX_TEXTURE_STAGES;
+    caps->FVFCaps = 2u & D3DFVFCAPS_TEXCOORDCOUNTMASK;
+    caps->MaxTextureBlendStages = 2;
+    caps->MaxSimultaneousTextures = 2;
 }
 
 static HRESULT WINAPI d3d_query_interface(IDirect3D8 *iface, REFIID iid,
@@ -873,6 +1052,8 @@ static BOOL supported_texture_format(D3DFORMAT format)
     case D3DFMT_X1R5G5B5:
     case D3DFMT_A1R5G5B5:
     case D3DFMT_A4R4G4B4:
+    case D3DFMT_L8:
+    case D3DFMT_A8:
     case D3DFMT_DXT1:
     case D3DFMT_DXT3:
     case D3DFMT_DXT5:
@@ -951,6 +1132,11 @@ static void device_init_states(D8Device *device)
     device->render_states[D3DRS_CULLMODE] = D3DCULL_CCW;
     device->render_states[D3DRS_LIGHTING] = TRUE;
     device->render_states[D3DRS_SHADEMODE] = D3DSHADE_GOURAUD;
+    device->render_states[D3DRS_ALPHAFUNC] = D3DCMP_ALWAYS;
+    device->render_states[D3DRS_SRCBLEND] = D3DBLEND_ONE;
+    device->render_states[D3DRS_DESTBLEND] = D3DBLEND_ZERO;
+    device->render_states[D3DRS_TEXTUREFACTOR] = 0xFFFFFFFFu;
+    device->render_states[D3DRS_COLORWRITEENABLE] = 0xFu;
     for (stage = 0; stage < D8WG_MAX_TEXTURE_STAGES; ++stage) {
         device->texture_stage_states[stage][D3DTSS_COLOROP] =
                 stage == 0 ? D3DTOP_MODULATE : D3DTOP_DISABLE;
@@ -960,6 +1146,14 @@ static void device_init_states(D8Device *device)
                 stage == 0 ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE;
         device->texture_stage_states[stage][D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
         device->texture_stage_states[stage][D3DTSS_ALPHAARG2] = D3DTA_CURRENT;
+        device->texture_stage_states[stage][D3DTSS_TEXCOORDINDEX] = stage;
+        device->texture_stage_states[stage][D3DTSS_ADDRESSU] = D3DTADDRESS_WRAP;
+        device->texture_stage_states[stage][D3DTSS_ADDRESSV] = D3DTADDRESS_WRAP;
+        device->texture_stage_states[stage][D3DTSS_MAGFILTER] = D3DTEXF_POINT;
+        device->texture_stage_states[stage][D3DTSS_MINFILTER] = D3DTEXF_POINT;
+        device->texture_stage_states[stage][D3DTSS_MIPFILTER] = D3DTEXF_NONE;
+        device->texture_stage_states[stage][D3DTSS_MAXANISOTROPY] = 1;
+        device->texture_stage_states[stage][D3DTSS_RESULTARG] = D3DTA_CURRENT;
     }
 }
 
@@ -1172,6 +1366,8 @@ static HRESULT WINAPI device_reset(IDirect3DDevice8 *iface,
     device->viewport.X = device->viewport.Y = 0;
     device->viewport.Width = reset.width;
     device->viewport.Height = reset.height;
+    device->viewport.MinZ = 0.0f;
+    device->viewport.MaxZ = 1.0f;
     if (!emit_command(D8WG_OP_RESET, &reset, sizeof(reset)))
         return D3DERR_DRIVERINTERNALERROR;
     if (window != device->tracked_window) {
@@ -1262,10 +1458,35 @@ static HRESULT WINAPI device_clear(IDirect3DDevice8 *iface, DWORD rect_count,
 static HRESULT WINAPI device_set_viewport(IDirect3DDevice8 *iface,
         const D3DVIEWPORT8 *viewport)
 {
+    D8Device *device = device_from_iface(iface);
+    D8WGSetViewport command;
     if (!viewport || !viewport->Width || !viewport->Height)
         return D3DERR_INVALIDCALL;
-    device_from_iface(iface)->viewport = *viewport;
-    return D3D_OK;
+    if (viewport->X > device->display_mode.Width
+            || viewport->Y > device->display_mode.Height
+            || viewport->Width > device->display_mode.Width - viewport->X
+            || viewport->Height > device->display_mode.Height - viewport->Y
+            || viewport->MinZ < 0.0f || viewport->MaxZ > 1.0f
+            || viewport->MinZ > viewport->MaxZ)
+        return D3DERR_INVALIDCALL;
+    if (device->viewport.X == viewport->X
+            && device->viewport.Y == viewport->Y
+            && device->viewport.Width == viewport->Width
+            && device->viewport.Height == viewport->Height
+            && device->viewport.MinZ == viewport->MinZ
+            && device->viewport.MaxZ == viewport->MaxZ)
+        return D3D_OK;
+    device->viewport = *viewport;
+    command.device_handle = device->handle;
+    command.x = viewport->X;
+    command.y = viewport->Y;
+    command.width = viewport->Width;
+    command.height = viewport->Height;
+    command.min_z = viewport->MinZ;
+    command.max_z = viewport->MaxZ;
+    command.reserved = 0;
+    return emit_command(D8WG_OP_SET_VIEWPORT, &command, sizeof(command))
+            ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
 }
 
 static HRESULT WINAPI device_get_viewport(IDirect3DDevice8 *iface,
@@ -1525,7 +1746,7 @@ static HRESULT WINAPI device_set_vertex_shader(IDirect3DDevice8 *iface,
 {
     D8Device *device = device_from_iface(iface);
     D8WGSetVertexFormat command;
-    /* Milestone 1 supports FVF tokens. D3D8 shader handles always have bit 0. */
+    /* The Maple 2D path supports FVF tokens. D3D8 shader handles use bit 0. */
     if (handle & 1u)
         return D3DERR_INVALIDCALL;
     if (device->vertex_shader == handle)
@@ -1813,8 +2034,15 @@ static HRESULT WINAPI vb_lock(IDirect3DVertexBuffer8 *iface, UINT offset,
         UINT size, BYTE **data_out, DWORD flags)
 {
     D8VertexBuffer *buffer = vb_from_iface(iface);
-    (void)flags;
     if (!data_out || buffer->locked || offset > buffer->length)
+        return D3DERR_INVALIDCALL;
+    if ((flags & D3DLOCK_DISCARD) && (flags & D3DLOCK_NOOVERWRITE))
+        return D3DERR_INVALIDCALL;
+    if ((flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE))
+            && !(buffer->usage & D3DUSAGE_DYNAMIC))
+        return D3DERR_INVALIDCALL;
+    if ((flags & D3DLOCK_READONLY)
+            && (flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE)))
         return D3DERR_INVALIDCALL;
     if (!size)
         size = buffer->length - offset;
@@ -1823,6 +2051,9 @@ static HRESULT WINAPI vb_lock(IDirect3DVertexBuffer8 *iface, UINT offset,
     buffer->locked = TRUE;
     buffer->lock_offset = offset;
     buffer->lock_size = size;
+    buffer->lock_flags = flags;
+    if (flags & D3DLOCK_DISCARD)
+        ZeroMemory(buffer->shadow, buffer->length);
     *data_out = buffer->shadow + offset;
     return D3D_OK;
 }
@@ -1833,11 +2064,14 @@ static HRESULT WINAPI vb_unlock(IDirect3DVertexBuffer8 *iface)
     BOOL result;
     if (!buffer->locked)
         return D3DERR_INVALIDCALL;
-    result = emit_buffer_update(buffer->handle, buffer->lock_offset,
-            buffer->shadow + buffer->lock_offset, buffer->lock_size);
+    result = (buffer->lock_flags & D3DLOCK_READONLY) ||
+            emit_buffer_update(buffer->handle, buffer->lock_offset,
+            buffer->shadow + buffer->lock_offset, buffer->lock_size,
+            buffer->lock_flags);
     buffer->locked = FALSE;
     buffer->lock_offset = 0;
     buffer->lock_size = 0;
+    buffer->lock_flags = 0;
     return result ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
 }
 
@@ -1950,8 +2184,15 @@ static HRESULT WINAPI ib_lock(IDirect3DIndexBuffer8 *iface, UINT offset,
         UINT size, BYTE **data_out, DWORD flags)
 {
     D8IndexBuffer *buffer = ib_from_iface(iface);
-    (void)flags;
     if (!data_out || buffer->locked || offset > buffer->length)
+        return D3DERR_INVALIDCALL;
+    if ((flags & D3DLOCK_DISCARD) && (flags & D3DLOCK_NOOVERWRITE))
+        return D3DERR_INVALIDCALL;
+    if ((flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE))
+            && !(buffer->usage & D3DUSAGE_DYNAMIC))
+        return D3DERR_INVALIDCALL;
+    if ((flags & D3DLOCK_READONLY)
+            && (flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE)))
         return D3DERR_INVALIDCALL;
     if (!size)
         size = buffer->length - offset;
@@ -1960,6 +2201,9 @@ static HRESULT WINAPI ib_lock(IDirect3DIndexBuffer8 *iface, UINT offset,
     buffer->locked = TRUE;
     buffer->lock_offset = offset;
     buffer->lock_size = size;
+    buffer->lock_flags = flags;
+    if (flags & D3DLOCK_DISCARD)
+        ZeroMemory(buffer->shadow, buffer->length);
     *data_out = buffer->shadow + offset;
     return D3D_OK;
 }
@@ -1970,11 +2214,14 @@ static HRESULT WINAPI ib_unlock(IDirect3DIndexBuffer8 *iface)
     BOOL result;
     if (!buffer->locked)
         return D3DERR_INVALIDCALL;
-    result = emit_buffer_update(buffer->handle, buffer->lock_offset,
-            buffer->shadow + buffer->lock_offset, buffer->lock_size);
+    result = (buffer->lock_flags & D3DLOCK_READONLY) ||
+            emit_buffer_update(buffer->handle, buffer->lock_offset,
+            buffer->shadow + buffer->lock_offset, buffer->lock_size,
+            buffer->lock_flags);
     buffer->locked = FALSE;
     buffer->lock_offset = 0;
     buffer->lock_size = 0;
+    buffer->lock_flags = 0;
     return result ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
 }
 
@@ -1990,6 +2237,516 @@ static HRESULT WINAPI ib_get_desc(IDirect3DIndexBuffer8 *iface,
     desc->Usage = buffer->usage;
     desc->Pool = buffer->pool;
     desc->Size = buffer->length;
+    return D3D_OK;
+}
+
+static UINT full_mip_level_count(UINT width, UINT height)
+{
+    UINT levels = 1;
+    while (width > 1 || height > 1) {
+        if (width > 1)
+            width >>= 1;
+        if (height > 1)
+            height >>= 1;
+        ++levels;
+    }
+    return levels;
+}
+
+static HRESULT WINAPI device_create_texture(IDirect3DDevice8 *iface,
+        UINT width, UINT height, UINT levels, DWORD usage,
+        D3DFORMAT format, D3DPOOL pool, IDirect3DTexture8 **texture_out)
+{
+    D8Device *device = device_from_iface(iface);
+    D8Texture *texture;
+    D8WGCreateTexture command;
+    UINT full_levels;
+    UINT level;
+    UINT level_width;
+    UINT level_height;
+    HRESULT failure = E_OUTOFMEMORY;
+
+    if (!texture_out || !width || !height || width > 4096 || height > 4096
+            || !supported_texture_format(format)
+            || (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))
+            || pool > D3DPOOL_SCRATCH)
+        return D3DERR_INVALIDCALL;
+    full_levels = full_mip_level_count(width, height);
+    if (!levels)
+        levels = full_levels;
+    if (levels > full_levels)
+        return D3DERR_INVALIDCALL;
+
+    texture = (D8Texture *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+            sizeof(*texture));
+    if (!texture)
+        return E_OUTOFMEMORY;
+    texture->levels = (D8TextureLevel *)HeapAlloc(GetProcessHeap(),
+            HEAP_ZERO_MEMORY, levels * sizeof(*texture->levels));
+    if (!texture->levels) {
+        HeapFree(GetProcessHeap(), 0, texture);
+        return E_OUTOFMEMORY;
+    }
+    texture->iface.lpVtbl = &g_texture_vtbl;
+    texture->refcount = 1;
+    texture->device = device;
+    texture->handle = allocate_handle();
+    texture->width = width;
+    texture->height = height;
+    texture->level_count = levels;
+    texture->usage = usage;
+    texture->format = format;
+    texture->pool = pool;
+    IDirect3DDevice8_AddRef(iface);
+
+    level_width = width;
+    level_height = height;
+    for (level = 0; level < levels; ++level) {
+        D8TextureLevel *level_data = &texture->levels[level];
+        level_data->width = level_width;
+        level_data->height = level_height;
+        if (!texture_level_layout(format, level_width, level_height,
+                &level_data->row_pitch, &level_data->row_count,
+                &level_data->byte_count))
+            goto allocation_failed;
+        level_data->shadow = (BYTE *)HeapAlloc(GetProcessHeap(),
+                HEAP_ZERO_MEMORY, level_data->byte_count);
+        if (!level_data->shadow)
+            goto allocation_failed;
+        if (level_width > 1)
+            level_width >>= 1;
+        if (level_height > 1)
+            level_height >>= 1;
+    }
+
+    command.device_handle = device->handle;
+    command.resource_handle = texture->handle;
+    command.width = width;
+    command.height = height;
+    command.level_count = levels;
+    command.format = format;
+    command.usage = usage;
+    command.pool = pool;
+    if (!emit_command(D8WG_OP_CREATE_TEXTURE, &command, sizeof(command))) {
+        failure = D3DERR_DRIVERINTERNALERROR;
+        goto allocation_failed;
+    }
+    *texture_out = &texture->iface;
+    return D3D_OK;
+
+allocation_failed:
+    for (level = 0; level < levels; ++level) {
+        if (texture->levels[level].shadow)
+            HeapFree(GetProcessHeap(), 0, texture->levels[level].shadow);
+    }
+    IDirect3DDevice8_Release(iface);
+    HeapFree(GetProcessHeap(), 0, texture->levels);
+    HeapFree(GetProcessHeap(), 0, texture);
+    return failure;
+}
+
+static HRESULT texture_lock_level(D8Texture *texture, UINT level,
+        D3DLOCKED_RECT *locked_rect, const RECT *rect, DWORD flags)
+{
+    D8TextureLevel *level_data;
+    RECT area;
+    UINT block_width;
+    UINT block_height;
+    UINT block_bytes;
+    UINT block_x;
+    UINT block_y;
+
+    if (!locked_rect || level >= texture->level_count)
+        return D3DERR_INVALIDCALL;
+    level_data = &texture->levels[level];
+    if (level_data->locked)
+        return D3DERR_INVALIDCALL;
+    if (rect) {
+        area = *rect;
+    } else {
+        SetRect(&area, 0, 0, (int)level_data->width,
+                (int)level_data->height);
+    }
+    if (area.left < 0 || area.top < 0 || area.right <= area.left
+            || area.bottom <= area.top
+            || (UINT)area.right > level_data->width
+            || (UINT)area.bottom > level_data->height
+            || !texture_format_layout(texture->format, &block_width,
+                    &block_height, &block_bytes))
+        return D3DERR_INVALIDCALL;
+    if (block_width > 1
+            && (((UINT)area.left % block_width)
+                || ((UINT)area.top % block_height)
+                || ((UINT)area.right != level_data->width
+                    && (UINT)area.right % block_width)
+                || ((UINT)area.bottom != level_data->height
+                    && (UINT)area.bottom % block_height)))
+        return D3DERR_INVALIDCALL;
+
+    block_x = (UINT)area.left / block_width;
+    block_y = (UINT)area.top / block_height;
+    level_data->lock_rect = area;
+    level_data->lock_flags = flags;
+    level_data->locked = TRUE;
+    locked_rect->Pitch = (INT)level_data->row_pitch;
+    locked_rect->pBits = level_data->shadow
+            + block_y * level_data->row_pitch + block_x * block_bytes;
+    return D3D_OK;
+}
+
+static HRESULT texture_unlock_level(D8Texture *texture, UINT level)
+{
+    D8TextureLevel *level_data;
+    BOOL result = TRUE;
+
+    if (level >= texture->level_count)
+        return D3DERR_INVALIDCALL;
+    level_data = &texture->levels[level];
+    if (!level_data->locked)
+        return D3DERR_INVALIDCALL;
+    if (!(level_data->lock_flags & D3DLOCK_READONLY))
+        result = emit_texture_update(texture, level, &level_data->lock_rect);
+    level_data->locked = FALSE;
+    level_data->lock_flags = 0;
+    ZeroMemory(&level_data->lock_rect, sizeof(level_data->lock_rect));
+    return result ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
+}
+
+static HRESULT WINAPI texture_query_interface(IDirect3DTexture8 *iface,
+        REFIID iid, void **object)
+{
+    (void)iid;
+    if (!object)
+        return E_POINTER;
+    *object = iface;
+    IDirect3DTexture8_AddRef(iface);
+    return S_OK;
+}
+
+static ULONG WINAPI texture_add_ref(IDirect3DTexture8 *iface)
+{
+    return (ULONG)InterlockedIncrement(&texture_from_iface(iface)->refcount);
+}
+
+static ULONG WINAPI texture_release(IDirect3DTexture8 *iface)
+{
+    D8Texture *texture = texture_from_iface(iface);
+    ULONG refs = (ULONG)InterlockedDecrement(&texture->refcount);
+    if (!refs) {
+        D8WGDestroyResource destroy;
+        UINT level;
+        destroy.resource_handle = texture->handle;
+        destroy.resource_kind = D8WG_RESOURCE_TEXTURE_2D;
+        emit_command(D8WG_OP_DESTROY_RESOURCE, &destroy, sizeof(destroy));
+        for (level = 0; level < texture->level_count; ++level)
+            HeapFree(GetProcessHeap(), 0, texture->levels[level].shadow);
+        HeapFree(GetProcessHeap(), 0, texture->levels);
+        IDirect3DDevice8_Release(&texture->device->iface);
+        HeapFree(GetProcessHeap(), 0, texture);
+    }
+    return refs;
+}
+
+static HRESULT WINAPI texture_get_device(IDirect3DTexture8 *iface,
+        IDirect3DDevice8 **device_out)
+{
+    D8Texture *texture = texture_from_iface(iface);
+    if (!device_out)
+        return D3DERR_INVALIDCALL;
+    *device_out = &texture->device->iface;
+    IDirect3DDevice8_AddRef(*device_out);
+    return D3D_OK;
+}
+
+static HRESULT WINAPI texture_set_private_data(IDirect3DTexture8 *iface,
+        REFGUID guid, const void *data, DWORD size, DWORD flags)
+{
+    (void)iface; (void)guid; (void)data; (void)size; (void)flags;
+    return D3DERR_INVALIDCALL;
+}
+
+static HRESULT WINAPI texture_get_private_data(IDirect3DTexture8 *iface,
+        REFGUID guid, void *data, DWORD *size)
+{
+    (void)iface; (void)guid; (void)data; (void)size;
+    return D3DERR_NOTFOUND;
+}
+
+static HRESULT WINAPI texture_free_private_data(IDirect3DTexture8 *iface,
+        REFGUID guid)
+{
+    (void)iface; (void)guid;
+    return D3DERR_NOTFOUND;
+}
+
+static DWORD WINAPI texture_set_priority(IDirect3DTexture8 *iface,
+        DWORD priority)
+{
+    D8Texture *texture = texture_from_iface(iface);
+    DWORD old = texture->priority;
+    texture->priority = priority;
+    return old;
+}
+
+static DWORD WINAPI texture_get_priority(IDirect3DTexture8 *iface)
+{
+    return texture_from_iface(iface)->priority;
+}
+
+static void WINAPI texture_preload(IDirect3DTexture8 *iface)
+{
+    (void)iface;
+}
+
+static D3DRESOURCETYPE WINAPI texture_get_type(IDirect3DTexture8 *iface)
+{
+    (void)iface;
+    return D3DRTYPE_TEXTURE;
+}
+
+static DWORD WINAPI texture_set_lod(IDirect3DTexture8 *iface, DWORD lod)
+{
+    D8Texture *texture = texture_from_iface(iface);
+    DWORD old = texture->lod;
+    if (lod >= texture->level_count)
+        lod = texture->level_count - 1;
+    texture->lod = lod;
+    return old;
+}
+
+static DWORD WINAPI texture_get_lod(IDirect3DTexture8 *iface)
+{
+    return texture_from_iface(iface)->lod;
+}
+
+static DWORD WINAPI texture_get_level_count(IDirect3DTexture8 *iface)
+{
+    return texture_from_iface(iface)->level_count;
+}
+
+static HRESULT WINAPI texture_get_level_desc(IDirect3DTexture8 *iface,
+        UINT level, D3DSURFACE_DESC *desc)
+{
+    D8Texture *texture = texture_from_iface(iface);
+    D8TextureLevel *level_data;
+    if (!desc || level >= texture->level_count)
+        return D3DERR_INVALIDCALL;
+    level_data = &texture->levels[level];
+    ZeroMemory(desc, sizeof(*desc));
+    desc->Format = texture->format;
+    desc->Type = D3DRTYPE_SURFACE;
+    desc->Usage = texture->usage;
+    desc->Pool = texture->pool;
+    desc->Size = level_data->byte_count;
+    desc->MultiSampleType = D3DMULTISAMPLE_NONE;
+    desc->Width = level_data->width;
+    desc->Height = level_data->height;
+    return D3D_OK;
+}
+
+static HRESULT WINAPI texture_get_surface_level(IDirect3DTexture8 *iface,
+        UINT level, IDirect3DSurface8 **surface_out)
+{
+    D8Texture *texture = texture_from_iface(iface);
+    D8Surface *surface;
+    if (!surface_out || level >= texture->level_count)
+        return D3DERR_INVALIDCALL;
+    surface = (D8Surface *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+            sizeof(*surface));
+    if (!surface)
+        return E_OUTOFMEMORY;
+    surface->iface.lpVtbl = &g_surface_vtbl;
+    surface->refcount = 1;
+    surface->texture = texture;
+    surface->level = level;
+    IDirect3DTexture8_AddRef(iface);
+    *surface_out = &surface->iface;
+    return D3D_OK;
+}
+
+static HRESULT WINAPI texture_lock_rect(IDirect3DTexture8 *iface, UINT level,
+        D3DLOCKED_RECT *locked_rect, const RECT *rect, DWORD flags)
+{
+    return texture_lock_level(texture_from_iface(iface), level, locked_rect,
+            rect, flags);
+}
+
+static HRESULT WINAPI texture_unlock_rect(IDirect3DTexture8 *iface,
+        UINT level)
+{
+    return texture_unlock_level(texture_from_iface(iface), level);
+}
+
+static HRESULT WINAPI texture_add_dirty_rect(IDirect3DTexture8 *iface,
+        const RECT *rect)
+{
+    D8Texture *texture = texture_from_iface(iface);
+    if (rect && (rect->left < 0 || rect->top < 0
+            || rect->right <= rect->left || rect->bottom <= rect->top
+            || (UINT)rect->right > texture->width
+            || (UINT)rect->bottom > texture->height))
+        return D3DERR_INVALIDCALL;
+    return D3D_OK;
+}
+
+static HRESULT WINAPI surface_query_interface(IDirect3DSurface8 *iface,
+        REFIID iid, void **object)
+{
+    (void)iid;
+    if (!object)
+        return E_POINTER;
+    *object = iface;
+    IDirect3DSurface8_AddRef(iface);
+    return S_OK;
+}
+
+static ULONG WINAPI surface_add_ref(IDirect3DSurface8 *iface)
+{
+    return (ULONG)InterlockedIncrement(&surface_from_iface(iface)->refcount);
+}
+
+static ULONG WINAPI surface_release(IDirect3DSurface8 *iface)
+{
+    D8Surface *surface = surface_from_iface(iface);
+    ULONG refs = (ULONG)InterlockedDecrement(&surface->refcount);
+    if (!refs) {
+        IDirect3DTexture8_Release(&surface->texture->iface);
+        HeapFree(GetProcessHeap(), 0, surface);
+    }
+    return refs;
+}
+
+static HRESULT WINAPI surface_get_device(IDirect3DSurface8 *iface,
+        IDirect3DDevice8 **device_out)
+{
+    return texture_get_device(&surface_from_iface(iface)->texture->iface,
+            device_out);
+}
+
+static HRESULT WINAPI surface_set_private_data(IDirect3DSurface8 *iface,
+        REFGUID guid, const void *data, DWORD size, DWORD flags)
+{
+    (void)iface; (void)guid; (void)data; (void)size; (void)flags;
+    return D3DERR_INVALIDCALL;
+}
+
+static HRESULT WINAPI surface_get_private_data(IDirect3DSurface8 *iface,
+        REFGUID guid, void *data, DWORD *size)
+{
+    (void)iface; (void)guid; (void)data; (void)size;
+    return D3DERR_NOTFOUND;
+}
+
+static HRESULT WINAPI surface_free_private_data(IDirect3DSurface8 *iface,
+        REFGUID guid)
+{
+    (void)iface; (void)guid;
+    return D3DERR_NOTFOUND;
+}
+
+static HRESULT WINAPI surface_get_container(IDirect3DSurface8 *iface,
+        REFIID iid, void **container)
+{
+    D8Surface *surface = surface_from_iface(iface);
+    (void)iid;
+    if (!container)
+        return E_POINTER;
+    *container = &surface->texture->iface;
+    IDirect3DTexture8_AddRef(&surface->texture->iface);
+    return S_OK;
+}
+
+static HRESULT WINAPI surface_get_desc(IDirect3DSurface8 *iface,
+        D3DSURFACE_DESC *desc)
+{
+    D8Surface *surface = surface_from_iface(iface);
+    return texture_get_level_desc(&surface->texture->iface,
+            surface->level, desc);
+}
+
+static HRESULT WINAPI surface_lock_rect(IDirect3DSurface8 *iface,
+        D3DLOCKED_RECT *locked_rect, const RECT *rect, DWORD flags)
+{
+    D8Surface *surface = surface_from_iface(iface);
+    return texture_lock_level(surface->texture, surface->level, locked_rect,
+            rect, flags);
+}
+
+static HRESULT WINAPI surface_unlock_rect(IDirect3DSurface8 *iface)
+{
+    D8Surface *surface = surface_from_iface(iface);
+    return texture_unlock_level(surface->texture, surface->level);
+}
+
+static HRESULT WINAPI device_get_texture(IDirect3DDevice8 *iface,
+        DWORD stage, IDirect3DBaseTexture8 **texture_out)
+{
+    D8Device *device = device_from_iface(iface);
+    if (!texture_out || stage >= D8WG_MAX_TEXTURE_STAGES)
+        return D3DERR_INVALIDCALL;
+    *texture_out = device->textures[stage]
+            ? (IDirect3DBaseTexture8 *)&device->textures[stage]->iface : NULL;
+    if (*texture_out)
+        IDirect3DBaseTexture8_AddRef(*texture_out);
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_set_texture(IDirect3DDevice8 *iface,
+        DWORD stage, IDirect3DBaseTexture8 *texture_iface)
+{
+    D8Device *device = device_from_iface(iface);
+    D8Texture *texture = texture_iface ? (D8Texture *)texture_iface : NULL;
+    D8WGSetTexture command;
+
+    if (stage >= D8WG_MAX_TEXTURE_STAGES
+            || (texture && (texture->iface.lpVtbl != &g_texture_vtbl
+                || texture->device != device)))
+        return D3DERR_INVALIDCALL;
+    if (device->textures[stage] == texture)
+        return D3D_OK;
+    if (texture)
+        IDirect3DTexture8_AddRef(&texture->iface);
+    if (device->textures[stage])
+        IDirect3DTexture8_Release(&device->textures[stage]->iface);
+    device->textures[stage] = texture;
+    command.device_handle = device->handle;
+    command.stage = stage;
+    command.texture_handle = texture ? texture->handle : 0;
+    command.reserved = 0;
+    return emit_command(D8WG_OP_SET_TEXTURE, &command, sizeof(command))
+            ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
+}
+
+static HRESULT WINAPI device_update_texture(IDirect3DDevice8 *iface,
+        IDirect3DBaseTexture8 *source_iface,
+        IDirect3DBaseTexture8 *destination_iface)
+{
+    D8Device *device = device_from_iface(iface);
+    D8Texture *source = (D8Texture *)source_iface;
+    D8Texture *destination = (D8Texture *)destination_iface;
+    UINT level;
+
+    if (!source || !destination
+            || source->iface.lpVtbl != &g_texture_vtbl
+            || destination->iface.lpVtbl != &g_texture_vtbl
+            || source->device != device || destination->device != device
+            || source->format != destination->format
+            || source->width != destination->width
+            || source->height != destination->height)
+        return D3DERR_INVALIDCALL;
+    for (level = 0; level < source->level_count
+            && level < destination->level_count; ++level) {
+        RECT full;
+        if (source->levels[level].locked || destination->levels[level].locked)
+            return D3DERR_INVALIDCALL;
+        CopyMemory(destination->levels[level].shadow,
+                source->levels[level].shadow,
+                destination->levels[level].byte_count);
+        SetRect(&full, 0, 0, (int)destination->levels[level].width,
+                (int)destination->levels[level].height);
+        if (!emit_texture_update(destination, level, &full))
+            return D3DERR_DRIVERINTERNALERROR;
+    }
     return D3D_OK;
 }
 
@@ -2018,9 +2775,6 @@ static void WINAPI device_set_gamma(IDirect3DDevice8 *iface, DWORD flags,
 { (void)iface; (void)flags; (void)ramp; }
 static void WINAPI device_get_gamma(IDirect3DDevice8 *iface, D3DGAMMARAMP *ramp)
 { (void)iface; if (ramp) ZeroMemory(ramp, sizeof(*ramp)); }
-DEV_STUB(create_texture, UINT w, UINT h, UINT levels, DWORD usage,
-        D3DFORMAT format, D3DPOOL pool, IDirect3DTexture8 **out)
-{ (void)iface;(void)w;(void)h;(void)levels;(void)usage;(void)format;(void)pool;(void)out; return D3DERR_INVALIDCALL; }
 DEV_STUB(create_volume_texture, UINT w, UINT h, UINT d, UINT levels, DWORD usage,
         D3DFORMAT format, D3DPOOL pool, IDirect3DVolumeTexture8 **out)
 { (void)iface;(void)w;(void)h;(void)d;(void)levels;(void)usage;(void)format;(void)pool;(void)out; return D3DERR_INVALIDCALL; }
@@ -2039,8 +2793,6 @@ DEV_STUB(create_image_surface, UINT w, UINT h, D3DFORMAT format,
 DEV_STUB(copy_rects, IDirect3DSurface8 *src, const RECT *rects, UINT count,
         IDirect3DSurface8 *dst, const POINT *points)
 { (void)iface;(void)src;(void)rects;(void)count;(void)dst;(void)points; return D3DERR_INVALIDCALL; }
-DEV_STUB(update_texture, IDirect3DBaseTexture8 *src, IDirect3DBaseTexture8 *dst)
-{ (void)iface;(void)src;(void)dst; return D3DERR_INVALIDCALL; }
 DEV_STUB(get_front_buffer, IDirect3DSurface8 *dst)
 { (void)iface;(void)dst; return D3DERR_INVALIDCALL; }
 DEV_STUB(set_render_target, IDirect3DSurface8 *rt, IDirect3DSurface8 *ds)
@@ -2086,10 +2838,6 @@ DEV_STUB(set_clip_status, const D3DCLIPSTATUS8 *status)
 { (void)iface;(void)status; return D3DERR_INVALIDCALL; }
 DEV_STUB(get_clip_status, D3DCLIPSTATUS8 *status)
 { (void)iface;(void)status; return D3DERR_INVALIDCALL; }
-DEV_STUB(get_texture, DWORD stage, IDirect3DBaseTexture8 **texture)
-{ (void)iface;(void)stage;if(texture)*texture=NULL; return D3D_OK; }
-DEV_STUB(set_texture, DWORD stage, IDirect3DBaseTexture8 *texture)
-{ (void)iface;(void)stage;(void)texture; return texture ? D3DERR_INVALIDCALL : D3D_OK; }
 DEV_STUB(get_info, DWORD id, void *info, DWORD size)
 { (void)iface;(void)id;(void)info;(void)size; return D3DERR_NOTAVAILABLE; }
 DEV_STUB(set_palette, UINT index, const PALETTEENTRY *entries)
@@ -2290,6 +3038,42 @@ static IDirect3DIndexBuffer8Vtbl g_ib_vtbl = {
     .Lock = ib_lock,
     .Unlock = ib_unlock,
     .GetDesc = ib_get_desc
+};
+
+static IDirect3DTexture8Vtbl g_texture_vtbl = {
+    .QueryInterface = texture_query_interface,
+    .AddRef = texture_add_ref,
+    .Release = texture_release,
+    .GetDevice = texture_get_device,
+    .SetPrivateData = texture_set_private_data,
+    .GetPrivateData = texture_get_private_data,
+    .FreePrivateData = texture_free_private_data,
+    .SetPriority = texture_set_priority,
+    .GetPriority = texture_get_priority,
+    .PreLoad = texture_preload,
+    .GetType = texture_get_type,
+    .SetLOD = texture_set_lod,
+    .GetLOD = texture_get_lod,
+    .GetLevelCount = texture_get_level_count,
+    .GetLevelDesc = texture_get_level_desc,
+    .GetSurfaceLevel = texture_get_surface_level,
+    .LockRect = texture_lock_rect,
+    .UnlockRect = texture_unlock_rect,
+    .AddDirtyRect = texture_add_dirty_rect
+};
+
+static IDirect3DSurface8Vtbl g_surface_vtbl = {
+    .QueryInterface = surface_query_interface,
+    .AddRef = surface_add_ref,
+    .Release = surface_release,
+    .GetDevice = surface_get_device,
+    .SetPrivateData = surface_set_private_data,
+    .GetPrivateData = surface_get_private_data,
+    .FreePrivateData = surface_free_private_data,
+    .GetContainer = surface_get_container,
+    .GetDesc = surface_get_desc,
+    .LockRect = surface_lock_rect,
+    .UnlockRect = surface_unlock_rect
 };
 
 IDirect3D8 *WINAPI Direct3DCreate8(UINT sdk_version)

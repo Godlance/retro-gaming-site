@@ -34,8 +34,12 @@ function fields(structName) {
 
 const sharedValues = {
     D8WG_VERSION_MAJOR: 1,
-    D8WG_VERSION_MINOR: 2,
+    D8WG_VERSION_MINOR: 3,
     D8WG_OP_UPDATE_SURFACE: 8,
+    D8WG_OP_CREATE_TEXTURE: 0x110,
+    D8WG_OP_UPDATE_TEXTURE: 0x111,
+    D8WG_OP_SET_TEXTURE: 0x202,
+    D8WG_OP_SET_VIEWPORT: 0x203,
     D8WG_OP_SET_INDICES: 0x209,
     D8WG_OP_DRAW_PRIMITIVE: 0x300,
     D8WG_OP_DRAW_INDEXED_PRIMITIVE: 0x301,
@@ -43,6 +47,7 @@ const sharedValues = {
     D8WG_OP_DRAW_INDEXED_PRIMITIVE_UP: 0x303,
     D8WG_RESOURCE_BUFFER_VERTEX: 1,
     D8WG_RESOURCE_BUFFER_INDEX: 2,
+    D8WG_RESOURCE_TEXTURE_2D: 3,
 };
 
 for (const [name, expected] of Object.entries(sharedValues)) {
@@ -61,6 +66,25 @@ assert.deepEqual(fields("D8WGPresent"), [
 ]);
 assert.deepEqual(fields("D8WGUpdateSurface"), [
     "device_handle", "hwnd", "x", "y", "width", "height",
+]);
+assert.deepEqual(fields("D8WGCreateTexture"), [
+    "device_handle", "resource_handle", "width", "height", "level_count",
+    "format", "usage", "pool",
+]);
+assert.deepEqual(fields("D8WGUpdateBuffer"), [
+    "resource_handle", "destination_offset", "byte_count", "data_offset",
+    "lock_flags", "reserved",
+]);
+assert.deepEqual(fields("D8WGUpdateTexture"), [
+    "resource_handle", "level", "x", "y", "width", "height", "row_pitch",
+    "data_bytes", "data_offset", "reserved",
+]);
+assert.deepEqual(fields("D8WGSetTexture"), [
+    "device_handle", "stage", "texture_handle", "reserved",
+]);
+assert.deepEqual(fields("D8WGSetViewport"), [
+    "device_handle", "x", "y", "width", "height", "min_z", "max_z",
+    "reserved",
 ]);
 assert.deepEqual(fields("D8WGDrawIndexedPrimitive"), [
     "device_handle", "primitive_type", "min_vertex_index", "vertex_count",
@@ -81,6 +105,11 @@ for (const size of [
     "D8WGAssertCommandHeaderSize",
     "D8WGAssertPresentSize",
     "D8WGAssertUpdateSurfaceSize",
+    "D8WGAssertCreateTextureSize",
+    "D8WGAssertUpdateBufferSize",
+    "D8WGAssertUpdateTextureSize",
+    "D8WGAssertSetTextureSize",
+    "D8WGAssertSetViewportSize",
     "D8WGAssertSetIndicesSize",
     "D8WGAssertDrawIndexedPrimitiveSize",
     "D8WGAssertDrawPrimitiveUPSize",

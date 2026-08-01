@@ -1489,17 +1489,28 @@ WebGPU 对象和 AudioWorklet 状态不能直接序列化进 v86 save state。
 
 ## 20. 当前仓库状态与下一步建议
 
-截至 2026-08-01，仓库已经完成 D8WG v1.2/M2 Geometry 与窗口生命周期修正：真实 XP triangle 和 `d3d8_geometry_test.exe` 均已通过，协议和 host executor 已扩展到 VB/IB、indexed draw、UP draw 与 triangle-fan 转换。v1.2 还会在 Win32 窗口移动、缩放、显示状态变化时独立同步 WebGPU overlay；设备释放或窗口销毁时立即隐藏 overlay，不再依赖下一次 `Present` 或进程退出兜底提交。继续写 texture、fixed-function 或 DirectSound 代码之前，建议按以下顺序推进：
+截至 2026-08-01，仓库代码已推进到 D8WG v1.3/M3 Maple 2D/Gr2D。v1.2 的 geometry 与窗口生命周期能力继续保留，v1.3 新增的实现范围如下：
 
-1. 暂停扩大代码范围，先评审本文的架构边界和阶段顺序。
-2. 完成阶段 0：固定 MapleStory 场景，采集旧路径基线和 API 使用面。
-3. 持续维护 D8WG header/parser 的协议一致性测试、C 结构尺寸断言和 malformed batch 测试。
-4. 在 XP 回归 `d3d8_geometry_test.exe` 的拖动、最小化、恢复和关闭窗口生命周期，确认 overlay 无错位、无残留。
-5. 只有 Clear、geometry、窗口生命周期、batch counters 和回退路径全部过关后，再进入 Maple Gr2D texture/alpha 阶段。
-6. 第一次完整通过 `d3d8_maple_gr2d_test` 后，立即做真实 Maple A/B profile，再决定优先补兼容功能还是先优化 hot path。
-7. 图形首次可玩后再启动 DirectSound PR；音频独立验收后才禁用 Maple 的 SB16。
+- guest Texture 与 texture-level Surface COM 对象、`LockRect`/`UnlockRect`、subrect、mip、`GetSurfaceLevel` 和 `UpdateTexture`；
+- `A8R8G8B8`、`X8R8G8B8`、常见 16 位格式、`L8/A8`，以及 DXT1/3/5 CPU decode fallback；
+- `XYZRHW` 加可选 `DIFFUSE`、`SPECULAR`、`TEX1/TEX2` 的动态 FVF 布局；
+- stage 0/1 常用 color/alpha op、argument modifier、texture factor、alpha test/blend；
+- point/linear、wrap/mirror/clamp、mip level/filter，以及 viewport 对应的 WebGPU scissor；
+- 动态 VB/IB lock flags 进入协议；`DISCARD` orphan GPU buffer，`NOOVERWRITE` 保持有序局部更新；
+- 16 MiB `Draw*UP`/ordered-upload transient ring，以及有上限的 pipeline/sampler/uniform/bind-group cache；
+- `d3d8_maple_gr2d_test.exe` 从仅做 mode/caps probe 扩展为实际 A4/A8、Surface、TEX2、alpha、SPECULAR、viewport 和 DrawUP 绘制。
 
-这个顺序的核心是：先用测量确认瓶颈，用协议和小测试固定边界，再逐步扩大兼容面。最终实现仍是一条直接的 D3D8 → WebGPU 路径，但每一步都有可观察结果、性能指标和明确回退点。
+本地自动验证已覆盖：guest DLL 无 CRT 编译与 import 审计、八个 XP Stage 3 测试程序编译、C/JS 协议一致性、malformed batch、动态 buffer orphan、全部纹理格式转换、DXT1/3/5 decode、两级纹理 shader/pipeline key、alpha、viewport、ordered texture upload 和 transient ring。真实 GPU 页面位于 `glbridge/tests/d3d8_webgpu_browser_test.html`。
+
+阶段 3 的“代码工作项完成”和“发布退出条件通过”必须区分。以下项目仍需要在实际运行环境验收，不能由当前主机上的 fake WebGPU 或交叉编译代替：
+
+1. 在支持 WebGPU 的普通 Chrome 中打开真实 GPU 回归页，确认显示 `PASS` 且控制台无 validation error；当前 macOS 无头 Chrome 卡在 adapter 初始化，未得到真实 GPU 结果。
+2. 把 v1.3 `d3d8.dll` 与 host executor 同步部署，在 XP 依次运行 Stage 3 测试套件，重点目视检查 `texture_formats`、`texture_stage_ops`、`multitexture`、`dynamic_resources`、`mipmap_filter` 和新的 `maple_gr2d` 绘制。
+3. 用 MapleStory v83 完成登录、角色选择和固定地图验收，检查 UI、精灵、文字、透明边缘、clipping 以及动态资源是否闪烁。
+4. 对同一角色、地图、视角和时间窗口采集旧 WineD3D/OpenGL/gl4es 路径与新 D3D8/WebGPU 路径的 FPS、frame time、PCI submit、pipeline creation 和内存 A/B 数据。
+5. 只有上述运行时退出条件通过后，才在发布清单中把阶段 3 标为完成，并开始阶段 4 depth/transform/lighting 或 DirectSound 工作。
+
+因此，当前状态是“阶段 3 实现已完整落到代码并通过静态/host 自动回归，真实 XP/Maple 发布验收待执行”，而不是提前宣称真实游戏兼容性和性能门槛已经通过。
 
 ## 21. 参考资料与许可边界
 

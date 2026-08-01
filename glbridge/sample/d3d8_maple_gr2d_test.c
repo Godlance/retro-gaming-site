@@ -41,6 +41,23 @@ typedef struct ModeCandidate
     BOOL format_supported[4];
 } ModeCandidate;
 
+typedef struct MapleVertex
+{
+    FLOAT x;
+    FLOAT y;
+    FLOAT z;
+    FLOAT rhw;
+    DWORD diffuse;
+    DWORD specular;
+    FLOAT u0;
+    FLOAT v0;
+    FLOAT u1;
+    FLOAT v1;
+} MapleVertex;
+
+#define MAPLE_FVF (D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_SPECULAR \
+        | D3DFVF_TEX2)
+
 static const FormatProbe g_format_probes[] =
 {
     {"A4R4G4B4", D3DFMT_A4R4G4B4},
@@ -185,6 +202,219 @@ static void release_d3d8(void)
         IDirect3D8_Release(g_d3d);
         g_d3d = NULL;
     }
+}
+
+static void set_quad(MapleVertex *vertices, FLOAT left, FLOAT top,
+        FLOAT right, FLOAT bottom, DWORD diffuse, DWORD specular,
+        FLOAT repeat)
+{
+    static const BYTE corners[6][2] =
+    {
+        {0, 0}, {1, 0}, {0, 1}, {0, 1}, {1, 0}, {1, 1}
+    };
+    UINT i;
+    for (i = 0; i < 6; ++i)
+    {
+        FLOAT u = (FLOAT)corners[i][0] * repeat;
+        FLOAT v = (FLOAT)corners[i][1] * repeat;
+        vertices[i].x = corners[i][0] ? right : left;
+        vertices[i].y = corners[i][1] ? bottom : top;
+        vertices[i].z = 0.5f;
+        vertices[i].rhw = 1.0f;
+        vertices[i].diffuse = diffuse;
+        vertices[i].specular = specular;
+        vertices[i].u0 = u;
+        vertices[i].v0 = v;
+        vertices[i].u1 = u;
+        vertices[i].v1 = v;
+    }
+}
+
+static HRESULT run_render_probe(void)
+{
+    IDirect3DTexture8 *base_texture = NULL;
+    IDirect3DTexture8 *light_texture = NULL;
+    IDirect3DSurface8 *base_surface = NULL;
+    D3DLOCKED_RECT locked;
+    D3DVIEWPORT8 viewport;
+    MapleVertex vertices[6];
+    UINT x;
+    UINT y;
+    HRESULT hr = D3D_OK;
+
+#define RENDER_CALL(stage, expression) do { \
+    hr = (expression); \
+    if (FAILED(hr)) { trace_hresult(stage, hr); goto cleanup; } \
+} while (0)
+
+    trace_text("09 Maple 2D render probe begin");
+    RENDER_CALL("09 CreateTexture(A4R4G4B4)",
+            IDirect3DDevice8_CreateTexture(g_device, 32, 32, 1, 0,
+            D3DFMT_A4R4G4B4, D3DPOOL_MANAGED, &base_texture));
+    RENDER_CALL("10 GetSurfaceLevel(A4R4G4B4)",
+            IDirect3DTexture8_GetSurfaceLevel(base_texture, 0,
+            &base_surface));
+    RENDER_CALL("11 Surface::LockRect(A4R4G4B4)",
+            IDirect3DSurface8_LockRect(base_surface, &locked, NULL, 0));
+    for (y = 0; y < 32; ++y)
+    {
+        WORD *row = (WORD *)((BYTE *)locked.pBits + y * locked.Pitch);
+        for (x = 0; x < 32; ++x)
+        {
+            UINT checker = ((x >> 2) ^ (y >> 2)) & 1;
+            UINT alpha = x < 2 || y < 2 || x >= 30 || y >= 30 ? 0 : 15;
+            UINT red = checker ? 15 : 3;
+            UINT green = checker ? 6 : 14;
+            UINT blue = checker ? 2 : 13;
+            row[x] = (WORD)((alpha << 12) | (red << 8)
+                    | (green << 4) | blue);
+        }
+    }
+    RENDER_CALL("12 Surface::UnlockRect(A4R4G4B4)",
+            IDirect3DSurface8_UnlockRect(base_surface));
+    IDirect3DSurface8_Release(base_surface);
+    base_surface = NULL;
+
+    RENDER_CALL("13 CreateTexture(A8R8G8B8)",
+            IDirect3DDevice8_CreateTexture(g_device, 32, 32, 1, 0,
+            D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &light_texture));
+    RENDER_CALL("14 Texture::LockRect(A8R8G8B8)",
+            IDirect3DTexture8_LockRect(light_texture, 0, &locked, NULL, 0));
+    for (y = 0; y < 32; ++y)
+    {
+        DWORD *row = (DWORD *)((BYTE *)locked.pBits + y * locked.Pitch);
+        for (x = 0; x < 32; ++x)
+        {
+            UINT dx = x > 15 ? x - 15 : 15 - x;
+            UINT dy = y > 15 ? y - 15 : 15 - y;
+            UINT alpha = 255 - (dx + dy) * 7;
+            row[x] = (alpha << 24) | 0x00C0E8FFu;
+        }
+    }
+    RENDER_CALL("15 Texture::UnlockRect(A8R8G8B8)",
+            IDirect3DTexture8_UnlockRect(light_texture, 0));
+
+    RENDER_CALL("16 SetVertexShader(XYZRHW|DIFFUSE|SPECULAR|TEX2)",
+            IDirect3DDevice8_SetVertexShader(g_device, MAPLE_FVF));
+    RENDER_CALL("17 LIGHTING=FALSE", IDirect3DDevice8_SetRenderState(
+            g_device, D3DRS_LIGHTING, FALSE));
+    RENDER_CALL("18 ZENABLE=FALSE", IDirect3DDevice8_SetRenderState(
+            g_device, D3DRS_ZENABLE, FALSE));
+    RENDER_CALL("19 CULLMODE=NONE", IDirect3DDevice8_SetRenderState(
+            g_device, D3DRS_CULLMODE, D3DCULL_NONE));
+    RENDER_CALL("20 SPECULARENABLE=TRUE", IDirect3DDevice8_SetRenderState(
+            g_device, D3DRS_SPECULARENABLE, TRUE));
+    RENDER_CALL("21 ALPHABLEND=TRUE", IDirect3DDevice8_SetRenderState(
+            g_device, D3DRS_ALPHABLENDENABLE, TRUE));
+    RENDER_CALL("22 SRCBLEND=SRCALPHA", IDirect3DDevice8_SetRenderState(
+            g_device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA));
+    RENDER_CALL("23 DESTBLEND=INVSRCALPHA", IDirect3DDevice8_SetRenderState(
+            g_device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA));
+    RENDER_CALL("24 ALPHATEST=TRUE", IDirect3DDevice8_SetRenderState(
+            g_device, D3DRS_ALPHATESTENABLE, TRUE));
+    RENDER_CALL("25 ALPHAREF=8", IDirect3DDevice8_SetRenderState(
+            g_device, D3DRS_ALPHAREF, 8));
+    RENDER_CALL("26 ALPHAFUNC=GREATER", IDirect3DDevice8_SetRenderState(
+            g_device, D3DRS_ALPHAFUNC, D3DCMP_GREATER));
+
+    RENDER_CALL("27 Clear", IDirect3DDevice8_Clear(g_device, 0, NULL,
+            D3DCLEAR_TARGET, 0xFF132038u, 1.0f, 0));
+    RENDER_CALL("28 BeginScene", IDirect3DDevice8_BeginScene(g_device));
+
+    RENDER_CALL("29 SetTexture(0,NULL)", IDirect3DDevice8_SetTexture(
+            g_device, 0, NULL));
+    RENDER_CALL("30 stage0 SELECTARG1", IDirect3DDevice8_SetTextureStageState(
+            g_device, 0, D3DTSS_COLOROP, D3DTOP_SELECTARG1));
+    RENDER_CALL("31 stage0 COLORARG1=DIFFUSE",
+            IDirect3DDevice8_SetTextureStageState(g_device, 0,
+            D3DTSS_COLORARG1, D3DTA_DIFFUSE));
+    RENDER_CALL("32 stage0 ALPHAARG1=DIFFUSE",
+            IDirect3DDevice8_SetTextureStageState(g_device, 0,
+            D3DTSS_ALPHAARG1, D3DTA_DIFFUSE));
+    RENDER_CALL("33 stage1 DISABLE", IDirect3DDevice8_SetTextureStageState(
+            g_device, 1, D3DTSS_COLOROP, D3DTOP_DISABLE));
+    set_quad(vertices, 20.0f, 20.0f, 780.0f, 580.0f,
+            0xFF203A5Au, 0, 1.0f);
+    RENDER_CALL("34 DrawUP background", IDirect3DDevice8_DrawPrimitiveUP(
+            g_device, D3DPT_TRIANGLELIST, 2, vertices,
+            sizeof(MapleVertex)));
+
+    viewport.X = 40;
+    viewport.Y = 80;
+    viewport.Width = 720;
+    viewport.Height = 440;
+    viewport.MinZ = 0.0f;
+    viewport.MaxZ = 1.0f;
+    RENDER_CALL("35 SetViewport", IDirect3DDevice8_SetViewport(g_device,
+            &viewport));
+    RENDER_CALL("36 SetTexture(0,A4)", IDirect3DDevice8_SetTexture(g_device,
+            0, (IDirect3DBaseTexture8 *)base_texture));
+    RENDER_CALL("37 stage0 MODULATE", IDirect3DDevice8_SetTextureStageState(
+            g_device, 0, D3DTSS_COLOROP, D3DTOP_MODULATE));
+    RENDER_CALL("38 stage0 COLORARG1=TEXTURE",
+            IDirect3DDevice8_SetTextureStageState(g_device, 0,
+            D3DTSS_COLORARG1, D3DTA_TEXTURE));
+    RENDER_CALL("39 stage0 COLORARG2=DIFFUSE",
+            IDirect3DDevice8_SetTextureStageState(g_device, 0,
+            D3DTSS_COLORARG2, D3DTA_DIFFUSE));
+    RENDER_CALL("40 stage0 ALPHAARG1=TEXTURE",
+            IDirect3DDevice8_SetTextureStageState(g_device, 0,
+            D3DTSS_ALPHAARG1, D3DTA_TEXTURE));
+    RENDER_CALL("41 stage0 POINT", IDirect3DDevice8_SetTextureStageState(
+            g_device, 0, D3DTSS_MINFILTER, D3DTEXF_POINT));
+    RENDER_CALL("42 stage0 WRAP", IDirect3DDevice8_SetTextureStageState(
+            g_device, 0, D3DTSS_ADDRESSU, D3DTADDRESS_WRAP));
+    set_quad(vertices, 20.0f, 100.0f, 370.0f, 500.0f,
+            0xFFFFFFFFu, 0x00100810u, 4.0f);
+    RENDER_CALL("43 DrawUP A4 sprite", IDirect3DDevice8_DrawPrimitiveUP(
+            g_device, D3DPT_TRIANGLELIST, 2, vertices,
+            sizeof(MapleVertex)));
+
+    RENDER_CALL("44 SetTexture(1,A8)", IDirect3DDevice8_SetTexture(g_device,
+            1, (IDirect3DBaseTexture8 *)light_texture));
+    RENDER_CALL("45 stage1 TEXCOORDINDEX=1",
+            IDirect3DDevice8_SetTextureStageState(g_device, 1,
+            D3DTSS_TEXCOORDINDEX, 1));
+    RENDER_CALL("46 stage1 ADD", IDirect3DDevice8_SetTextureStageState(
+            g_device, 1, D3DTSS_COLOROP, D3DTOP_ADD));
+    RENDER_CALL("47 stage1 COLORARG1=CURRENT",
+            IDirect3DDevice8_SetTextureStageState(g_device, 1,
+            D3DTSS_COLORARG1, D3DTA_CURRENT));
+    RENDER_CALL("48 stage1 COLORARG2=TEXTURE",
+            IDirect3DDevice8_SetTextureStageState(g_device, 1,
+            D3DTSS_COLORARG2, D3DTA_TEXTURE));
+    RENDER_CALL("49 stage1 ALPHA SELECT CURRENT",
+            IDirect3DDevice8_SetTextureStageState(g_device, 1,
+            D3DTSS_ALPHAOP, D3DTOP_SELECTARG1));
+    RENDER_CALL("50 stage1 ALPHAARG1=CURRENT",
+            IDirect3DDevice8_SetTextureStageState(g_device, 1,
+            D3DTSS_ALPHAARG1, D3DTA_CURRENT));
+    RENDER_CALL("51 stage1 LINEAR", IDirect3DDevice8_SetTextureStageState(
+            g_device, 1, D3DTSS_MINFILTER, D3DTEXF_LINEAR));
+    RENDER_CALL("52 stage1 CLAMP", IDirect3DDevice8_SetTextureStageState(
+            g_device, 1, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP));
+    set_quad(vertices, 430.0f, 100.0f, 780.0f, 500.0f,
+            0xFFE8F4FFu, 0x00101010u, 1.0f);
+    RENDER_CALL("53 DrawUP TEX2 sprite", IDirect3DDevice8_DrawPrimitiveUP(
+            g_device, D3DPT_TRIANGLELIST, 2, vertices,
+            sizeof(MapleVertex)));
+
+    RENDER_CALL("54 EndScene", IDirect3DDevice8_EndScene(g_device));
+    RENDER_CALL("55 Present", IDirect3DDevice8_Present(g_device,
+            NULL, NULL, NULL, NULL));
+    trace_text("RESULT RENDER PASS: A4/A8 Surface, TEX2, alpha, viewport, DrawUP");
+
+cleanup:
+    if (g_device)
+    {
+        IDirect3DDevice8_SetTexture(g_device, 1, NULL);
+        IDirect3DDevice8_SetTexture(g_device, 0, NULL);
+    }
+    if (base_surface) IDirect3DSurface8_Release(base_surface);
+    if (light_texture) IDirect3DTexture8_Release(light_texture);
+    if (base_texture) IDirect3DTexture8_Release(base_texture);
+#undef RENDER_CALL
+    return hr;
 }
 
 static HRESULT run_gr2d_regression(HWND hwnd)
@@ -436,6 +666,10 @@ static HRESULT run_gr2d_regression(HWND hwnd)
                 (unsigned long)creation_parameters.DeviceType);
         trace_text(line);
     }
+
+    hr = run_render_probe();
+    if (FAILED(hr))
+        return hr;
 
     if (enum_failure_count)
     {

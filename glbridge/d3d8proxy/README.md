@@ -6,7 +6,7 @@ DMA arena. The VGL2 descriptor is only the transport envelope; command
 `0xFFE0` carries a versioned D8WG batch decoded by
 `../d3d8-webgpu/d3d8_executor.js`.
 
-Implemented geometry/lifecycle milestone (D8WG protocol v1.2):
+Implemented Maple 2D/Gr2D milestone (D8WG protocol v1.3):
 
 - adapter enumeration, MapleStory v83 format probes, caps, and `CreateDevice`;
 - `Clear`, `BeginScene`, `EndScene`, and `Present`;
@@ -19,6 +19,23 @@ Implemented geometry/lifecycle milestone (D8WG protocol v1.2):
 - CPU-side conversion of regular and indexed `D3DPT_TRIANGLEFAN` draws into
   WebGPU triangle-list index buffers;
 - `D3DFMT_INDEX16` and `D3DFMT_INDEX32`;
+- Texture/level-Surface COM objects with `LockRect`/`UnlockRect`, subrect
+  uploads, managed shadow storage, `GetSurfaceLevel`, and `UpdateTexture`;
+- `A8R8G8B8`, `X8R8G8B8`, `R5G6B5`, `X1R5G5B5`, `A1R5G5B5`,
+  `A4R4G4B4`, `L8`, and `A8` conversion to sampled RGBA8;
+- DXT1/DXT3/DXT5 CPU decode fallback, including independent mip/subrect
+  uploads;
+- FVF `XYZRHW`, optional `DIFFUSE`/`SPECULAR`, and `TEX1`/`TEX2`, including
+  D3D8 texture-coordinate-size encodings;
+- texture stages 0/1, common color/alpha operations and arguments, texture
+  factor, alpha test, alpha blending, point/linear sampling, wrap/mirror/clamp,
+  and mip-level selection;
+- WebGPU scissor application for the D3D8 viewport;
+- ordered `D3DLOCK_DISCARD` buffer orphaning and `D3DLOCK_NOOVERWRITE`
+  updates for dynamic VB/IB resources;
+- a shared 16 MiB transient upload ring for `Draw*UP`, fan conversion, and
+  ordered buffer/texture staging;
+- bounded LRU caches for pipelines, samplers, uniforms, and bind groups;
 - guest-side suppression of repeated render and texture-stage states;
 - client-area position updates on Win32 move/size/show events, including apps
   that render only one frame;
@@ -27,11 +44,9 @@ Implemented geometry/lifecycle milestone (D8WG protocol v1.2):
 - one main PCI submit at `Present` (extra submits occur only when the DMA arena
   fills or when a window lifecycle event must reach the host immediately).
 
-Texture objects, depth/stencil, state blocks, and programmable shaders are
-intentionally not advertised as implemented yet. Unsupported calls return
-`D3DERR_INVALIDCALL`. UP draws currently use short-lived per-frame WebGPU
-buffers; the Maple Gr2D milestone will replace these allocations with a
-bounded transient ring.
+Depth/stencil rendering, render targets, `CopyRects`, state blocks, transforms,
+lighting/fog, and programmable shaders remain later milestones. Unsupported
+calls return `D3DERR_INVALIDCALL`, and caps stay conservative for those paths.
 
 Build an XP-compatible DLL without a C runtime dependency:
 
@@ -39,23 +54,33 @@ Build an XP-compatible DLL without a C runtime dependency:
 ./glbridge/d3d8proxy/build.sh /private/tmp/d3d8.dll
 ```
 
-Build the XP geometry acceptance test without a C runtime dependency:
+Build all XP Stage 3 acceptance tests without a C runtime dependency:
 
 ```sh
-i686-w64-mingw32-gcc -mwindows -std=gnu99 -Os -s -nostdlib \
-  -Wall -Wextra -Werror \
-  -Wl,--subsystem,windows:5.01 -Wl,-e,_WinMainCRTStartup@0 \
-  -o /private/tmp/d3d8_geometry_test.exe \
-  glbridge/sample/d3d8_geometry_test.c \
-  -ld3d8 -lgdi32 -luser32 -lkernel32
+./glbridge/d3d8proxy/build_stage3_tests.sh /private/tmp/d3d8-stage3-tests
 ```
 
-Place the test beside the new `d3d8.dll`. A pass displays four coloured
-panels and the title `D3D8 geometry PASS`.
+Place the new `d3d8.dll` beside each test. The suite covers geometry,
+texture/format conversion, texture-stage operations, TEX2, dynamic resources,
+mip/filter state, and the rendered Maple Gr2D probe. The Gr2D pass should show
+two clipped sprite panels and a title containing `PASS`.
 
-The v1.2 guest DLL and host executor must be deployed together. The executor
+Host-side protocol/executor tests:
+
+```sh
+node glbridge/tests/d3d8_protocol_consistency_test.js
+node --test glbridge/tests/d3d8_webgpu_executor_test.js
+```
+
+The real-GPU validation page is
+`glbridge/tests/d3d8_webgpu_browser_test.html`; serve the repository over
+localhost and open it in a WebGPU-enabled browser. It reports `PASS` only
+after creating a real textured/alpha/TEX2 pipeline without WebGPU validation
+errors.
+
+The v1.3 guest DLL and host executor must be deployed together. The executor
 rejects a different protocol minor version instead of silently skipping newer
-geometry commands.
+texture or fixed-function commands.
 
 Install the resulting DLL beside the target executable. Use a separate game
 deployment profile that does not contain the custom `opengl32.dll` proxy:

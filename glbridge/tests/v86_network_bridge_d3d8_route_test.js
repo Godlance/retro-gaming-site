@@ -49,7 +49,7 @@ bridge.lastPresentedFrameId = 999;
 const d8wg = Buffer.alloc(32);
 d8wg.writeUInt32LE(0x47573844, 0);
 d8wg.writeUInt16LE(1, 4);
-d8wg.writeUInt16LE(2, 6);
+d8wg.writeUInt16LE(3, 6);
 const envelope = Buffer.alloc(8 + d8wg.length);
 envelope.writeUInt16LE(0xFFE0, 0);
 envelope.writeUInt16LE(0xFFFF, 2);

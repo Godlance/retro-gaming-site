@@ -12,7 +12,7 @@
 
 #define D8WG_MAGIC 0x47573844u /* "D8WG" */
 #define D8WG_VERSION_MAJOR 1u
-#define D8WG_VERSION_MINOR 2u
+#define D8WG_VERSION_MINOR 3u
 
 #define D8WG_BATCH_FLAG_PRESENT (1u << 0)
 
@@ -29,9 +29,13 @@ enum D8WGOpcode {
     D8WG_OP_CREATE_BUFFER = 0x100,
     D8WG_OP_UPDATE_BUFFER = 0x101,
     D8WG_OP_DESTROY_RESOURCE = 0x103,
+    D8WG_OP_CREATE_TEXTURE = 0x110,
+    D8WG_OP_UPDATE_TEXTURE = 0x111,
 
     D8WG_OP_SET_RENDER_STATE = 0x200,
     D8WG_OP_SET_TEXTURE_STAGE_STATE = 0x201,
+    D8WG_OP_SET_TEXTURE = 0x202,
+    D8WG_OP_SET_VIEWPORT = 0x203,
     D8WG_OP_SET_STREAM_SOURCE = 0x208,
     D8WG_OP_SET_INDICES = 0x209,
     D8WG_OP_SET_VERTEX_FORMAT = 0x20A,
@@ -44,6 +48,7 @@ enum D8WGOpcode {
 
 #define D8WG_RESOURCE_BUFFER_VERTEX 1u
 #define D8WG_RESOURCE_BUFFER_INDEX 2u
+#define D8WG_RESOURCE_TEXTURE_2D 3u
 
 #pragma pack(push, 1)
 typedef struct D8WGBatchHeader {
@@ -131,7 +136,33 @@ typedef struct D8WGUpdateBuffer {
     uint32_t destination_offset;
     uint32_t byte_count;
     uint32_t data_offset;
+    uint32_t lock_flags;
+    uint32_t reserved;
 } D8WGUpdateBuffer;
+
+typedef struct D8WGCreateTexture {
+    uint32_t device_handle;
+    uint32_t resource_handle;
+    uint32_t width;
+    uint32_t height;
+    uint32_t level_count;
+    uint32_t format;
+    uint32_t usage;
+    uint32_t pool;
+} D8WGCreateTexture;
+
+typedef struct D8WGUpdateTexture {
+    uint32_t resource_handle;
+    uint32_t level;
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t row_pitch;
+    uint32_t data_bytes;
+    uint32_t data_offset;
+    uint32_t reserved;
+} D8WGUpdateTexture;
 
 typedef struct D8WGDestroyResource {
     uint32_t resource_handle;
@@ -151,6 +182,24 @@ typedef struct D8WGSetTextureStageState {
     uint32_t state;
     uint32_t value;
 } D8WGSetTextureStageState;
+
+typedef struct D8WGSetTexture {
+    uint32_t device_handle;
+    uint32_t stage;
+    uint32_t texture_handle;
+    uint32_t reserved;
+} D8WGSetTexture;
+
+typedef struct D8WGSetViewport {
+    uint32_t device_handle;
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+    float min_z;
+    float max_z;
+    uint32_t reserved;
+} D8WGSetViewport;
 
 typedef struct D8WGSetStreamSource {
     uint32_t device_handle;
@@ -226,6 +275,16 @@ typedef char D8WGAssertUpdateSurfaceSize[
         sizeof(D8WGUpdateSurface) == 24 ? 1 : -1];
 typedef char D8WGAssertCreateBufferSize[
         sizeof(D8WGCreateBuffer) == 32 ? 1 : -1];
+typedef char D8WGAssertUpdateBufferSize[
+        sizeof(D8WGUpdateBuffer) == 24 ? 1 : -1];
+typedef char D8WGAssertCreateTextureSize[
+        sizeof(D8WGCreateTexture) == 32 ? 1 : -1];
+typedef char D8WGAssertUpdateTextureSize[
+        sizeof(D8WGUpdateTexture) == 40 ? 1 : -1];
+typedef char D8WGAssertSetTextureSize[
+        sizeof(D8WGSetTexture) == 16 ? 1 : -1];
+typedef char D8WGAssertSetViewportSize[
+        sizeof(D8WGSetViewport) == 32 ? 1 : -1];
 typedef char D8WGAssertSetIndicesSize[
         sizeof(D8WGSetIndices) == 16 ? 1 : -1];
 typedef char D8WGAssertDrawIndexedPrimitiveSize[
