@@ -255,7 +255,8 @@ emcc gl4es_bridge.c \
     "_v86gl_glDrawArraysPackedGL2",
     "_v86gl_glDrawElementsPackedGL2",
     "_v86gl_glDrawArraysPackedBlob",
-    "_v86gl_glDrawElementsPackedBlob"
+    "_v86gl_glDrawElementsPackedBlob",
+    "_v86gl_execute_batch"
   ]' \
   -o gl4es.js
 

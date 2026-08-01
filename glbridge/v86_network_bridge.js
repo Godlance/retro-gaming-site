@@ -6,7 +6,7 @@
 (function(global) {
     "use strict";
 
-    const V86GL_BRIDGE_VERSION = "d3d8-fbo-allocation-trace-v5-20260726-packed-arena-v1-packed-blob-v1";
+    const V86GL_BRIDGE_VERSION = "d3d8-fbo-allocation-trace-v5-20260726-packed-arena-v1-packed-blob-v1-wasm-batch-v1";
     global.V86GL_BRIDGE_VERSION = V86GL_BRIDGE_VERSION;
     console.info("[v86gl] bridge version", V86GL_BRIDGE_VERSION);
 
@@ -33,6 +33,13 @@
     const V86GL_CTRL_DESTROY_CONTEXT = 0xFFF2;
     const V86GL_CTRL_TEST_TRACE = 0xFFF3;
     const V86GL_EXTENDED_RECORD_SIZE = 0xFFFF;
+    const DEFAULT_WASM_BATCH_ARENA_INITIAL_BYTES = 1024 * 1024;
+    const DEFAULT_WASM_BATCH_ARENA_MAX_BYTES = 64 * 1024 * 1024;
+    const V86GL_WASM_BATCH_RESULT_BYTES = 16;
+    const V86GL_WASM_BATCH_STATUS_COMPLETE = 0;
+    const V86GL_WASM_BATCH_STATUS_UNSUPPORTED = 1;
+    const V86GL_WASM_BATCH_STATUS_MALFORMED = 2;
+    const V86GL_WASM_BATCH_STATUS_REJECTED = 3;
     const V86GL_TEST_TRACE_PHASE_CALLING = 1;
     const V86GL_TEST_TRACE_PHASE_RETURNED = 2;
     const V86GL_TEST_TRACE_PHASE_PASS = 3;
@@ -696,6 +703,23 @@
                 attachments: Object.create(null),
             });
             this.framebufferHistory = [];
+            const configuredBatchInitialBytes =
+                Number(this.options.wasmBatchInitialBytes);
+            const configuredBatchMaxBytes =
+                Number(this.options.wasmBatchMaxBytes);
+            this.wasmBatchInitialBytes = Number.isFinite(
+                configuredBatchInitialBytes) && configuredBatchInitialBytes > 0 ?
+                Math.floor(configuredBatchInitialBytes) :
+                DEFAULT_WASM_BATCH_ARENA_INITIAL_BYTES;
+            this.wasmBatchMaxBytes = Number.isFinite(
+                configuredBatchMaxBytes) && configuredBatchMaxBytes > 0 ?
+                Math.floor(configuredBatchMaxBytes) :
+                DEFAULT_WASM_BATCH_ARENA_MAX_BYTES;
+            this.wasmBatchMaxBytes = Math.max(
+                this.wasmBatchInitialBytes, this.wasmBatchMaxBytes);
+            this.wasmBatchArenaPtr = 0;
+            this.wasmBatchArenaCapacity = 0;
+            this.wasmBatchDecoder = undefined;
             const configuredInitialArenaBytes =
                 Number(this.options.packedArenaInitialBytes);
             const configuredMaxArenaBytes =
@@ -1275,6 +1299,167 @@
             } finally {
                 this.packedArenaOffset = 0;
                 this.packedArenaActive = false;
+            }
+        }
+
+        resolveWasmBatchDecoder() {
+            if (this.wasmBatchDecoder !== undefined) {
+                return this.wasmBatchDecoder;
+            }
+            const module = this.module;
+            const fn = module && (
+                module._v86gl_execute_batch ||
+                module.v86gl_execute_batch);
+            this.wasmBatchDecoder = typeof fn === "function" ? fn : null;
+            return this.wasmBatchDecoder;
+        }
+
+        alignWasmBatchArena(value) {
+            if (!Number.isSafeInteger(value) || value < 0) {
+                return -1;
+            }
+            return Math.ceil(value / 16) * 16;
+        }
+
+        ensureWasmBatchArena(requiredBytes) {
+            requiredBytes = this.alignWasmBatchArena(requiredBytes);
+            if (requiredBytes <= 0 || requiredBytes > this.wasmBatchMaxBytes) {
+                return false;
+            }
+            if (this.wasmBatchArenaPtr &&
+                    this.wasmBatchArenaCapacity >= requiredBytes) {
+                return true;
+            }
+
+            let capacity = this.alignWasmBatchArena(Math.max(
+                this.wasmBatchInitialBytes,
+                this.wasmBatchArenaCapacity || 0));
+            while (capacity > 0 && capacity < requiredBytes) {
+                const next = Math.min(
+                    this.wasmBatchMaxBytes,
+                    Math.max(requiredBytes, capacity * 2));
+                if (next <= capacity) {
+                    return false;
+                }
+                capacity = this.alignWasmBatchArena(next);
+            }
+            if (capacity <= 0) {
+                return false;
+            }
+
+            const ptr = this.malloc(capacity);
+            const heap = this.heapU8();
+            if (!ptr || !heap || ptr + capacity > heap.length) {
+                this.free(ptr);
+                return false;
+            }
+
+            const oldPtr = this.wasmBatchArenaPtr;
+            this.wasmBatchArenaPtr = ptr;
+            this.wasmBatchArenaCapacity = capacity;
+            this.free(oldPtr);
+            return true;
+        }
+
+        prepareWasmBatch(bytes) {
+            const decoder = this.resolveWasmBatchDecoder();
+            if (!decoder || !bytes || !bytes.length) {
+                return null;
+            }
+            const resultOffset = this.alignWasmBatchArena(bytes.length);
+            if (resultOffset < 0) {
+                return null;
+            }
+            const requiredBytes = resultOffset + V86GL_WASM_BATCH_RESULT_BYTES;
+            if (!this.ensureWasmBatchArena(requiredBytes)) {
+                return null;
+            }
+            const dataPtr = this.wasmBatchArenaPtr >>> 0;
+            const resultPtr = (dataPtr + resultOffset) >>> 0;
+            const heap = this.heapU8();
+            if (!heap || resultPtr + V86GL_WASM_BATCH_RESULT_BYTES > heap.length) {
+                return null;
+            }
+            heap.set(bytes, dataPtr);
+            return { decoder, dataPtr, resultPtr, byteLength: bytes.length };
+        }
+
+        executeWasmBatchRange(batch, offset) {
+            if (!batch || offset < 0 || offset >= batch.byteLength) {
+                return null;
+            }
+            let heap = this.heapU8();
+            if (!heap || batch.resultPtr + V86GL_WASM_BATCH_RESULT_BYTES >
+                    heap.length) {
+                return null;
+            }
+            heap.fill(0, batch.resultPtr,
+                batch.resultPtr + V86GL_WASM_BATCH_RESULT_BYTES);
+            let ok = 0;
+            try {
+                ok = batch.decoder.call(this.module,
+                    batch.dataPtr + offset,
+                    batch.byteLength - offset,
+                    batch.resultPtr);
+            } catch (err) {
+                console.error("[v86gl] WASM batch decoder threw", err);
+                this.wasmBatchDecoder = null;
+                return null;
+            }
+            heap = this.heapU8();
+            if (!heap || batch.resultPtr + V86GL_WASM_BATCH_RESULT_BYTES >
+                    heap.length) {
+                return null;
+            }
+            return {
+                ok: ok !== 0,
+                consumedBytes: u32(heap, batch.resultPtr),
+                commandCount: u32(heap, batch.resultPtr + 4),
+                stopFunction: u32(heap, batch.resultPtr + 8),
+                status: u32(heap, batch.resultPtr + 12),
+            };
+        }
+
+        observeWasmBatchCommand(fn, p) {
+            switch (fn) {
+            case GLFN_MATRIX_MODE:
+                if (p.length >= 4) this.matrixMode = u32(p, 0);
+                break;
+            case GLFN_ACTIVE_TEXTURE:
+                if (p.length >= 4) this.activeTexture = u32(p, 0);
+                break;
+            case GLFN_CLIENT_ACTIVE_TEXTURE:
+                if (p.length >= 4) this.clientActiveTexture = u32(p, 0);
+                break;
+            case GLFN_BIND_TEXTURE:
+                if (p.length >= 8) {
+                    this.noteTextureBind(u32(p, 0), u32(p, 4));
+                }
+                break;
+            case GLFN_CLEAR:
+                if (p.length >= 4) {
+                    const state = this.framebufferBufferState(
+                        this.boundDrawFramebuffer);
+                    this.recordFramebufferEvent("clear", {
+                        mask: "0x" + u32(p, 0).toString(16),
+                        drawBuffers: state.drawBuffers.map(
+                            buffer => "0x" + buffer.toString(16)),
+                    });
+                }
+                break;
+            case GLFN_DRAW_ARRAYS:
+            case GLFN_DRAW_ELEMENTS:
+            case GLFN_DRAW_ARRAYS_GL2:
+            case GLFN_DRAW_ELEMENTS_GL2:
+            case GLFN_DRAW_ARRAYS_DIRECT:
+            case GLFN_DRAW_ELEMENTS_DIRECT:
+            case GLFN_DRAW_RANGE_ELEMENTS_DIRECT:
+                this.lastDrawFramebuffer =
+                    this.boundDrawFramebuffer >>> 0;
+                if (typeof this.notePackedBlobDraw === "function") {
+                    this.notePackedBlobDraw("WasmBatch");
+                }
+                break;
             }
         }
 
@@ -3769,6 +3954,11 @@
             this.packedArenaOffset = 0;
             this.packedArenaActive = false;
             this.free(packedArenaPtr);
+            const wasmBatchArenaPtr = this.wasmBatchArenaPtr;
+            this.wasmBatchArenaPtr = 0;
+            this.wasmBatchArenaCapacity = 0;
+            this.wasmBatchDecoder = null;
+            this.free(wasmBatchArenaPtr);
             this.module = null;
             return destroyed;
         }
@@ -5067,32 +5257,102 @@
             return true;
         }
 
+        observeWasmBatchRecords(p, start, end, renderer,
+                                commandFrameId) {
+            let offset = start;
+            let commands = 0;
+            while (offset + 4 <= end) {
+                const fn = u16(p, offset);
+                let size = u16(p, offset + 2);
+                offset += 4;
+                if (size === V86GL_EXTENDED_RECORD_SIZE) {
+                    if (offset + 4 > end) return -1;
+                    size = u32(p, offset);
+                    offset += 4;
+                }
+                if (offset + size > end) return -1;
+                const args = p.subarray(offset, offset + size);
+                offset += size;
+                commands++;
+                this.noteDrawableFunction(fn, commandFrameId);
+                renderer.observeWasmBatchCommand(fn, args);
+                this.recordStateCall(fn, args);
+            }
+            return offset === end ? commands : -1;
+        }
+
         executeGLCommands(p, source, frameId) {
             let offset = 0;
             let commands = 0;
             const renderer = this.requireRenderer();
             const commandFrameId = frameId ? frameId >>> 0 : 0;
+            const useWasmBatch = !this.options ||
+                this.options.enableWasmBatchDecoder !== false;
+            const wasmBatch = useWasmBatch ? renderer.prepareWasmBatch(p) : null;
 
-            while (offset + 4 <= p.length) {
+            while (offset < p.length) {
+                if (wasmBatch && offset + 4 <= p.length) {
+                    const result = renderer.executeWasmBatchRange(
+                        wasmBatch, offset);
+                    if (result && result.ok && result.consumedBytes > 0 &&
+                            result.consumedBytes <= p.length - offset) {
+                        const end = offset + result.consumedBytes;
+                        const observed = this.observeWasmBatchRecords(
+                            p, offset, end, renderer, commandFrameId);
+                        if (observed < 0 ||
+                                observed !== (result.commandCount >>> 0)) {
+                            console.error(
+                                "[v86gl] WASM batch observation mismatch", {
+                                    source: source || "",
+                                    offset,
+                                    consumedBytes: result.consumedBytes,
+                                    wasmCommands: result.commandCount >>> 0,
+                                    observedCommands: observed,
+                                });
+                            break;
+                        }
+                        offset = end;
+                        commands += observed;
+                        continue;
+                    }
+                    if (result &&
+                            result.status ===
+                                V86GL_WASM_BATCH_STATUS_MALFORMED &&
+                            result.consumedBytes === 0) {
+                        console.warn("[v86gl] malformed WASM GL batch", {
+                            source: source || "",
+                            offset,
+                            stopFunction: result.stopFunction >>> 0,
+                        });
+                        break;
+                    }
+                    /* Unsupported/rejected records intentionally fall through
+                     * to the established JavaScript dispatcher for one call. */
+                }
+
+                if (offset + 4 > p.length) {
+                    console.warn("[v86gl] truncated GL frame header",
+                        p.length - offset);
+                    break;
+                }
                 const fn = u16(p, offset);
                 let size = u16(p, offset + 2);
                 offset += 4;
-
                 if (size === V86GL_EXTENDED_RECORD_SIZE) {
                     if (offset + 4 > p.length) {
-                        console.warn("[v86gl] truncated extended GL frame command", fn, p.length - offset);
+                        console.warn(
+                            "[v86gl] truncated extended GL frame command",
+                            fn, p.length - offset);
                         break;
                     }
-
                     size = u32(p, offset);
                     offset += 4;
                 }
-
                 if (offset + size > p.length) {
-                    console.warn("[v86gl] truncated GL frame command", fn, size, p.length - offset);
+                    console.warn("[v86gl] truncated GL frame command",
+                        fn, size, p.length - offset);
                     break;
                 }
-
                 const args = p.subarray(offset, offset + size);
                 offset += size;
                 commands++;
@@ -5101,26 +5361,21 @@
                     this.makeCurrent(args);
                     continue;
                 }
-
                 if (fn === V86GL_CTRL_RELEASE_CURRENT) {
                     this.releaseCurrent();
                     continue;
                 }
-
                 if (fn === V86GL_CTRL_DESTROY_CONTEXT) {
                     this.destroyContext();
                     continue;
                 }
-
                 if (fn === V86GL_CTRL_TEST_TRACE) {
                     this.handleGuestTestTrace(args, source, commandFrameId);
                     continue;
                 }
-
                 this.noteDrawableFunction(fn, commandFrameId);
                 this.callRenderer(fn, args);
             }
-
             return commands;
         }
 

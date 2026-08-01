@@ -6797,3 +6797,279 @@ int v86gl_glDrawElementsPackedBlob(const uint8_t* blob, uint32_t blob_size,
     return 1;
 }
 
+
+/* Hybrid asynchronous GL command batch decoder. */
+#define V86GL_WASM_BATCH_EXTENDED_SIZE 0xFFFFu
+#define V86GL_WASM_BATCH_STATUS_COMPLETE 0u
+#define V86GL_WASM_BATCH_STATUS_UNSUPPORTED 1u
+#define V86GL_WASM_BATCH_STATUS_MALFORMED 2u
+#define V86GL_WASM_BATCH_STATUS_REJECTED 3u
+
+static uint16_t v86gl_wasm_batch_u16(const uint8_t* p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+static uint32_t v86gl_wasm_batch_u32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+        ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static int32_t v86gl_wasm_batch_i32(const uint8_t* p) {
+    return (int32_t)v86gl_wasm_batch_u32(p);
+}
+static float v86gl_wasm_batch_f32(const uint8_t* p) {
+    uint32_t bits = v86gl_wasm_batch_u32(p);
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+static double v86gl_wasm_batch_f64(const uint8_t* p) {
+    uint64_t bits = (uint64_t)p[0] | ((uint64_t)p[1] << 8) |
+        ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+        ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+        ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+    double value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+static void v86gl_wasm_batch_write_u32(uint8_t* p, uint32_t value) {
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+    p[2] = (uint8_t)(value >> 16);
+    p[3] = (uint8_t)(value >> 24);
+}
+
+#define V86GL_WASM_BATCH_NEED(n) \
+    do { if (size < (uint32_t)(n)) return -1; } while (0)
+
+static int v86gl_wasm_batch_dispatch(uint16_t fn, const uint8_t* p,
+                                     uint32_t size) {
+    GLfloat matrix[16];
+    switch (fn) {
+    case 1: V86GL_WASM_BATCH_NEED(16); v86gl_glViewport(
+        v86gl_wasm_batch_i32(p), v86gl_wasm_batch_i32(p + 4),
+        v86gl_wasm_batch_i32(p + 8), v86gl_wasm_batch_i32(p + 12)); return 1;
+    case 2: V86GL_WASM_BATCH_NEED(16); v86gl_glClearColor(
+        v86gl_wasm_batch_f32(p), v86gl_wasm_batch_f32(p + 4),
+        v86gl_wasm_batch_f32(p + 8), v86gl_wasm_batch_f32(p + 12)); return 1;
+    case 3: V86GL_WASM_BATCH_NEED(4); v86gl_glClear(v86gl_wasm_batch_u32(p)); return 1;
+    case 4: V86GL_WASM_BATCH_NEED(4); v86gl_glBegin(v86gl_wasm_batch_u32(p)); return 1;
+    case 5: v86gl_glEnd(); return 1;
+    case 6: V86GL_WASM_BATCH_NEED(16); v86gl_glColor4f(
+        v86gl_wasm_batch_f32(p), v86gl_wasm_batch_f32(p + 4),
+        v86gl_wasm_batch_f32(p + 8), v86gl_wasm_batch_f32(p + 12)); return 1;
+    case 7: V86GL_WASM_BATCH_NEED(12); v86gl_glVertex3f(
+        v86gl_wasm_batch_f32(p), v86gl_wasm_batch_f32(p + 4),
+        v86gl_wasm_batch_f32(p + 8)); return 1;
+    case 8: v86gl_glFlush(); return 1;
+    case 10: V86GL_WASM_BATCH_NEED(4); v86gl_glMatrixMode(v86gl_wasm_batch_u32(p)); return 1;
+    case 11: v86gl_glLoadIdentity(); return 1;
+    case 12: V86GL_WASM_BATCH_NEED(48); v86gl_glFrustum(
+        v86gl_wasm_batch_f64(p), v86gl_wasm_batch_f64(p + 8),
+        v86gl_wasm_batch_f64(p + 16), v86gl_wasm_batch_f64(p + 24),
+        v86gl_wasm_batch_f64(p + 32), v86gl_wasm_batch_f64(p + 40)); return 1;
+    case 13: V86GL_WASM_BATCH_NEED(48); v86gl_glOrtho(
+        v86gl_wasm_batch_f64(p), v86gl_wasm_batch_f64(p + 8),
+        v86gl_wasm_batch_f64(p + 16), v86gl_wasm_batch_f64(p + 24),
+        v86gl_wasm_batch_f64(p + 32), v86gl_wasm_batch_f64(p + 40)); return 1;
+    case 14: V86GL_WASM_BATCH_NEED(12); v86gl_glTranslatef(
+        v86gl_wasm_batch_f32(p), v86gl_wasm_batch_f32(p + 4),
+        v86gl_wasm_batch_f32(p + 8)); return 1;
+    case 15: V86GL_WASM_BATCH_NEED(16); v86gl_glRotatef(
+        v86gl_wasm_batch_f32(p), v86gl_wasm_batch_f32(p + 4),
+        v86gl_wasm_batch_f32(p + 8), v86gl_wasm_batch_f32(p + 12)); return 1;
+    case 16: V86GL_WASM_BATCH_NEED(12); v86gl_glScalef(
+        v86gl_wasm_batch_f32(p), v86gl_wasm_batch_f32(p + 4),
+        v86gl_wasm_batch_f32(p + 8)); return 1;
+    case 17: v86gl_glPushMatrix(); return 1;
+    case 18: v86gl_glPopMatrix(); return 1;
+    case 19: V86GL_WASM_BATCH_NEED(4); v86gl_glEnable(v86gl_wasm_batch_u32(p)); return 1;
+    case 20: V86GL_WASM_BATCH_NEED(4); v86gl_glDisable(v86gl_wasm_batch_u32(p)); return 1;
+    case 21: V86GL_WASM_BATCH_NEED(4); v86gl_glDepthFunc(v86gl_wasm_batch_u32(p)); return 1;
+    case 22: V86GL_WASM_BATCH_NEED(8); v86gl_glClearDepth(v86gl_wasm_batch_f64(p)); return 1;
+    case 23: V86GL_WASM_BATCH_NEED(4); v86gl_glShadeModel(v86gl_wasm_batch_u32(p)); return 1;
+    case 24: V86GL_WASM_BATCH_NEED(4); v86gl_glCullFace(v86gl_wasm_batch_u32(p)); return 1;
+    case 25: V86GL_WASM_BATCH_NEED(4); v86gl_glFrontFace(v86gl_wasm_batch_u32(p)); return 1;
+    case 28: V86GL_WASM_BATCH_NEED(8); v86gl_glBindTexture(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4)); return 1;
+    case 31: V86GL_WASM_BATCH_NEED(12); v86gl_glTexParameteri(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4),
+        v86gl_wasm_batch_i32(p + 8)); return 1;
+    case 32: V86GL_WASM_BATCH_NEED(12); v86gl_glTexParameterf(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4),
+        v86gl_wasm_batch_f32(p + 8)); return 1;
+    case 33: V86GL_WASM_BATCH_NEED(8); v86gl_glPixelStorei(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_i32(p + 4)); return 1;
+    case 34: V86GL_WASM_BATCH_NEED(12); v86gl_glTexEnvi(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4),
+        v86gl_wasm_batch_i32(p + 8)); return 1;
+    case 35: V86GL_WASM_BATCH_NEED(12); v86gl_glTexEnvf(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4),
+        v86gl_wasm_batch_f32(p + 8)); return 1;
+    case 36: V86GL_WASM_BATCH_NEED(8); v86gl_glTexCoord2f(
+        v86gl_wasm_batch_f32(p), v86gl_wasm_batch_f32(p + 4)); return 1;
+    case 37: V86GL_WASM_BATCH_NEED(4); v86gl_glEnableClientState(v86gl_wasm_batch_u32(p)); return 1;
+    case 38: V86GL_WASM_BATCH_NEED(4); v86gl_glDisableClientState(v86gl_wasm_batch_u32(p)); return 1;
+    case 39: return v86gl_glDrawArraysPackedBlob(p, size, 0u) ? 1 : -1;
+    case 40: return v86gl_glDrawElementsPackedBlob(p, size, 0u) ? 1 : -1;
+    case 41: V86GL_WASM_BATCH_NEED(8); v86gl_glBlendFunc(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4)); return 1;
+    case 42: V86GL_WASM_BATCH_NEED(8); v86gl_glAlphaFunc(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_f32(p + 4)); return 1;
+    case 43: V86GL_WASM_BATCH_NEED(4); v86gl_glDepthMask((GLboolean)v86gl_wasm_batch_u32(p)); return 1;
+    case 44: V86GL_WASM_BATCH_NEED(16); v86gl_glColorMask(
+        (GLboolean)v86gl_wasm_batch_u32(p), (GLboolean)v86gl_wasm_batch_u32(p + 4),
+        (GLboolean)v86gl_wasm_batch_u32(p + 8), (GLboolean)v86gl_wasm_batch_u32(p + 12)); return 1;
+    case 45: V86GL_WASM_BATCH_NEED(16); v86gl_glScissor(
+        v86gl_wasm_batch_i32(p), v86gl_wasm_batch_i32(p + 4),
+        v86gl_wasm_batch_i32(p + 8), v86gl_wasm_batch_i32(p + 12)); return 1;
+    case 46: V86GL_WASM_BATCH_NEED(4); v86gl_glLineWidth(v86gl_wasm_batch_f32(p)); return 1;
+    case 47: V86GL_WASM_BATCH_NEED(8); v86gl_glPolygonMode(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4)); return 1;
+    case 48: V86GL_WASM_BATCH_NEED(4); v86gl_glActiveTexture(v86gl_wasm_batch_u32(p)); return 1;
+    case 49: V86GL_WASM_BATCH_NEED(4); v86gl_glClientActiveTexture(v86gl_wasm_batch_u32(p)); return 1;
+    case 51: V86GL_WASM_BATCH_NEED(12); v86gl_glNormal3f(
+        v86gl_wasm_batch_f32(p), v86gl_wasm_batch_f32(p + 4),
+        v86gl_wasm_batch_f32(p + 8)); return 1;
+    case 52: V86GL_WASM_BATCH_NEED(8); v86gl_glFogf(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_f32(p + 4)); return 1;
+    case 53: V86GL_WASM_BATCH_NEED(8); v86gl_glFogi(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_i32(p + 4)); return 1;
+    case 69: V86GL_WASM_BATCH_NEED(64); memcpy(matrix, p, sizeof(matrix));
+        v86gl_glLoadMatrixf(matrix); return 1;
+    case 70: V86GL_WASM_BATCH_NEED(64); memcpy(matrix, p, sizeof(matrix));
+        v86gl_glMultMatrixf(matrix); return 1;
+    case 71: V86GL_WASM_BATCH_NEED(16); v86gl_glDepthRange(
+        v86gl_wasm_batch_f64(p), v86gl_wasm_batch_f64(p + 8)); return 1;
+    case 72: V86GL_WASM_BATCH_NEED(4); v86gl_glClearStencil(v86gl_wasm_batch_i32(p)); return 1;
+    case 73: V86GL_WASM_BATCH_NEED(12); v86gl_glStencilFunc(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_i32(p + 4),
+        v86gl_wasm_batch_u32(p + 8)); return 1;
+    case 74: V86GL_WASM_BATCH_NEED(4); v86gl_glStencilMask(v86gl_wasm_batch_u32(p)); return 1;
+    case 75: V86GL_WASM_BATCH_NEED(12); v86gl_glStencilOp(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4),
+        v86gl_wasm_batch_u32(p + 8)); return 1;
+    case 76: V86GL_WASM_BATCH_NEED(8); v86gl_glHint(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4)); return 1;
+    case 77: V86GL_WASM_BATCH_NEED(8); v86gl_glPolygonOffset(
+        v86gl_wasm_batch_f32(p), v86gl_wasm_batch_f32(p + 4)); return 1;
+    case 95: V86GL_WASM_BATCH_NEED(16); v86gl_glBlendColor(
+        v86gl_wasm_batch_f32(p), v86gl_wasm_batch_f32(p + 4),
+        v86gl_wasm_batch_f32(p + 8), v86gl_wasm_batch_f32(p + 12)); return 1;
+    case 96: V86GL_WASM_BATCH_NEED(4); v86gl_glBlendEquation(v86gl_wasm_batch_u32(p)); return 1;
+    case 97: V86GL_WASM_BATCH_NEED(16); v86gl_glBlendFuncSeparate(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4),
+        v86gl_wasm_batch_u32(p + 8), v86gl_wasm_batch_u32(p + 12)); return 1;
+    case 98: V86GL_WASM_BATCH_NEED(8); v86gl_glSampleCoverage(
+        v86gl_wasm_batch_f32(p), (GLboolean)v86gl_wasm_batch_u32(p + 4)); return 1;
+    case 115: V86GL_WASM_BATCH_NEED(4); v86gl_glPointSize(v86gl_wasm_batch_f32(p)); return 1;
+    case 137: V86GL_WASM_BATCH_NEED(8); v86gl_glBlendEquationSeparate(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4)); return 1;
+    case 139: V86GL_WASM_BATCH_NEED(16); v86gl_glStencilOpSeparate(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4),
+        v86gl_wasm_batch_u32(p + 8), v86gl_wasm_batch_u32(p + 12)); return 1;
+    case 140: V86GL_WASM_BATCH_NEED(16); v86gl_glStencilFuncSeparate(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4),
+        v86gl_wasm_batch_i32(p + 8), v86gl_wasm_batch_u32(p + 12)); return 1;
+    case 141: V86GL_WASM_BATCH_NEED(8); v86gl_glStencilMaskSeparate(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4)); return 1;
+    case 162: return v86gl_glDrawArraysPackedBlob(
+        p, size, V86GL_PACKED_BLOB_LAYOUT_GL2) ? 1 : -1;
+    case 163: return v86gl_glDrawElementsPackedBlob(
+        p, size, V86GL_PACKED_BLOB_LAYOUT_GL2) ? 1 : -1;
+    case 196: V86GL_WASM_BATCH_NEED(8); v86gl_glBindBufferMapped(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4)); return 1;
+    case 199: V86GL_WASM_BATCH_NEED(16); v86gl_glVertexPointerVBO(
+        v86gl_wasm_batch_i32(p), v86gl_wasm_batch_u32(p + 4),
+        v86gl_wasm_batch_i32(p + 8), (uintptr_t)v86gl_wasm_batch_u32(p + 12)); return 1;
+    case 200: V86GL_WASM_BATCH_NEED(16); v86gl_glColorPointerVBO(
+        v86gl_wasm_batch_i32(p), v86gl_wasm_batch_u32(p + 4),
+        v86gl_wasm_batch_i32(p + 8), (uintptr_t)v86gl_wasm_batch_u32(p + 12)); return 1;
+    case 201: V86GL_WASM_BATCH_NEED(16); v86gl_glTexCoordPointerVBO(
+        v86gl_wasm_batch_i32(p), v86gl_wasm_batch_u32(p + 4),
+        v86gl_wasm_batch_i32(p + 8), (uintptr_t)v86gl_wasm_batch_u32(p + 12)); return 1;
+    case 202: V86GL_WASM_BATCH_NEED(16); v86gl_glNormalPointerVBO(
+        v86gl_wasm_batch_i32(p), v86gl_wasm_batch_u32(p + 4),
+        v86gl_wasm_batch_i32(p + 8), (uintptr_t)v86gl_wasm_batch_u32(p + 12)); return 1;
+    case 205: V86GL_WASM_BATCH_NEED(24); v86gl_glVertexAttribPointerMapped(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_i32(p + 4),
+        v86gl_wasm_batch_u32(p + 8), (GLboolean)v86gl_wasm_batch_u32(p + 12),
+        v86gl_wasm_batch_i32(p + 16), (uintptr_t)v86gl_wasm_batch_u32(p + 20)); return 1;
+    case 206: V86GL_WASM_BATCH_NEED(12); v86gl_glDrawArraysDirect(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_i32(p + 4),
+        v86gl_wasm_batch_i32(p + 8)); return 1;
+    case 207: V86GL_WASM_BATCH_NEED(24); v86gl_glDrawElementsDirect(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4),
+        v86gl_wasm_batch_u32(p + 8), v86gl_wasm_batch_i32(p + 12),
+        v86gl_wasm_batch_u32(p + 16), (uintptr_t)v86gl_wasm_batch_u32(p + 20)); return 1;
+    case 208: V86GL_WASM_BATCH_NEED(24); v86gl_glDrawRangeElementsDirect(
+        v86gl_wasm_batch_u32(p), v86gl_wasm_batch_u32(p + 4),
+        v86gl_wasm_batch_u32(p + 8), v86gl_wasm_batch_i32(p + 12),
+        v86gl_wasm_batch_u32(p + 16), (uintptr_t)v86gl_wasm_batch_u32(p + 20)); return 1;
+    default: return 0;
+    }
+}
+#undef V86GL_WASM_BATCH_NEED
+
+EMSCRIPTEN_KEEPALIVE
+int v86gl_execute_batch(const uint8_t* data, uint32_t data_size,
+                         uint8_t* result) {
+    uint32_t offset = 0;
+    uint32_t commands = 0;
+    uint32_t stop_fn = 0;
+    uint32_t status = V86GL_WASM_BATCH_STATUS_COMPLETE;
+    if (!data || !result) return 0;
+
+    while (offset < data_size) {
+        uint32_t record_start = offset;
+        uint32_t payload_size;
+        uint32_t header_size = 4u;
+        uint16_t fn;
+        int dispatched;
+
+        if (data_size - offset < 4u) {
+            status = V86GL_WASM_BATCH_STATUS_MALFORMED;
+            break;
+        }
+        fn = v86gl_wasm_batch_u16(data + offset);
+        payload_size = v86gl_wasm_batch_u16(data + offset + 2u);
+        offset += 4u;
+        if (payload_size == V86GL_WASM_BATCH_EXTENDED_SIZE) {
+            if (data_size - offset < 4u) {
+                offset = record_start;
+                stop_fn = fn;
+                status = V86GL_WASM_BATCH_STATUS_MALFORMED;
+                break;
+            }
+            payload_size = v86gl_wasm_batch_u32(data + offset);
+            offset += 4u;
+            header_size = 8u;
+        }
+        if (payload_size > data_size - offset) {
+            offset = record_start;
+            stop_fn = fn;
+            status = V86GL_WASM_BATCH_STATUS_MALFORMED;
+            break;
+        }
+        dispatched = v86gl_wasm_batch_dispatch(fn, data + offset, payload_size);
+        if (dispatched == 0) {
+            offset = record_start;
+            stop_fn = fn;
+            status = V86GL_WASM_BATCH_STATUS_UNSUPPORTED;
+            break;
+        }
+        if (dispatched < 0) {
+            offset = record_start;
+            stop_fn = fn;
+            status = V86GL_WASM_BATCH_STATUS_REJECTED;
+            break;
+        }
+        offset = record_start + header_size + payload_size;
+        commands++;
+    }
+
+    v86gl_wasm_batch_write_u32(result, offset);
+    v86gl_wasm_batch_write_u32(result + 4, commands);
+    v86gl_wasm_batch_write_u32(result + 8, stop_fn);
+    v86gl_wasm_batch_write_u32(result + 12, status);
+    return 1;
+}
+
