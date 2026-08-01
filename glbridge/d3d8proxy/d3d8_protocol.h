@@ -12,7 +12,7 @@
 
 #define D8WG_MAGIC 0x47573844u /* "D8WG" */
 #define D8WG_VERSION_MAJOR 1u
-#define D8WG_VERSION_MINOR 3u
+#define D8WG_VERSION_MINOR 4u
 
 #define D8WG_BATCH_FLAG_PRESENT (1u << 0)
 
@@ -36,6 +36,10 @@ enum D8WGOpcode {
     D8WG_OP_SET_TEXTURE_STAGE_STATE = 0x201,
     D8WG_OP_SET_TEXTURE = 0x202,
     D8WG_OP_SET_VIEWPORT = 0x203,
+    D8WG_OP_SET_TRANSFORM = 0x204,
+    D8WG_OP_SET_MATERIAL = 0x205,
+    D8WG_OP_SET_LIGHT = 0x206,
+    D8WG_OP_LIGHT_ENABLE = 0x207,
     D8WG_OP_SET_STREAM_SOURCE = 0x208,
     D8WG_OP_SET_INDICES = 0x209,
     D8WG_OP_SET_VERTEX_FORMAT = 0x20A,
@@ -86,6 +90,8 @@ typedef struct D8WGCreateDevice {
     uint32_t backbuffer_format;
     uint32_t windowed;
     uint32_t behavior_flags;
+    uint32_t enable_auto_depth_stencil;
+    uint32_t auto_depth_stencil_format;
 } D8WGCreateDevice;
 
 typedef struct D8WGPresent {
@@ -201,6 +207,44 @@ typedef struct D8WGSetViewport {
     uint32_t reserved;
 } D8WGSetViewport;
 
+typedef struct D8WGSetTransform {
+    uint32_t device_handle;
+    uint32_t state;
+    float matrix[16];
+} D8WGSetTransform;
+
+typedef struct D8WGSetMaterial {
+    uint32_t device_handle;
+    float diffuse[4];
+    float ambient[4];
+    float specular[4];
+    float emissive[4];
+    float power;
+} D8WGSetMaterial;
+
+typedef struct D8WGSetLight {
+    uint32_t device_handle;
+    uint32_t index;
+    uint32_t type;
+    float diffuse[4];
+    float specular[4];
+    float ambient[4];
+    float position[3];
+    float direction[3];
+    float range;
+    float falloff;
+    float attenuation[3];
+    float theta;
+    float phi;
+} D8WGSetLight;
+
+typedef struct D8WGLightEnable {
+    uint32_t device_handle;
+    uint32_t index;
+    uint32_t enable;
+    uint32_t reserved;
+} D8WGLightEnable;
+
 typedef struct D8WGSetStreamSource {
     uint32_t device_handle;
     uint32_t stream;
@@ -269,6 +313,8 @@ typedef char D8WGAssertBatchHeaderSize[
         sizeof(D8WGBatchHeader) == 32 ? 1 : -1];
 typedef char D8WGAssertCommandHeaderSize[
         sizeof(D8WGCommandHeader) == 16 ? 1 : -1];
+typedef char D8WGAssertCreateDeviceSize[
+        sizeof(D8WGCreateDevice) == 44 ? 1 : -1];
 typedef char D8WGAssertPresentSize[
         sizeof(D8WGPresent) == 24 ? 1 : -1];
 typedef char D8WGAssertUpdateSurfaceSize[
@@ -285,6 +331,14 @@ typedef char D8WGAssertSetTextureSize[
         sizeof(D8WGSetTexture) == 16 ? 1 : -1];
 typedef char D8WGAssertSetViewportSize[
         sizeof(D8WGSetViewport) == 32 ? 1 : -1];
+typedef char D8WGAssertSetTransformSize[
+        sizeof(D8WGSetTransform) == 72 ? 1 : -1];
+typedef char D8WGAssertSetMaterialSize[
+        sizeof(D8WGSetMaterial) == 72 ? 1 : -1];
+typedef char D8WGAssertSetLightSize[
+        sizeof(D8WGSetLight) == 112 ? 1 : -1];
+typedef char D8WGAssertLightEnableSize[
+        sizeof(D8WGLightEnable) == 16 ? 1 : -1];
 typedef char D8WGAssertSetIndicesSize[
         sizeof(D8WGSetIndices) == 16 ? 1 : -1];
 typedef char D8WGAssertDrawIndexedPrimitiveSize[

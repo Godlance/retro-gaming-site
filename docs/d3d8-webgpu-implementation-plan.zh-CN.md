@@ -977,6 +977,13 @@ cache 必须有计数、命中率和上限。不要无界增长；场景切换�
 
 ### 阶段 4：完整 fixed function
 
+当前落地状态（D8WG v1.4，2026-08-01）：
+
+- 已实现 Maple 黑屏实际触发的 `FVF 0x142`（`XYZ | DIFFUSE | TEX1`），并保留 `XYZRHW` 路径。
+- 已实现 world/view/projection、texture transform、depth/stencil、material、directional/point/spot light、specular、normalize normals、local viewer、fog、texture coordinate generation、flat/Gouraud 和 blend op。
+- 已增加 transform/depth、raster/stencil、lighting、fog、textured-cube 的 XP 回归构建脚本，以及 host fake-WebGPU 和真实 WebGPU validation 页面覆盖。
+- 尚未关闭阶段 4 发布门槛：需要真实 XP/Maple 验收；explicit render target/depth surface、`CopyRects`、clip plane 与按 trace 决定的 cube/volume 路径仍待实现。对应 caps 已保持保守，不把这些冷路径标成已支持。
+
 工作项：
 
 - `XYZ`、world/view/projection。
@@ -1489,28 +1496,28 @@ WebGPU 对象和 AudioWorklet 状态不能直接序列化进 v86 save state。
 
 ## 20. 当前仓库状态与下一步建议
 
-截至 2026-08-01，仓库代码已推进到 D8WG v1.3/M3 Maple 2D/Gr2D。v1.2 的 geometry 与窗口生命周期能力继续保留，v1.3 新增的实现范围如下：
+截至 2026-08-01，仓库协议已推进到 D8WG v1.4，进入阶段 4 fixed-function core。阶段 3 的 texture/Gr2D、动态资源、mip 与缓存能力继续保留；v1.4 新增：
 
-- guest Texture 与 texture-level Surface COM 对象、`LockRect`/`UnlockRect`、subrect、mip、`GetSurfaceLevel` 和 `UpdateTexture`；
-- `A8R8G8B8`、`X8R8G8B8`、常见 16 位格式、`L8/A8`，以及 DXT1/3/5 CPU decode fallback；
-- `XYZRHW` 加可选 `DIFFUSE`、`SPECULAR`、`TEX1/TEX2` 的动态 FVF 布局；
-- stage 0/1 常用 color/alpha op、argument modifier、texture factor、alpha test/blend；
-- point/linear、wrap/mirror/clamp、mip level/filter，以及 viewport 对应的 WebGPU scissor；
-- 动态 VB/IB lock flags 进入协议；`DISCARD` orphan GPU buffer，`NOOVERWRITE` 保持有序局部更新；
-- 16 MiB `Draw*UP`/ordered-upload transient ring，以及有上限的 pipeline/sampler/uniform/bind-group cache；
-- `d3d8_maple_gr2d_test.exe` 从仅做 mode/caps probe 扩展为实际 A4/A8、Surface、TEX2、alpha、SPECULAR、viewport 和 DrawUP 绘制。
+- Maple 黑屏日志中实际出现的 `FVF 0x142`，以及通用 `XYZ`、`NORMAL`、`PSIZE` 布局；
+- world/view/projection、`MultiplyTransform`、texture transform 与 camera-space texture coordinate generation；
+- 自动 D16/D24S8 协商和 WebGPU D24S8 attachment、depth compare/write/bias、全部 D3D8 stencil compare/op/mask 与 clear；
+- material、全局 ambient、8 盏 directional/point/spot lights、material source、specular、local viewer 和 normalize normals；
+- vertex/table/range fog、flat/Gouraud、colour write、cull、常用 blend factor 与 `D3DRS_BLENDOP`；
+- 协议 v1.4 的 transform/material/light/light-enable 命令，以及对应严格 payload 校验；
+- Stage 4 的 transform/depth、raster/stencil、lighting、fog、textured-cube XP 回归构建脚本。
 
-本地自动验证已覆盖：guest DLL 无 CRT 编译与 import 审计、八个 XP Stage 3 测试程序编译、C/JS 协议一致性、malformed batch、动态 buffer orphan、全部纹理格式转换、DXT1/3/5 decode、两级纹理 shader/pipeline key、alpha、viewport、ordered texture upload 和 transient ring。真实 GPU 页面位于 `glbridge/tests/d3d8_webgpu_browser_test.html`。
+本地自动验证已覆盖：guest DLL 的 XP 5.1/无 CRT 编译与 import 审计、Stage 3 和 Stage 4 全部测试程序交叉编译、协议 C/JS 一致性、精确 `0x142` attribute offset、W/V/P、D24S8、stencil reference、material/light uniform、specular、normalization、texture transform、flat interpolation 和 blend op。真实 GPU 页面位于 `glbridge/tests/d3d8_webgpu_browser_test.html`，现在同时创建 XYZRHW 和 XYZ/normal/texture-transform pipeline。
 
-阶段 3 的“代码工作项完成”和“发布退出条件通过”必须区分。以下项目仍需要在实际运行环境验收，不能由当前主机上的 fake WebGPU 或交叉编译代替：
+“阶段 4 核心代码落地”和“Maple 已可玩/阶段 4 发布门槛关闭”仍必须区分。下一步按以下顺序验收：
 
-1. 在支持 WebGPU 的普通 Chrome 中打开真实 GPU 回归页，确认显示 `PASS` 且控制台无 validation error；当前 macOS 无头 Chrome 卡在 adapter 初始化，未得到真实 GPU 结果。
-2. 把 v1.3 `d3d8.dll` 与 host executor 同步部署，在 XP 依次运行 Stage 3 测试套件，重点目视检查 `texture_formats`、`texture_stage_ops`、`multitexture`、`dynamic_resources`、`mipmap_filter` 和新的 `maple_gr2d` 绘制。
-3. 用 MapleStory v83 完成登录、角色选择和固定地图验收，检查 UI、精灵、文字、透明边缘、clipping 以及动态资源是否闪烁。
-4. 对同一角色、地图、视角和时间窗口采集旧 WineD3D/OpenGL/gl4es 路径与新 D3D8/WebGPU 路径的 FPS、frame time、PCI submit、pipeline creation 和内存 A/B 数据。
-5. 只有上述运行时退出条件通过后，才在发布清单中把阶段 3 标为完成，并开始阶段 4 depth/transform/lighting 或 DirectSound 工作。
+1. 将 v1.4 `d3d8.dll`、`d3d8_executor.js`、bridge 同步部署，硬刷新浏览器并确认版本串包含 `d8wg-m4-fixed-v1-20260801`。
+2. 在 XP 运行五个 Stage 4 测试，确认标题为 `PASS` 且 transform/depth、stencil、lighting、fog 和 textured cube 画面正确。
+3. 启动 MapleStory v83，首先确认旧 warning `unsupported FVF ... 0x142` 消失并出现首帧；随后完成登录、角色选择、进入地图、切图和 10 分钟运行。
+4. 如出现新 warning，按首个 unsupported FVF/op/state 继续补齐；不要用吞掉 warning 或返回伪成功的方式绕过。
+5. 实现并验收 explicit render target/depth surface、`CopyRects`、clip plane；只有 trace 证明 Maple 或目标测试使用时再启用 cube/volume caps 与实现。
+6. 对同场景采集旧链与 WebGPU 新链的 FPS、frame time、PCI submit、pipeline creation 和内存 A/B 数据。
 
-因此，当前状态是“阶段 3 实现已完整落到代码并通过静态/host 自动回归，真实 XP/Maple 发布验收待执行”，而不是提前宣称真实游戏兼容性和性能门槛已经通过。
+因此当前准确状态是：“阶段 4 Maple fixed-function 核心已实现并通过静态/host 自动回归，真实 WebGPU/XP/Maple 验收以及阶段 4 冷资源路径尚未完成”。
 
 ## 21. 参考资料与许可边界
 

@@ -28,18 +28,22 @@ function fields(structName) {
     const match = header.match(new RegExp("typedef struct " + structName +
         "\\s*\\{([\\s\\S]*?)\\}\\s*" + structName + ";"));
     assert.ok(match, "missing C protocol struct " + structName);
-    return [...match[1].matchAll(/\b(?:u?int(?:16|32)_t|float)\s+(\w+)\s*;/g)]
+    return [...match[1].matchAll(/\b(?:u?int(?:16|32)_t|float)\s+(\w+)(?:\[\d+\])?\s*;/g)]
         .map(item => item[1]);
 }
 
 const sharedValues = {
     D8WG_VERSION_MAJOR: 1,
-    D8WG_VERSION_MINOR: 3,
+    D8WG_VERSION_MINOR: 4,
     D8WG_OP_UPDATE_SURFACE: 8,
     D8WG_OP_CREATE_TEXTURE: 0x110,
     D8WG_OP_UPDATE_TEXTURE: 0x111,
     D8WG_OP_SET_TEXTURE: 0x202,
     D8WG_OP_SET_VIEWPORT: 0x203,
+    D8WG_OP_SET_TRANSFORM: 0x204,
+    D8WG_OP_SET_MATERIAL: 0x205,
+    D8WG_OP_SET_LIGHT: 0x206,
+    D8WG_OP_LIGHT_ENABLE: 0x207,
     D8WG_OP_SET_INDICES: 0x209,
     D8WG_OP_DRAW_PRIMITIVE: 0x300,
     D8WG_OP_DRAW_INDEXED_PRIMITIVE: 0x301,
@@ -60,6 +64,11 @@ for (const [name, expected] of Object.entries(sharedValues)) {
 
 assert.deepEqual(fields("D8WGSetIndices"), [
     "device_handle", "buffer_handle", "base_vertex_index", "reserved",
+]);
+assert.deepEqual(fields("D8WGCreateDevice"), [
+    "device_handle", "hwnd", "x", "y", "width", "height",
+    "backbuffer_format", "windowed", "behavior_flags",
+    "enable_auto_depth_stencil", "auto_depth_stencil_format",
 ]);
 assert.deepEqual(fields("D8WGPresent"), [
     "device_handle", "hwnd", "x", "y", "width", "height",
@@ -86,6 +95,17 @@ assert.deepEqual(fields("D8WGSetViewport"), [
     "device_handle", "x", "y", "width", "height", "min_z", "max_z",
     "reserved",
 ]);
+assert.deepEqual(fields("D8WGSetTransform"), [
+    "device_handle", "state", "matrix",
+]);
+assert.deepEqual(fields("D8WGSetMaterial"), [
+    "device_handle", "diffuse", "ambient", "specular", "emissive", "power",
+]);
+assert.deepEqual(fields("D8WGSetLight"), [
+    "device_handle", "index", "type", "diffuse", "specular", "ambient",
+    "position", "direction", "range", "falloff", "attenuation", "theta",
+    "phi",
+]);
 assert.deepEqual(fields("D8WGDrawIndexedPrimitive"), [
     "device_handle", "primitive_type", "min_vertex_index", "vertex_count",
     "start_index", "primitive_count",
@@ -103,6 +123,7 @@ assert.deepEqual(fields("D8WGDrawIndexedPrimitiveUP"), [
 for (const size of [
     "D8WGAssertBatchHeaderSize",
     "D8WGAssertCommandHeaderSize",
+    "D8WGAssertCreateDeviceSize",
     "D8WGAssertPresentSize",
     "D8WGAssertUpdateSurfaceSize",
     "D8WGAssertCreateTextureSize",
@@ -110,6 +131,10 @@ for (const size of [
     "D8WGAssertUpdateTextureSize",
     "D8WGAssertSetTextureSize",
     "D8WGAssertSetViewportSize",
+    "D8WGAssertSetTransformSize",
+    "D8WGAssertSetMaterialSize",
+    "D8WGAssertSetLightSize",
+    "D8WGAssertLightEnableSize",
     "D8WGAssertSetIndicesSize",
     "D8WGAssertDrawIndexedPrimitiveSize",
     "D8WGAssertDrawPrimitiveUPSize",

@@ -22,6 +22,10 @@ const OP_SET_RENDER_STATE = 0x200;
 const OP_SET_TEXTURE_STAGE_STATE = 0x201;
 const OP_SET_TEXTURE = 0x202;
 const OP_SET_VIEWPORT = 0x203;
+const OP_SET_TRANSFORM = 0x204;
+const OP_SET_MATERIAL = 0x205;
+const OP_SET_LIGHT = 0x206;
+const OP_LIGHT_ENABLE = 0x207;
 const OP_SET_STREAM_SOURCE = 0x208;
 const OP_SET_INDICES = 0x209;
 const OP_SET_VERTEX_FORMAT = 0x20A;
@@ -37,7 +41,7 @@ function u32Payload(...values) {
 }
 
 function createDevicePayload(deviceHandle, width, height) {
-    const payload = Buffer.alloc(36);
+    const payload = Buffer.alloc(44);
     payload.writeUInt32LE(deviceHandle, 0);
     payload.writeUInt32LE(0x1234, 4);
     payload.writeInt32LE(11, 8);
@@ -47,6 +51,8 @@ function createDevicePayload(deviceHandle, width, height) {
     payload.writeUInt32LE(22, 24); // D3DFMT_X8R8G8B8
     payload.writeUInt32LE(1, 28);
     payload.writeUInt32LE(0x20, 32);
+    payload.writeUInt32LE(1, 36); // EnableAutoDepthStencil
+    payload.writeUInt32LE(75, 40); // D3DFMT_D24S8
     return payload;
 }
 
@@ -58,6 +64,36 @@ function surfacePayload(deviceHandle, x, y, width, height) {
     payload.writeInt32LE(y, 12);
     payload.writeUInt32LE(width, 16);
     payload.writeUInt32LE(height, 20);
+    return payload;
+}
+
+function transformPayload(deviceHandle, state, values) {
+    assert.equal(values.length, 16);
+    const payload = Buffer.alloc(72);
+    payload.writeUInt32LE(deviceHandle, 0);
+    payload.writeUInt32LE(state, 4);
+    values.forEach((value, index) =>
+        payload.writeFloatLE(value, 8 + index * 4));
+    return payload;
+}
+
+function materialPayload(deviceHandle, values) {
+    assert.equal(values.length, 17);
+    const payload = Buffer.alloc(72);
+    payload.writeUInt32LE(deviceHandle, 0);
+    values.forEach((value, index) =>
+        payload.writeFloatLE(value, 4 + index * 4));
+    return payload;
+}
+
+function lightPayload(deviceHandle, index, type, values) {
+    assert.equal(values.length, 25);
+    const payload = Buffer.alloc(112);
+    payload.writeUInt32LE(deviceHandle, 0);
+    payload.writeUInt32LE(index, 4);
+    payload.writeUInt32LE(type, 8);
+    values.forEach((value, item) =>
+        payload.writeFloatLE(value, 12 + item * 4));
     return payload;
 }
 
@@ -74,7 +110,7 @@ function batch(commandSpecs, frameId) {
     const result = Buffer.alloc(32 + commandBytes);
     result.writeUInt32LE(D8WG_MAGIC, 0);
     result.writeUInt16LE(1, 4);
-    result.writeUInt16LE(3, 6);
+    result.writeUInt16LE(4, 6);
     result.writeUInt32LE(frameId, 8);
     result.writeUInt32LE(1, 12);
     result.writeUInt32LE(commandSpecs.length, 16);
@@ -136,6 +172,14 @@ function makeFakeWebGPU() {
         setIndexBuffer(...args) {
             this.calls.push(["setIndexBuffer", ...args]);
             calls.push(["setIndexBuffer", ...args]);
+        }
+        setViewport(...args) {
+            this.calls.push(["setViewport", ...args]);
+            calls.push(["setViewport", ...args]);
+        }
+        setStencilReference(value) {
+            this.calls.push(["setStencilReference", value]);
+            calls.push(["setStencilReference", value]);
         }
         setScissorRect(...args) { this.calls.push(["setScissorRect", ...args]); calls.push(["setScissorRect", ...args]); }
         draw(...args) { this.calls.push(["draw", ...args]); calls.push(["draw", ...args]); }
@@ -546,8 +590,8 @@ async function main() {
     assert.equal(executor.failed, null);
     assert.equal(executor.getStats().pipelineCreations, 2);
     assert.equal(executor.getStats().drawCalls, 7);
-    assert.equal(fake.calls.filter(call => call[0] === "createTexture").length, 12,
-        "fallback, uncompressed formats, and DXT1/3/5 must be GPU resources");
+    assert.equal(fake.calls.filter(call => call[0] === "createTexture").length, 13,
+        "fallback, automatic depth, uncompressed formats, and DXT1/3/5 must be GPU resources");
     const textureWrites = fake.calls.filter(call => call[0] === "writeTexture");
     for (const write of textureWrites.slice(2, 5)) {
         assert.equal(write[2].byteLength, 64,
@@ -570,6 +614,163 @@ async function main() {
         "alpha blending must be represented in the WebGPU pipeline");
     assert.match(fake.calls.filter(call => call[0] === "shader").at(-1)[1].code,
         /discard;/, "alpha test must be compiled into the fixed-function shader");
+
+    const identity = [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    ];
+    const mapleVertices = Buffer.alloc(3 * 24);
+    const mapleView = new DataView(mapleVertices.buffer,
+        mapleVertices.byteOffset, mapleVertices.byteLength);
+    [[-1, 1, 0.5, 0, 0], [1, 1, 0.5, 1, 0], [-1, -1, 0.5, 0, 1]]
+        .forEach((vertex, index) => {
+            const offset = index * 24;
+            mapleView.setFloat32(offset, vertex[0], true);
+            mapleView.setFloat32(offset + 4, vertex[1], true);
+            mapleView.setFloat32(offset + 8, vertex[2], true);
+            mapleView.setUint32(offset + 12, 0xFFFFFFFF, true);
+            mapleView.setFloat32(offset + 16, vertex[3], true);
+            mapleView.setFloat32(offset + 20, vertex[4], true);
+        });
+    const mapleTransformBatch = batch([
+        command(OP_SET_TRANSFORM,
+            transformPayload(deviceHandle, 256, identity)),
+        command(OP_SET_TRANSFORM,
+            transformPayload(deviceHandle, 2, identity)),
+        command(OP_SET_TRANSFORM,
+            transformPayload(deviceHandle, 3, identity)),
+        command(OP_SET_VIEWPORT, u32Payload(deviceHandle, 25, 30,
+            320, 240, 0, 0x3F800000, 0)),
+        command(OP_SET_VERTEX_FORMAT, u32Payload(deviceHandle, 0x142)),
+        command(OP_CLEAR, u32Payload(deviceHandle, 7, 0xFF000000,
+            0x3F800000, 0, 0)),
+        commandWithBlobs(OP_DRAW_PRIMITIVE_UP,
+            u32Payload(deviceHandle, 4, 1, 24, 3,
+                mapleVertices.length, 0, 0),
+            [{ offsetField: 24, data: mapleVertices }]),
+        command(OP_PRESENT, surfacePayload(deviceHandle, 33, 44, 800, 600)),
+    ], 5);
+    await executor.submit(mapleTransformBatch, { submitCount: 5 });
+    assert.equal(executor.failed, null);
+    const maplePipeline = fake.calls.filter(call => call[0] === "createPipeline")
+        .at(-1)[1];
+    assert.equal(maplePipeline.vertex.buffers[0].arrayStride, 24);
+    assert.deepEqual(maplePipeline.vertex.buffers[0].attributes.map(attribute =>
+        [attribute.shaderLocation, attribute.offset, attribute.format]), [
+        [0, 0, "float32x3"],
+        [1, 12, "unorm8x4"],
+        [3, 16, "float32x2"],
+    ], "Maple FVF 0x142 must decode XYZ, diffuse, and TEX1 without padding");
+    assert.ok(maplePipeline.depthStencil,
+        "automatic D24S8 must be present in the fixed-function pipeline");
+    const mapleShader = fake.calls.filter(call => call[0] === "shader")
+        .at(-1)[1].code;
+    assert.match(mapleShader,
+        /surface\.projection \* eye_position/,
+        "XYZ vertices must use the D3D world/view/projection transform");
+    assert.ok(fake.calls.some(call => call[0] === "setViewport" &&
+        call.slice(1).join(",") === "25,30,320,240,0,1"),
+    "XYZ draws must apply the D3D viewport instead of only scissoring");
+    assert.ok(fake.calls.some(call => call[0] === "setStencilReference"),
+        "the dynamic D3D stencil reference must be set on depth passes");
+
+    const normalVertices = Buffer.alloc(3 * 24);
+    const normalView = new DataView(normalVertices.buffer,
+        normalVertices.byteOffset, normalVertices.byteLength);
+    [[-1, -1, 0, 0, 0, -1], [0, 1, 0, 0, 0, -1], [1, -1, 0, 0, 0, -1]]
+        .forEach((vertex, index) => vertex.forEach((value, component) =>
+            normalView.setFloat32(index * 24 + component * 4, value, true)));
+    const material = [
+        0.95, 0.55, 0.12, 1,
+        0.15, 0.35, 0.8, 1,
+        0, 0, 0, 0,
+        0, 0, 0, 0,
+        0,
+    ];
+    const directional = [
+        1, 0.95, 0.8, 1,
+        0, 0, 0, 0,
+        0, 0, 0, 0,
+        0, 0, 0,
+        0.35, -0.55, 0.75,
+        100, 1,
+        1, 0, 0,
+        0, 0,
+    ];
+    const lightingBatch = batch([
+        command(OP_SET_MATERIAL, materialPayload(deviceHandle, material)),
+        command(OP_SET_LIGHT,
+            lightPayload(deviceHandle, 0, 3, directional)),
+        command(OP_LIGHT_ENABLE, u32Payload(deviceHandle, 0, 1, 0)),
+        command(OP_SET_RENDER_STATE, u32Payload(deviceHandle, 137, 1, 0)),
+        command(OP_SET_RENDER_STATE,
+            u32Payload(deviceHandle, 139, 0xFF606060, 0)),
+        command(OP_SET_TEXTURE_STAGE_STATE,
+            u32Payload(deviceHandle, 0, 1, 2)),
+        command(OP_SET_TEXTURE_STAGE_STATE,
+            u32Payload(deviceHandle, 0, 2, 0)),
+        command(OP_SET_TEXTURE_STAGE_STATE,
+            u32Payload(deviceHandle, 1, 1, 1)),
+        command(OP_SET_VERTEX_FORMAT, u32Payload(deviceHandle, 0x12)),
+        commandWithBlobs(OP_DRAW_PRIMITIVE_UP,
+            u32Payload(deviceHandle, 4, 1, 24, 3,
+                normalVertices.length, 0, 0),
+            [{ offsetField: 24, data: normalVertices }]),
+        command(OP_PRESENT, surfacePayload(deviceHandle, 33, 44, 800, 600)),
+    ], 6);
+    await executor.submit(lightingBatch, { submitCount: 6 });
+    assert.equal(executor.failed, null);
+    const lightingPipeline = fake.calls
+        .filter(call => call[0] === "createPipeline").at(-1)[1];
+    assert.deepEqual(lightingPipeline.vertex.buffers[0].attributes.map(attribute =>
+        [attribute.shaderLocation, attribute.offset, attribute.format]), [
+        [0, 0, "float32x3"],
+        [5, 12, "float32x3"],
+    ], "XYZ|NORMAL must preserve the D3D FVF normal offset");
+    const lightingShader = fake.calls.filter(call => call[0] === "shader")
+        .at(-1)[1].code;
+    assert.match(lightingShader, /surface\.lights\[light_index\]/,
+        "fixed-function lighting must consume the host light table");
+    assert.match(lightingShader,
+        /active_material_ambient \* surface\.global_ambient/,
+        "fixed-function lighting must include material/global ambient");
+
+    const textureTransformBatch = batch([
+        command(OP_SET_TRANSFORM,
+            transformPayload(deviceHandle, 16, identity)),
+        command(OP_SET_TEXTURE_STAGE_STATE,
+            u32Payload(deviceHandle, 0, 11, 0x10000)),
+        command(OP_SET_TEXTURE_STAGE_STATE,
+            u32Payload(deviceHandle, 0, 24, 2)),
+        command(OP_SET_RENDER_STATE, u32Payload(deviceHandle, 9, 1, 0)),
+        command(OP_SET_RENDER_STATE, u32Payload(deviceHandle, 29, 1, 0)),
+        command(OP_SET_RENDER_STATE, u32Payload(deviceHandle, 143, 1, 0)),
+        command(OP_SET_RENDER_STATE, u32Payload(deviceHandle, 171, 2, 0)),
+        command(OP_SET_VERTEX_FORMAT, u32Payload(deviceHandle, 0x12)),
+        commandWithBlobs(OP_DRAW_PRIMITIVE_UP,
+            u32Payload(deviceHandle, 4, 1, 24, 3,
+                normalVertices.length, 0, 0),
+            [{ offsetField: 24, data: normalVertices }]),
+        command(OP_PRESENT, surfacePayload(deviceHandle, 33, 44, 800, 600)),
+    ], 7);
+    await executor.submit(textureTransformBatch, { submitCount: 7 });
+    assert.equal(executor.failed, null);
+    const completeFixedPipeline = fake.calls
+        .filter(call => call[0] === "createPipeline").at(-1)[1];
+    const completeFixedShader = fake.calls
+        .filter(call => call[0] === "shader").at(-1)[1].code;
+    assert.match(completeFixedShader, /surface\.texture_transforms\[0\]/,
+        "stage 4 must apply D3DTS_TEXTURE0 when transform flags are enabled");
+    assert.match(completeFixedShader, /@interpolate\(flat\)/,
+        "D3DSHADE_FLAT must select flat colour interpolation");
+    assert.match(completeFixedShader, /light\.specular \* specular_factor/,
+        "fixed-function lighting must evaluate material/light specular");
+    assert.match(completeFixedShader, /normalize\(eye_normal_value\)/,
+        "D3DRS_NORMALIZENORMALS must normalize transformed normals");
+    assert.equal(completeFixedPipeline.fragment.targets[0].blend.color.operation,
+        "subtract", "D3DRS_BLENDOP must reach the WebGPU blend pipeline");
 
     const bad = Buffer.from(secondBatch);
     bad.writeUInt32LE(bad.length, 20);
@@ -603,13 +804,13 @@ async function main() {
             u32Payload(deviceHandle, index32Handle, 0, 0)),
         command(OP_DRAW_INDEXED_PRIMITIVE,
             u32Payload(deviceHandle, 4, 0, 3, 0, 1)),
-    ], 7);
+    ], 8);
     assert.throws(() => executor.executeBatch(staleHandleBatch, {}),
         /unknown index buffer/);
 
     const destroyDeviceBatch = batch([
         command(OP_DESTROY_RESOURCE, u32Payload(deviceHandle, 0)),
-    ], 8);
+    ], 9);
     executor.executeBatch(destroyDeviceBatch, {});
     assert.equal(executor.devices.has(deviceHandle), false);
     assert.equal(executor.resources.size, 0,

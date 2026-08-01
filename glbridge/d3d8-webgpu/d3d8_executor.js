@@ -10,7 +10,7 @@
 
     const D8WG_MAGIC = 0x47573844; // "D8WG"
     const D8WG_VERSION_MAJOR = 1;
-    const D8WG_VERSION_MINOR = 3;
+    const D8WG_VERSION_MINOR = 4;
     const D8WG_BATCH_HEADER_BYTES = 32;
     const D8WG_COMMAND_HEADER_BYTES = 16;
 
@@ -31,6 +31,10 @@
     const OP_SET_TEXTURE_STAGE_STATE = 0x201;
     const OP_SET_TEXTURE = 0x202;
     const OP_SET_VIEWPORT = 0x203;
+    const OP_SET_TRANSFORM = 0x204;
+    const OP_SET_MATERIAL = 0x205;
+    const OP_SET_LIGHT = 0x206;
+    const OP_LIGHT_ENABLE = 0x207;
     const OP_SET_STREAM_SOURCE = 0x208;
     const OP_SET_INDICES = 0x209;
     const OP_SET_VERTEX_FORMAT = 0x20A;
@@ -56,23 +60,59 @@
     const D3DFMT_INDEX16 = 101;
     const D3DFMT_INDEX32 = 102;
     const D3DCLEAR_TARGET = 0x1;
+    const D3DCLEAR_ZBUFFER = 0x2;
+    const D3DCLEAR_STENCIL = 0x4;
     const D3DFVF_POSITION_MASK = 0x00E;
+    const D3DFVF_XYZ = 0x002;
     const D3DFVF_XYZRHW = 0x004;
+    const D3DFVF_NORMAL = 0x010;
+    const D3DFVF_PSIZE = 0x020;
     const D3DFVF_DIFFUSE = 0x040;
     const D3DFVF_SPECULAR = 0x080;
     const D3DFVF_TEXCOUNT_MASK = 0xF00;
     const D3DFVF_TEXCOUNT_SHIFT = 8;
 
     const D3DRS_ALPHATESTENABLE = 15;
+    const D3DRS_SHADEMODE = 9;
+    const D3DRS_ZENABLE = 7;
+    const D3DRS_ZWRITEENABLE = 14;
     const D3DRS_SRCBLEND = 19;
     const D3DRS_DESTBLEND = 20;
     const D3DRS_CULLMODE = 22;
+    const D3DRS_ZFUNC = 23;
     const D3DRS_ALPHAREF = 24;
     const D3DRS_ALPHAFUNC = 25;
     const D3DRS_ALPHABLENDENABLE = 27;
+    const D3DRS_FOGENABLE = 28;
     const D3DRS_SPECULARENABLE = 29;
+    const D3DRS_FOGCOLOR = 34;
+    const D3DRS_FOGTABLEMODE = 35;
+    const D3DRS_FOGSTART = 36;
+    const D3DRS_FOGEND = 37;
+    const D3DRS_FOGDENSITY = 38;
+    const D3DRS_ZBIAS = 47;
+    const D3DRS_RANGEFOGENABLE = 48;
+    const D3DRS_STENCILENABLE = 52;
+    const D3DRS_STENCILFAIL = 53;
+    const D3DRS_STENCILZFAIL = 54;
+    const D3DRS_STENCILPASS = 55;
+    const D3DRS_STENCILFUNC = 56;
+    const D3DRS_STENCILREF = 57;
+    const D3DRS_STENCILMASK = 58;
+    const D3DRS_STENCILWRITEMASK = 59;
     const D3DRS_TEXTUREFACTOR = 60;
+    const D3DRS_FOGVERTEXMODE = 140;
+    const D3DRS_LIGHTING = 137;
+    const D3DRS_AMBIENT = 139;
+    const D3DRS_COLORVERTEX = 141;
+    const D3DRS_LOCALVIEWER = 142;
+    const D3DRS_NORMALIZENORMALS = 143;
+    const D3DRS_DIFFUSEMATERIALSOURCE = 145;
+    const D3DRS_SPECULARMATERIALSOURCE = 146;
+    const D3DRS_AMBIENTMATERIALSOURCE = 147;
+    const D3DRS_EMISSIVEMATERIALSOURCE = 148;
     const D3DRS_COLORWRITEENABLE = 168;
+    const D3DRS_BLENDOP = 171;
     const D3DCULL_NONE = 1;
     const D3DCULL_CCW = 3;
 
@@ -90,6 +130,7 @@
     const D3DTSS_MIPFILTER = 18;
     const D3DTSS_MAXMIPLEVEL = 20;
     const D3DTSS_MAXANISOTROPY = 21;
+    const D3DTSS_TEXTURETRANSFORMFLAGS = 24;
     const D3DTSS_COLORARG0 = 26;
     const D3DTSS_ALPHAARG0 = 27;
     const D3DTSS_RESULTARG = 28;
@@ -112,6 +153,7 @@
     const BUFFER_USAGE_UNIFORM = 0x40;
     const TEXTURE_USAGE_COPY_DST = 0x02;
     const TEXTURE_USAGE_TEXTURE_BINDING = 0x04;
+    const TEXTURE_USAGE_RENDER_ATTACHMENT = 0x10;
     const TRANSIENT_BUFFER_BYTES = 16 * 1024 * 1024;
     const D3DLOCK_DISCARD = 0x2000;
 
@@ -340,11 +382,28 @@
     }
 
     function parseFVF(fvf, stride) {
-        if ((fvf & D3DFVF_POSITION_MASK) !== D3DFVF_XYZRHW) return null;
-        const attributes = [{ shaderLocation: 0, offset: 0, format: "float32x4" }];
-        let offset = 16;
+        const position = fvf & D3DFVF_POSITION_MASK;
+        if (position !== D3DFVF_XYZ && position !== D3DFVF_XYZRHW)
+            return null;
+        const pretransformed = position === D3DFVF_XYZRHW;
+        const attributes = [{ shaderLocation: 0, offset: 0,
+            format: pretransformed ? "float32x4" : "float32x3" }];
+        let offset = pretransformed ? 16 : 12;
         const result = { attributes, diffuse: false, specular: false,
-            texDims: [], minimumStride: 16 };
+            normal: false, pointSize: false,
+            texDims: [], minimumStride: offset, pretransformed };
+        if (fvf & D3DFVF_NORMAL) {
+            if (pretransformed) return null;
+            attributes.push({ shaderLocation: 5, offset,
+                format: "float32x3" });
+            result.normal = true;
+            offset += 12;
+        }
+        if (fvf & D3DFVF_PSIZE) {
+            attributes.push({ shaderLocation: 6, offset, format: "float32" });
+            result.pointSize = true;
+            offset += 4;
+        }
         if (fvf & D3DFVF_DIFFUSE) {
             attributes.push({ shaderLocation: 1, offset, format: "unorm8x4" });
             result.diffuse = true;
@@ -433,6 +492,24 @@
         }
     }
 
+    function compareFunction(value) {
+        return ({ 1: "never", 2: "less", 3: "equal", 4: "less-equal",
+            5: "greater", 6: "not-equal", 7: "greater-equal",
+            8: "always" })[value >>> 0] || "always";
+    }
+
+    function stencilOperation(value) {
+        return ({ 1: "keep", 2: "zero", 3: "replace",
+            4: "increment-clamp", 5: "decrement-clamp", 6: "invert",
+            7: "increment-wrap", 8: "decrement-wrap" })[value >>> 0] || "keep";
+    }
+
+    function dwordFloat(value) {
+        const bits = new Uint32Array(1);
+        bits[0] = value >>> 0;
+        return new Float32Array(bits.buffer)[0];
+    }
+
     function blendFactor(value) {
         return ({ 1: "zero", 2: "one", 3: "src", 4: "one-minus-src",
             5: "src-alpha", 6: "one-minus-src-alpha", 7: "dst-alpha",
@@ -452,15 +529,35 @@
             destination = 5;
         }
         return {
-            color: { operation: "add", srcFactor: blendFactor(source),
+            color: { operation: blendOperation(
+                state.renderStates[D3DRS_BLENDOP]), srcFactor: blendFactor(source),
                 dstFactor: blendFactor(destination) },
-            alpha: { operation: "add", srcFactor: blendFactor(source),
+            alpha: { operation: blendOperation(
+                state.renderStates[D3DRS_BLENDOP]), srcFactor: blendFactor(source),
                 dstFactor: blendFactor(destination) },
         };
     }
 
+    function blendOperation(value) {
+        return ({ 1: "add", 2: "subtract", 3: "reverse-subtract",
+            4: "min", 5: "max" })[value >>> 0] || "add";
+    }
+
+    function materialSource(state, renderState, uniformName) {
+        if (!state.renderStates[D3DRS_COLORVERTEX])
+            return "surface." + uniformName;
+        switch (state.renderStates[renderState] >>> 0) {
+        case 1: return "vertex_diffuse";
+        case 2: return "vertex_specular";
+        default: return "surface." + uniformName;
+        }
+    }
+
     function fixedFunctionShader(state, layout) {
-        const inputs = ["    @location(0) position: vec4<f32>,"];
+        const inputs = ["    @location(0) position: " +
+            (layout.pretransformed ? "vec4<f32>," : "vec3<f32>,")];
+        if (layout.normal)
+            inputs.push("    @location(5) normal: vec3<f32>,");
         if (layout.diffuse) inputs.push("    @location(1) diffuse_bgra: vec4<f32>,");
         if (layout.specular) inputs.push("    @location(2) specular_bgra: vec4<f32>,");
         for (let stage = 0; stage < layout.texDims.length; stage++) {
@@ -469,24 +566,127 @@
                 ": " + (dimensions === 1 ? "f32" : "vec" + dimensions + "<f32>") + ",");
         }
         const vertexAssignments = [
-            "    output.diffuse = " + (layout.diffuse ? "input.diffuse_bgra.bgra;" : "vec4<f32>(1.0);"),
-            "    output.specular = " + (layout.specular ? "input.specular_bgra.bgra;" : "vec4<f32>(0.0);"),
+            "    let vertex_diffuse = " + (layout.diffuse ?
+                "input.diffuse_bgra.bgra;" : "vec4<f32>(1.0);"),
+            "    let vertex_specular = " + (layout.specular ?
+                "input.specular_bgra.bgra;" : "vec4<f32>(0.0);"),
+            "    output.diffuse = vertex_diffuse;",
+            "    output.specular = vertex_specular;",
         ];
         for (let stage = 0; stage < 2; stage++) {
-            const dimensions = layout.texDims[stage] || 0;
-            vertexAssignments.push("    output.tex" + stage + " = " +
-                (!dimensions ? "vec2<f32>(0.0);" : dimensions === 1 ?
-                    "vec2<f32>(input.tex" + stage + ", 0.0);" :
-                    "input.tex" + stage + ".xy;"));
+            const texcoordIndex = state.textureStageStates[stage]
+                [D3DTSS_TEXCOORDINDEX] >>> 0;
+            const coordinateSet = texcoordIndex & 0xFFFF;
+            const dimensions = coordinateSet < layout.texDims.length ?
+                layout.texDims[coordinateSet] : 0;
+            const inputName = "input.tex" + coordinateSet;
+            const generated = texcoordIndex & 0xFFFF0000;
+            let source = !dimensions ? "vec4<f32>(0.0, 0.0, 0.0, 1.0)" :
+                dimensions === 1 ? "vec4<f32>(" + inputName +
+                    ", 0.0, 0.0, 1.0)" :
+                dimensions === 2 ? "vec4<f32>(" + inputName +
+                    ", 0.0, 1.0)" :
+                dimensions === 3 ? "vec4<f32>(" + inputName +
+                    ", 1.0)" : inputName;
+            if (generated === 0x20000 && !layout.pretransformed)
+                source = "eye_position";
+            else if (generated === 0x10000 && layout.normal)
+                source = "vec4<f32>(eye_normal, 1.0)";
+            else if (generated === 0x30000 && layout.normal)
+                source = "vec4<f32>(reflect(normalize(eye_position.xyz), eye_normal), 1.0)";
+            const transformFlags = state.textureStageStates[stage]
+                [D3DTSS_TEXTURETRANSFORMFLAGS] >>> 0;
+            if (transformFlags & 0xFF) {
+                const transformed = "transformed_tex" + stage;
+                vertexAssignments.push("    let " + transformed +
+                    " = surface.texture_transforms[" + stage + "] * " +
+                    source + ";");
+                if (transformFlags & 0x100) {
+                    const component = (transformFlags & 0xFF) >= 4 ? "w" :
+                        (transformFlags & 0xFF) === 3 ? "z" : "y";
+                    vertexAssignments.push("    output.tex" + stage + " = " +
+                        transformed + ".xy / max(0.000001, abs(" +
+                        transformed + "." + component + ")) * sign(" +
+                        transformed + "." + component + ");");
+                } else {
+                    vertexAssignments.push("    output.tex" + stage +
+                        " = " + transformed + ".xy;");
+                }
+            } else {
+                vertexAssignments.push("    output.tex" + stage + " = " +
+                    source + ".xy;");
+            }
+        }
+        if (state.renderStates[D3DRS_LIGHTING] && layout.normal) {
+            const materialDiffuse = materialSource(state,
+                D3DRS_DIFFUSEMATERIALSOURCE, "material_diffuse");
+            const materialSpecular = materialSource(state,
+                D3DRS_SPECULARMATERIALSOURCE, "material_specular");
+            const materialAmbient = materialSource(state,
+                D3DRS_AMBIENTMATERIALSOURCE, "material_ambient");
+            const materialEmissive = materialSource(state,
+                D3DRS_EMISSIVEMATERIALSOURCE, "material_emissive");
+            const viewer = state.renderStates[D3DRS_LOCALVIEWER] ?
+                "normalize(-eye_position.xyz)" : "vec3<f32>(0.0, 0.0, -1.0)";
+            vertexAssignments.push(`
+    let active_material_diffuse = ${materialDiffuse};
+    let active_material_specular = ${materialSpecular};
+    let active_material_ambient = ${materialAmbient};
+    let active_material_emissive = ${materialEmissive};
+    let viewer_direction = ${viewer};
+    var lit_diffuse = active_material_emissive +
+        active_material_ambient * surface.global_ambient;
+    var lit_specular = vec4<f32>(0.0);
+    for (var light_index: u32 = 0u; light_index < 8u; light_index++) {
+        let light = surface.lights[light_index];
+        if (light.spot_angles_enabled.z > 0.5) {
+            let eye_light_direction = normalize((surface.view *
+                vec4<f32>(light.direction_range.xyz, 0.0)).xyz);
+            var to_light = -eye_light_direction;
+            var attenuation = 1.0;
+            if (light.position_type.w < 2.5) {
+                let eye_light_position = (surface.view *
+                    vec4<f32>(light.position_type.xyz, 1.0)).xyz;
+                let delta = eye_light_position - eye_position.xyz;
+                let distance = length(delta);
+                to_light = delta / max(distance, 0.000001);
+                attenuation = select(0.0, 1.0 / max(0.000001,
+                    light.attenuation_falloff.x +
+                    light.attenuation_falloff.y * distance +
+                    light.attenuation_falloff.z * distance * distance),
+                    distance <= light.direction_range.w);
+                if (light.position_type.w > 1.5) {
+                    let rho = dot(-to_light, eye_light_direction);
+                    let outer = cos(light.spot_angles_enabled.y * 0.5);
+                    let inner = cos(light.spot_angles_enabled.x * 0.5);
+                    attenuation *= pow(clamp((rho - outer) /
+                        max(0.000001, inner - outer), 0.0, 1.0),
+                        max(0.0, light.attenuation_falloff.w));
+                }
+            }
+            let n_dot_l = max(dot(eye_normal, to_light), 0.0);
+            lit_diffuse += attenuation *
+                (active_material_ambient * light.ambient +
+                 active_material_diffuse * light.diffuse * n_dot_l);
+            if (n_dot_l > 0.0 && surface.material_params.x > 0.0) {
+                let halfway = normalize(to_light + viewer_direction);
+                let specular_factor = pow(max(dot(eye_normal, halfway), 0.0),
+                    surface.material_params.x);
+                lit_specular += attenuation * active_material_specular *
+                    light.specular * specular_factor;
+            }
+        }
+    }
+    output.diffuse = vec4<f32>(clamp(lit_diffuse.rgb,
+        vec3<f32>(0.0), vec3<f32>(1.0)), active_material_diffuse.a);
+    output.specular = clamp(lit_specular, vec4<f32>(0.0), vec4<f32>(1.0));`);
         }
         const fragment = [
             "    let textureFactor = surface.texture_factor;",
             "    var current = input.diffuse;",
             "    var temporary = vec4<f32>(0.0);",
-            "    let stage0Texture = textureSample(texture0, sampler0, input.tex" +
-                ((state.textureStageStates[0][D3DTSS_TEXCOORDINDEX] & 0xFFFF) === 1 ? "1" : "0") + ");",
-            "    let stage1Texture = textureSample(texture1, sampler1, input.tex" +
-                ((state.textureStageStates[1][D3DTSS_TEXCOORDINDEX] & 0xFFFF) === 0 ? "0" : "1") + ");",
+            "    let stage0Texture = textureSample(texture0, sampler0, input.tex0);",
+            "    let stage1Texture = textureSample(texture1, sampler1, input.tex1);",
         ];
         for (let stage = 0; stage < 2; stage++) {
             const values = state.textureStageStates[stage];
@@ -515,12 +715,54 @@
         if (state.renderStates[D3DRS_ALPHATESTENABLE])
             fragment.push("    if (" + alphaTestDiscard(
                 state.renderStates[D3DRS_ALPHAFUNC]) + ") { discard; }");
+        if (state.renderStates[D3DRS_FOGENABLE]) {
+            const fogMode = state.renderStates[D3DRS_FOGTABLEMODE] ||
+                state.renderStates[D3DRS_FOGVERTEXMODE];
+            if (fogMode === 1)
+                fragment.push("    let fog_factor = clamp(exp(-surface.fog_params.z * input.fog_depth), 0.0, 1.0);");
+            else if (fogMode === 2)
+                fragment.push("    let fog_factor = clamp(exp(-pow(surface.fog_params.z * input.fog_depth, 2.0)), 0.0, 1.0);");
+            else
+                fragment.push("    let fog_factor = clamp((surface.fog_params.y - input.fog_depth) / max(0.000001, surface.fog_params.y - surface.fog_params.x), 0.0, 1.0);");
+            fragment.push("    current = vec4<f32>(mix(surface.fog_color.rgb, current.rgb, fog_factor), current.a);");
+        }
         fragment.push("    return current;");
+        const positionAssignment = layout.pretransformed ? `
+    let pixel = input.position.xy - vec2<f32>(0.5, 0.5);
+    let rhw = select(1.0, input.position.w, abs(input.position.w) > 0.000001);
+    let clipW = 1.0 / rhw;
+    output.position = vec4<f32>((pixel.x * surface.inverse_size.x * 2.0 - 1.0) * clipW,
+        (1.0 - pixel.y * surface.inverse_size.y * 2.0) * clipW,
+        clamp(input.position.z, 0.0, 1.0) * clipW, clipW);` : `
+    let world_position = surface.world * vec4<f32>(input.position, 1.0);
+    let eye_position = surface.view * world_position;
+    output.position = surface.projection * eye_position;
+    output.fog_depth = ${state.renderStates[D3DRS_RANGEFOGENABLE] ?
+        "length(eye_position.xyz)" : "abs(eye_position.z)"};`;
+        const normalAssignment = layout.normal ? `
+    let eye_normal_value = (surface.view * surface.world *
+        vec4<f32>(input.normal, 0.0)).xyz;
+    let eye_normal = ${state.renderStates[D3DRS_NORMALIZENORMALS] ?
+        "normalize(eye_normal_value)" : "eye_normal_value"};` : "";
+        const interpolation = state.renderStates[D3DRS_SHADEMODE] === 1 ?
+            " @interpolate(flat)" : "";
         return `
+struct LightUniform {
+    diffuse: vec4<f32>, specular: vec4<f32>, ambient: vec4<f32>,
+    position_type: vec4<f32>, direction_range: vec4<f32>,
+    attenuation_falloff: vec4<f32>, spot_angles_enabled: vec4<f32>,
+};
 struct SurfaceUniforms {
     size: vec2<f32>, inverse_size: vec2<f32>,
     texture_factor: vec4<f32>, alpha_ref: f32,
     padding0: f32, padding1: f32, padding2: f32,
+    world: mat4x4<f32>, view: mat4x4<f32>, projection: mat4x4<f32>,
+    fog_color: vec4<f32>, fog_params: vec4<f32>,
+    material_diffuse: vec4<f32>, material_ambient: vec4<f32>,
+    material_specular: vec4<f32>, material_emissive: vec4<f32>,
+    material_params: vec4<f32>, global_ambient: vec4<f32>,
+    lights: array<LightUniform, 8>,
+    texture_transforms: array<mat4x4<f32>, 2>,
 };
 @group(0) @binding(0) var<uniform> surface: SurfaceUniforms;
 @group(0) @binding(1) var texture0: texture_2d<f32>;
@@ -532,19 +774,17 @@ ${inputs.join("\n")}
 };
 struct VSOutput {
     @builtin(position) position: vec4<f32>,
-    @location(0) diffuse: vec4<f32>,
-    @location(1) specular: vec4<f32>,
+    @location(0)${interpolation} diffuse: vec4<f32>,
+    @location(1)${interpolation} specular: vec4<f32>,
     @location(2) tex0: vec2<f32>,
     @location(3) tex1: vec2<f32>,
+    @location(4) fog_depth: f32,
 };
 @vertex fn vs_main(input: VSInput) -> VSOutput {
     var output: VSOutput;
-    let pixel = input.position.xy - vec2<f32>(0.5, 0.5);
-    let rhw = select(1.0, input.position.w, abs(input.position.w) > 0.000001);
-    let clipW = 1.0 / rhw;
-    output.position = vec4<f32>((pixel.x * surface.inverse_size.x * 2.0 - 1.0) * clipW,
-        (1.0 - pixel.y * surface.inverse_size.y * 2.0) * clipW,
-        clamp(input.position.z, 0.0, 1.0) * clipW, clipW);
+${positionAssignment}
+${layout.pretransformed ? "    output.fog_depth = input.position.z;" : ""}
+${normalAssignment}
 ${vertexAssignments.join("\n")}
     return output;
 }
@@ -554,20 +794,45 @@ ${fragment.join("\n")}
 `;
     }
 
+    function identityMatrix() {
+        return new Float32Array([
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1,
+        ]);
+    }
+
     function freshDeviceState(handle, surface) {
         const renderStates = new Uint32Array(256);
         const textureStageStates = Array.from({ length: 8 },
             () => new Uint32Array(32));
         renderStates[7] = 1; // D3DRS_ZENABLE = D3DZB_TRUE
         renderStates[14] = 1; // D3DRS_ZWRITEENABLE
+        renderStates[D3DRS_ZFUNC] = 4; // D3DCMP_LESSEQUAL
         renderStates[D3DRS_CULLMODE] = D3DCULL_CCW;
         renderStates[137] = 1; // D3DRS_LIGHTING
         renderStates[9] = 2; // D3DRS_SHADEMODE = GOURAUD
         renderStates[D3DRS_ALPHAFUNC] = 8; // ALWAYS
         renderStates[D3DRS_SRCBLEND] = 2; // ONE
         renderStates[D3DRS_DESTBLEND] = 1; // ZERO
+        renderStates[D3DRS_BLENDOP] = 1; // ADD
         renderStates[D3DRS_TEXTUREFACTOR] = 0xFFFFFFFF;
         renderStates[D3DRS_COLORWRITEENABLE] = 0xF;
+        renderStates[D3DRS_FOGEND] = 0x3F800000;
+        renderStates[D3DRS_FOGDENSITY] = 0x3F800000;
+        renderStates[D3DRS_STENCILFAIL] = 1; // KEEP
+        renderStates[D3DRS_STENCILZFAIL] = 1;
+        renderStates[D3DRS_STENCILPASS] = 1;
+        renderStates[D3DRS_STENCILFUNC] = 8; // ALWAYS
+        renderStates[D3DRS_STENCILMASK] = 0xFFFFFFFF;
+        renderStates[D3DRS_STENCILWRITEMASK] = 0xFFFFFFFF;
+        renderStates[D3DRS_COLORVERTEX] = 1;
+        renderStates[D3DRS_LOCALVIEWER] = 1;
+        renderStates[D3DRS_DIFFUSEMATERIALSOURCE] = 1; // COLOR1
+        renderStates[D3DRS_SPECULARMATERIALSOURCE] = 2; // COLOR2
+        renderStates[D3DRS_AMBIENTMATERIALSOURCE] = 0; // MATERIAL
+        renderStates[D3DRS_EMISSIVEMATERIALSOURCE] = 0; // MATERIAL
         for (let stage = 0; stage < 8; stage++) {
             textureStageStates[stage][D3DTSS_COLOROP] =
                 stage === 0 ? 4 : D3DTOP_DISABLE; // MODULATE
@@ -596,8 +861,26 @@ ${fragment.join("\n")}
             textures: new Uint32Array(8),
             viewport: { x: 0, y: 0, width: surface.width,
                 height: surface.height, minZ: 0, maxZ: 1 },
+            transforms: {
+                world: identityMatrix(),
+                view: identityMatrix(),
+                projection: identityMatrix(),
+                textures: Array.from({ length: 8 }, identityMatrix),
+            },
+            material: {
+                diffuse: [1, 1, 1, 1], ambient: [1, 1, 1, 1],
+                specular: [0, 0, 0, 0], emissive: [0, 0, 0, 0], power: 0,
+            },
+            lights: Array.from({ length: 8 }, () => ({
+                type: 0,
+                diffuse: [0, 0, 0, 0], specular: [0, 0, 0, 0],
+                ambient: [0, 0, 0, 0], position: [0, 0, 0],
+                direction: [0, 0, 1], range: 0, falloff: 0,
+                attenuation: [1, 0, 0], theta: 0, phi: 0, enabled: false,
+            })),
             fvf: 0,
             inScene: false,
+            uniformSerial: 0,
             uniformVariants: new Map(),
             bindGroups: new Map(),
         };
@@ -756,6 +1039,8 @@ ${fragment.join("\n")}
                 format: u32(bytes, offset + 24),
                 windowed: !!u32(bytes, offset + 28),
                 behaviorFlags: u32(bytes, offset + 32),
+                autoDepthStencil: !!u32(bytes, offset + 36),
+                autoDepthStencilFormat: u32(bytes, offset + 40),
             };
         }
 
@@ -766,10 +1051,28 @@ ${fragment.join("\n")}
             state.bindGroups.clear();
         }
 
+        createDepthSurface(state) {
+            if (state.depthTexture) state.depthTexture.destroy();
+            state.depthTexture = null;
+            state.depthView = null;
+            if (!state.surface.autoDepthStencil) return;
+            state.depthTexture = this.device.createTexture({
+                label: "D3D8 automatic depth-stencil " +
+                    state.handle.toString(16),
+                size: { width: state.surface.width,
+                    height: state.surface.height, depthOrArrayLayers: 1 },
+                sampleCount: 1,
+                dimension: "2d",
+                format: "depth24plus-stencil8",
+                usage: TEXTURE_USAGE_RENDER_ATTACHMENT,
+            });
+            state.depthView = state.depthTexture.createView();
+        }
+
         uniformFor(state) {
             const factorValue = state.renderStates[D3DRS_TEXTUREFACTOR] >>> 0;
             const alphaReference = state.renderStates[D3DRS_ALPHAREF] & 255;
-            const key = factorValue + ":" + alphaReference;
+            const key = String(state.uniformSerial);
             let buffer = state.uniformVariants.get(key);
             if (buffer) {
                 state.uniformVariants.delete(key);
@@ -793,14 +1096,50 @@ ${fragment.join("\n")}
             buffer = this.device.createBuffer({
                 label: "D3D8 fixed uniforms " + state.handle.toString(16) +
                     " " + key,
-                size: 48,
+                size: 1392,
                 usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
             });
-            this.device.queue.writeBuffer(buffer, 0, new Float32Array([
+            const fogColor = d3dColor(
+                state.renderStates[D3DRS_FOGCOLOR] >>> 0);
+            const globalAmbient = d3dColor(
+                state.renderStates[D3DRS_AMBIENT] >>> 0);
+            const values = new Float32Array(348);
+            values.set([
                 width, height, 1 / width, 1 / height,
                 factor.r, factor.g, factor.b, factor.a,
                 alphaReference, 0, 0, 0,
-            ]));
+            ]);
+            values.set(state.transforms.world, 12);
+            values.set(state.transforms.view, 28);
+            values.set(state.transforms.projection, 44);
+            values.set([fogColor.r, fogColor.g, fogColor.b, fogColor.a], 60);
+            values.set([
+                dwordFloat(state.renderStates[D3DRS_FOGSTART]),
+                dwordFloat(state.renderStates[D3DRS_FOGEND]),
+                dwordFloat(state.renderStates[D3DRS_FOGDENSITY]),
+                0,
+            ], 64);
+            values.set(state.material.diffuse, 68);
+            values.set(state.material.ambient, 72);
+            values.set(state.material.specular, 76);
+            values.set(state.material.emissive, 80);
+            values.set([state.material.power, 0, 0, 0], 84);
+            values.set([globalAmbient.r, globalAmbient.g,
+                globalAmbient.b, globalAmbient.a], 88);
+            state.lights.forEach((light, index) => {
+                const offset = 92 + index * 28;
+                values.set(light.diffuse, offset);
+                values.set(light.specular, offset + 4);
+                values.set(light.ambient, offset + 8);
+                values.set([...light.position, light.type], offset + 12);
+                values.set([...light.direction, light.range], offset + 16);
+                values.set([...light.attenuation, light.falloff], offset + 20);
+                values.set([light.theta, light.phi,
+                    light.enabled ? 1 : 0, 0], offset + 24);
+            });
+            values.set(state.transforms.textures[0], 316);
+            values.set(state.transforms.textures[1], 332);
+            this.device.queue.writeBuffer(buffer, 0, values);
             state.uniformVariants.set(key, buffer);
             return { buffer, key };
         }
@@ -813,6 +1152,7 @@ ${fragment.join("\n")}
                 if (state) {
                     for (const buffer of state.uniformVariants.values())
                         buffer.destroy();
+                    if (state.depthTexture) state.depthTexture.destroy();
                 }
                 state = freshDeviceState(handle, surface);
                 this.devices.set(handle, state);
@@ -826,6 +1166,7 @@ ${fragment.join("\n")}
             this.canvas.height = surface.height;
             this.configureContext();
             this.createSurfaceUniform(state);
+            this.createDepthSurface(state);
             if (typeof this.options.onSurface === "function") {
                 this.options.onSurface(surface, reset ? "reset" : "create");
             }
@@ -865,7 +1206,7 @@ ${fragment.join("\n")}
             }
         }
 
-        ensureFrame(state, clearValue) {
+        ensureFrame(state, clearOptions) {
             if (this.frame && this.frame.deviceHandle !== state.handle) {
                 this.finishFrame(false);
             }
@@ -885,20 +1226,35 @@ ${fragment.join("\n")}
                 };
                 this.transientCursor = 0;
             }
-            if (clearValue !== undefined) {
-                this.endPass();
-            }
+            if (clearOptions !== undefined) this.endPass();
             if (!this.frame.pass) {
-                const shouldClear = clearValue !== undefined || this.frame.fresh;
-                this.frame.pass = this.frame.encoder.beginRenderPass({
+                const clear = clearOptions || {};
+                const fresh = this.frame.fresh;
+                const descriptor = {
                     label: "D3D8 color pass",
                     colorAttachments: [{
                         view: this.frame.view,
-                        clearValue: clearValue || { r: 0, g: 0, b: 0, a: 1 },
-                        loadOp: shouldClear ? "clear" : "load",
+                        clearValue: clear.color || { r: 0, g: 0, b: 0, a: 1 },
+                        loadOp: fresh || clear.color ? "clear" : "load",
                         storeOp: "store",
                     }],
-                });
+                };
+                if (state.depthView) {
+                    descriptor.depthStencilAttachment = {
+                        view: state.depthView,
+                        depthClearValue: clear.depth === undefined ? 1 :
+                            Math.max(0, Math.min(1, clear.depth)),
+                        depthLoadOp: fresh || clear.depth !== undefined ?
+                            "clear" : "load",
+                        depthStoreOp: "store",
+                        stencilClearValue: clear.stencil === undefined ? 0 :
+                            clear.stencil & 0xFF,
+                        stencilLoadOp: fresh || clear.stencil !== undefined ?
+                            "clear" : "load",
+                        stencilStoreOp: "store",
+                    };
+                }
+                this.frame.pass = this.frame.encoder.beginRenderPass(descriptor);
                 this.frame.fresh = false;
             }
             return this.frame.pass;
@@ -952,6 +1308,7 @@ ${fragment.join("\n")}
                 }
                 for (const buffer of state.uniformVariants.values())
                     buffer.destroy();
+                if (state.depthTexture) state.depthTexture.destroy();
                 for (const [resourceHandle, child] of this.resources) {
                     if (child.deviceHandle !== handle) continue;
                     if (child.gpuBuffer) child.gpuBuffer.destroy();
@@ -976,7 +1333,8 @@ ${fragment.join("\n")}
             const shaderStates = [D3DTSS_COLOROP, D3DTSS_COLORARG1,
                 D3DTSS_COLORARG2, D3DTSS_ALPHAOP, D3DTSS_ALPHAARG1,
                 D3DTSS_ALPHAARG2, D3DTSS_TEXCOORDINDEX,
-                D3DTSS_COLORARG0, D3DTSS_ALPHAARG0, D3DTSS_RESULTARG];
+                D3DTSS_COLORARG0, D3DTSS_ALPHAARG0, D3DTSS_RESULTARG,
+                D3DTSS_TEXTURETRANSFORMFLAGS];
             for (let stage = 0; stage < 2; stage++) {
                 for (const selector of shaderStates)
                     stageKey.push(state.textureStageStates[stage][selector] >>> 0);
@@ -986,10 +1344,36 @@ ${fragment.join("\n")}
                 cull, blend,
                 state.renderStates[D3DRS_SRCBLEND] >>> 0,
                 state.renderStates[D3DRS_DESTBLEND] >>> 0,
+                state.renderStates[D3DRS_BLENDOP] >>> 0,
+                state.renderStates[D3DRS_SHADEMODE] >>> 0,
                 state.renderStates[D3DRS_ALPHATESTENABLE] >>> 0,
                 state.renderStates[D3DRS_ALPHAFUNC] >>> 0,
                 state.renderStates[D3DRS_SPECULARENABLE] >>> 0,
+                state.renderStates[D3DRS_FOGENABLE] >>> 0,
+                state.renderStates[D3DRS_FOGTABLEMODE] >>> 0,
+                state.renderStates[D3DRS_FOGVERTEXMODE] >>> 0,
+                state.renderStates[D3DRS_RANGEFOGENABLE] >>> 0,
+                state.renderStates[D3DRS_LIGHTING] >>> 0,
+                state.renderStates[D3DRS_COLORVERTEX] >>> 0,
+                state.renderStates[D3DRS_LOCALVIEWER] >>> 0,
+                state.renderStates[D3DRS_NORMALIZENORMALS] >>> 0,
+                state.renderStates[D3DRS_DIFFUSEMATERIALSOURCE] >>> 0,
+                state.renderStates[D3DRS_SPECULARMATERIALSOURCE] >>> 0,
+                state.renderStates[D3DRS_AMBIENTMATERIALSOURCE] >>> 0,
+                state.renderStates[D3DRS_EMISSIVEMATERIALSOURCE] >>> 0,
                 state.renderStates[D3DRS_COLORWRITEENABLE] >>> 0,
+                state.depthView ? 1 : 0,
+                state.renderStates[D3DRS_ZENABLE] >>> 0,
+                state.renderStates[D3DRS_ZWRITEENABLE] >>> 0,
+                state.renderStates[D3DRS_ZFUNC] >>> 0,
+                state.renderStates[D3DRS_ZBIAS] >>> 0,
+                state.renderStates[D3DRS_STENCILENABLE] >>> 0,
+                state.renderStates[D3DRS_STENCILFAIL] >>> 0,
+                state.renderStates[D3DRS_STENCILZFAIL] >>> 0,
+                state.renderStates[D3DRS_STENCILPASS] >>> 0,
+                state.renderStates[D3DRS_STENCILFUNC] >>> 0,
+                state.renderStates[D3DRS_STENCILMASK] >>> 0,
+                state.renderStates[D3DRS_STENCILWRITEMASK] >>> 0,
                 ...stageKey].join(":");
             let pipeline = this.pipelineCache.get(key);
             if (pipeline) {
@@ -1030,6 +1414,40 @@ ${fragment.join("\n")}
                     // The screen-space Y conversion flips winding.
                     frontFace: cull === D3DCULL_CCW ? "cw" : "ccw",
                 },
+                ...(state.depthView ? { depthStencil: {
+                    format: "depth24plus-stencil8",
+                    depthWriteEnabled: !!state.renderStates[D3DRS_ZENABLE] &&
+                        !!state.renderStates[D3DRS_ZWRITEENABLE],
+                    depthCompare: state.renderStates[D3DRS_ZENABLE] ?
+                        compareFunction(state.renderStates[D3DRS_ZFUNC]) :
+                        "always",
+                    stencilFront: state.renderStates[D3DRS_STENCILENABLE] ? {
+                        compare: compareFunction(
+                            state.renderStates[D3DRS_STENCILFUNC]),
+                        failOp: stencilOperation(
+                            state.renderStates[D3DRS_STENCILFAIL]),
+                        depthFailOp: stencilOperation(
+                            state.renderStates[D3DRS_STENCILZFAIL]),
+                        passOp: stencilOperation(
+                            state.renderStates[D3DRS_STENCILPASS]),
+                    } : {},
+                    stencilBack: state.renderStates[D3DRS_STENCILENABLE] ? {
+                        compare: compareFunction(
+                            state.renderStates[D3DRS_STENCILFUNC]),
+                        failOp: stencilOperation(
+                            state.renderStates[D3DRS_STENCILFAIL]),
+                        depthFailOp: stencilOperation(
+                            state.renderStates[D3DRS_STENCILZFAIL]),
+                        passOp: stencilOperation(
+                            state.renderStates[D3DRS_STENCILPASS]),
+                    } : {},
+                    stencilReadMask: state.renderStates[D3DRS_STENCILENABLE] ?
+                        state.renderStates[D3DRS_STENCILMASK] >>> 0 : 0,
+                    stencilWriteMask: state.renderStates[D3DRS_STENCILENABLE] ?
+                        state.renderStates[D3DRS_STENCILWRITEMASK] >>> 0 : 0,
+                    depthBias: -Math.min(16,
+                        state.renderStates[D3DRS_ZBIAS] >>> 0),
+                } } : {}),
             });
             pipeline._d8wgId = this.nextPipelineId++;
             if (this.pipelineCache.size >= this.maxPipelines) {
@@ -1169,6 +1587,15 @@ ${fragment.join("\n")}
             const height = Math.min(state.viewport.height >>> 0,
                 state.surface.height - y);
             if (!width || !height) return false;
+            if ((state.fvf & D3DFVF_POSITION_MASK) === D3DFVF_XYZ)
+                pass.setViewport(x, y, width, height,
+                    state.viewport.minZ, state.viewport.maxZ);
+            else
+                pass.setViewport(0, 0, state.surface.width,
+                    state.surface.height, 0, 1);
+            if (state.depthView)
+                pass.setStencilReference(
+                    state.renderStates[D3DRS_STENCILREF] & 0xFF);
             pass.setScissorRect(x, y, width, height);
             return true;
         }
@@ -1541,11 +1968,11 @@ ${fragment.join("\n")}
                 }
                 break;
             case OP_CREATE_DEVICE:
-                if (commandEnd - payloadOffset < 36) throw new Error("short CREATE_DEVICE");
+                if (commandEnd - payloadOffset < 44) throw new Error("short CREATE_DEVICE");
                 this.createOrResetDevice(bytes, payloadOffset, false);
                 break;
             case OP_RESET:
-                if (commandEnd - payloadOffset < 36) throw new Error("short RESET");
+                if (commandEnd - payloadOffset < 44) throw new Error("short RESET");
                 this.createOrResetDevice(bytes, payloadOffset, true);
                 break;
             case OP_UPDATE_SURFACE: {
@@ -1579,14 +2006,21 @@ ${fragment.join("\n")}
                         "rectangular Clear currently falls back to a full-target clear",
                         { rectCount });
                 }
-                if (flags & D3DCLEAR_TARGET) {
-                    this.ensureFrame(state, d3dColor(u32(bytes, payloadOffset + 8)));
-                } else {
-                    this.warnOnce("depth-clear",
-                        "depth/stencil-only Clear is deferred to fixed-function stage 4",
-                        { depth: f32(bytes, payloadOffset + 12),
-                          stencil: u32(bytes, payloadOffset + 16) });
+                const clear = {};
+                if (flags & D3DCLEAR_TARGET)
+                    clear.color = d3dColor(u32(bytes, payloadOffset + 8));
+                if (flags & D3DCLEAR_ZBUFFER)
+                    clear.depth = f32(bytes, payloadOffset + 12);
+                if (flags & D3DCLEAR_STENCIL)
+                    clear.stencil = u32(bytes, payloadOffset + 16);
+                if ((flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) &&
+                        !state.depthView) {
+                    this.warnOnce("depth-clear-without-surface",
+                        "depth/stencil Clear ignored because the device has no automatic depth surface");
+                    delete clear.depth;
+                    delete clear.stencil;
                 }
+                this.ensureFrame(state, clear);
                 break;
             }
             case OP_BEGIN_SCENE:
@@ -1702,6 +2136,7 @@ ${fragment.join("\n")}
                     throw new Error("invalid SET_RENDER_STATE");
                 }
                 state.renderStates[index] = u32(bytes, payloadOffset + 8);
+                state.uniformSerial++;
                 break;
             }
             case OP_SET_TEXTURE_STAGE_STATE: {
@@ -1738,7 +2173,8 @@ ${fragment.join("\n")}
                 const minZ = f32(bytes, payloadOffset + 20);
                 const maxZ = f32(bytes, payloadOffset + 24);
                 if (!state || !width || !height || !Number.isFinite(minZ) ||
-                        !Number.isFinite(maxZ) || minZ > maxZ)
+                        !Number.isFinite(maxZ) || minZ < 0 || maxZ > 1 ||
+                        minZ > maxZ)
                     throw new Error("invalid SET_VIEWPORT");
                 state.viewport = {
                     x: u32(bytes, payloadOffset + 4),
@@ -1748,6 +2184,98 @@ ${fragment.join("\n")}
                     minZ,
                     maxZ,
                 };
+                break;
+            }
+            case OP_SET_TRANSFORM: {
+                if (commandEnd - payloadOffset < 72)
+                    throw new Error("short SET_TRANSFORM");
+                const state = this.devices.get(u32(bytes, payloadOffset));
+                const transformState = u32(bytes, payloadOffset + 4);
+                if (!state) throw new Error("invalid SET_TRANSFORM device");
+                const matrix = new Float32Array(16);
+                for (let index = 0; index < 16; index++) {
+                    const value = f32(bytes, payloadOffset + 8 + index * 4);
+                    if (!Number.isFinite(value))
+                        throw new Error("SET_TRANSFORM contains a non-finite matrix");
+                    matrix[index] = value;
+                }
+                if (transformState === 2)
+                    state.transforms.view = matrix;
+                else if (transformState === 3)
+                    state.transforms.projection = matrix;
+                else if (transformState >= 16 && transformState <= 23)
+                    state.transforms.textures[transformState - 16] = matrix;
+                else if (transformState >= 256 && transformState < 512) {
+                    if (transformState === 256)
+                        state.transforms.world = matrix;
+                    else
+                        this.warnOnce("world-transform-" + transformState,
+                            "indexed world transform is stored but vertex blending is not yet enabled",
+                            transformState);
+                } else {
+                    throw new Error("invalid D3D8 transform state " + transformState);
+                }
+                state.uniformSerial++;
+                break;
+            }
+            case OP_SET_MATERIAL: {
+                if (commandEnd - payloadOffset < 72)
+                    throw new Error("short SET_MATERIAL");
+                const state = this.devices.get(u32(bytes, payloadOffset));
+                if (!state) throw new Error("invalid SET_MATERIAL device");
+                const read = (offset, count) => Array.from({ length: count },
+                    (_, index) => f32(bytes, payloadOffset + offset + index * 4));
+                const values = read(4, 17);
+                if (!values.every(Number.isFinite))
+                    throw new Error("SET_MATERIAL contains a non-finite value");
+                state.material = {
+                    diffuse: values.slice(0, 4),
+                    ambient: values.slice(4, 8),
+                    specular: values.slice(8, 12),
+                    emissive: values.slice(12, 16),
+                    power: values[16],
+                };
+                state.uniformSerial++;
+                break;
+            }
+            case OP_SET_LIGHT: {
+                if (commandEnd - payloadOffset < 112)
+                    throw new Error("short SET_LIGHT");
+                const state = this.devices.get(u32(bytes, payloadOffset));
+                const index = u32(bytes, payloadOffset + 4);
+                const type = u32(bytes, payloadOffset + 8);
+                if (!state || index >= state.lights.length ||
+                        type < 1 || type > 3)
+                    throw new Error("invalid SET_LIGHT");
+                const read = (offset, count) => Array.from({ length: count },
+                    (_, item) => f32(bytes, payloadOffset + offset + item * 4));
+                const values = read(12, 25);
+                if (!values.every(Number.isFinite))
+                    throw new Error("SET_LIGHT contains a non-finite value");
+                const enabled = state.lights[index].enabled;
+                state.lights[index] = {
+                    type,
+                    diffuse: values.slice(0, 4),
+                    specular: values.slice(4, 8),
+                    ambient: values.slice(8, 12),
+                    position: values.slice(12, 15),
+                    direction: values.slice(15, 18),
+                    range: values[18], falloff: values[19],
+                    attenuation: values.slice(20, 23),
+                    theta: values[23], phi: values[24], enabled,
+                };
+                state.uniformSerial++;
+                break;
+            }
+            case OP_LIGHT_ENABLE: {
+                if (commandEnd - payloadOffset < 16)
+                    throw new Error("short LIGHT_ENABLE");
+                const state = this.devices.get(u32(bytes, payloadOffset));
+                const index = u32(bytes, payloadOffset + 4);
+                if (!state || index >= state.lights.length)
+                    throw new Error("invalid LIGHT_ENABLE");
+                state.lights[index].enabled = !!u32(bytes, payloadOffset + 8);
+                state.uniformSerial++;
                 break;
             }
             case OP_SET_STREAM_SOURCE: {

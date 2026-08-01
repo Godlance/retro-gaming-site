@@ -6,7 +6,7 @@ DMA arena. The VGL2 descriptor is only the transport envelope; command
 `0xFFE0` carries a versioned D8WG batch decoded by
 `../d3d8-webgpu/d3d8_executor.js`.
 
-Implemented Maple 2D/Gr2D milestone (D8WG protocol v1.3):
+Implemented Maple fixed-function core (D8WG protocol v1.4):
 
 - adapter enumeration, MapleStory v83 format probes, caps, and `CreateDevice`;
 - `Clear`, `BeginScene`, `EndScene`, and `Present`;
@@ -25,8 +25,18 @@ Implemented Maple 2D/Gr2D milestone (D8WG protocol v1.3):
   `A4R4G4B4`, `L8`, and `A8` conversion to sampled RGBA8;
 - DXT1/DXT3/DXT5 CPU decode fallback, including independent mip/subrect
   uploads;
-- FVF `XYZRHW`, optional `DIFFUSE`/`SPECULAR`, and `TEX1`/`TEX2`, including
-  D3D8 texture-coordinate-size encodings;
+- FVF `XYZRHW` and `XYZ`, optional `NORMAL`/`PSIZE`/`DIFFUSE`/`SPECULAR`, and
+  `TEX1`/`TEX2`, including the exact Maple `0x142` layout and D3D8
+  texture-coordinate-size encodings;
+- world/view/projection and texture transforms, including
+  `MultiplyTransform` and texture-coordinate generation;
+- automatic D16/D24S8 negotiation backed by WebGPU D24S8, viewport depth
+  range, depth compare/write/bias, all D3D8 stencil compares/operations/masks,
+  and target/depth/stencil clears;
+- material state, eight directional/point/spot lights, global ambient,
+  material colour sources, local viewer, specular and normalized normals;
+- linear/EXP/EXP2 vertex/table fog, range fog, flat/Gouraud interpolation,
+  culling, colour masks, blend factors and `D3DRS_BLENDOP`;
 - texture stages 0/1, common color/alpha operations and arguments, texture
   factor, alpha test, alpha blending, point/linear sampling, wrap/mirror/clamp,
   and mip-level selection;
@@ -44,9 +54,12 @@ Implemented Maple 2D/Gr2D milestone (D8WG protocol v1.3):
 - one main PCI submit at `Present` (extra submits occur only when the DMA arena
   fills or when a window lifecycle event must reach the host immediately).
 
-Depth/stencil rendering, render targets, `CopyRects`, state blocks, transforms,
-lighting/fog, and programmable shaders remain later milestones. Unsupported
-calls return `D3DERR_INVALIDCALL`, and caps stay conservative for those paths.
+The current v1.4 boundary is deliberate: explicit render/depth surfaces,
+render-to-texture, `CopyRects`, clip planes, cube/volume textures, state blocks,
+and programmable shaders are not implemented yet. Unsupported calls return
+`D3DERR_INVALIDCALL`; cube/volume and explicit render-target capability probes
+are not advertised. Maple runtime acceptance is still required before this
+core is called game-ready.
 
 Build an XP-compatible DLL without a C runtime dependency:
 
@@ -65,6 +78,16 @@ texture/format conversion, texture-stage operations, TEX2, dynamic resources,
 mip/filter state, and the rendered Maple Gr2D probe. The Gr2D pass should show
 two clipped sprite panels and a title containing `PASS`.
 
+Build the XP Stage 4 fixed-function acceptance tests:
+
+```sh
+./glbridge/d3d8proxy/build_stage4_tests.sh /private/tmp/d3d8-stage4-tests
+```
+
+This builds transform/depth, raster/stencil, lighting/material, fog, and
+textured-cube tests. Run them with the v1.4 DLL beside each executable before
+testing MapleStory itself.
+
 Host-side protocol/executor tests:
 
 ```sh
@@ -75,10 +98,10 @@ node --test glbridge/tests/d3d8_webgpu_executor_test.js
 The real-GPU validation page is
 `glbridge/tests/d3d8_webgpu_browser_test.html`; serve the repository over
 localhost and open it in a WebGPU-enabled browser. It reports `PASS` only
-after creating a real textured/alpha/TEX2 pipeline without WebGPU validation
-errors.
+after creating both pre-transformed and XYZ/normal/texture-transform pipelines
+without WebGPU validation errors.
 
-The v1.3 guest DLL and host executor must be deployed together. The executor
+The v1.4 guest DLL and host executor must be deployed together. The executor
 rejects a different protocol minor version instead of silently skipping newer
 texture or fixed-function commands.
 

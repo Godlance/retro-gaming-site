@@ -5,10 +5,10 @@
  * COM/state/resource semantics in the guest, batches high-level commands in
  * the existing v86gl.sys DMA arena, and sends one D8WG stream to WebGPU.
  *
- * The Maple 2D milestone implements Clear/Present, XYZRHW fixed-function
- * geometry, Texture/Surface uploads, two texture stages, alpha, viewport, and
- * dynamic-resource submission. Later fixed-function and programmable paths
- * return D3DERR_INVALIDCALL rather than pretending that rendering succeeded.
+ * The fixed-function path implements Maple's XYZRHW and XYZ geometry,
+ * transforms, material/lights, fog, depth/stencil, texture stages and dynamic
+ * resources. Unsupported resource and programmable paths return
+ * D3DERR_INVALIDCALL rather than pretending that rendering succeeded.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -19,11 +19,25 @@
 #include "../winproxy/v86gl_ioctl.h"
 #include "d3d8_protocol.h"
 
+/* These legacy D3D shade-cap bits are omitted by some d3d8.h variants. */
+#ifndef D3DPSHADECAPS_COLORFLATRGB
+#define D3DPSHADECAPS_COLORFLATRGB 0x00000002u
+#endif
+#ifndef D3DPSHADECAPS_ALPHAFLATBLEND
+#define D3DPSHADECAPS_ALPHAFLATBLEND 0x00001000u
+#endif
+
 #define D8WG_LOG_PREFIX "[d3d8-webgpu] "
 #define D8WG_MAX_RENDER_STATES 256u
 #define D8WG_MAX_TEXTURE_STAGES 8u
 #define D8WG_MAX_TEXTURE_STAGE_STATES 32u
 #define D8WG_MAX_STREAMS 16u
+#define D8WG_MAX_LIGHTS 8u
+#define D8WG_TRANSFORM_VIEW_SLOT 0u
+#define D8WG_TRANSFORM_PROJECTION_SLOT 1u
+#define D8WG_TRANSFORM_TEXTURE_SLOT 2u
+#define D8WG_TRANSFORM_WORLD_SLOT 10u
+#define D8WG_MAX_TRANSFORMS (D8WG_TRANSFORM_WORLD_SLOT + 256u)
 #define D8WG_VGL2_RECORD_HEADER_BYTES 8u
 #define D8WG_HANDLE_GENERATION_ONE (1u << 20)
 
@@ -65,6 +79,11 @@ struct D8Device {
     D3DPRESENT_PARAMETERS present;
     D3DDISPLAYMODE display_mode;
     D3DVIEWPORT8 viewport;
+    D3DMATRIX transforms[D8WG_MAX_TRANSFORMS];
+    D3DMATERIAL8 material;
+    D3DLIGHT8 lights[D8WG_MAX_LIGHTS];
+    BOOL light_set[D8WG_MAX_LIGHTS];
+    BOOL light_enabled[D8WG_MAX_LIGHTS];
     DWORD render_states[D8WG_MAX_RENDER_STATES];
     DWORD texture_stage_states[D8WG_MAX_TEXTURE_STAGES]
                                       [D8WG_MAX_TEXTURE_STAGE_STATES];
@@ -878,13 +897,24 @@ static void fill_caps(D3DCAPS8 *caps)
             | D3DDEVCAPS_TEXTUREVIDEOMEMORY;
     caps->PrimitiveMiscCaps = D3DPMISCCAPS_CULLNONE
             | D3DPMISCCAPS_CULLCW | D3DPMISCCAPS_CULLCCW
-            | D3DPMISCCAPS_COLORWRITEENABLE;
-    caps->RasterCaps = D3DPRASTERCAPS_DITHER | D3DPRASTERCAPS_ZTEST;
+            | D3DPMISCCAPS_COLORWRITEENABLE | D3DPMISCCAPS_BLENDOP;
+    caps->RasterCaps = D3DPRASTERCAPS_ZTEST | D3DPRASTERCAPS_ZBIAS
+            | D3DPRASTERCAPS_FOGVERTEX
+            | D3DPRASTERCAPS_FOGTABLE | D3DPRASTERCAPS_WFOG
+            | D3DPRASTERCAPS_FOGRANGE;
     caps->ZCmpCaps = 0xFFu;
     caps->SrcBlendCaps = 0x1FFFu;
     caps->DestBlendCaps = 0x1FFFu;
     caps->AlphaCmpCaps = 0xFFu;
-    caps->ShadeCaps = D3DPSHADECAPS_COLORGOURAUDRGB
+    caps->StencilCaps = D3DSTENCILCAPS_KEEP | D3DSTENCILCAPS_ZERO
+            | D3DSTENCILCAPS_REPLACE | D3DSTENCILCAPS_INCRSAT
+            | D3DSTENCILCAPS_DECRSAT | D3DSTENCILCAPS_INVERT
+            | D3DSTENCILCAPS_INCR | D3DSTENCILCAPS_DECR;
+    caps->ShadeCaps = D3DPSHADECAPS_COLORFLATRGB
+            | D3DPSHADECAPS_COLORGOURAUDRGB
+            | D3DPSHADECAPS_SPECULARGOURAUDRGB
+            | D3DPSHADECAPS_FOGGOURAUD
+            | D3DPSHADECAPS_ALPHAFLATBLEND
             | D3DPSHADECAPS_ALPHAGOURAUDBLEND;
     caps->TextureCaps = D3DPTEXTURECAPS_ALPHA
             | D3DPTEXTURECAPS_MIPMAP
@@ -895,8 +925,8 @@ static void fill_caps(D3DCAPS8 *caps)
             | D3DPTFILTERCAPS_MAGFLINEAR
             | D3DPTFILTERCAPS_MIPFPOINT
             | D3DPTFILTERCAPS_MIPFLINEAR;
-    caps->CubeTextureFilterCaps = caps->TextureFilterCaps;
-    caps->VolumeTextureFilterCaps = caps->TextureFilterCaps;
+    caps->CubeTextureFilterCaps = 0;
+    caps->VolumeTextureFilterCaps = 0;
     caps->TextureAddressCaps = D3DPTADDRESSCAPS_WRAP
             | D3DPTADDRESSCAPS_MIRROR
             | D3DPTADDRESSCAPS_CLAMP;
@@ -913,17 +943,17 @@ static void fill_caps(D3DCAPS8 *caps)
             | D3DTEXOPCAPS_BLENDCURRENTALPHA
             | D3DTEXOPCAPS_DOTPRODUCT3 | D3DTEXOPCAPS_MULTIPLYADD
             | D3DTEXOPCAPS_LERP;
-    caps->VolumeTextureAddressCaps = caps->TextureAddressCaps;
+    caps->VolumeTextureAddressCaps = 0;
     caps->MaxTextureWidth = 4096;
     caps->MaxTextureHeight = 4096;
-    caps->MaxVolumeExtent = 256;
+    caps->MaxVolumeExtent = 0;
     caps->MaxTextureRepeat = 8192;
     caps->MaxTextureAspectRatio = 4096;
     caps->MaxAnisotropy = 1;
     caps->MaxVertexW = 1.0e10f;
     caps->MaxPrimitiveCount = 0xFFFFFu;
     caps->MaxVertexIndex = 0xFFFFFFu;
-    caps->MaxStreams = D8WG_MAX_STREAMS;
+    caps->MaxStreams = 1;
     caps->MaxStreamStride = 255;
     caps->VertexShaderVersion = 0;
     caps->MaxVertexShaderConst = 96;
@@ -932,6 +962,11 @@ static void fill_caps(D3DCAPS8 *caps)
     caps->FVFCaps = 2u & D3DFVFCAPS_TEXCOORDCOUNTMASK;
     caps->MaxTextureBlendStages = 2;
     caps->MaxSimultaneousTextures = 2;
+    caps->MaxActiveLights = D8WG_MAX_LIGHTS;
+    caps->VertexProcessingCaps = D3DVTXPCAPS_TEXGEN
+            | D3DVTXPCAPS_MATERIALSOURCE7
+            | D3DVTXPCAPS_DIRECTIONALLIGHTS
+            | D3DVTXPCAPS_POSITIONALLIGHTS | D3DVTXPCAPS_LOCALVIEWER;
 }
 
 static HRESULT WINAPI d3d_query_interface(IDirect3D8 *iface, REFIID iid,
@@ -1069,10 +1104,15 @@ static HRESULT WINAPI d3d_check_device_format(IDirect3D8 *iface,
 {
     (void)iface;
     (void)adapter_format;
-    (void)usage;
     if (adapter || type != D3DDEVTYPE_HAL)
         return D3DERR_NOTAVAILABLE;
-    if (resource_type == D3DRTYPE_TEXTURE && supported_texture_format(format))
+    if (resource_type == D3DRTYPE_TEXTURE
+            && !(usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))
+            && supported_texture_format(format))
+        return D3D_OK;
+    if (resource_type == D3DRTYPE_SURFACE
+            && (usage & D3DUSAGE_DEPTHSTENCIL)
+            && (format == D3DFMT_D16 || format == D3DFMT_D24S8))
         return D3D_OK;
     return D3DERR_NOTAVAILABLE;
 }
@@ -1124,11 +1164,13 @@ static HMONITOR WINAPI d3d_get_adapter_monitor(IDirect3D8 *iface,
 static void device_init_states(D8Device *device)
 {
     UINT stage;
+    UINT transform;
     ZeroMemory(device->render_states, sizeof(device->render_states));
     ZeroMemory(device->texture_stage_states,
             sizeof(device->texture_stage_states));
     device->render_states[D3DRS_ZENABLE] = D3DZB_TRUE;
     device->render_states[D3DRS_ZWRITEENABLE] = TRUE;
+    device->render_states[D3DRS_ZFUNC] = D3DCMP_LESSEQUAL;
     device->render_states[D3DRS_CULLMODE] = D3DCULL_CCW;
     device->render_states[D3DRS_LIGHTING] = TRUE;
     device->render_states[D3DRS_SHADEMODE] = D3DSHADE_GOURAUD;
@@ -1137,6 +1179,34 @@ static void device_init_states(D8Device *device)
     device->render_states[D3DRS_DESTBLEND] = D3DBLEND_ZERO;
     device->render_states[D3DRS_TEXTUREFACTOR] = 0xFFFFFFFFu;
     device->render_states[D3DRS_COLORWRITEENABLE] = 0xFu;
+    device->render_states[D3DRS_FOGEND] = 0x3F800000u;
+    device->render_states[D3DRS_FOGDENSITY] = 0x3F800000u;
+    device->render_states[D3DRS_STENCILFAIL] = D3DSTENCILOP_KEEP;
+    device->render_states[D3DRS_STENCILZFAIL] = D3DSTENCILOP_KEEP;
+    device->render_states[D3DRS_STENCILPASS] = D3DSTENCILOP_KEEP;
+    device->render_states[D3DRS_STENCILFUNC] = D3DCMP_ALWAYS;
+    device->render_states[D3DRS_STENCILMASK] = 0xFFFFFFFFu;
+    device->render_states[D3DRS_STENCILWRITEMASK] = 0xFFFFFFFFu;
+    device->render_states[D3DRS_COLORVERTEX] = TRUE;
+    device->render_states[D3DRS_LOCALVIEWER] = TRUE;
+    device->render_states[D3DRS_DIFFUSEMATERIALSOURCE] = D3DMCS_COLOR1;
+    device->render_states[D3DRS_SPECULARMATERIALSOURCE] = D3DMCS_COLOR2;
+    device->render_states[D3DRS_AMBIENTMATERIALSOURCE] = D3DMCS_MATERIAL;
+    device->render_states[D3DRS_EMISSIVEMATERIALSOURCE] = D3DMCS_MATERIAL;
+    ZeroMemory(&device->material, sizeof(device->material));
+    device->material.Diffuse.r = device->material.Diffuse.g =
+            device->material.Diffuse.b = device->material.Diffuse.a = 1.0f;
+    device->material.Ambient = device->material.Diffuse;
+    ZeroMemory(device->lights, sizeof(device->lights));
+    ZeroMemory(device->light_set, sizeof(device->light_set));
+    ZeroMemory(device->light_enabled, sizeof(device->light_enabled));
+    for (transform = 0; transform < D8WG_MAX_TRANSFORMS; ++transform) {
+        ZeroMemory(&device->transforms[transform], sizeof(D3DMATRIX));
+        device->transforms[transform].m[0][0] = 1.0f;
+        device->transforms[transform].m[1][1] = 1.0f;
+        device->transforms[transform].m[2][2] = 1.0f;
+        device->transforms[transform].m[3][3] = 1.0f;
+    }
     for (stage = 0; stage < D8WG_MAX_TEXTURE_STAGES; ++stage) {
         device->texture_stage_states[stage][D3DTSS_COLOROP] =
                 stage == 0 ? D3DTOP_MODULATE : D3DTOP_DISABLE;
@@ -1171,6 +1241,10 @@ static HRESULT WINAPI d3d_create_device(IDirect3D8 *iface, UINT adapter,
     if (adapter || type != D3DDEVTYPE_HAL || !parameters || !device_out)
         return D3DERR_INVALIDCALL;
     if (parameters->MultiSampleType != D3DMULTISAMPLE_NONE)
+        return D3DERR_NOTAVAILABLE;
+    if (parameters->EnableAutoDepthStencil
+            && parameters->AutoDepthStencilFormat != D3DFMT_D16
+            && parameters->AutoDepthStencilFormat != D3DFMT_D24S8)
         return D3DERR_NOTAVAILABLE;
 
     device = (D8Device *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
@@ -1225,6 +1299,8 @@ static HRESULT WINAPI d3d_create_device(IDirect3D8 *iface, UINT adapter,
     command.backbuffer_format = device->display_mode.Format;
     command.windowed = parameters->Windowed;
     command.behavior_flags = behavior;
+    command.enable_auto_depth_stencil = parameters->EnableAutoDepthStencil;
+    command.auto_depth_stencil_format = parameters->AutoDepthStencilFormat;
     if (!emit_command(D8WG_OP_CREATE_DEVICE, &command, sizeof(command))) {
         IDirect3D8_Release(iface);
         HeapFree(GetProcessHeap(), 0, device);
@@ -1361,6 +1437,8 @@ static HRESULT WINAPI device_reset(IDirect3DDevice8 *iface,
             ? device->display_mode.Format : parameters->BackBufferFormat;
     reset.windowed = parameters->Windowed;
     reset.behavior_flags = device->creation.BehaviorFlags;
+    reset.enable_auto_depth_stencil = parameters->EnableAutoDepthStencil;
+    reset.auto_depth_stencil_format = parameters->AutoDepthStencilFormat;
     fill_display_mode(&device->display_mode, reset.width, reset.height,
             reset.backbuffer_format);
     device->viewport.X = device->viewport.Y = 0;
@@ -2801,24 +2879,211 @@ DEV_STUB(get_render_target, IDirect3DSurface8 **rt)
 { (void)iface;(void)rt; return D3DERR_INVALIDCALL; }
 DEV_STUB(get_depth_surface, IDirect3DSurface8 **ds)
 { (void)iface;(void)ds; return D3DERR_INVALIDCALL; }
-DEV_STUB(set_transform, D3DTRANSFORMSTATETYPE state, const D3DMATRIX *m)
-{ (void)iface;(void)state;(void)m; return D3DERR_INVALIDCALL; }
-DEV_STUB(get_transform, D3DTRANSFORMSTATETYPE state, D3DMATRIX *m)
-{ (void)iface;(void)state;(void)m; return D3DERR_INVALIDCALL; }
-DEV_STUB(multiply_transform, D3DTRANSFORMSTATETYPE state, const D3DMATRIX *m)
-{ (void)iface;(void)state;(void)m; return D3DERR_INVALIDCALL; }
-DEV_STUB(set_material, const D3DMATERIAL8 *m)
-{ (void)iface;(void)m; return D3DERR_INVALIDCALL; }
-DEV_STUB(get_material, D3DMATERIAL8 *m)
-{ (void)iface;(void)m; return D3DERR_INVALIDCALL; }
-DEV_STUB(set_light, DWORD index, const D3DLIGHT8 *light)
-{ (void)iface;(void)index;(void)light; return D3DERR_INVALIDCALL; }
-DEV_STUB(get_light, DWORD index, D3DLIGHT8 *light)
-{ (void)iface;(void)index;(void)light; return D3DERR_INVALIDCALL; }
-DEV_STUB(light_enable, DWORD index, WINBOOL enable)
-{ (void)iface;(void)index;(void)enable; return D3DERR_INVALIDCALL; }
-DEV_STUB(get_light_enable, DWORD index, WINBOOL *enable)
-{ (void)iface;(void)index;(void)enable; return D3DERR_INVALIDCALL; }
+static BOOL transform_slot(D3DTRANSFORMSTATETYPE state, UINT *slot)
+{
+    UINT value = (UINT)state;
+    if (state == D3DTS_VIEW) {
+        *slot = D8WG_TRANSFORM_VIEW_SLOT;
+        return TRUE;
+    }
+    if (state == D3DTS_PROJECTION) {
+        *slot = D8WG_TRANSFORM_PROJECTION_SLOT;
+        return TRUE;
+    }
+    if (value >= (UINT)D3DTS_TEXTURE0 && value <= (UINT)D3DTS_TEXTURE7) {
+        *slot = D8WG_TRANSFORM_TEXTURE_SLOT + value - (UINT)D3DTS_TEXTURE0;
+        return TRUE;
+    }
+    if (value >= (UINT)D3DTS_WORLD && value < (UINT)D3DTS_WORLD + 256u) {
+        *slot = D8WG_TRANSFORM_WORLD_SLOT + value - (UINT)D3DTS_WORLD;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL matrix_equal(const D3DMATRIX *left, const D3DMATRIX *right)
+{
+    UINT row;
+    UINT column;
+    for (row = 0; row < 4; ++row) {
+        for (column = 0; column < 4; ++column) {
+            if (left->m[row][column] != right->m[row][column])
+                return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static void matrix_multiply(D3DMATRIX *result, const D3DMATRIX *left,
+        const D3DMATRIX *right)
+{
+    D3DMATRIX temporary;
+    UINT row;
+    UINT column;
+    UINT inner;
+    for (row = 0; row < 4; ++row) {
+        for (column = 0; column < 4; ++column) {
+            float value = 0.0f;
+            for (inner = 0; inner < 4; ++inner)
+                value += left->m[row][inner] * right->m[inner][column];
+            temporary.m[row][column] = value;
+        }
+    }
+    *result = temporary;
+}
+
+static HRESULT emit_transform(D8Device *device,
+        D3DTRANSFORMSTATETYPE state, const D3DMATRIX *matrix)
+{
+    D8WGSetTransform command;
+    command.device_handle = device->handle;
+    command.state = (UINT)state;
+    CopyMemory(command.matrix, matrix, sizeof(command.matrix));
+    return emit_command(D8WG_OP_SET_TRANSFORM, &command, sizeof(command))
+            ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
+}
+
+static HRESULT WINAPI device_set_transform(IDirect3DDevice8 *iface,
+        D3DTRANSFORMSTATETYPE state, const D3DMATRIX *matrix)
+{
+    D8Device *device = device_from_iface(iface);
+    UINT slot;
+    if (!matrix || !transform_slot(state, &slot))
+        return D3DERR_INVALIDCALL;
+    if (matrix_equal(&device->transforms[slot], matrix))
+        return D3D_OK;
+    device->transforms[slot] = *matrix;
+    return emit_transform(device, state, matrix);
+}
+
+static HRESULT WINAPI device_get_transform(IDirect3DDevice8 *iface,
+        D3DTRANSFORMSTATETYPE state, D3DMATRIX *matrix)
+{
+    UINT slot;
+    if (!matrix || !transform_slot(state, &slot))
+        return D3DERR_INVALIDCALL;
+    *matrix = device_from_iface(iface)->transforms[slot];
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_multiply_transform(IDirect3DDevice8 *iface,
+        D3DTRANSFORMSTATETYPE state, const D3DMATRIX *matrix)
+{
+    D8Device *device = device_from_iface(iface);
+    D3DMATRIX product;
+    UINT slot;
+    if (!matrix || !transform_slot(state, &slot))
+        return D3DERR_INVALIDCALL;
+    matrix_multiply(&product, &device->transforms[slot], matrix);
+    if (matrix_equal(&device->transforms[slot], &product))
+        return D3D_OK;
+    device->transforms[slot] = product;
+    return emit_transform(device, state, &product);
+}
+static BOOL bytes_equal(const void *left, const void *right, UINT size)
+{
+    const BYTE *a = (const BYTE *)left;
+    const BYTE *b = (const BYTE *)right;
+    UINT index;
+    for (index = 0; index < size; ++index) {
+        if (a[index] != b[index]) return FALSE;
+    }
+    return TRUE;
+}
+
+static HRESULT WINAPI device_set_material(IDirect3DDevice8 *iface,
+        const D3DMATERIAL8 *material)
+{
+    D8Device *device = device_from_iface(iface);
+    D8WGSetMaterial command;
+    if (!material) return D3DERR_INVALIDCALL;
+    if (bytes_equal(&device->material, material, sizeof(*material)))
+        return D3D_OK;
+    device->material = *material;
+    command.device_handle = device->handle;
+    CopyMemory(command.diffuse, &material->Diffuse, sizeof(command.diffuse));
+    CopyMemory(command.ambient, &material->Ambient, sizeof(command.ambient));
+    CopyMemory(command.specular, &material->Specular, sizeof(command.specular));
+    CopyMemory(command.emissive, &material->Emissive, sizeof(command.emissive));
+    command.power = material->Power;
+    return emit_command(D8WG_OP_SET_MATERIAL, &command, sizeof(command))
+            ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
+}
+
+static HRESULT WINAPI device_get_material(IDirect3DDevice8 *iface,
+        D3DMATERIAL8 *material)
+{
+    if (!material) return D3DERR_INVALIDCALL;
+    *material = device_from_iface(iface)->material;
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_set_light(IDirect3DDevice8 *iface, DWORD index,
+        const D3DLIGHT8 *light)
+{
+    D8Device *device = device_from_iface(iface);
+    D8WGSetLight command;
+    if (!light || index >= D8WG_MAX_LIGHTS || light->Type < D3DLIGHT_POINT
+            || light->Type > D3DLIGHT_DIRECTIONAL)
+        return D3DERR_INVALIDCALL;
+    if (device->light_set[index] &&
+            bytes_equal(&device->lights[index], light, sizeof(*light)))
+        return D3D_OK;
+    device->lights[index] = *light;
+    device->light_set[index] = TRUE;
+    command.device_handle = device->handle;
+    command.index = index;
+    command.type = light->Type;
+    CopyMemory(command.diffuse, &light->Diffuse, sizeof(command.diffuse));
+    CopyMemory(command.specular, &light->Specular, sizeof(command.specular));
+    CopyMemory(command.ambient, &light->Ambient, sizeof(command.ambient));
+    CopyMemory(command.position, &light->Position, sizeof(command.position));
+    CopyMemory(command.direction, &light->Direction, sizeof(command.direction));
+    command.range = light->Range;
+    command.falloff = light->Falloff;
+    command.attenuation[0] = light->Attenuation0;
+    command.attenuation[1] = light->Attenuation1;
+    command.attenuation[2] = light->Attenuation2;
+    command.theta = light->Theta;
+    command.phi = light->Phi;
+    return emit_command(D8WG_OP_SET_LIGHT, &command, sizeof(command))
+            ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
+}
+
+static HRESULT WINAPI device_get_light(IDirect3DDevice8 *iface, DWORD index,
+        D3DLIGHT8 *light)
+{
+    D8Device *device = device_from_iface(iface);
+    if (!light || index >= D8WG_MAX_LIGHTS || !device->light_set[index])
+        return D3DERR_INVALIDCALL;
+    *light = device->lights[index];
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_light_enable(IDirect3DDevice8 *iface,
+        DWORD index, WINBOOL enable)
+{
+    D8Device *device = device_from_iface(iface);
+    D8WGLightEnable command;
+    if (index >= D8WG_MAX_LIGHTS) return D3DERR_INVALIDCALL;
+    enable = !!enable;
+    if (device->light_enabled[index] == enable) return D3D_OK;
+    device->light_enabled[index] = enable;
+    command.device_handle = device->handle;
+    command.index = index;
+    command.enable = enable;
+    command.reserved = 0;
+    return emit_command(D8WG_OP_LIGHT_ENABLE, &command, sizeof(command))
+            ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
+}
+
+static HRESULT WINAPI device_get_light_enable(IDirect3DDevice8 *iface,
+        DWORD index, WINBOOL *enable)
+{
+    if (!enable || index >= D8WG_MAX_LIGHTS) return D3DERR_INVALIDCALL;
+    *enable = device_from_iface(iface)->light_enabled[index];
+    return D3D_OK;
+}
 DEV_STUB(set_clip_plane, DWORD index, const float *plane)
 { (void)iface;(void)index;(void)plane; return D3DERR_INVALIDCALL; }
 DEV_STUB(get_clip_plane, DWORD index, float *plane)

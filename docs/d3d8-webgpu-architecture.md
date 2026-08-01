@@ -43,7 +43,7 @@ V86GLDMADesc
 The outer VGL2 `PRESENT` flag is deliberately clear. `D8WG_OP_PRESENT` is
 executed by WebGPU, so the GL bridge must not swap its canvas.
 
-## Implemented milestone (M1)
+## Initial implemented milestone (M1)
 
 Guest:
 
@@ -82,8 +82,22 @@ M1 is sufficient for `d3d8_clear_test.exe`, the capability-only
 4. M5: state blocks, Reset/device-loss recovery, swap chains, readback and
    D3D8 shader models 1.x.
 
-Each unsupported M1 method returns `D3DERR_INVALIDCALL`; it must not report
+Each unsupported method returns `D3DERR_INVALIDCALL`; it must not report
 success while dropping rendering work.
+
+## Current implementation (D8WG v1.4 / M4 fixed-function core)
+
+M1-M3 remain implemented. v1.4 additionally carries `XYZ` vertices and the
+exact MapleStory `FVF 0x142` layout, world/view/projection and texture
+transforms, automatic D24S8, depth/stencil state, material and eight
+directional/point/spot lights, specular/local-viewer/normalization, fog,
+texture-coordinate generation, flat/Gouraud shading and blend operations.
+
+The M4 release gate is not yet closed. Real Chrome/XP/Maple acceptance remains
+mandatory, and explicit render targets/depth surfaces, `CopyRects`, clip
+planes and trace-prioritized cube/volume resources are still outside v1.4.
+Their caps remain conservative so an application cannot mistake an
+unsupported cold path for a working one.
 
 ## Performance contract
 
