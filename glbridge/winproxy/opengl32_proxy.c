@@ -4705,6 +4705,55 @@ static void emit_gl_call(uint16_t fn, const void* args, uint32_t args_size) {
 
     emit_pci_record(fn, args, args_size, FALSE);
 }
+#ifndef V86GL_PACKED_DIRECT_DMA
+#define V86GL_PACKED_DIRECT_DMA 1
+#endif
+
+/*
+ * Packed draws know their final protocol size before serialization. In the
+ * normal path, reserve the PCI record first and write the header, indices, and
+ * client-array blocks directly into the mapped DMA buffer.
+ *
+ * Display-list compilation retains the old temporary-payload path because
+ * GL_COMPILE records without executing, while GL_COMPILE_AND_EXECUTE records
+ * and submits the same payload.
+ */
+static int reserve_packed_draw_payload(uint16_t fn, uint32_t args_size,
+                                       uint8_t** payload_out,
+                                       BOOL* payload_is_dma_out) {
+    if (!payload_out || !payload_is_dma_out) {
+        v86gl_set_error(GL_INVALID_VALUE);
+        return 0;
+    }
+
+    *payload_out = NULL;
+    *payload_is_dma_out = FALSE;
+
+#if V86GL_PACKED_DIRECT_DMA
+    if (!g_current_display_list || g_replaying_display_list) {
+        if (!reserve_pci_record(fn, NULL, args_size, payload_out)) {
+            return 0;
+        }
+        *payload_is_dma_out = TRUE;
+        return 1;
+    }
+#endif
+
+    *payload_out = alloc_payload(args_size);
+    return *payload_out != NULL;
+}
+
+static void commit_packed_draw_payload(uint16_t fn, uint8_t* payload,
+                                       uint32_t args_size,
+                                       BOOL payload_is_dma) {
+    if (!payload || payload_is_dma) {
+        return;
+    }
+
+    emit_gl_call(fn, payload, args_size);
+    HeapFree(GetProcessHeap(), 0, payload);
+}
+
 
 static BOOL selection_or_feedback_mode(void) {
     return g_render_mode == GL_SELECT || g_render_mode == GL_FEEDBACK;
@@ -14880,6 +14929,8 @@ void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     uint32_t generic_block_size = 0;
     uint32_t total_size;
     uint8_t* payload;
+    uint16_t draw_fn;
+    BOOL payload_is_dma;
     uint8_t* p;
     uint32_t i;
     struct {
@@ -14993,8 +15044,9 @@ void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count) {
         total_size = sizeof(header) + block_size;
     }
 
-    payload = alloc_payload(total_size);
-    if (!payload) {
+    draw_fn = generic_attrib_count ? GLFN_DRAW_ARRAYS_GL2 : GLFN_DRAW_ARRAYS;
+    if (!reserve_packed_draw_payload(draw_fn, total_size,
+                                     &payload, &payload_is_dma)) {
         return;
     }
 
@@ -15029,9 +15081,8 @@ void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count) {
         }
     }
 
-    emit_gl_call(generic_attrib_count ? GLFN_DRAW_ARRAYS_GL2 : GLFN_DRAW_ARRAYS,
-                 payload, total_size);
-    HeapFree(GetProcessHeap(), 0, payload);
+    commit_packed_draw_payload(draw_fn, payload, total_size,
+                               payload_is_dma);
     if (g_trace_calls) {
         v86gl_trace("glDrawArrays leave queued=%lu", (unsigned long)g_dma_command_count);
     }
@@ -15051,6 +15102,8 @@ void APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvo
     uint32_t generic_block_size = 0;
     uint32_t total_size;
     uint8_t* payload;
+    uint16_t draw_fn;
+    BOOL payload_is_dma;
     uint8_t* p;
     const uint8_t* index_data;
     uint32_t i;
@@ -15214,8 +15267,9 @@ void APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvo
         total_size = sizeof(header) + index_data_size + block_size;
     }
 
-    payload = alloc_payload(total_size);
-    if (!payload) {
+    draw_fn = generic_attrib_count ? GLFN_DRAW_ELEMENTS_GL2 : GLFN_DRAW_ELEMENTS;
+    if (!reserve_packed_draw_payload(draw_fn, total_size,
+                                     &payload, &payload_is_dma)) {
         return;
     }
 
@@ -15256,9 +15310,8 @@ void APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvo
         }
     }
 
-    emit_gl_call(generic_attrib_count ? GLFN_DRAW_ELEMENTS_GL2 : GLFN_DRAW_ELEMENTS,
-                 payload, total_size);
-    HeapFree(GetProcessHeap(), 0, payload);
+    commit_packed_draw_payload(draw_fn, payload, total_size,
+                               payload_is_dma);
     if (g_trace_calls) {
         v86gl_trace("glDrawElements leave queued=%lu", (unsigned long)g_dma_command_count);
     }
