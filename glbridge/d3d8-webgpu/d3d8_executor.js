@@ -9,8 +9,10 @@
     "use strict";
 
     const D8WG_MAGIC = 0x47573844; // "D8WG"
+    const D8WG_CHECKPOINT_MAGIC = 0x43533844; // "D8SC"
+    const D8WG_CHECKPOINT_VERSION = 1;
     const D8WG_VERSION_MAJOR = 1;
-    const D8WG_VERSION_MINOR = 4;
+    const D8WG_VERSION_MINOR = 6;
     const D8WG_BATCH_HEADER_BYTES = 32;
     const D8WG_COMMAND_HEADER_BYTES = 16;
 
@@ -38,6 +40,7 @@
     const OP_SET_STREAM_SOURCE = 0x208;
     const OP_SET_INDICES = 0x209;
     const OP_SET_VERTEX_FORMAT = 0x20A;
+    const OP_SET_RENDER_TARGET = 0x20B;
     const OP_DRAW_PRIMITIVE = 0x300;
     const OP_DRAW_INDEXED_PRIMITIVE = 0x301;
     const OP_DRAW_PRIMITIVE_UP = 0x302;
@@ -46,6 +49,7 @@
     const RESOURCE_BUFFER_VERTEX = 1;
     const RESOURCE_BUFFER_INDEX = 2;
     const RESOURCE_TEXTURE_2D = 3;
+    const D3DUSAGE_RENDERTARGET = 0x1;
     const D3DFMT_A8R8G8B8 = 21;
     const D3DFMT_X8R8G8B8 = 22;
     const D3DFMT_R5G6B5 = 23;
@@ -880,6 +884,8 @@ ${fragment.join("\n")}
             })),
             fvf: 0,
             inScene: false,
+            renderTarget: { handle: 0, level: 0 },
+            depthSurfaceEnabled: surface.autoDepthStencil,
             uniformSerial: 0,
             uniformVariants: new Map(),
             bindGroups: new Map(),
@@ -899,8 +905,17 @@ ${fragment.join("\n")}
             this.device = this.options.device || null;
             this.context = this.options.context || null;
             this.format = this.options.format || null;
+            this.sessions = new Map();
+            this.activeSession = null;
+            this.maxSessions = Math.max(16, this.options.maxSessions || 128);
+            this.sessionSerial = 0;
+            // These aliases always point at the session of the current/most
+            // recently executed batch. Keeping them preserves the public test
+            // and diagnostics surface while all ownership is session-local.
             this.devices = new Map();
             this.resources = new Map();
+            this.retiredDeviceHandles = new Set();
+            this.retiredResourceHandles = new Set();
             this.pipelineCache = new Map();
             this.samplerCache = new Map();
             this.maxPipelines = Math.max(32, this.options.maxPipelines || 512);
@@ -919,6 +934,7 @@ ${fragment.join("\n")}
             this.frame = null;
             this.readyPromise = null;
             this.work = Promise.resolve();
+            this.pendingSubmissions = 0;
             this.failed = null;
             this.warned = new Set();
             this.stats = {
@@ -939,7 +955,70 @@ ${fragment.join("\n")}
                 uniformCacheEvictions: 0,
                 malformedBatches: 0,
                 unsupportedCommands: 0,
+                deviceRecoveries: 0,
+                staleCommandsDropped: 0,
+                rectangularClears: 0,
+                deferredDestroys: 0,
             };
+        }
+
+        sessionKey(low, high) {
+            return (high >>> 0).toString(16).padStart(8, "0") + ":" +
+                (low >>> 0).toString(16).padStart(8, "0");
+        }
+
+        setActiveSession(session, finishForeignFrame) {
+            if (finishForeignFrame && this.frame &&
+                    this.frame.sessionKey !== session.key) {
+                this.finishFrame(false);
+            }
+            this.activeSession = session;
+            this.devices = session.devices;
+            this.resources = session.resources;
+            this.retiredDeviceHandles = session.retiredDeviceHandles;
+            this.retiredResourceHandles = session.retiredResourceHandles;
+            session.lastUsed = ++this.sessionSerial;
+        }
+
+        activateSession(low, high) {
+            low >>>= 0;
+            high >>>= 0;
+            if (!low && !high)
+                throw new Error("D8WG batch has an empty process session");
+            const key = this.sessionKey(low, high);
+            let session = this.sessions.get(key);
+            if (!session) {
+                session = {
+                    key, low, high,
+                    devices: new Map(),
+                    resources: new Map(),
+                    retiredDeviceHandles: new Set(),
+                    retiredResourceHandles: new Set(),
+                    helloSeen: false,
+                    lastUsed: 0,
+                };
+                this.sessions.set(key, session);
+            }
+            this.setActiveSession(session, true);
+            this.pruneSessions();
+            return session;
+        }
+
+        pruneSessions() {
+            if (this.sessions.size <= this.maxSessions) return;
+            for (const [key, session] of this.sessions) {
+                if (this.sessions.size <= this.maxSessions) break;
+                if (session === this.activeSession || session.devices.size ||
+                        session.resources.size) continue;
+                this.sessions.delete(key);
+            }
+        }
+
+        retireHandle(set, handle) {
+            if (!handle) return;
+            set.add(handle >>> 0);
+            if (set.size > 8192)
+                set.delete(set.values().next().value);
         }
 
         warnOnce(key, message, details) {
@@ -986,9 +1065,7 @@ ${fragment.join("\n")}
                 });
                 if (this.device.lost && typeof this.device.lost.then === "function") {
                     this.device.lost.then(info => {
-                        this.failed = new Error("WebGPU device lost: " +
-                            (info && info.message || "unknown reason"));
-                        console.error("[d3d8-webgpu] device lost", info);
+                        this.scheduleDeviceRecovery(info);
                     });
                 }
                 return this;
@@ -1011,12 +1088,13 @@ ${fragment.join("\n")}
         submit(bytes, metadata) {
             const owned = bytes instanceof Uint8Array ? bytes.slice() :
                 new Uint8Array(bytes || []);
+            this.pendingSubmissions++;
             this.work = this.work.then(() => this.initialize())
                 .then(() => this.executeBatch(owned, metadata || {}))
                 .catch(error => {
                     this.failed = error;
                     console.error("[d3d8-webgpu] batch failed", error, metadata || {});
-                });
+                }).finally(() => { this.pendingSubmissions--; });
             return this.work;
         }
 
@@ -1024,10 +1102,95 @@ ${fragment.join("\n")}
             return this.work;
         }
 
+        discardFrame() {
+            if (!this.frame) return;
+            this.endPass();
+            for (const buffer of this.frame.transientBuffers)
+                buffer.destroy();
+            const deferredDestroy = this.frame.deferredDestroy;
+            this.frame = null;
+            // The discarded encoder no longer references these objects, but
+            // an earlier submitted frame still might. Retire them behind the
+            // queue completion fence rather than destroying them immediately.
+            this.scheduleGPUDestruction(deferredDestroy);
+        }
+
+        scheduleGPUDestruction(objects) {
+            const pending = Array.from(new Set((objects || []).filter(
+                object => object && typeof object.destroy === "function")));
+            if (!pending.length) return;
+            const destroy = () => {
+                for (const object of pending) object.destroy();
+            };
+            this.stats.deferredDestroys += pending.length;
+            if (this.device && this.device.queue &&
+                    typeof this.device.queue.onSubmittedWorkDone === "function") {
+                this.device.queue.onSubmittedWorkDone().then(destroy, destroy);
+            } else {
+                destroy();
+            }
+        }
+
+        retireGPUObjects(...objects) {
+            const pending = objects.filter(object => object &&
+                typeof object.destroy === "function");
+            if (!pending.length) return;
+            if (this.frame)
+                this.frame.deferredDestroy.push(...pending);
+            else
+                this.scheduleGPUDestruction(pending);
+        }
+
+        async recoverDevice(replacementDevice, info) {
+            this.discardFrame();
+            const checkpoint = this.serializeState();
+            if (this.fallbackTexture) this.fallbackTexture.destroy();
+            if (this.transientBuffer) this.transientBuffer.destroy();
+            this.fallbackTexture = null;
+            this.fallbackView = null;
+            this.transientBuffer = null;
+            // GPU pipelines and samplers are owned by the lost GPUDevice and
+            // must never be reused by the replacement device, even when their
+            // logical D3D8 cache keys are identical.
+            this.pipelineCache.clear();
+            this.samplerCache.clear();
+            this.device = replacementDevice || null;
+            if (!replacementDevice) this.adapter = null;
+            this.readyPromise = null;
+            this.failed = null;
+            await this.initialize();
+            this.restoreState(checkpoint);
+            this.stats.deviceRecoveries++;
+            if (typeof this.options.onDeviceRecovered === "function")
+                this.options.onDeviceRecovered(info || {});
+        }
+
+        scheduleDeviceRecovery(info, replacementDevice) {
+            const message = info && info.message || "unknown reason";
+            console.warn("[d3d8-webgpu] device lost; rebuilding resources", info);
+            this.work = this.work.then(() =>
+                this.recoverDevice(replacementDevice, info)).catch(error => {
+                this.failed = new Error("WebGPU device recovery failed after " +
+                    message + ": " + (error && error.message || error));
+                console.error("[d3d8-webgpu] device recovery failed", error);
+            });
+            return this.work;
+        }
+
+        injectDeviceLoss(replacementDevice) {
+            if (!replacementDevice)
+                throw new Error("device-loss injection requires a replacement device");
+            return this.scheduleDeviceRecovery({ reason: "injected",
+                message: "test injection" }, replacementDevice);
+        }
+
         parseSurface(bytes, offset) {
             const width = Math.max(1, u32(bytes, offset + 16));
             const height = Math.max(1, u32(bytes, offset + 20));
             return {
+                sessionKey: this.activeSession.key,
+                sessionIdLow: this.activeSession.low,
+                sessionIdHigh: this.activeSession.high,
                 hwnd: u32(bytes, offset + 4),
                 x: i32(bytes, offset + 8),
                 y: i32(bytes, offset + 12),
@@ -1045,14 +1208,13 @@ ${fragment.join("\n")}
         }
 
         createSurfaceUniform(state) {
-            for (const buffer of state.uniformVariants.values())
-                buffer.destroy();
+            this.retireGPUObjects(...state.uniformVariants.values());
             state.uniformVariants.clear();
             state.bindGroups.clear();
         }
 
         createDepthSurface(state) {
-            if (state.depthTexture) state.depthTexture.destroy();
+            this.retireGPUObjects(state.depthTexture);
             state.depthTexture = null;
             state.depthView = null;
             if (!state.surface.autoDepthStencil) return;
@@ -1087,7 +1249,7 @@ ${fragment.join("\n")}
                 if (this.frame)
                     this.frame.transientBuffers.push(oldest);
                 else
-                    oldest.destroy();
+                    this.retireGPUObjects(oldest);
                 this.stats.uniformCacheEvictions++;
             }
             const width = Math.max(1, state.surface.width);
@@ -1144,15 +1306,14 @@ ${fragment.join("\n")}
             return { buffer, key };
         }
 
-        createOrResetDevice(bytes, payloadOffset, reset) {
+        createOrResetDevice(bytes, payloadOffset, reset, surfaceReason) {
             const handle = u32(bytes, payloadOffset);
             const surface = this.parseSurface(bytes, payloadOffset);
             let state = this.devices.get(handle);
             if (!state || !reset) {
                 if (state) {
-                    for (const buffer of state.uniformVariants.values())
-                        buffer.destroy();
-                    if (state.depthTexture) state.depthTexture.destroy();
+                    this.retireGPUObjects(...state.uniformVariants.values(),
+                        state.depthTexture);
                 }
                 state = freshDeviceState(handle, surface);
                 this.devices.set(handle, state);
@@ -1168,8 +1329,20 @@ ${fragment.join("\n")}
             this.createSurfaceUniform(state);
             this.createDepthSurface(state);
             if (typeof this.options.onSurface === "function") {
-                this.options.onSurface(surface, reset ? "reset" : "create");
+                this.options.onSurface(surface,
+                    surfaceReason || (reset ? "reset" : "create"));
             }
+        }
+
+        resetDevice(bytes, payloadOffset) {
+            const oldHandle = u32(bytes, payloadOffset);
+            const newHandle = u32(bytes, payloadOffset + 4);
+            if (!oldHandle || !newHandle || oldHandle === newHandle)
+                throw new Error("RESET has an invalid device epoch");
+            if (!this.devices.has(oldHandle))
+                throw new Error("RESET references an unknown old device");
+            this.destroyResource(oldHandle);
+            this.createOrResetDevice(bytes, payloadOffset + 4, false, "reset");
         }
 
         updateSurface(bytes, payloadOffset, state, reason) {
@@ -1206,23 +1379,204 @@ ${fragment.join("\n")}
             }
         }
 
+        mirrorRenderTargetClear(state, color, rectangles) {
+            const handle = state.renderTarget.handle >>> 0;
+            if (!handle) return;
+            const resource = this.resources.get(handle);
+            const level = resource && resource.shadowLevels[
+                state.renderTarget.level >>> 0];
+            if (!resource || resource.kind !== RESOURCE_TEXTURE_2D || !level ||
+                    (resource.format !== D3DFMT_A8R8G8B8 &&
+                     resource.format !== D3DFMT_X8R8G8B8)) return;
+            const b = color & 0xFF;
+            const g = (color >>> 8) & 0xFF;
+            const r = (color >>> 16) & 0xFF;
+            const a = resource.format === D3DFMT_A8R8G8B8 ?
+                (color >>> 24) & 0xFF : 0xFF;
+            const areas = rectangles && rectangles.length ? rectangles : [{
+                x1: 0, y1: 0, x2: level.width, y2: level.height,
+            }];
+            for (const area of areas) {
+                const x1 = Math.max(0, Math.min(level.width, area.x1 | 0));
+                const y1 = Math.max(0, Math.min(level.height, area.y1 | 0));
+                const x2 = Math.max(x1, Math.min(level.width, area.x2 | 0));
+                const y2 = Math.max(y1, Math.min(level.height, area.y2 | 0));
+                for (let y = y1; y < y2; y++) {
+                    let offset = y * level.rowPitch + x1 * 4;
+                    for (let x = x1; x < x2; x++, offset += 4) {
+                        level.data[offset] = b;
+                        level.data[offset + 1] = g;
+                        level.data[offset + 2] = r;
+                        level.data[offset + 3] = a;
+                    }
+                }
+            }
+        }
+
+        clearPipelineFor(state, flags) {
+            const hasDepth = !!(state.depthView && state.depthSurfaceEnabled &&
+                !state.renderTarget.handle);
+            const targetFormat = state.renderTarget.handle ?
+                "rgba8unorm" : this.format;
+            const effectiveFlags = (flags & D3DCLEAR_TARGET) |
+                (hasDepth ? flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL) : 0);
+            const key = ["rect-clear", targetFormat, hasDepth ? 1 : 0,
+                effectiveFlags].join(":");
+            let pipeline = this.pipelineCache.get(key);
+            if (pipeline) {
+                this.pipelineCache.delete(key);
+                this.pipelineCache.set(key, pipeline);
+                return pipeline;
+            }
+            const module = this.device.createShaderModule({
+                label: "D3D8 rectangular Clear shader",
+                code: `
+struct ClearData {
+    color: vec4<f32>,
+    depth: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> clearData: ClearData;
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0));
+    var output: VertexOutput;
+    output.position = vec4<f32>(positions[index], clearData.depth.x, 1.0);
+    return output;
+}
+@fragment fn fs_main() -> @location(0) vec4<f32> {
+    return clearData.color;
+}`,
+            });
+            pipeline = this.device.createRenderPipeline({
+                label: "D3D8 rectangular Clear pipeline " + key,
+                layout: "auto",
+                vertex: { module, entryPoint: "vs_main" },
+                fragment: {
+                    module,
+                    entryPoint: "fs_main",
+                    targets: [{
+                        format: targetFormat,
+                        writeMask: effectiveFlags & D3DCLEAR_TARGET ? 0xF : 0,
+                    }],
+                },
+                primitive: { topology: "triangle-list", cullMode: "none" },
+                ...(hasDepth ? { depthStencil: {
+                    format: "depth24plus-stencil8",
+                    depthWriteEnabled: !!(effectiveFlags & D3DCLEAR_ZBUFFER),
+                    depthCompare: "always",
+                    stencilFront: effectiveFlags & D3DCLEAR_STENCIL ? {
+                        compare: "always", failOp: "keep",
+                        depthFailOp: "keep", passOp: "replace",
+                    } : {},
+                    stencilBack: effectiveFlags & D3DCLEAR_STENCIL ? {
+                        compare: "always", failOp: "keep",
+                        depthFailOp: "keep", passOp: "replace",
+                    } : {},
+                    stencilReadMask: 0xFF,
+                    stencilWriteMask: effectiveFlags & D3DCLEAR_STENCIL ?
+                        0xFF : 0,
+                } } : {}),
+            });
+            pipeline._d8wgId = this.nextPipelineId++;
+            if (this.pipelineCache.size >= this.maxPipelines) {
+                this.pipelineCache.delete(this.pipelineCache.keys().next().value);
+                this.stats.pipelineCacheEvictions++;
+            }
+            this.pipelineCache.set(key, pipeline);
+            this.stats.pipelineCreations++;
+            return pipeline;
+        }
+
+        clearRectangles(state, flags, color, depth, stencil, rectangles) {
+            const target = state.renderTarget.handle ?
+                this.resources.get(state.renderTarget.handle) : null;
+            const level = target ? state.renderTarget.level >>> 0 : 0;
+            const width = target ? Math.max(1, target.width >>> level) :
+                state.surface.width;
+            const height = target ? Math.max(1, target.height >>> level) :
+                state.surface.height;
+            const hasDepth = !!(state.depthView && state.depthSurfaceEnabled &&
+                !state.renderTarget.handle);
+            if (!(flags & D3DCLEAR_TARGET) && !hasDepth) return;
+
+            const data = new Uint8Array(32);
+            const values = new DataView(data.buffer);
+            const clearColor = d3dColor(color);
+            values.setFloat32(0, clearColor.r, true);
+            values.setFloat32(4, clearColor.g, true);
+            values.setFloat32(8, clearColor.b, true);
+            values.setFloat32(12, clearColor.a, true);
+            values.setFloat32(16, Math.max(0, Math.min(1, depth)), true);
+            const pass = this.ensureFrame(state);
+            const uniform = this.device.createBuffer({
+                label: "D3D8 rectangular Clear uniforms",
+                size: data.byteLength,
+                usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
+            });
+            this.device.queue.writeBuffer(uniform, 0, data);
+            this.frame.transientBuffers.push(uniform);
+            const pipeline = this.clearPipelineFor(state, flags);
+            const group = this.device.createBindGroup({
+                layout: pipeline.getBindGroupLayout(0),
+                entries: [{ binding: 0, resource: {
+                    buffer: uniform,
+                    offset: 0,
+                    size: data.byteLength,
+                } }],
+            });
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, group);
+            if (hasDepth && flags & D3DCLEAR_STENCIL)
+                pass.setStencilReference(stencil & 0xFF);
+            for (const area of rectangles) {
+                const x1 = Math.max(0, Math.min(width, area.x1 | 0));
+                const y1 = Math.max(0, Math.min(height, area.y1 | 0));
+                const x2 = Math.max(x1, Math.min(width, area.x2 | 0));
+                const y2 = Math.max(y1, Math.min(height, area.y2 | 0));
+                if (x2 === x1 || y2 === y1) continue;
+                pass.setScissorRect(x1, y1, x2 - x1, y2 - y1);
+                pass.draw(3, 1, 0, 0);
+                this.stats.rectangularClears++;
+            }
+        }
+
         ensureFrame(state, clearOptions) {
-            if (this.frame && this.frame.deviceHandle !== state.handle) {
+            const targetHandle = state.renderTarget.handle >>> 0;
+            if (this.frame && (this.frame.sessionKey !== this.activeSession.key ||
+                    this.frame.deviceHandle !== state.handle ||
+                    this.frame.targetHandle !== targetHandle)) {
                 this.finishFrame(false);
             }
             if (!this.frame) {
                 const encoder = this.device.createCommandEncoder({
                     label: "D3D8 frame",
                 });
-                const view = this.context.getCurrentTexture().createView();
+                const target = targetHandle ? this.resources.get(targetHandle) : null;
+                if (targetHandle && (!target ||
+                        target.kind !== RESOURCE_TEXTURE_2D ||
+                        !(target.usage & D3DUSAGE_RENDERTARGET))) {
+                    throw new Error("active render target is stale");
+                }
+                const view = target ? target.gpuTexture.createView({
+                    baseMipLevel: state.renderTarget.level,
+                    mipLevelCount: 1,
+                }) : this.context.getCurrentTexture().createView();
                 this.frame = {
+                    sessionKey: this.activeSession.key,
                     deviceHandle: state.handle,
+                    targetHandle,
                     state,
                     encoder,
                     view,
                     pass: null,
                     fresh: true,
                     transientBuffers: [],
+                    deferredDestroy: [],
                 };
                 this.transientCursor = 0;
             }
@@ -1239,7 +1593,8 @@ ${fragment.join("\n")}
                         storeOp: "store",
                     }],
                 };
-                if (state.depthView) {
+                if (state.depthView && state.depthSurfaceEnabled &&
+                        !targetHandle) {
                     descriptor.depthStencilAttachment = {
                         view: state.depthView,
                         depthClearValue: clear.depth === undefined ? 1 :
@@ -1264,20 +1619,13 @@ ${fragment.join("\n")}
             if (!this.frame) return false;
             const state = this.frame.state;
             const transientBuffers = this.frame.transientBuffers;
+            const deferredDestroy = this.frame.deferredDestroy;
             this.endPass();
             this.device.queue.submit([this.frame.encoder.finish()]);
             this.stats.queueSubmits++;
             this.frame = null;
-            if (transientBuffers.length) {
-                const destroy = () => {
-                    for (const buffer of transientBuffers) buffer.destroy();
-                };
-                if (typeof this.device.queue.onSubmittedWorkDone === "function") {
-                    this.device.queue.onSubmittedWorkDone().then(destroy, destroy);
-                } else {
-                    destroy();
-                }
-            }
+            this.scheduleGPUDestruction(transientBuffers.concat(
+                deferredDestroy));
             if (notify) {
                 this.stats.presents++;
                 if (typeof this.options.onPresent === "function") {
@@ -1290,8 +1638,9 @@ ${fragment.join("\n")}
         destroyResource(handle) {
             const resource = this.resources.get(handle);
             if (resource) {
-                if (resource.gpuBuffer) resource.gpuBuffer.destroy();
-                if (resource.gpuTexture) resource.gpuTexture.destroy();
+                this.retireHandle(this.retiredResourceHandles, handle);
+                this.retireGPUObjects(resource.gpuBuffer,
+                    resource.gpuTexture);
                 this.resources.delete(handle);
                 if (resource.kind === RESOURCE_TEXTURE_2D) {
                     for (const device of this.devices.values())
@@ -1300,19 +1649,18 @@ ${fragment.join("\n")}
             }
             const state = this.devices.get(handle);
             if (state) {
+                this.retireHandle(this.retiredDeviceHandles, handle);
                 if (this.frame && this.frame.deviceHandle === handle) {
-                    const transientBuffers = this.frame.transientBuffers;
-                    this.endPass();
-                    this.frame = null;
-                    for (const buffer of transientBuffers) buffer.destroy();
+                    this.discardFrame();
                 }
-                for (const buffer of state.uniformVariants.values())
-                    buffer.destroy();
-                if (state.depthTexture) state.depthTexture.destroy();
+                this.retireGPUObjects(...state.uniformVariants.values(),
+                    state.depthTexture);
                 for (const [resourceHandle, child] of this.resources) {
                     if (child.deviceHandle !== handle) continue;
-                    if (child.gpuBuffer) child.gpuBuffer.destroy();
-                    if (child.gpuTexture) child.gpuTexture.destroy();
+                    this.retireHandle(this.retiredResourceHandles,
+                        resourceHandle);
+                    this.retireGPUObjects(child.gpuBuffer,
+                        child.gpuTexture);
                     this.resources.delete(resourceHandle);
                 }
                 this.devices.delete(handle);
@@ -1339,7 +1687,9 @@ ${fragment.join("\n")}
                 for (const selector of shaderStates)
                     stageKey.push(state.textureStageStates[stage][selector] >>> 0);
             }
-            const key = [this.format, topology, stripIndexFormat || "none",
+            const targetFormat = state.renderTarget.handle ?
+                "rgba8unorm" : this.format;
+            const key = [targetFormat, topology, stripIndexFormat || "none",
                 state.fvf >>> 0, stride >>> 0,
                 cull, blend,
                 state.renderStates[D3DRS_SRCBLEND] >>> 0,
@@ -1362,7 +1712,8 @@ ${fragment.join("\n")}
                 state.renderStates[D3DRS_AMBIENTMATERIALSOURCE] >>> 0,
                 state.renderStates[D3DRS_EMISSIVEMATERIALSOURCE] >>> 0,
                 state.renderStates[D3DRS_COLORWRITEENABLE] >>> 0,
-                state.depthView ? 1 : 0,
+                state.depthView && state.depthSurfaceEnabled &&
+                    !state.renderTarget.handle ? 1 : 0,
                 state.renderStates[D3DRS_ZENABLE] >>> 0,
                 state.renderStates[D3DRS_ZWRITEENABLE] >>> 0,
                 state.renderStates[D3DRS_ZFUNC] >>> 0,
@@ -1401,7 +1752,7 @@ ${fragment.join("\n")}
                     module: shaderModule,
                     entryPoint: "fs_main",
                     targets: [{
-                        format: this.format,
+                        format: targetFormat,
                         ...(blend ? { blend: blendState(state) } : {}),
                         writeMask: state.renderStates[D3DRS_COLORWRITEENABLE] & 0xF,
                     }],
@@ -1414,7 +1765,8 @@ ${fragment.join("\n")}
                     // The screen-space Y conversion flips winding.
                     frontFace: cull === D3DCULL_CCW ? "cw" : "ccw",
                 },
-                ...(state.depthView ? { depthStencil: {
+                ...(state.depthView && state.depthSurfaceEnabled &&
+                        !state.renderTarget.handle ? { depthStencil: {
                     format: "depth24plus-stencil8",
                     depthWriteEnabled: !!state.renderStates[D3DRS_ZENABLE] &&
                         !!state.renderStates[D3DRS_ZWRITEENABLE],
@@ -1625,8 +1977,26 @@ ${fragment.join("\n")}
                 sampleCount: 1,
                 dimension: "2d",
                 format: "rgba8unorm",
-                usage: TEXTURE_USAGE_COPY_DST | TEXTURE_USAGE_TEXTURE_BINDING,
+                usage: TEXTURE_USAGE_COPY_DST | TEXTURE_USAGE_TEXTURE_BINDING |
+                    ((u32(bytes, payloadOffset + 24) & D3DUSAGE_RENDERTARGET) ?
+                        TEXTURE_USAGE_RENDER_ATTACHMENT : 0),
             });
+            const formatInfo = textureFormatInfo(format);
+            const shadowLevels = [];
+            for (let level = 0; level < levelCount; level++) {
+                const levelWidth = Math.max(1, width >>> level);
+                const levelHeight = Math.max(1, height >>> level);
+                const columns = Math.ceil(levelWidth / formatInfo.blockWidth);
+                const rows = Math.ceil(levelHeight / formatInfo.blockHeight);
+                const rowPitch = columns * formatInfo.blockBytes;
+                shadowLevels.push({
+                    width: levelWidth,
+                    height: levelHeight,
+                    rowPitch,
+                    rows,
+                    data: new Uint8Array(rowPitch * rows),
+                });
+            }
             this.resources.set(handle, {
                 handle,
                 deviceHandle,
@@ -1639,6 +2009,7 @@ ${fragment.join("\n")}
                 pool: u32(bytes, payloadOffset + 28),
                 gpuTexture,
                 views: new Map([[0, gpuTexture.createView()]]),
+                shadowLevels,
             });
         }
 
@@ -1676,6 +2047,16 @@ ${fragment.join("\n")}
                 throw new Error("UPDATE_TEXTURE DXT rectangle is not block aligned");
             const source = checkedDataRange(bytes, dataOffset, dataBytes,
                 "UPDATE_TEXTURE data");
+            const shadow = resource.shadowLevels[level];
+            const blockX = Math.floor(x / format.blockWidth);
+            const blockY = Math.floor(y / format.blockHeight);
+            for (let row = 0; row < rows; row++) {
+                const sourceStart = row * rowPitch;
+                const destinationStart = (blockY + row) * shadow.rowPitch +
+                    blockX * format.blockBytes;
+                shadow.data.set(source.subarray(sourceStart,
+                    sourceStart + minimumRow), destinationStart);
+            }
             const rgba = decodeTextureUpload(resource.format, source,
                 width, height, rowPitch);
             const destination = {
@@ -1961,19 +2342,46 @@ ${fragment.join("\n")}
 
         executeCommand(bytes, commandOffset, opcode, payloadOffset,
                 commandEnd) {
+            const firstHandle = commandEnd - payloadOffset >= 4 ?
+                u32(bytes, payloadOffset) : 0;
+            const resourceOpcode = opcode === OP_UPDATE_BUFFER ||
+                opcode === OP_UPDATE_TEXTURE;
+            if ((resourceOpcode &&
+                    this.retiredResourceHandles.has(firstHandle)) ||
+                    (opcode === OP_DESTROY_RESOURCE &&
+                        (this.retiredResourceHandles.has(firstHandle) ||
+                         this.retiredDeviceHandles.has(firstHandle))) ||
+                    (opcode !== OP_CREATE_DEVICE && !resourceOpcode &&
+                        opcode !== OP_DESTROY_RESOURCE &&
+                        this.retiredDeviceHandles.has(firstHandle))) {
+                if ((opcode === OP_CREATE_BUFFER || opcode === OP_CREATE_TEXTURE)
+                        && commandEnd - payloadOffset >= 8) {
+                    this.retireHandle(this.retiredResourceHandles,
+                        u32(bytes, payloadOffset + 4));
+                }
+                this.stats.staleCommandsDropped++;
+                return;
+            }
             switch (opcode) {
             case OP_HELLO:
-                if (u32(bytes, payloadOffset) !== 32) {
+                if (commandEnd - payloadOffset < 16 ||
+                        u32(bytes, payloadOffset) !== 32) {
                     throw new Error("only a 32-bit D8WG guest is supported");
                 }
+                if (u32(bytes, payloadOffset + 8) !== this.activeSession.low ||
+                        u32(bytes, payloadOffset + 12) !==
+                            this.activeSession.high) {
+                    throw new Error("HELLO process session does not match its batch");
+                }
+                this.activeSession.helloSeen = true;
                 break;
             case OP_CREATE_DEVICE:
                 if (commandEnd - payloadOffset < 44) throw new Error("short CREATE_DEVICE");
                 this.createOrResetDevice(bytes, payloadOffset, false);
                 break;
             case OP_RESET:
-                if (commandEnd - payloadOffset < 44) throw new Error("short RESET");
-                this.createOrResetDevice(bytes, payloadOffset, true);
+                if (commandEnd - payloadOffset < 48) throw new Error("short RESET");
+                this.resetDevice(bytes, payloadOffset);
                 break;
             case OP_UPDATE_SURFACE: {
                 if (commandEnd - payloadOffset < 24) {
@@ -2001,18 +2409,34 @@ ${fragment.join("\n")}
                 if (!state) throw new Error("CLEAR references an unknown device");
                 const flags = u32(bytes, payloadOffset + 4);
                 const rectCount = u32(bytes, payloadOffset + 20);
-                if (rectCount) {
-                    this.warnOnce("clear-rects",
-                        "rectangular Clear currently falls back to a full-target clear",
-                        { rectCount });
+                if (rectCount > Math.floor((commandEnd - payloadOffset - 24) /
+                        16)) {
+                    throw new Error("CLEAR rectangle array is truncated");
                 }
+                const rectangles = [];
+                for (let index = 0; index < rectCount; index++) {
+                    const offset = payloadOffset + 24 + index * 16;
+                    rectangles.push({
+                        x1: i32(bytes, offset),
+                        y1: i32(bytes, offset + 4),
+                        x2: i32(bytes, offset + 8),
+                        y2: i32(bytes, offset + 12),
+                    });
+                }
+                const color = u32(bytes, payloadOffset + 8);
+                const depth = f32(bytes, payloadOffset + 12);
+                const stencil = u32(bytes, payloadOffset + 16);
                 const clear = {};
-                if (flags & D3DCLEAR_TARGET)
-                    clear.color = d3dColor(u32(bytes, payloadOffset + 8));
+                if (flags & D3DCLEAR_TARGET) {
+                    clear.color = d3dColor(color);
+                    // Keep the canonical save-state shadow coherent for the
+                    // supported A8/X8 lockable render-target formats.
+                    this.mirrorRenderTargetClear(state, color, rectangles);
+                }
                 if (flags & D3DCLEAR_ZBUFFER)
-                    clear.depth = f32(bytes, payloadOffset + 12);
+                    clear.depth = depth;
                 if (flags & D3DCLEAR_STENCIL)
-                    clear.stencil = u32(bytes, payloadOffset + 16);
+                    clear.stencil = stencil;
                 if ((flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) &&
                         !state.depthView) {
                     this.warnOnce("depth-clear-without-surface",
@@ -2020,7 +2444,11 @@ ${fragment.join("\n")}
                     delete clear.depth;
                     delete clear.stencil;
                 }
-                this.ensureFrame(state, clear);
+                if (rectangles.length)
+                    this.clearRectangles(state, flags, color, depth,
+                        stencil, rectangles);
+                else
+                    this.ensureFrame(state, clear);
                 break;
             }
             case OP_BEGIN_SCENE:
@@ -2032,6 +2460,7 @@ ${fragment.join("\n")}
             }
             case OP_CREATE_BUFFER: {
                 if (commandEnd - payloadOffset < 32) throw new Error("short CREATE_BUFFER");
+                const deviceHandle = u32(bytes, payloadOffset);
                 const handle = u32(bytes, payloadOffset + 4);
                 const kind = u32(bytes, payloadOffset + 8);
                 const byteCount = u32(bytes, payloadOffset + 12);
@@ -2039,6 +2468,8 @@ ${fragment.join("\n")}
                     kind !== RESOURCE_BUFFER_INDEX) {
                     throw new Error("unknown D8WG buffer kind " + kind);
                 }
+                if (!this.devices.has(deviceHandle))
+                    throw new Error("CREATE_BUFFER references an unknown device");
                 const format = u32(bytes, payloadOffset + 20);
                 if (kind === RESOURCE_BUFFER_INDEX && !indexFormatInfo(format)) {
                     throw new Error("invalid D8WG index buffer format " + format);
@@ -2046,7 +2477,7 @@ ${fragment.join("\n")}
                 this.destroyResource(handle);
                 this.resources.set(handle, {
                     handle,
-                    deviceHandle: u32(bytes, payloadOffset),
+                    deviceHandle,
                     kind,
                     byteCount,
                     usage: u32(bytes, payloadOffset + 16),
@@ -2094,7 +2525,7 @@ ${fragment.join("\n")}
                     if (this.frame)
                         this.frame.transientBuffers.push(previous);
                     else
-                        previous.destroy();
+                        this.retireGPUObjects(previous);
                     this.stats.bufferOrphans++;
                 }
                 resource.shadow.set(
@@ -2306,6 +2737,24 @@ ${fragment.join("\n")}
                 state.fvf = u32(bytes, payloadOffset + 4);
                 break;
             }
+            case OP_SET_RENDER_TARGET: {
+                if (commandEnd - payloadOffset < 16)
+                    throw new Error("short SET_RENDER_TARGET");
+                const state = this.devices.get(u32(bytes, payloadOffset));
+                const handle = u32(bytes, payloadOffset + 4);
+                const level = u32(bytes, payloadOffset + 8);
+                const resource = handle ? this.resources.get(handle) : null;
+                if (!state || (handle && (!resource ||
+                        resource.deviceHandle !== state.handle ||
+                        resource.kind !== RESOURCE_TEXTURE_2D ||
+                        !(resource.usage & D3DUSAGE_RENDERTARGET) ||
+                        level >= resource.levelCount)))
+                    throw new Error("invalid SET_RENDER_TARGET");
+                if (this.frame) this.finishFrame(false);
+                state.renderTarget = { handle, level };
+                state.depthSurfaceEnabled = !!u32(bytes, payloadOffset + 12);
+                break;
+            }
             case OP_DRAW_PRIMITIVE:
                 if (commandEnd - payloadOffset < 16) throw new Error("short DRAW_PRIMITIVE");
                 this.drawPrimitive(bytes, payloadOffset);
@@ -2354,6 +2803,8 @@ ${fragment.join("\n")}
                 this.stats.malformedBatches++;
                 throw new Error("unsupported D8WG minor version " + u16(bytes, 6));
             }
+            const session = this.activateSession(u32(bytes, 24),
+                u32(bytes, 28));
             const expectedCount = u32(bytes, 16);
             const commandBytes = u32(bytes, 20);
             if (commandBytes > bytes.length - D8WG_BATCH_HEADER_BYTES) {
@@ -2363,6 +2814,10 @@ ${fragment.join("\n")}
             const end = D8WG_BATCH_HEADER_BYTES + commandBytes;
             let offset = D8WG_BATCH_HEADER_BYTES;
             let decoded = 0;
+            if (!session.helloSeen && expectedCount &&
+                    u16(bytes, offset) !== OP_HELLO) {
+                throw new Error("D8WG process session began without HELLO");
+            }
             while (offset < end) {
                 if (end - offset < D8WG_COMMAND_HEADER_BYTES) {
                     throw new Error("D8WG command header is truncated");
@@ -2386,6 +2841,7 @@ ${fragment.join("\n")}
             if (this.options.trace) {
                 console.info("[d3d8-webgpu] batch", {
                     frameId: u32(bytes, 8),
+                    session: session.key,
                     flags: u32(bytes, 12),
                     commandCount: decoded,
                     commandBytes,
@@ -2395,17 +2851,302 @@ ${fragment.join("\n")}
             return decoded;
         }
 
+        serializeSession(session) {
+            this.setActiveSession(session, false);
+            const records = [];
+            const makePayload = byteLength => new Uint8Array(byteLength);
+            const putU32 = (payload, offset, value) =>
+                new DataView(payload.buffer, payload.byteOffset,
+                    payload.byteLength).setUint32(offset, value >>> 0, true);
+            const putI32 = (payload, offset, value) =>
+                new DataView(payload.buffer, payload.byteOffset,
+                    payload.byteLength).setInt32(offset, value | 0, true);
+            const putF32 = (payload, offset, value) =>
+                new DataView(payload.buffer, payload.byteOffset,
+                    payload.byteLength).setFloat32(offset, value, true);
+            const u32Payload = (...values) => {
+                const payload = makePayload(values.length * 4);
+                values.forEach((value, index) => putU32(payload,
+                    index * 4, value));
+                return payload;
+            };
+            const add = (opcode, payload, blob, dataOffsetField) => {
+                records.push({ opcode, payload, blob: blob || null,
+                    dataOffsetField });
+            };
+            const addTransform = (handle, transformState, matrix) => {
+                const payload = makePayload(72);
+                putU32(payload, 0, handle);
+                putU32(payload, 4, transformState);
+                for (let index = 0; index < 16; index++)
+                    putF32(payload, 8 + index * 4, matrix[index]);
+                add(OP_SET_TRANSFORM, payload);
+            };
+
+            add(OP_HELLO, u32Payload(32, 0, session.low, session.high));
+
+            for (const state of this.devices.values()) {
+                const surface = state.surface;
+                const create = makePayload(44);
+                putU32(create, 0, state.handle);
+                putU32(create, 4, surface.hwnd);
+                putI32(create, 8, surface.x);
+                putI32(create, 12, surface.y);
+                putU32(create, 16, surface.width);
+                putU32(create, 20, surface.height);
+                putU32(create, 24, surface.format);
+                putU32(create, 28, surface.windowed ? 1 : 0);
+                putU32(create, 32, surface.behaviorFlags);
+                putU32(create, 36, surface.autoDepthStencil ? 1 : 0);
+                putU32(create, 40, surface.autoDepthStencilFormat);
+                add(OP_CREATE_DEVICE, create);
+
+                for (const resource of this.resources.values()) {
+                    if (resource.deviceHandle !== state.handle) continue;
+                    if (resource.kind === RESOURCE_BUFFER_VERTEX ||
+                            resource.kind === RESOURCE_BUFFER_INDEX) {
+                        add(OP_CREATE_BUFFER, u32Payload(state.handle,
+                            resource.handle, resource.kind,
+                            resource.byteCount, resource.usage,
+                            resource.kind === RESOURCE_BUFFER_VERTEX ?
+                                resource.fvf : resource.format,
+                            resource.pool, 0));
+                        add(OP_UPDATE_BUFFER, u32Payload(resource.handle, 0,
+                            resource.byteCount, 0, 0, 0),
+                            resource.shadow.subarray(0, resource.byteCount), 12);
+                    } else if (resource.kind === RESOURCE_TEXTURE_2D) {
+                        add(OP_CREATE_TEXTURE, u32Payload(state.handle,
+                            resource.handle, resource.width, resource.height,
+                            resource.levelCount, resource.format,
+                            resource.usage, resource.pool));
+                        resource.shadowLevels.forEach((level, levelIndex) => {
+                            add(OP_UPDATE_TEXTURE, u32Payload(resource.handle,
+                                levelIndex, 0, 0, level.width, level.height,
+                                level.rowPitch, level.data.byteLength, 0, 0),
+                                level.data, 32);
+                        });
+                    }
+                }
+
+                for (let index = 0; index < state.renderStates.length; index++)
+                    add(OP_SET_RENDER_STATE, u32Payload(state.handle, index,
+                        state.renderStates[index], 0));
+                for (let stage = 0; stage < 8; stage++) {
+                    for (let index = 0; index < 32; index++) {
+                        add(OP_SET_TEXTURE_STAGE_STATE, u32Payload(state.handle,
+                            stage, index,
+                            state.textureStageStates[stage][index]));
+                    }
+                }
+                const viewport = makePayload(32);
+                putU32(viewport, 0, state.handle);
+                putU32(viewport, 4, state.viewport.x);
+                putU32(viewport, 8, state.viewport.y);
+                putU32(viewport, 12, state.viewport.width);
+                putU32(viewport, 16, state.viewport.height);
+                putF32(viewport, 20, state.viewport.minZ);
+                putF32(viewport, 24, state.viewport.maxZ);
+                add(OP_SET_VIEWPORT, viewport);
+                addTransform(state.handle, 256, state.transforms.world);
+                addTransform(state.handle, 2, state.transforms.view);
+                addTransform(state.handle, 3, state.transforms.projection);
+                state.transforms.textures.forEach((matrix, index) =>
+                    addTransform(state.handle, 16 + index, matrix));
+
+                const material = makePayload(72);
+                putU32(material, 0, state.handle);
+                [state.material.diffuse, state.material.ambient,
+                    state.material.specular, state.material.emissive]
+                    .forEach((values, group) => values.forEach((value, index) =>
+                        putF32(material, 4 + group * 16 + index * 4, value)));
+                putF32(material, 68, state.material.power);
+                add(OP_SET_MATERIAL, material);
+                state.lights.forEach((light, index) => {
+                    if (!light.type) return;
+                    const payload = makePayload(112);
+                    putU32(payload, 0, state.handle);
+                    putU32(payload, 4, index);
+                    putU32(payload, 8, light.type);
+                    [light.diffuse, light.specular, light.ambient]
+                        .forEach((values, group) => values.forEach(
+                            (value, item) => putF32(payload,
+                                12 + group * 16 + item * 4, value)));
+                    light.position.forEach((value, item) =>
+                        putF32(payload, 60 + item * 4, value));
+                    light.direction.forEach((value, item) =>
+                        putF32(payload, 72 + item * 4, value));
+                    putF32(payload, 84, light.range);
+                    putF32(payload, 88, light.falloff);
+                    light.attenuation.forEach((value, item) =>
+                        putF32(payload, 92 + item * 4, value));
+                    putF32(payload, 104, light.theta);
+                    putF32(payload, 108, light.phi);
+                    add(OP_SET_LIGHT, payload);
+                    if (light.enabled)
+                        add(OP_LIGHT_ENABLE, u32Payload(state.handle,
+                            index, 1, 0));
+                });
+                for (let stage = 0; stage < state.textures.length; stage++)
+                    add(OP_SET_TEXTURE, u32Payload(state.handle, stage,
+                        state.textures[stage], 0));
+                state.streams.forEach((stream, index) =>
+                    add(OP_SET_STREAM_SOURCE, u32Payload(state.handle, index,
+                        stream.handle, stream.stride)));
+                add(OP_SET_INDICES, u32Payload(state.handle,
+                    state.indices.handle, state.indices.baseVertex, 0));
+                add(OP_SET_VERTEX_FORMAT, u32Payload(state.handle, state.fvf));
+                add(OP_SET_RENDER_TARGET, u32Payload(state.handle,
+                    state.renderTarget.handle, state.renderTarget.level,
+                    state.depthSurfaceEnabled ? 1 : 0));
+                if (state.inScene)
+                    add(OP_BEGIN_SCENE, u32Payload(state.handle, 0));
+            }
+
+            let commandBytes = 0;
+            for (const record of records) {
+                record.size = (D8WG_COMMAND_HEADER_BYTES +
+                    record.payload.byteLength +
+                    (record.blob ? record.blob.byteLength : 0) + 7) & ~7;
+                record.offset = D8WG_BATCH_HEADER_BYTES + commandBytes;
+                commandBytes += record.size;
+            }
+            const result = new Uint8Array(D8WG_BATCH_HEADER_BYTES +
+                commandBytes);
+            const view = new DataView(result.buffer);
+            view.setUint32(0, D8WG_MAGIC, true);
+            view.setUint16(4, D8WG_VERSION_MAJOR, true);
+            view.setUint16(6, D8WG_VERSION_MINOR, true);
+            view.setUint32(16, records.length, true);
+            view.setUint32(20, commandBytes, true);
+            view.setUint32(24, session.low, true);
+            view.setUint32(28, session.high, true);
+            let sequence = 1;
+            for (const record of records) {
+                if (record.blob && record.dataOffsetField !== undefined) {
+                    putU32(record.payload, record.dataOffsetField,
+                        record.offset + D8WG_COMMAND_HEADER_BYTES +
+                        record.payload.byteLength);
+                }
+                view.setUint16(record.offset, record.opcode, true);
+                view.setUint32(record.offset + 4, record.size, true);
+                view.setUint32(record.offset + 8, sequence++, true);
+                result.set(record.payload,
+                    record.offset + D8WG_COMMAND_HEADER_BYTES);
+                if (record.blob) {
+                    result.set(record.blob, record.offset +
+                        D8WG_COMMAND_HEADER_BYTES + record.payload.byteLength);
+                }
+            }
+            return result;
+        }
+
+        serializeState() {
+            if (this.pendingSubmissions)
+                throw new Error("D3D8 commands are still in flight; retry the save");
+            if (this.frame)
+                throw new Error("D3D8 has an unfinished frame; retry the save");
+
+            const original = this.activeSession;
+            const batches = [];
+            for (const session of this.sessions.values()) {
+                if (!session.devices.size && !session.resources.size) continue;
+                batches.push(this.serializeSession(session));
+            }
+            if (original) this.setActiveSession(original, false);
+
+            let byteLength = 16;
+            for (const batch of batches)
+                byteLength += 8 + ((batch.byteLength + 7) & ~7);
+            const result = new Uint8Array(byteLength);
+            const view = new DataView(result.buffer);
+            view.setUint32(0, D8WG_CHECKPOINT_MAGIC, true);
+            view.setUint16(4, D8WG_CHECKPOINT_VERSION, true);
+            view.setUint32(8, batches.length, true);
+            view.setUint32(12, byteLength, true);
+            let offset = 16;
+            for (const batch of batches) {
+                view.setUint32(offset, batch.byteLength, true);
+                result.set(batch, offset + 8);
+                offset += 8 + ((batch.byteLength + 7) & ~7);
+            }
+            return result;
+        }
+
+        clearAllSessions() {
+            this.discardFrame();
+            for (const session of Array.from(this.sessions.values())) {
+                this.setActiveSession(session, false);
+                for (const handle of Array.from(session.devices.keys()))
+                    this.destroyResource(handle);
+                for (const handle of Array.from(session.resources.keys()))
+                    this.destroyResource(handle);
+            }
+            this.sessions.clear();
+            this.activeSession = null;
+            this.devices = new Map();
+            this.resources = new Map();
+            this.retiredDeviceHandles = new Set();
+            this.retiredResourceHandles = new Set();
+        }
+
+        restoreState(checkpoint) {
+            if (this.pendingSubmissions)
+                throw new Error("D3D8 commands are still in flight during restore");
+            this.clearAllSessions();
+            const bytes = checkpoint instanceof Uint8Array ? checkpoint :
+                new Uint8Array(checkpoint || []);
+            if (!bytes.byteLength) return;
+            if (bytes.byteLength >= D8WG_BATCH_HEADER_BYTES &&
+                    u32(bytes, 0) === D8WG_MAGIC) {
+                this.executeBatch(bytes, { stateRestore: true });
+                return;
+            }
+            if (bytes.byteLength < 16 ||
+                    u32(bytes, 0) !== D8WG_CHECKPOINT_MAGIC ||
+                    u16(bytes, 4) !== D8WG_CHECKPOINT_VERSION ||
+                    u32(bytes, 12) !== bytes.byteLength) {
+                throw new Error("invalid D3D8 multi-session checkpoint");
+            }
+            const count = u32(bytes, 8);
+            let offset = 16;
+            for (let index = 0; index < count; index++) {
+                if (offset + 8 > bytes.byteLength)
+                    throw new Error("truncated D3D8 checkpoint record");
+                const size = u32(bytes, offset);
+                if (size < D8WG_BATCH_HEADER_BYTES ||
+                        size > bytes.byteLength - offset - 8) {
+                    throw new Error("invalid D3D8 checkpoint record size");
+                }
+                this.executeBatch(bytes.subarray(offset + 8,
+                    offset + 8 + size), { stateRestore: true, index });
+                offset += 8 + ((size + 7) & ~7);
+            }
+            if (offset !== bytes.byteLength)
+                throw new Error("D3D8 checkpoint has trailing data");
+        }
+
         getStats() {
             let uniformsCached = 0;
             let bindGroupsCached = 0;
-            for (const state of this.devices.values()) {
-                uniformsCached += state.uniformVariants.size;
-                bindGroupsCached += state.bindGroups.size;
+            let devicesLive = 0;
+            let resourcesLive = 0;
+            let sessionsLive = 0;
+            for (const session of this.sessions.values()) {
+                devicesLive += session.devices.size;
+                resourcesLive += session.resources.size;
+                if (session.devices.size || session.resources.size)
+                    sessionsLive++;
+                for (const state of session.devices.values()) {
+                    uniformsCached += state.uniformVariants.size;
+                    bindGroupsCached += state.bindGroups.size;
+                }
             }
             return {
                 ...this.stats,
-                devicesLive: this.devices.size,
-                resourcesLive: this.resources.size,
+                sessionsLive,
+                sessionsTracked: this.sessions.size,
+                devicesLive,
+                resourcesLive,
                 pipelinesCached: this.pipelineCache.size,
                 samplersCached: this.samplerCache.size,
                 uniformsCached,

@@ -34,9 +34,9 @@ static const FormatProbe g_probes[] =
     {"DXT3 texture", 0, D3DRTYPE_TEXTURE, D3DFMT_DXT3, TRUE, 1},
     {"DXT5 texture", 0, D3DRTYPE_TEXTURE, D3DFMT_DXT5, TRUE, 1},
     {"cube texture", 0, D3DRTYPE_CUBETEXTURE,
-            D3DFMT_A8R8G8B8, TRUE, 1},
+            D3DFMT_A8R8G8B8, FALSE, 3},
     {"volume texture", 0, D3DRTYPE_VOLUMETEXTURE,
-            D3DFMT_A8R8G8B8, TRUE, 1},
+            D3DFMT_A8R8G8B8, FALSE, 3},
     {"render-target texture", D3DUSAGE_RENDERTARGET,
             D3DRTYPE_TEXTURE, D3DFMT_A8R8G8B8, TRUE, 1}
 };
@@ -117,6 +117,25 @@ static void require_bits(const char *name, DWORD actual, DWORD required,
     mismatch(line, category);
 }
 
+static void reject_bits(const char *name, DWORD actual, DWORD rejected,
+        UINT category)
+{
+    char line[240];
+    if (!(actual & rejected)) return;
+    wsprintfA(line, "%s advertises unsupported tested bits", name);
+    mismatch(line, category);
+}
+
+static void require_value(const char *name, DWORD actual, DWORD expected,
+        UINT category)
+{
+    char line[240];
+    if (actual == expected) return;
+    wsprintfA(line, "%s is %lu, expected %lu", name,
+            (unsigned long)actual, (unsigned long)expected);
+    mismatch(line, category);
+}
+
 static void dump_caps(void)
 {
     trace_text("---- GetDeviceCaps complete dump ----");
@@ -193,29 +212,28 @@ static void audit_caps(void)
             D3DSTENCILCAPS_KEEP | D3DSTENCILCAPS_REPLACE, 2);
     require_bits("TextureOpCaps", g_caps.TextureOpCaps,
             tested_texture_ops, 2);
-    begin_stage("audit required extended caps");
+    begin_stage("audit honest Stage 5 capability boundary");
     require_bits("TextureCaps", g_caps.TextureCaps,
+            D3DPTEXTURECAPS_ALPHA | D3DPTEXTURECAPS_MIPMAP
+            | D3DPTEXTURECAPS_PERSPECTIVE,
+            3);
+    reject_bits("TextureCaps", g_caps.TextureCaps,
             D3DPTEXTURECAPS_CUBEMAP | D3DPTEXTURECAPS_VOLUMEMAP
             | D3DPTEXTURECAPS_MIPCUBEMAP | D3DPTEXTURECAPS_MIPVOLUMEMAP,
             3);
-    require_bits("CubeTextureFilterCaps", g_caps.CubeTextureFilterCaps,
-            D3DPTFILTERCAPS_MINFPOINT | D3DPTFILTERCAPS_MAGFPOINT, 3);
-    require_bits("VolumeTextureFilterCaps", g_caps.VolumeTextureFilterCaps,
-            D3DPTFILTERCAPS_MINFPOINT | D3DPTFILTERCAPS_MAGFPOINT, 3);
-    require_bits("VolumeTextureAddressCaps", g_caps.VolumeTextureAddressCaps,
-            D3DPTADDRESSCAPS_WRAP | D3DPTADDRESSCAPS_CLAMP, 3);
-    if (g_caps.MaxVolumeExtent < 256)
-        mismatch("MaxVolumeExtent is below required value 256", 3);
-    if (g_caps.VertexShaderVersion < D3DVS_VERSION(1, 1))
-        mismatch("VertexShaderVersion is below 1.1", 3);
-    if (g_caps.MaxVertexShaderConst < 96)
-        mismatch("MaxVertexShaderConst is below 96", 3);
-    if (g_caps.PixelShaderVersion < D3DPS_VERSION(1, 1))
-        mismatch("PixelShaderVersion is below 1.1", 3);
-    if (g_caps.MaxSimultaneousTextures < 8)
-        mismatch("MaxSimultaneousTextures is below required value 8", 3);
-    if (g_caps.MaxTextureBlendStages < 8)
-        mismatch("MaxTextureBlendStages is below required value 8", 3);
+    require_value("CubeTextureFilterCaps", g_caps.CubeTextureFilterCaps,
+            0, 3);
+    require_value("VolumeTextureFilterCaps", g_caps.VolumeTextureFilterCaps,
+            0, 3);
+    require_value("VolumeTextureAddressCaps", g_caps.VolumeTextureAddressCaps,
+            0, 3);
+    require_value("MaxVolumeExtent", g_caps.MaxVolumeExtent, 0, 3);
+    require_value("VertexShaderVersion", g_caps.VertexShaderVersion, 0, 3);
+    require_value("PixelShaderVersion", g_caps.PixelShaderVersion, 0, 3);
+    require_value("MaxSimultaneousTextures",
+            g_caps.MaxSimultaneousTextures, 2, 3);
+    require_value("MaxTextureBlendStages", g_caps.MaxTextureBlendStages,
+            2, 3);
 }
 
 static void audit_formats(void)
@@ -247,7 +265,7 @@ typedef struct AuditVertex
     float u, v, w;
 } AuditVertex;
 
-#define AUDIT_VERTEX_FVF (D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1 | D3DFVF_TEXCOORDSIZE3(0))
+#define AUDIT_VERTEX_FVF (D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1)
 #define AUDIT_SHADER_PARAM 0x80000000u
 
 static void resource_failure(const char *name, HRESULT hr, UINT category)
@@ -394,6 +412,10 @@ static void audit_dxt_format(D3DFORMAT format, UINT block_bytes, const char *nam
     IDirect3DTexture8_Release(texture);
 }
 
+/* Positive cube/volume/SM1.1/eight-stage probes belong to Stage 6. Keep the
+ * source beside the audit so it can be enabled when those caps are honestly
+ * advertised, but do not compile it into the Stage 5 acceptance executable. */
+#if 0
 static void audit_cube_texture(void)
 {
     IDirect3DCubeTexture8 *texture = NULL;
@@ -611,11 +633,36 @@ static void audit_eight_texture_stages(void)
     IDirect3DDevice8_SetTextureStageState(g_device, 1,
             D3DTSS_COLOROP, D3DTOP_DISABLE);
 }
+#endif
 
-static void audit_extended_resources(void)
+static void audit_hidden_stage6_paths(void)
+{
+    IDirect3DCubeTexture8 *cube = (IDirect3DCubeTexture8 *)(ULONG_PTR)1;
+    IDirect3DVolumeTexture8 *volume =
+            (IDirect3DVolumeTexture8 *)(ULONG_PTR)1;
+    DWORD shader = 0xCCCCCCCCu;
+    static const DWORD declaration[] = { D3DVSD_END() };
+    static const DWORD vertex_shader[] = { D3DVS_VERSION(1, 1), D3DVS_END() };
+    HRESULT hr;
+
+    hr = IDirect3DDevice8_CreateCubeTexture(g_device, 8, 1, 0,
+            D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &cube);
+    if (hr != D3DERR_INVALIDCALL || cube != NULL)
+        mismatch("unadvertised cube texture was not rejected/null", 3);
+    hr = IDirect3DDevice8_CreateVolumeTexture(g_device, 4, 4, 4, 1, 0,
+            D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &volume);
+    if (hr != D3DERR_INVALIDCALL || volume != NULL)
+        mismatch("unadvertised volume texture was not rejected/null", 3);
+    hr = IDirect3DDevice8_CreateVertexShader(g_device, declaration,
+            vertex_shader, &shader, 0);
+    if (hr != D3DERR_INVALIDCALL || shader != 0)
+        mismatch("unadvertised vertex shader was not rejected/zeroed", 3);
+}
+
+static void audit_supported_resources(void)
 {
     HRESULT hr;
-    begin_stage("exercise extended texture and shader paths");
+    begin_stage("exercise advertised Stage 5 resource paths");
     audit_render_target_texture();
     hr = IDirect3DDevice8_BeginScene(g_device);
     if (FAILED(hr))
@@ -626,12 +673,9 @@ static void audit_extended_resources(void)
     audit_dxt_format(D3DFMT_DXT1, 8, "DXT1 mip-chain upload/draw");
     audit_dxt_format(D3DFMT_DXT3, 16, "DXT3 mip-chain upload/draw");
     audit_dxt_format(D3DFMT_DXT5, 16, "DXT5 mip-chain upload/draw");
-    audit_cube_texture();
-    audit_volume_texture();
-    audit_eight_texture_stages();
-    audit_shader_pipeline();
     hr = IDirect3DDevice8_EndScene(g_device);
     if (FAILED(hr)) resource_failure("extended-path EndScene", hr, 3);
+    audit_hidden_stage6_paths();
 }
 
 static HRESULT create_dashboard_device(void)
@@ -677,7 +721,7 @@ static HRESULT render_dashboard(void)
     if (FAILED(hr)) return fail_stage("Present", hr);
     if (!g_mismatch_count)
         SetWindowTextA(g_window,
-                "D3D8 caps audit: PASS - core formats | extended textures | fixed caps | extended caps");
+                "D3D8 caps audit: PASS - core formats | DXT/RT | fixed caps | honest Stage 6 boundary");
     else
     {
         wsprintfA(title, "D3D8 caps audit: %u MISMATCHES - first: %s",
@@ -748,7 +792,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous,
         hr = create_dashboard_device();
         if (FAILED(hr)) fail_stage("CreateDevice dashboard", hr);
     }
-    if (SUCCEEDED(hr)) audit_extended_resources();
+    if (SUCCEEDED(hr)) audit_supported_resources();
     if (SUCCEEDED(hr)) hr = render_dashboard();
     if (SUCCEEDED(hr) && g_mismatch_count)
     {

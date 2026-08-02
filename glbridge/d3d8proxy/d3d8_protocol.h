@@ -12,7 +12,7 @@
 
 #define D8WG_MAGIC 0x47573844u /* "D8WG" */
 #define D8WG_VERSION_MAJOR 1u
-#define D8WG_VERSION_MINOR 4u
+#define D8WG_VERSION_MINOR 6u
 
 #define D8WG_BATCH_FLAG_PRESENT (1u << 0)
 
@@ -43,6 +43,7 @@ enum D8WGOpcode {
     D8WG_OP_SET_STREAM_SOURCE = 0x208,
     D8WG_OP_SET_INDICES = 0x209,
     D8WG_OP_SET_VERTEX_FORMAT = 0x20A,
+    D8WG_OP_SET_RENDER_TARGET = 0x20B,
 
     D8WG_OP_DRAW_PRIMITIVE = 0x300,
     D8WG_OP_DRAW_INDEXED_PRIMITIVE = 0x301,
@@ -63,8 +64,9 @@ typedef struct D8WGBatchHeader {
     uint32_t flags;
     uint32_t command_count;
     uint32_t command_bytes;
-    uint32_t upload_offset;
-    uint32_t upload_bytes;
+    /* Per-process namespace. Handles are unique only inside this session. */
+    uint32_t session_id_low;
+    uint32_t session_id_high;
 } D8WGBatchHeader;
 
 typedef struct D8WGCommandHeader {
@@ -78,6 +80,8 @@ typedef struct D8WGCommandHeader {
 typedef struct D8WGHello {
     uint32_t guest_pointer_bits;
     uint32_t feature_bits;
+    uint32_t session_id_low;
+    uint32_t session_id_high;
 } D8WGHello;
 
 typedef struct D8WGCreateDevice {
@@ -93,6 +97,23 @@ typedef struct D8WGCreateDevice {
     uint32_t enable_auto_depth_stencil;
     uint32_t auto_depth_stencil_format;
 } D8WGCreateDevice;
+
+/* Reset replaces the device namespace.  Commands carrying the old handle are
+ * stale after this record and can never resolve resources of the new epoch. */
+typedef struct D8WGResetDevice {
+    uint32_t old_device_handle;
+    uint32_t new_device_handle;
+    uint32_t hwnd;
+    int32_t x;
+    int32_t y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t backbuffer_format;
+    uint32_t windowed;
+    uint32_t behavior_flags;
+    uint32_t enable_auto_depth_stencil;
+    uint32_t auto_depth_stencil_format;
+} D8WGResetDevice;
 
 typedef struct D8WGPresent {
     uint32_t device_handle;
@@ -195,6 +216,13 @@ typedef struct D8WGSetTexture {
     uint32_t texture_handle;
     uint32_t reserved;
 } D8WGSetTexture;
+
+typedef struct D8WGSetRenderTarget {
+    uint32_t device_handle;
+    uint32_t color_texture_handle;
+    uint32_t color_level;
+    uint32_t depth_enabled;
+} D8WGSetRenderTarget;
 
 typedef struct D8WGSetViewport {
     uint32_t device_handle;
@@ -313,6 +341,8 @@ typedef char D8WGAssertBatchHeaderSize[
         sizeof(D8WGBatchHeader) == 32 ? 1 : -1];
 typedef char D8WGAssertCommandHeaderSize[
         sizeof(D8WGCommandHeader) == 16 ? 1 : -1];
+typedef char D8WGAssertHelloSize[
+        sizeof(D8WGHello) == 16 ? 1 : -1];
 typedef char D8WGAssertCreateDeviceSize[
         sizeof(D8WGCreateDevice) == 44 ? 1 : -1];
 typedef char D8WGAssertPresentSize[

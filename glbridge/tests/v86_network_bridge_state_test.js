@@ -70,6 +70,15 @@ function pixelStorePayload(pname, param) {
     return payload;
 }
 
+function d3d8Envelope(payload) {
+    const envelope = Buffer.alloc(8 + payload.length);
+    envelope.writeUInt16LE(0xFFE0, 0);
+    envelope.writeUInt16LE(0xFFFF, 2);
+    envelope.writeUInt32LE(payload.length, 4);
+    Buffer.from(payload).copy(envelope, 8);
+    return envelope;
+}
+
 function makeModule(name, modules) {
     let nextPtr = 1024;
     const calls = [];
@@ -149,6 +158,25 @@ async function main() {
     const listeners = Object.create(null);
     let resetCount = 0;
     let restoreGate = null;
+    let d3d8SerializeCount = 0;
+    const restoredD3D8States = [];
+    const d3d8LifecycleEvents = [];
+    const d3d8Checkpoint = Uint8Array.from([
+        0x44, 0x38, 0x57, 0x47, 1, 0, 5, 0, 0x51, 0x52, 0x53, 0x54,
+    ]);
+    const d3d8Executor = {
+        serializeState() {
+            d3d8SerializeCount++;
+            return d3d8Checkpoint.slice();
+        },
+        restoreState(bytes) {
+            restoredD3D8States.push(Uint8Array.from(bytes));
+            d3d8LifecycleEvents.push("restore");
+        },
+        submit(bytes) {
+            d3d8LifecycleEvents.push("submit:" + bytes[0]);
+        },
+    };
     const pci = {
         registers: [0, 0, 0, 1, 0, 100, 0, 7],
         get_state() {
@@ -172,6 +200,7 @@ async function main() {
     const canvas = { width: 800, height: 600, style, parentElement: null };
     const bridge = globalThis.installV86GLNetworkBridge(emulator, canvas, {
         gl4es: makeModule("initial", modules),
+        d3d8Executor,
         resetGL4ESRenderer() {
             resetCount++;
             const module = makeModule("fresh-" + modules.length, modules);
@@ -273,6 +302,12 @@ async function main() {
     assert.ok(savedPCIState[8] instanceof Uint8Array,
               "the GL journal must be embedded in the v86 PCI state");
     assert.ok(savedPCIState[8].byteLength > 48, "the journal must contain GL resources");
+    assert.equal(new DataView(savedPCIState[8].buffer,
+        savedPCIState[8].byteOffset, savedPCIState[8].byteLength)
+        .getUint32(44, true), d3d8Checkpoint.byteLength,
+        "the v86 checkpoint header must carry the D3D8 epoch byte length");
+    assert.ok(d3d8SerializeCount >= 2,
+        "prepare/get_state must obtain a current canonical D3D8 checkpoint");
 
     const postMipmapPixels = Buffer.from([0xDE, 0xAD, 0xBE, 0xEF]);
     bridge.executeGLCommands(Buffer.concat([
@@ -331,8 +366,17 @@ async function main() {
         commandCount: 1,
         flags: 0,
     });
-    assert.equal(bridge.pendingPCIBatches.length, 1,
-                 "new guest work must wait until GL resources are replayed");
+    listeners["v86gl-pci-frame"]({
+        bytes: d3d8Envelope(Uint8Array.of(0xA5, 0x5A)),
+        frameId: 11,
+        submitCount: 2,
+        commandCount: 1,
+        flags: 0,
+    });
+    assert.equal(bridge.pendingPCIBatches.length, 2,
+                 "new GL and D3D8 guest work must wait until both checkpoints replay");
+    assert.equal(d3d8LifecycleEvents.length, 0,
+        "a queued D3D8 batch must not run against the pre-restore device epoch");
     restoreGate.resolve(restoreGate.module);
     const restored = await bridge.finishStateRestore();
     assert.equal(restored.hasGLState, true);
@@ -340,6 +384,13 @@ async function main() {
                  "restored guest frame ids must not be rejected as stale");
     assert.equal(bridge.pendingPCIBatches.length, 0,
                  "batches from the abandoned timeline must be discarded");
+    assert.equal(restoredD3D8States.length, 1,
+        "state restore must rebuild the D3D8 executor exactly once");
+    assert.deepEqual(Array.from(restoredD3D8States[0]),
+        Array.from(d3d8Checkpoint),
+        "state restore must pass the exact saved D3D8 epoch checkpoint");
+    assert.deepEqual(d3d8LifecycleEvents, ["restore", "submit:165"],
+        "the D3D8 checkpoint must restore before queued guest batches resume");
 
     const restoredModule = modules.at(-1);
     const replayed = restoredModule.calls.map(call => call[0]);

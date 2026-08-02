@@ -6,7 +6,7 @@
 (function(global) {
     "use strict";
 
-    const V86GL_BRIDGE_VERSION = "webgl-clean-v1-20260801-packed-arena-v1-packed-blob-v1-wasm-batch-v1-d8wg-m4-fixed-v1-20260801";
+    const V86GL_BRIDGE_VERSION = "webgl-clean-v1-20260801-packed-arena-v1-packed-blob-v1-wasm-batch-v1-d8wg-m6-session-v3-20260802";
     global.V86GL_BRIDGE_VERSION = V86GL_BRIDGE_VERSION;
     console.info("[v86gl] bridge version", V86GL_BRIDGE_VERSION);
 
@@ -3798,6 +3798,7 @@
                     document.getElementById("d3d8_webgpu_canvas") : null);
             this.d3d8Executor = null;
             this.d3d8Surface = { hwnd: 0, x: 0, y: 0, width: 0, height: 0 };
+            this.d3d8OwnerSessionKey = null;
             this.d3d8Visible = false;
             this.buf = [];
             this.pendingPackets = [];
@@ -3860,10 +3861,15 @@
             const userPresent = executorOptions.onPresent;
             const userDestroy = executorOptions.onDestroy;
             executorOptions.onSurface = (surface, reason) => {
-                this.d3d8Surface = { ...this.d3d8Surface, ...surface };
+                const sessionKey = surface.sessionKey || null;
                 if (reason === "hide" || surface.visible === false) {
-                    this.hideD3D8Canvas();
+                    if (!sessionKey || sessionKey === this.d3d8OwnerSessionKey) {
+                        this.d3d8Surface = { ...this.d3d8Surface, ...surface };
+                        this.hideD3D8Canvas();
+                    }
                 } else {
+                    this.d3d8OwnerSessionKey = sessionKey;
+                    this.d3d8Surface = { ...this.d3d8Surface, ...surface };
                     this.positionD3D8Canvas();
                 }
                 if (typeof userSurface === "function") {
@@ -3871,6 +3877,7 @@
                 }
             };
             executorOptions.onPresent = (surface, stats) => {
+                this.d3d8OwnerSessionKey = surface.sessionKey || null;
                 this.d3d8Surface = { ...this.d3d8Surface, ...surface };
                 if (surface.visible === false) {
                     this.hideD3D8Canvas();
@@ -3882,9 +3889,13 @@
                 }
             };
             executorOptions.onDestroy = (surface, reason) => {
-                this.d3d8Surface = { ...this.d3d8Surface, ...surface,
-                    visible: false };
-                this.hideD3D8Canvas();
+                const sessionKey = surface.sessionKey || null;
+                if (!sessionKey || sessionKey === this.d3d8OwnerSessionKey) {
+                    this.d3d8Surface = { ...this.d3d8Surface, ...surface,
+                        visible: false };
+                    this.d3d8OwnerSessionKey = null;
+                    this.hideD3D8Canvas();
+                }
                 if (typeof userDestroy === "function") {
                     userDestroy(surface, reason);
                 }
@@ -4011,9 +4022,13 @@
                 throw new Error("v86gl PCI device is not ready for save state");
             }
             this.validateStateJournal();
+            const d3d8State = this.d3d8Executor &&
+                    typeof this.d3d8Executor.serializeState === "function" ?
+                this.d3d8Executor.serializeState() : new Uint8Array(0);
             return {
                 entries: this.stateJournal.length,
-                bytes: STATE_JOURNAL_HEADER_SIZE + this.stateJournalBytes,
+                bytes: STATE_JOURNAL_HEADER_SIZE + this.stateJournalBytes +
+                    d3d8State.byteLength,
             };
         }
 
@@ -4110,7 +4125,11 @@
 
         serializeStateJournal() {
             this.validateStateJournal();
-            const totalSize = STATE_JOURNAL_HEADER_SIZE + this.stateJournalBytes;
+            const d3d8State = this.d3d8Executor &&
+                    typeof this.d3d8Executor.serializeState === "function" ?
+                this.d3d8Executor.serializeState() : new Uint8Array(0);
+            const totalSize = STATE_JOURNAL_HEADER_SIZE + this.stateJournalBytes +
+                d3d8State.byteLength;
             if (totalSize > 0xFFFFFFFF) {
                 throw new Error("OpenGL save-state journal is too large");
             }
@@ -4128,7 +4147,7 @@
             view.setInt32(32, this.surface.y | 0, true);
             view.setUint32(36, this.surface.width >>> 0, true);
             view.setUint32(40, this.surface.height >>> 0, true);
-            view.setUint32(44, 0, true);
+            view.setUint32(44, d3d8State.byteLength, true);
 
             let offset = STATE_JOURNAL_HEADER_SIZE;
             for (const entry of this.stateJournal) {
@@ -4139,6 +4158,7 @@
                 result.set(entry.payload, offset);
                 offset += entry.payload.length;
             }
+            result.set(d3d8State, offset);
             return result;
         }
 
@@ -4196,6 +4216,12 @@
                 journalBytes += STATE_JOURNAL_ENTRY_HEADER_SIZE + payloadSize;
                 entries.push({ fn, payload });
             }
+            const d3d8Bytes = view.getUint32(44, true);
+            if (d3d8Bytes > totalSize - offset) {
+                throw new Error("D3D8 save-state checkpoint is truncated");
+            }
+            const d3d8State = bytes.slice(offset, offset + d3d8Bytes);
+            offset += d3d8Bytes;
             if (offset !== totalSize) {
                 throw new Error("OpenGL save-state journal has trailing data");
             }
@@ -4203,6 +4229,7 @@
             return {
                 entries,
                 journalBytes,
+                d3d8State,
                 contextCurrent: !!(view.getUint32(20, true) & STATE_JOURNAL_CONTEXT_CURRENT),
                 surface: {
                     hwnd: view.getUint32(24, true),
@@ -4641,7 +4668,7 @@
             this.cancelOverlayHide();
         }
 
-        async replaceRendererForStateRestore(parsed, operation) {
+        async replaceRendererForStateRestore(parsed, operation, deferResume) {
             if (operation !== this.activeRestoreOperation) {
                 throw new Error("OpenGL state restore was cancelled");
             }
@@ -4706,7 +4733,7 @@
                     }
                 }
 
-                if (operation === this.activeRestoreOperation) {
+                if (operation === this.activeRestoreOperation && !deferResume) {
                     this.restoringState = false;
                     this.drainPendingCommands();
                 }
@@ -4721,13 +4748,30 @@
 
         async restoreStateJournal(checkpoint, operation) {
             const parsed = this.parseStateJournal(checkpoint);
-            await this.replaceRendererForStateRestore(parsed, operation);
+            await this.replaceRendererForStateRestore(parsed, operation, true);
+            try {
+                if (this.d3d8Executor &&
+                        typeof this.d3d8Executor.restoreState === "function") {
+                    this.d3d8Executor.restoreState(parsed.d3d8State);
+                }
+                if (operation === this.activeRestoreOperation) {
+                    this.restoringState = false;
+                    this.drainPendingCommands();
+                }
+            } catch (err) {
+                if (operation === this.activeRestoreOperation) {
+                    this.restoringState = false;
+                    this.pendingPCIBatches = [];
+                }
+                throw err;
+            }
         }
 
         async resetAfterLegacyStateRestore(operation) {
             await this.replaceRendererForStateRestore({
                 entries: [],
                 journalBytes: 0,
+                d3d8State: new Uint8Array(0),
                 contextCurrent: false,
                 surface: { hwnd: 0, x: 0, y: 0, width: 0, height: 0 },
             }, operation);
@@ -4987,6 +5031,13 @@
             const incomingBytes = event.bytes instanceof Uint8Array ?
                 event.bytes : new Uint8Array(event.bytes || []);
             if (this.isD3D8BatchStream(incomingBytes)) {
+                if (this.restoringState) {
+                    this.pendingPCIBatches.push({
+                        ...event,
+                        bytes: incomingBytes.slice(),
+                    });
+                    return;
+                }
                 this.pushD3D8PCIBatch(event, incomingBytes);
                 return;
             }

@@ -977,12 +977,13 @@ cache 必须有计数、命中率和上限。不要无界增长；场景切换�
 
 ### 阶段 4：完整 fixed function
 
-当前落地状态（D8WG v1.4，2026-08-01）：
+完成状态（D8WG v1.4，2026-08-01）：
 
 - 已实现 Maple 黑屏实际触发的 `FVF 0x142`（`XYZ | DIFFUSE | TEX1`），并保留 `XYZRHW` 路径。
 - 已实现 world/view/projection、texture transform、depth/stencil、material、directional/point/spot light、specular、normalize normals、local viewer、fog、texture coordinate generation、flat/Gouraud 和 blend op。
 - 已增加 transform/depth、raster/stencil、lighting、fog、textured-cube 的 XP 回归构建脚本，以及 host fake-WebGPU 和真实 WebGPU validation 页面覆盖。
-- 尚未关闭阶段 4 发布门槛：需要真实 XP/Maple 验收；explicit render target/depth surface、`CopyRects`、clip plane 与按 trace 决定的 cube/volume 路径仍待实现。对应 caps 已保持保守，不把这些冷路径标成已支持。
+- XP 下 Stage 3/4 测试程序已经由人工验收，MapleStory v83 已进入游戏并确认画面正常；阶段 4 的 Maple fixed-function 发布门槛已关闭。
+- explicit render target/depth surface 与 `CopyRects` 已在阶段 5 实现。Maple trace 未要求的 clip plane、cube/volume 路径仍返回明确错误，并保持 caps 不宣告，因此不阻塞阶段 4 完成。
 
 工作项：
 
@@ -1013,6 +1014,20 @@ cache 必须有计数、命中率和上限。不要无界增长；场景切换�
 
 ### 阶段 5：生命周期与兼容性
 
+当前落地状态（D8WG v1.6，2026-08-02）：
+
+- 已实现 recorded state block 和 `D3DSBT_ALL`/`PIXELSTATE`/`VERTEXSTATE`，覆盖 begin/end/create/capture/apply/delete；捕获的纹理、VB、IB 保持 COM 引用并在覆盖/删除时释放。
+- `Reset` 每次分配全新的 device epoch 和资源 handle namespace；DEFAULT-pool、锁定资源、未结束 scene/state-block、additional swap chain 及隐式 back/depth surface 会按 D3D8 约束阻止 Reset。
+- MANAGED/SYSTEMMEM 资源保留 CPU shadow，Reset 后用新 handle 重建并重新上传；当前绑定和默认状态被重置，viewport、尺寸、窗口跟踪和自动 depth 配置同步更新。
+- host 保存 retired device/resource handle 集，来自旧 epoch 的延迟 batch 在执行任何资源访问前丢弃；测试覆盖旧 device 的 update/bind/draw 不得触碰新 device。
+- WebGPU `device.lost` 会保存 canonical CPU checkpoint、申请/注入 replacement device、清空属于旧 GPUDevice 的 pipeline/sampler 缓存并重建所有设备状态与资源。
+- 已实现 additional swap chain 的 COM 生命周期、backbuffer、Present window 路由和 Reset blocker；浏览器仍只有一个 D3D8 canvas，因此它提供兼容的单显示面路由，不模拟多 canvas 同时显示。
+- 已实现 render target/depth/image surface、lockable render target、`CopyRects`、`GetFrontBuffer`、`Set/GetRenderTarget`、`GetDepthStencilSurface`，以及 clear/copy/upload 路径的 CPU readback shadow。
+- `QueryInterface`、`GetDevice`、Surface `GetContainer`、parent/refcount、失败输出置空、跨 device 对象拒绝和常用尺寸/格式/锁参数边界已经收紧。
+- v86 save state 现在在 GL journal 后附带 canonical D3D8 checkpoint；load state 先清理当前 GPU namespace，再恢复保存时的 device/resource/state epoch，随后才释放排队的 guest 命令。
+- 每个 XP D3D8 进程现在生成独立的 64 位 session cookie，并由每个 batch header 和 `HELLO` 双重声明；host 的 device/resource/retired-handle 表按 session 隔离。不同 EXE 即使从完全相同的数值 handle 起步，也不会互相销毁、Reset 或隐藏对方的 canvas；多 session checkpoint 会分记录保存和恢复。
+- WebGPU 没有同步 texture mapping。当前 readback 对 CPU upload、`Clear` 和 `CopyRects` 是精确的；仅由任意 GPU draw 产生的像素不会同步回写 guest shadow。Maple 不使用该冷路径；依赖它的其他游戏需要另行实现可暂停 guest 的异步 GPU readback 协议。
+
 工作项：
 
 - State block create/begin/end/capture/apply/delete。
@@ -1036,6 +1051,19 @@ cache 必须有计数、命中率和上限。不要无界增长；场景切换�
 - 连续运行和多次地图切换无 GPU 资源增长。
 - Reset 后画面、资源和逻辑状态恢复。
 - stale batch/handle 不会访问新 device 的资源。
+
+自动验收覆盖：
+
+- `d3d8_stateblock_test.exe`：recorded/all state block 的 capture/apply/delete 和实际绘制。
+- `d3d8_reset_lifecycle_test.exe`：设备创建/销毁、两次 resize Reset、MANAGED 2D/DXT mip 重建、DEFAULT VB 释放与重建。
+- `d3d8_lifecycle_compat_test.exe`：additional swap chain、RT/depth/image/front-buffer、container/refcount、96 次资源循环、8 次 device epoch、绑定资源/设备引用环回收和错误输出。
+- `d3d8_caps_audit_test.exe`：核验 Stage 5 对外能力与实现一致；核心纹理、DXT1/3/5 和 render-target texture 必须可用，cube/volume texture、SM1.1 和超过两级纹理在阶段 6 前必须保持未公布并返回正确失败输出。
+- host executor：192 次 create/destroy 后 live resource 数不增长，24 次 Reset 后只有一个 device 且零旧资源，72 条旧 epoch 命令被丢弃，并覆盖 device-lost 注入。
+- host executor：矩形 color/depth/stencil `Clear` 通过带 scissor 的 GPU clear draw 保持区域语义；被当前 command buffer 引用的 texture/buffer/depth/uniform 在 queue fence 完成后才物理销毁。
+- cross-process session：两个客体进程使用完全相同的 device/resource 数值句柄时仍可并存；销毁或延迟重放其中一个会话不会影响另一个，多会话 save/load 后隔离关系保持不变。
+- bridge state test：D3D8 checkpoint 字节随 v86 state 保存，恢复时只重建一次且字节完全一致，旧时间线的排队命令被清除。
+
+发布门槛仍需一次真实 XP/browser 人工运行：四个 Stage 5 exe 标题均为 `PASS`，随后执行 Maple 登录、连续切图、save/load 后继续绘制及 10–30 分钟资源曲线观察。自动测试通过代表实现已落地，不替代这项最终长时间验收。
 
 ### 阶段 6：D3D8 shader model 1.x
 
@@ -1496,28 +1524,29 @@ WebGPU 对象和 AudioWorklet 状态不能直接序列化进 v86 save state。
 
 ## 20. 当前仓库状态与下一步建议
 
-截至 2026-08-01，仓库协议已推进到 D8WG v1.4，进入阶段 4 fixed-function core。阶段 3 的 texture/Gr2D、动态资源、mip 与缓存能力继续保留；v1.4 新增：
+截至 2026-08-02，阶段 4 已由 XP 测试程序和 MapleStory v83 实机验收关闭，仓库协议已推进到 D8WG v1.6 的阶段 5 lifecycle/compatibility。阶段 3/4 的 texture、Gr2D 和 fixed-function 能力继续保留；v1.5/v1.6 新增：
 
-- Maple 黑屏日志中实际出现的 `FVF 0x142`，以及通用 `XYZ`、`NORMAL`、`PSIZE` 布局；
-- world/view/projection、`MultiplyTransform`、texture transform 与 camera-space texture coordinate generation；
-- 自动 D16/D24S8 协商和 WebGPU D24S8 attachment、depth compare/write/bias、全部 D3D8 stencil compare/op/mask 与 clear；
-- material、全局 ambient、8 盏 directional/point/spot lights、material source、specular、local viewer 和 normalize normals；
-- vertex/table/range fog、flat/Gouraud、colour write、cull、常用 blend factor 与 `D3DRS_BLENDOP`；
-- 协议 v1.4 的 transform/material/light/light-enable 命令，以及对应严格 payload 校验；
-- Stage 4 的 transform/depth、raster/stencil、lighting、fog、textured-cube XP 回归构建脚本。
+- 完整 state block 生命周期和资源引用捕获；
+- 新 device epoch 的 `Reset`、DEFAULT/lock/surface blocker、MANAGED 资源重建和窗口尺寸更新；
+- additional swap chain、render/depth/image surface、render-to-texture、`CopyRects`、lockable RT 和 front-buffer CPU mirror；
+- device-lost 自动恢复、旧 GPUDevice cache 失效、retired handle/stale batch 隔离；
+- canonical D3D8 save/load checkpoint，与 v86 PCI state journal 原子保存和有序恢复；
+- COM interface/parent/container/refcount 和失败输出/参数边界收紧；
+- 64 位 process session namespace、跨 EXE 相同 handle 隔离、旧 session 延迟 teardown 保护和多 session save/load；
+- Stage 5 的 stateblock、reset、surface/swapchain、资源压力 XP 回归构建脚本。
 
-本地自动验证已覆盖：guest DLL 的 XP 5.1/无 CRT 编译与 import 审计、Stage 3 和 Stage 4 全部测试程序交叉编译、协议 C/JS 一致性、精确 `0x142` attribute offset、W/V/P、D24S8、stencil reference、material/light uniform、specular、normalization、texture transform、flat interpolation 和 blend op。真实 GPU 页面位于 `glbridge/tests/d3d8_webgpu_browser_test.html`，现在同时创建 XYZRHW 和 XYZ/normal/texture-transform pipeline。
+本地自动验证已覆盖：guest DLL 的 XP 5.1/无 CRT 编译与 import 审计、Stage 3/4/5 测试程序交叉编译、协议 C/JS 一致性、device-lost 恢复、save/load checkpoint、192 次资源压力、24 次 host Reset 和 stale epoch 拒绝。真实 GPU 页面仍位于 `glbridge/tests/d3d8_webgpu_browser_test.html`。
 
-“阶段 4 核心代码落地”和“Maple 已可玩/阶段 4 发布门槛关闭”仍必须区分。下一步按以下顺序验收：
+下一步按以下顺序关闭阶段 5 的真实运行门槛：
 
-1. 将 v1.4 `d3d8.dll`、`d3d8_executor.js`、bridge 同步部署，硬刷新浏览器并确认版本串包含 `d8wg-m4-fixed-v1-20260801`。
-2. 在 XP 运行五个 Stage 4 测试，确认标题为 `PASS` 且 transform/depth、stencil、lighting、fog 和 textured cube 画面正确。
-3. 启动 MapleStory v83，首先确认旧 warning `unsupported FVF ... 0x142` 消失并出现首帧；随后完成登录、角色选择、进入地图、切图和 10 分钟运行。
-4. 如出现新 warning，按首个 unsupported FVF/op/state 继续补齐；不要用吞掉 warning 或返回伪成功的方式绕过。
-5. 实现并验收 explicit render target/depth surface、`CopyRects`、clip plane；只有 trace 证明 Maple 或目标测试使用时再启用 cube/volume caps 与实现。
-6. 对同场景采集旧链与 WebGPU 新链的 FPS、frame time、PCI submit、pipeline creation 和内存 A/B 数据。
+1. 同步部署 v1.6 `d3d8.dll`、`d3d8_executor.js` 和 bridge，硬刷新并确认版本串包含 `d8wg-m6-session-v3-20260802`。
+2. 运行 `build_stage5_tests.sh` 生成的四个 exe，确认标题均为 `PASS`；特别观察第二次 Reset、additional swap-chain blocker 和 RT readback。
+3. 启动 MapleStory，完成登录、角色选择、至少十次地图切换和 10–30 分钟运行，记录 `resourcesLive`、pipeline/cache 和浏览器 GPU memory 是否回到稳定平台。
+4. 保存 v86 state，继续改变地图/资源后再加载，确认恢复的画面和逻辑可继续绘制，且旧时间线没有闪回或 stale-handle warning。
+5. 用测试注入一次 device lost，确认 replacement device 恢复后仍可 Present；任何恢复失败都必须作为明确错误上报，不能静默黑屏。
+6. 若目标游戏真的调用 draw-generated GPU readback，再设计可暂停 v86 guest 的异步 readback 握手；不要在主线程用忙等或每帧 readback 破坏性能。
 
-因此当前准确状态是：“阶段 4 Maple fixed-function 核心已实现并通过静态/host 自动回归，真实 WebGPU/XP/Maple 验收以及阶段 4 冷资源路径尚未完成”。
+因此当前准确状态是：“阶段 4 已完成；阶段 5 代码与自动回归已落地，等待真实 XP 的 Stage 5 exe、save/load、device-lost 和长时间切图验收后关闭发布门槛”。
 
 ## 21. 参考资料与许可边界
 

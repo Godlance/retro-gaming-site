@@ -14,6 +14,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
 #include <windows.h>
+#include <initguid.h>
 #include <d3d8.h>
 #include <stdint.h>
 #include "../winproxy/v86gl_ioctl.h"
@@ -47,6 +48,8 @@ typedef struct D8VertexBuffer D8VertexBuffer;
 typedef struct D8IndexBuffer D8IndexBuffer;
 typedef struct D8Texture D8Texture;
 typedef struct D8Surface D8Surface;
+typedef struct D8StateBlock D8StateBlock;
+typedef struct D8SwapChain D8SwapChain;
 
 typedef struct D8TextureLevel {
     BYTE *shadow;
@@ -65,6 +68,42 @@ typedef struct D8StreamBinding {
     UINT stride;
 } D8StreamBinding;
 
+typedef struct D8StateSnapshot {
+    BYTE render_mask[D8WG_MAX_RENDER_STATES];
+    BYTE texture_stage_mask[D8WG_MAX_TEXTURE_STAGES]
+                           [D8WG_MAX_TEXTURE_STAGE_STATES];
+    BYTE texture_mask[D8WG_MAX_TEXTURE_STAGES];
+    BYTE stream_mask[D8WG_MAX_STREAMS];
+    BYTE transform_mask[D8WG_MAX_TRANSFORMS];
+    BYTE light_mask[D8WG_MAX_LIGHTS];
+    BYTE light_enable_mask[D8WG_MAX_LIGHTS];
+    BOOL viewport_mask;
+    BOOL material_mask;
+    BOOL indices_mask;
+    BOOL vertex_shader_mask;
+    DWORD render_states[D8WG_MAX_RENDER_STATES];
+    DWORD texture_stage_states[D8WG_MAX_TEXTURE_STAGES]
+                                      [D8WG_MAX_TEXTURE_STAGE_STATES];
+    D8Texture *textures[D8WG_MAX_TEXTURE_STAGES];
+    D8StreamBinding streams[D8WG_MAX_STREAMS];
+    D8IndexBuffer *index_buffer;
+    UINT base_vertex_index;
+    DWORD vertex_shader;
+    D3DVIEWPORT8 viewport;
+    D3DMATRIX transforms[D8WG_MAX_TRANSFORMS];
+    D3DMATERIAL8 material;
+    D3DLIGHT8 lights[D8WG_MAX_LIGHTS];
+    BOOL light_set[D8WG_MAX_LIGHTS];
+    BOOL light_enabled[D8WG_MAX_LIGHTS];
+} D8StateSnapshot;
+
+struct D8StateBlock {
+    D8StateBlock *next;
+    DWORD token;
+    D3DSTATEBLOCKTYPE type;
+    D8StateSnapshot state;
+};
+
 struct D8Direct3D {
     IDirect3D8 iface;
     LONG refcount;
@@ -73,6 +112,8 @@ struct D8Direct3D {
 struct D8Device {
     IDirect3DDevice8 iface;
     LONG refcount;
+    LONG child_parent_refs;
+    BOOL releasing_owned_refs;
     D8Direct3D *parent;
     uint32_t handle;
     D3DDEVICE_CREATION_PARAMETERS creation;
@@ -99,6 +140,21 @@ struct D8Device {
     BOOL window_unicode;
     D8WGUpdateSurface last_surface;
     BOOL has_last_surface;
+    D8StateBlock *state_blocks;
+    D8StateBlock *recording_state_block;
+    DWORD next_state_block_token;
+    D8VertexBuffer *vertex_buffers;
+    D8IndexBuffer *index_buffers;
+    D8Texture *texture_resources;
+    uint32_t reset_epoch;
+    D8Texture *render_target_texture;
+    UINT render_target_level;
+    BOOL depth_surface_enabled;
+    BYTE *front_shadow;
+    UINT front_shadow_pitch;
+    UINT additional_swap_chain_count;
+    UINT implicit_surface_count;
+    D8Surface *depth_surface;
 };
 
 struct D8VertexBuffer {
@@ -116,6 +172,7 @@ struct D8VertexBuffer {
     UINT lock_size;
     DWORD lock_flags;
     BOOL locked;
+    D8VertexBuffer *next_device_resource;
 };
 
 struct D8IndexBuffer {
@@ -133,6 +190,7 @@ struct D8IndexBuffer {
     UINT lock_size;
     DWORD lock_flags;
     BOOL locked;
+    D8IndexBuffer *next_device_resource;
 };
 
 struct D8Texture {
@@ -149,13 +207,32 @@ struct D8Texture {
     DWORD priority;
     DWORD lod;
     D8TextureLevel *levels;
+    D8Texture *next_device_resource;
+    BOOL lockable_render_target;
 };
 
 struct D8Surface {
     IDirect3DSurface8 iface;
     LONG refcount;
     D8Texture *texture;
+    D8Device *device;
     UINT level;
+    D3DSURFACE_DESC desc;
+    BYTE *shadow;
+    UINT row_pitch;
+    RECT lock_rect;
+    DWORD lock_flags;
+    BOOL locked;
+    BOOL backbuffer;
+    BOOL depth_stencil;
+    BOOL reset_blocker;
+};
+
+struct D8SwapChain {
+    IDirect3DSwapChain8 iface;
+    LONG refcount;
+    D8Device *device;
+    D3DPRESENT_PARAMETERS present;
 };
 
 static HANDLE g_transport = INVALID_HANDLE_VALUE;
@@ -165,7 +242,9 @@ static uint32_t g_batch_bytes;
 static uint32_t g_command_count;
 static uint32_t g_frame_id = 1;
 static uint32_t g_sequence = 1;
-static uint32_t g_next_handle = 1;
+static uint32_t g_next_handle = D8WG_HANDLE_GENERATION_ONE;
+static uint32_t g_session_id_low;
+static uint32_t g_session_id_high;
 static BOOL g_transport_failed;
 static BOOL g_hello_emitted;
 static CRITICAL_SECTION g_transport_lock;
@@ -176,6 +255,13 @@ static IDirect3DVertexBuffer8Vtbl g_vb_vtbl;
 static IDirect3DIndexBuffer8Vtbl g_ib_vtbl;
 static IDirect3DTexture8Vtbl g_texture_vtbl;
 static IDirect3DSurface8Vtbl g_surface_vtbl;
+static IDirect3DSwapChain8Vtbl g_swapchain_vtbl;
+
+static void state_block_release_references(D8StateBlock *block);
+static BOOL recreate_device_resources(D8Device *device);
+static BOOL device_has_reset_blockers(D8Device *device);
+static void device_clear_bindings(D8Device *device);
+static void device_release_owned_references(D8Device *device);
 
 static D8Direct3D *d3d_from_iface(IDirect3D8 *iface)
 {
@@ -207,6 +293,25 @@ static D8Surface *surface_from_iface(IDirect3DSurface8 *iface)
     return (D8Surface *)iface;
 }
 
+static BOOL guid_equal(REFIID left, REFIID right)
+{
+    UINT index;
+    if (!left || !right || left->Data1 != right->Data1
+            || left->Data2 != right->Data2 || left->Data3 != right->Data3)
+        return FALSE;
+    for (index = 0; index < 8; ++index) {
+        if (left->Data4[index] != right->Data4[index]) return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL iid_is_unknown(REFIID iid)
+{
+    static const IID unknown = { 0x00000000, 0x0000, 0x0000,
+        { 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+    return guid_equal(iid, &unknown);
+}
+
 static void d8wg_log(const char *text)
 {
     OutputDebugStringA(D8WG_LOG_PREFIX);
@@ -216,12 +321,10 @@ static void d8wg_log(const char *text)
 
 static uint32_t allocate_handle(void)
 {
-    uint32_t index = (uint32_t)InterlockedIncrement((LONG *)&g_next_handle);
-    index &= 0x000FFFFFu;
-    if (!index)
-        index = (uint32_t)InterlockedIncrement((LONG *)&g_next_handle)
-                & 0x000FFFFFu;
-    return D8WG_HANDLE_GENERATION_ONE | index;
+    uint32_t handle = (uint32_t)InterlockedIncrement((LONG *)&g_next_handle);
+    if (!handle)
+        handle = (uint32_t)InterlockedIncrement((LONG *)&g_next_handle);
+    return handle;
 }
 
 static uint8_t *batch_base(void)
@@ -254,6 +357,8 @@ static void reset_batch_locked(void)
     header->version_major = D8WG_VERSION_MAJOR;
     header->version_minor = D8WG_VERSION_MINOR;
     header->frame_id = g_frame_id;
+    header->session_id_low = g_session_id_low;
+    header->session_id_high = g_session_id_high;
 }
 
 static void close_transport_locked(void)
@@ -333,8 +438,8 @@ static BOOL submit_batch_locked(BOOL present)
     batch->flags = present ? D8WG_BATCH_FLAG_PRESENT : 0;
     batch->command_count = g_command_count;
     batch->command_bytes = g_batch_bytes - sizeof(*batch);
-    batch->upload_offset = 0;
-    batch->upload_bytes = 0;
+    batch->session_id_low = g_session_id_low;
+    batch->session_id_high = g_session_id_high;
 
     outer = g_dma_buffer + sizeof(V86GLDMADesc);
     outer[0] = (uint8_t)(V86GL_CTRL_D3D8_BATCH & 0xFFu);
@@ -565,6 +670,49 @@ static BOOL texture_level_layout(D3DFORMAT format, UINT width, UINT height,
     *row_count = (height + block_height - 1u) / block_height;
     return multiply_u32(columns, block_bytes, row_pitch)
             && multiply_u32(*row_pitch, *row_count, byte_count);
+}
+
+static void write_surface_color(BYTE *destination, D3DFORMAT format,
+        D3DCOLOR color)
+{
+    UINT a = (color >> 24) & 0xffu;
+    UINT r = (color >> 16) & 0xffu;
+    UINT g = (color >> 8) & 0xffu;
+    UINT b = color & 0xffu;
+    WORD packed;
+    switch (format) {
+    case D3DFMT_A8R8G8B8:
+    case D3DFMT_X8R8G8B8:
+        *(DWORD *)destination = color;
+        break;
+    case D3DFMT_R5G6B5:
+        packed = (WORD)((r >> 3) << 11 | (g >> 2) << 5 | (b >> 3));
+        *(WORD *)destination = packed;
+        break;
+    case D3DFMT_X1R5G5B5:
+        packed = (WORD)(0x8000u | (r >> 3) << 10 | (g >> 3) << 5
+                | (b >> 3));
+        *(WORD *)destination = packed;
+        break;
+    case D3DFMT_A1R5G5B5:
+        packed = (WORD)((a >> 7) << 15 | (r >> 3) << 10
+                | (g >> 3) << 5 | (b >> 3));
+        *(WORD *)destination = packed;
+        break;
+    case D3DFMT_A4R4G4B4:
+        packed = (WORD)((a >> 4) << 12 | (r >> 4) << 8
+                | (g >> 4) << 4 | (b >> 4));
+        *(WORD *)destination = packed;
+        break;
+    case D3DFMT_L8:
+        *destination = (BYTE)((r * 77u + g * 150u + b * 29u) >> 8);
+        break;
+    case D3DFMT_A8:
+        *destination = (BYTE)a;
+        break;
+    default:
+        break;
+    }
 }
 
 static BOOL emit_texture_update(D8Texture *texture, UINT level,
@@ -868,7 +1016,29 @@ static void emit_hello_once(void)
         return;
     hello.guest_pointer_bits = 32;
     hello.feature_bits = 0;
+    hello.session_id_low = g_session_id_low;
+    hello.session_id_high = g_session_id_high;
     emit_command(D8WG_OP_HELLO, &hello, sizeof(hello));
+}
+
+static void initialize_session_id(HINSTANCE instance)
+{
+    FILETIME time;
+    LARGE_INTEGER counter;
+    DWORD process_id = GetCurrentProcessId();
+    DWORD thread_id = GetCurrentThreadId();
+
+    GetSystemTimeAsFileTime(&time);
+    if (!QueryPerformanceCounter(&counter)) {
+        counter.LowPart = GetTickCount();
+        counter.HighPart = process_id ^ thread_id;
+    }
+    g_session_id_low = time.dwLowDateTime ^ counter.LowPart ^ process_id
+            ^ (uint32_t)(uintptr_t)instance;
+    g_session_id_high = time.dwHighDateTime ^ counter.HighPart
+            ^ GetTickCount() ^ (thread_id * 0x9E3779B9u);
+    if (!g_session_id_low && !g_session_id_high)
+        g_session_id_high = 0xD8A80001u;
 }
 
 static void fill_display_mode(D3DDISPLAYMODE *mode, UINT width, UINT height,
@@ -972,9 +1142,11 @@ static void fill_caps(D3DCAPS8 *caps)
 static HRESULT WINAPI d3d_query_interface(IDirect3D8 *iface, REFIID iid,
         void **object)
 {
-    (void)iid;
     if (!object)
         return E_POINTER;
+    *object = NULL;
+    if (!iid || (!iid_is_unknown(iid) && !guid_equal(iid, &IID_IDirect3D8)))
+        return E_NOINTERFACE;
     *object = iface;
     IDirect3D8_AddRef(iface);
     return S_OK;
@@ -1066,16 +1238,25 @@ static HRESULT WINAPI d3d_get_adapter_display_mode(IDirect3D8 *iface,
     return D3D_OK;
 }
 
+static BOOL supported_backbuffer_format(D3DFORMAT format)
+{
+    return format == D3DFMT_A8R8G8B8 || format == D3DFMT_X8R8G8B8
+            || format == D3DFMT_R5G6B5;
+}
+
 static HRESULT WINAPI d3d_check_device_type(IDirect3D8 *iface, UINT adapter,
         D3DDEVTYPE type, D3DFORMAT display_format,
         D3DFORMAT backbuffer_format, WINBOOL windowed)
 {
     (void)iface;
-    (void)display_format;
-    (void)backbuffer_format;
     (void)windowed;
-    return !adapter && type == D3DDEVTYPE_HAL ? D3D_OK
-            : D3DERR_NOTAVAILABLE;
+    if (adapter || type != D3DDEVTYPE_HAL)
+        return D3DERR_NOTAVAILABLE;
+    if ((display_format != D3DFMT_X8R8G8B8
+            && display_format != D3DFMT_R5G6B5)
+            || !supported_backbuffer_format(backbuffer_format))
+        return D3DERR_NOTAVAILABLE;
+    return D3D_OK;
 }
 
 static BOOL supported_texture_format(D3DFORMAT format)
@@ -1109,6 +1290,10 @@ static HRESULT WINAPI d3d_check_device_format(IDirect3D8 *iface,
     if (resource_type == D3DRTYPE_TEXTURE
             && !(usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))
             && supported_texture_format(format))
+        return D3D_OK;
+    if (resource_type == D3DRTYPE_TEXTURE
+            && usage == D3DUSAGE_RENDERTARGET
+            && (format == D3DFMT_A8R8G8B8 || format == D3DFMT_X8R8G8B8))
         return D3D_OK;
     if (resource_type == D3DRTYPE_SURFACE
             && (usage & D3DUSAGE_DEPTHSTENCIL)
@@ -1227,6 +1412,179 @@ static void device_init_states(D8Device *device)
     }
 }
 
+static BOOL emit_vertex_buffer_create(D8Device *device,
+        D8VertexBuffer *buffer)
+{
+    D8WGCreateBuffer command;
+    command.device_handle = device->handle;
+    command.resource_handle = buffer->handle;
+    command.resource_kind = D8WG_RESOURCE_BUFFER_VERTEX;
+    command.byte_count = buffer->length;
+    command.usage = buffer->usage;
+    command.fvf = buffer->fvf;
+    command.pool = buffer->pool;
+    command.reserved = 0;
+    return emit_command(D8WG_OP_CREATE_BUFFER, &command, sizeof(command));
+}
+
+static BOOL emit_index_buffer_create(D8Device *device,
+        D8IndexBuffer *buffer)
+{
+    D8WGCreateBuffer command;
+    command.device_handle = device->handle;
+    command.resource_handle = buffer->handle;
+    command.resource_kind = D8WG_RESOURCE_BUFFER_INDEX;
+    command.byte_count = buffer->length;
+    command.usage = buffer->usage;
+    command.fvf = buffer->format;
+    command.pool = buffer->pool;
+    command.reserved = 0;
+    return emit_command(D8WG_OP_CREATE_BUFFER, &command, sizeof(command));
+}
+
+static BOOL emit_texture_create(D8Device *device, D8Texture *texture)
+{
+    D8WGCreateTexture command;
+    command.device_handle = device->handle;
+    command.resource_handle = texture->handle;
+    command.width = texture->width;
+    command.height = texture->height;
+    command.level_count = texture->level_count;
+    command.format = texture->format;
+    command.usage = texture->usage;
+    command.pool = texture->pool;
+    return emit_command(D8WG_OP_CREATE_TEXTURE, &command, sizeof(command));
+}
+
+static BOOL device_has_reset_blockers(D8Device *device)
+{
+    D8VertexBuffer *vb;
+    D8IndexBuffer *ib;
+    D8Texture *texture;
+    UINT level;
+    if (device->in_scene || device->recording_state_block
+            || device->additional_swap_chain_count
+            || device->implicit_surface_count)
+        return TRUE;
+    for (vb = device->vertex_buffers; vb; vb = vb->next_device_resource) {
+        if (vb->pool == D3DPOOL_DEFAULT || vb->locked)
+            return TRUE;
+    }
+    for (ib = device->index_buffers; ib; ib = ib->next_device_resource) {
+        if (ib->pool == D3DPOOL_DEFAULT || ib->locked)
+            return TRUE;
+    }
+    for (texture = device->texture_resources; texture;
+            texture = texture->next_device_resource) {
+        if (texture->pool == D3DPOOL_DEFAULT)
+            return TRUE;
+        for (level = 0; level < texture->level_count; ++level) {
+            if (texture->levels[level].locked)
+                return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static void device_clear_bindings(D8Device *device)
+{
+    UINT index;
+    for (index = 0; index < D8WG_MAX_STREAMS; ++index) {
+        D8VertexBuffer *buffer = device->streams[index].buffer;
+        device->streams[index].buffer = NULL;
+        device->streams[index].stride = 0;
+        if (buffer) IDirect3DVertexBuffer8_Release(&buffer->iface);
+    }
+    if (device->index_buffer) {
+        D8IndexBuffer *buffer = device->index_buffer;
+        device->index_buffer = NULL;
+        device->base_vertex_index = 0;
+        IDirect3DIndexBuffer8_Release(&buffer->iface);
+    }
+    for (index = 0; index < D8WG_MAX_TEXTURE_STAGES; ++index) {
+        D8Texture *texture = device->textures[index];
+        device->textures[index] = NULL;
+        if (texture) IDirect3DTexture8_Release(&texture->iface);
+    }
+    device->vertex_shader = 0;
+    if (device->render_target_texture) {
+        D8Texture *texture = device->render_target_texture;
+        device->render_target_texture = NULL;
+        device->render_target_level = 0;
+        IDirect3DTexture8_Release(&texture->iface);
+    }
+    if (device->depth_surface) {
+        D8Surface *surface = device->depth_surface;
+        device->depth_surface = NULL;
+        IDirect3DSurface8_Release(&surface->iface);
+    }
+    device->depth_surface_enabled = device->present.EnableAutoDepthStencil;
+}
+
+/*
+ * D3D8 resources retain their parent device, while device state retains the
+ * currently bound resources.  Track the parent-side references separately so
+ * that releasing the last public device reference can drop device-owned state
+ * and break that otherwise-uncollectable COM cycle.  Externally held resources
+ * continue to keep the device alive and may still return it from GetDevice().
+ */
+static void device_release_owned_references(D8Device *device)
+{
+    D8StateBlock *block;
+    D8StateBlock *recording;
+
+    device_clear_bindings(device);
+
+    block = device->state_blocks;
+    device->state_blocks = NULL;
+    while (block) {
+        D8StateBlock *next = block->next;
+        state_block_release_references(block);
+        HeapFree(GetProcessHeap(), 0, block);
+        block = next;
+    }
+    recording = device->recording_state_block;
+    device->recording_state_block = NULL;
+    if (recording) {
+        state_block_release_references(recording);
+        HeapFree(GetProcessHeap(), 0, recording);
+    }
+}
+
+static BOOL recreate_device_resources(D8Device *device)
+{
+    D8VertexBuffer *vb;
+    D8IndexBuffer *ib;
+    D8Texture *texture;
+    UINT level;
+    for (vb = device->vertex_buffers; vb; vb = vb->next_device_resource) {
+        vb->handle = allocate_handle();
+        if (!emit_vertex_buffer_create(device, vb)
+                || !emit_buffer_update(vb->handle, 0, vb->shadow,
+                        vb->length, 0))
+            return FALSE;
+    }
+    for (ib = device->index_buffers; ib; ib = ib->next_device_resource) {
+        ib->handle = allocate_handle();
+        if (!emit_index_buffer_create(device, ib)
+                || !emit_buffer_update(ib->handle, 0, ib->shadow,
+                        ib->length, 0))
+            return FALSE;
+    }
+    for (texture = device->texture_resources; texture;
+            texture = texture->next_device_resource) {
+        texture->handle = allocate_handle();
+        if (!emit_texture_create(device, texture)) return FALSE;
+        for (level = 0; level < texture->level_count; ++level) {
+            RECT full;
+            SetRect(&full, 0, 0, (int)texture->levels[level].width,
+                    (int)texture->levels[level].height);
+            if (!emit_texture_update(texture, level, &full)) return FALSE;
+        }
+    }
+    return TRUE;
+}
+
 static HRESULT WINAPI d3d_create_device(IDirect3D8 *iface, UINT adapter,
         D3DDEVTYPE type, HWND focus_window, DWORD behavior,
         D3DPRESENT_PARAMETERS *parameters, IDirect3DDevice8 **device_out)
@@ -1237,8 +1595,13 @@ static HRESULT WINAPI d3d_create_device(IDirect3D8 *iface, UINT adapter,
     HWND window;
     RECT client;
     POINT origin;
+    UINT front_row_count;
+    UINT front_byte_count;
 
-    if (adapter || type != D3DDEVTYPE_HAL || !parameters || !device_out)
+    if (!device_out)
+        return D3DERR_INVALIDCALL;
+    *device_out = NULL;
+    if (adapter || type != D3DDEVTYPE_HAL || !parameters)
         return D3DERR_INVALIDCALL;
     if (parameters->MultiSampleType != D3DMULTISAMPLE_NONE)
         return D3DERR_NOTAVAILABLE;
@@ -1246,6 +1609,13 @@ static HRESULT WINAPI d3d_create_device(IDirect3D8 *iface, UINT adapter,
             && parameters->AutoDepthStencilFormat != D3DFMT_D16
             && parameters->AutoDepthStencilFormat != D3DFMT_D24S8)
         return D3DERR_NOTAVAILABLE;
+    if (parameters->BackBufferFormat != D3DFMT_UNKNOWN
+            && !supported_backbuffer_format(parameters->BackBufferFormat))
+        return D3DERR_NOTAVAILABLE;
+    if (parameters->BackBufferWidth > 8192
+            || parameters->BackBufferHeight > 8192
+            || parameters->BackBufferCount > 1)
+        return D3DERR_INVALIDCALL;
 
     device = (D8Device *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             sizeof(*device));
@@ -1273,6 +1643,23 @@ static HRESULT WINAPI d3d_create_device(IDirect3D8 *iface, UINT adapter,
     device->viewport.MinZ = 0.0f;
     device->viewport.MaxZ = 1.0f;
     device_init_states(device);
+    device->depth_surface_enabled = parameters->EnableAutoDepthStencil;
+    if (!texture_level_layout(device->display_mode.Format,
+            device->display_mode.Width, device->display_mode.Height,
+            &device->front_shadow_pitch, &front_row_count,
+            &front_byte_count)
+            || front_row_count != device->display_mode.Height) {
+        IDirect3D8_Release(iface);
+        HeapFree(GetProcessHeap(), 0, device);
+        return D3DERR_NOTAVAILABLE;
+    }
+    device->front_shadow = (BYTE *)HeapAlloc(GetProcessHeap(),
+            HEAP_ZERO_MEMORY, front_byte_count);
+    if (!device->front_shadow) {
+        IDirect3D8_Release(iface);
+        HeapFree(GetProcessHeap(), 0, device);
+        return E_OUTOFMEMORY;
+    }
 
     window = parameters->hDeviceWindow ? parameters->hDeviceWindow
             : focus_window;
@@ -1303,6 +1690,7 @@ static HRESULT WINAPI d3d_create_device(IDirect3D8 *iface, UINT adapter,
     command.auto_depth_stencil_format = parameters->AutoDepthStencilFormat;
     if (!emit_command(D8WG_OP_CREATE_DEVICE, &command, sizeof(command))) {
         IDirect3D8_Release(iface);
+        HeapFree(GetProcessHeap(), 0, device->front_shadow);
         HeapFree(GetProcessHeap(), 0, device);
         return D3DERR_DRIVERINTERNALERROR;
     }
@@ -1317,9 +1705,12 @@ static HRESULT WINAPI d3d_create_device(IDirect3D8 *iface, UINT adapter,
 static HRESULT WINAPI device_query_interface(IDirect3DDevice8 *iface,
         REFIID iid, void **object)
 {
-    (void)iid;
     if (!object)
         return E_POINTER;
+    *object = NULL;
+    if (!iid || (!iid_is_unknown(iid)
+            && !guid_equal(iid, &IID_IDirect3DDevice8)))
+        return E_NOINTERFACE;
     *object = iface;
     IDirect3DDevice8_AddRef(iface);
     return S_OK;
@@ -1334,13 +1725,37 @@ static ULONG WINAPI device_release(IDirect3DDevice8 *iface)
 {
     D8Device *device = device_from_iface(iface);
     ULONG refs = (ULONG)InterlockedDecrement(&device->refcount);
+
+    if (device->releasing_owned_refs)
+        return refs;
+
+    if ((LONG)refs == InterlockedCompareExchange(
+            &device->child_parent_refs, 0, 0)) {
+        device->releasing_owned_refs = TRUE;
+        device_release_owned_references(device);
+        device->releasing_owned_refs = FALSE;
+        refs = (ULONG)InterlockedCompareExchange(&device->refcount, 0, 0);
+    }
     if (!refs) {
         detach_device_window(device);
         emit_device_destroy_and_flush(device->handle);
         IDirect3D8_Release(&device->parent->iface);
+        HeapFree(GetProcessHeap(), 0, device->front_shadow);
         HeapFree(GetProcessHeap(), 0, device);
     }
     return refs;
+}
+
+static void device_child_add_ref(D8Device *device)
+{
+    InterlockedIncrement(&device->child_parent_refs);
+    IDirect3DDevice8_AddRef(&device->iface);
+}
+
+static void device_child_release(D8Device *device)
+{
+    InterlockedDecrement(&device->child_parent_refs);
+    IDirect3DDevice8_Release(&device->iface);
 }
 
 static HRESULT WINAPI device_test_cooperative_level(IDirect3DDevice8 *iface)
@@ -1404,14 +1819,26 @@ static HRESULT WINAPI device_reset(IDirect3DDevice8 *iface,
         D3DPRESENT_PARAMETERS *parameters)
 {
     D8Device *device = device_from_iface(iface);
-    D8WGCreateDevice reset;
+    D8WGResetDevice reset;
     RECT client;
     POINT origin;
     HWND window;
+    BYTE *new_front_shadow;
+    UINT new_front_pitch;
+    UINT new_front_rows;
+    UINT new_front_bytes;
 
-    if (!parameters || parameters->MultiSampleType != D3DMULTISAMPLE_NONE)
+    if (!parameters || parameters->MultiSampleType != D3DMULTISAMPLE_NONE
+            || parameters->BackBufferCount > 1
+            || device_has_reset_blockers(device))
         return D3DERR_INVALIDCALL;
-    device->present = *parameters;
+    if (parameters->EnableAutoDepthStencil
+            && parameters->AutoDepthStencilFormat != D3DFMT_D16
+            && parameters->AutoDepthStencilFormat != D3DFMT_D24S8)
+        return D3DERR_NOTAVAILABLE;
+    if (parameters->BackBufferFormat != D3DFMT_UNKNOWN
+            && !supported_backbuffer_format(parameters->BackBufferFormat))
+        return D3DERR_NOTAVAILABLE;
     window = parameters->hDeviceWindow ? parameters->hDeviceWindow
             : device->creation.hFocusWindow;
     SetRect(&client, 0, 0, 640, 480);
@@ -1421,7 +1848,8 @@ static HRESULT WINAPI device_reset(IDirect3DDevice8 *iface,
         ClientToScreen(window, &origin);
     }
     ZeroMemory(&reset, sizeof(reset));
-    reset.device_handle = device->handle;
+    reset.old_device_handle = device->handle;
+    reset.new_device_handle = allocate_handle();
     reset.hwnd = (uint32_t)(uintptr_t)window;
     reset.x = origin.x;
     reset.y = origin.y;
@@ -1439,14 +1867,38 @@ static HRESULT WINAPI device_reset(IDirect3DDevice8 *iface,
     reset.behavior_flags = device->creation.BehaviorFlags;
     reset.enable_auto_depth_stencil = parameters->EnableAutoDepthStencil;
     reset.auto_depth_stencil_format = parameters->AutoDepthStencilFormat;
+    if (reset.width > 8192 || reset.height > 8192)
+        return D3DERR_INVALIDCALL;
+    if (!texture_level_layout((D3DFORMAT)reset.backbuffer_format,
+            reset.width, reset.height, &new_front_pitch, &new_front_rows,
+            &new_front_bytes) || new_front_rows != reset.height)
+        return D3DERR_NOTAVAILABLE;
+    new_front_shadow = (BYTE *)HeapAlloc(GetProcessHeap(),
+            HEAP_ZERO_MEMORY, new_front_bytes);
+    if (!new_front_shadow)
+        return E_OUTOFMEMORY;
+    if (!emit_command(D8WG_OP_RESET, &reset, sizeof(reset)))
+    {
+        HeapFree(GetProcessHeap(), 0, new_front_shadow);
+        return D3DERR_DRIVERINTERNALERROR;
+    }
+    device_clear_bindings(device);
+    HeapFree(GetProcessHeap(), 0, device->front_shadow);
+    device->front_shadow = new_front_shadow;
+    device->front_shadow_pitch = new_front_pitch;
+    device->handle = reset.new_device_handle;
+    ++device->reset_epoch;
+    device->present = *parameters;
     fill_display_mode(&device->display_mode, reset.width, reset.height,
             reset.backbuffer_format);
+    device_init_states(device);
     device->viewport.X = device->viewport.Y = 0;
     device->viewport.Width = reset.width;
     device->viewport.Height = reset.height;
     device->viewport.MinZ = 0.0f;
     device->viewport.MaxZ = 1.0f;
-    if (!emit_command(D8WG_OP_RESET, &reset, sizeof(reset)))
+    device->depth_surface_enabled = parameters->EnableAutoDepthStencil;
+    if (!recreate_device_resources(device))
         return D3DERR_DRIVERINTERNALERROR;
     if (window != device->tracked_window) {
         detach_device_window(device);
@@ -1530,6 +1982,47 @@ static HRESULT WINAPI device_clear(IDirect3DDevice8 *iface, DWORD rect_count,
         (void)header;
     }
     LeaveCriticalSection(&g_transport_lock);
+    if (result && (flags & D3DCLEAR_TARGET)) {
+        BYTE *shadow = device->front_shadow;
+        UINT pitch = device->front_shadow_pitch;
+        UINT width = device->display_mode.Width;
+        UINT height = device->display_mode.Height;
+        D3DFORMAT format = device->display_mode.Format;
+        UINT block_width;
+        UINT block_height;
+        UINT pixel_bytes;
+        UINT rect_index;
+        if (device->render_target_texture) {
+            D8TextureLevel *level = &device->render_target_texture->levels[
+                    device->render_target_level];
+            shadow = level->shadow;
+            pitch = level->row_pitch;
+            width = level->width;
+            height = level->height;
+            format = device->render_target_texture->format;
+        }
+        if (!texture_format_layout(format, &block_width, &block_height,
+                &pixel_bytes) || block_width != 1 || block_height != 1)
+            return D3DERR_DRIVERINTERNALERROR;
+        for (rect_index = 0; rect_index < (rect_count ? rect_count : 1u);
+                ++rect_index) {
+            LONG left = rect_count ? rects[rect_index].x1 : 0;
+            LONG top = rect_count ? rects[rect_index].y1 : 0;
+            LONG right = rect_count ? rects[rect_index].x2 : (LONG)width;
+            LONG bottom = rect_count ? rects[rect_index].y2 : (LONG)height;
+            LONG y;
+            if (left < 0) left = 0;
+            if (top < 0) top = 0;
+            if (right > (LONG)width) right = (LONG)width;
+            if (bottom > (LONG)height) bottom = (LONG)height;
+            for (y = top; y < bottom; ++y) {
+                BYTE *row = shadow + y * pitch;
+                LONG x;
+                for (x = left; x < right; ++x)
+                    write_surface_color(row + x * pixel_bytes, format, color);
+            }
+        }
+    }
     return result ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
 }
 
@@ -1547,6 +2040,8 @@ static HRESULT WINAPI device_set_viewport(IDirect3DDevice8 *iface,
             || viewport->MinZ < 0.0f || viewport->MaxZ > 1.0f
             || viewport->MinZ > viewport->MaxZ)
         return D3DERR_INVALIDCALL;
+    if (device->recording_state_block)
+        device->recording_state_block->state.viewport_mask = TRUE;
     if (device->viewport.X == viewport->X
             && device->viewport.Y == viewport->Y
             && device->viewport.Width == viewport->Width
@@ -1583,6 +2078,8 @@ static HRESULT WINAPI device_set_render_state(IDirect3DDevice8 *iface,
     D8WGSetRenderState command;
     if ((UINT)state >= D8WG_MAX_RENDER_STATES)
         return D3DERR_INVALIDCALL;
+    if (device->recording_state_block)
+        device->recording_state_block->state.render_mask[state] = 1;
     if (device->render_states[state] == value)
         return D3D_OK;
     device->render_states[state] = value;
@@ -1611,6 +2108,9 @@ static HRESULT WINAPI device_set_texture_stage_state(IDirect3DDevice8 *iface,
     if (stage >= D8WG_MAX_TEXTURE_STAGES
             || (UINT)state >= D8WG_MAX_TEXTURE_STAGE_STATES)
         return D3DERR_INVALIDCALL;
+    if (device->recording_state_block)
+        device->recording_state_block->state.texture_stage_mask[stage][state]
+                = 1;
     if (device->texture_stage_states[stage][state] == value)
         return D3D_OK;
     device->texture_stage_states[stage][state] = value;
@@ -1638,8 +2138,10 @@ static HRESULT WINAPI device_create_vertex_buffer(IDirect3DDevice8 *iface,
 {
     D8Device *device = device_from_iface(iface);
     D8VertexBuffer *buffer;
-    D8WGCreateBuffer command;
-    if (!length || !buffer_out)
+    if (!buffer_out)
+        return D3DERR_INVALIDCALL;
+    *buffer_out = NULL;
+    if (!length || pool > D3DPOOL_SCRATCH)
         return D3DERR_INVALIDCALL;
     buffer = (D8VertexBuffer *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             sizeof(*buffer));
@@ -1654,27 +2156,21 @@ static HRESULT WINAPI device_create_vertex_buffer(IDirect3DDevice8 *iface,
     buffer->iface.lpVtbl = &g_vb_vtbl;
     buffer->refcount = 1;
     buffer->device = device;
-    IDirect3DDevice8_AddRef(iface);
+    device_child_add_ref(device);
     buffer->handle = allocate_handle();
     buffer->length = length;
     buffer->usage = usage;
     buffer->fvf = fvf;
     buffer->pool = pool;
 
-    command.device_handle = device->handle;
-    command.resource_handle = buffer->handle;
-    command.resource_kind = D8WG_RESOURCE_BUFFER_VERTEX;
-    command.byte_count = length;
-    command.usage = usage;
-    command.fvf = fvf;
-    command.pool = pool;
-    command.reserved = 0;
-    if (!emit_command(D8WG_OP_CREATE_BUFFER, &command, sizeof(command))) {
-        IDirect3DDevice8_Release(iface);
+    if (!emit_vertex_buffer_create(device, buffer)) {
+        device_child_release(device);
         HeapFree(GetProcessHeap(), 0, buffer->shadow);
         HeapFree(GetProcessHeap(), 0, buffer);
         return D3DERR_DRIVERINTERNALERROR;
     }
+    buffer->next_device_resource = device->vertex_buffers;
+    device->vertex_buffers = buffer;
     *buffer_out = &buffer->iface;
     return D3D_OK;
 }
@@ -1685,10 +2181,12 @@ static HRESULT WINAPI device_create_index_buffer(IDirect3DDevice8 *iface,
 {
     D8Device *device = device_from_iface(iface);
     D8IndexBuffer *buffer;
-    D8WGCreateBuffer command;
     UINT index_size;
 
-    if (!length || !buffer_out)
+    if (!buffer_out)
+        return D3DERR_INVALIDCALL;
+    *buffer_out = NULL;
+    if (!length || pool > D3DPOOL_SCRATCH)
         return D3DERR_INVALIDCALL;
     if (format == D3DFMT_INDEX16)
         index_size = 2;
@@ -1712,27 +2210,21 @@ static HRESULT WINAPI device_create_index_buffer(IDirect3DDevice8 *iface,
     buffer->iface.lpVtbl = &g_ib_vtbl;
     buffer->refcount = 1;
     buffer->device = device;
-    IDirect3DDevice8_AddRef(iface);
+    device_child_add_ref(device);
     buffer->handle = allocate_handle();
     buffer->length = length;
     buffer->usage = usage;
     buffer->format = format;
     buffer->pool = pool;
 
-    command.device_handle = device->handle;
-    command.resource_handle = buffer->handle;
-    command.resource_kind = D8WG_RESOURCE_BUFFER_INDEX;
-    command.byte_count = length;
-    command.usage = usage;
-    command.fvf = format;
-    command.pool = pool;
-    command.reserved = 0;
-    if (!emit_command(D8WG_OP_CREATE_BUFFER, &command, sizeof(command))) {
-        IDirect3DDevice8_Release(iface);
+    if (!emit_index_buffer_create(device, buffer)) {
+        device_child_release(device);
         HeapFree(GetProcessHeap(), 0, buffer->shadow);
         HeapFree(GetProcessHeap(), 0, buffer);
         return D3DERR_DRIVERINTERNALERROR;
     }
+    buffer->next_device_resource = device->index_buffers;
+    device->index_buffers = buffer;
     *buffer_out = &buffer->iface;
     return D3D_OK;
 }
@@ -1745,8 +2237,11 @@ static HRESULT WINAPI device_set_stream_source(IDirect3DDevice8 *iface,
     D8WGSetStreamSource command;
     if (stream >= D8WG_MAX_STREAMS)
         return D3DERR_INVALIDCALL;
-    if (buffer && buffer->device != device)
+    if (buffer && (buffer_iface->lpVtbl != &g_vb_vtbl
+            || buffer->device != device))
         return D3DERR_INVALIDCALL;
+    if (device->recording_state_block)
+        device->recording_state_block->state.stream_mask[stream] = 1;
     if (device->streams[stream].buffer == buffer
             && device->streams[stream].stride == stride)
         return D3D_OK;
@@ -1787,8 +2282,11 @@ static HRESULT WINAPI device_set_indices(IDirect3DDevice8 *iface,
     D8WGSetIndices command;
 
     if (base_vertex_index > 0x7FFFFFFFu
-            || (buffer && buffer->device != device))
+            || (buffer && (buffer_iface->lpVtbl != &g_ib_vtbl
+                || buffer->device != device)))
         return D3DERR_INVALIDCALL;
+    if (device->recording_state_block)
+        device->recording_state_block->state.indices_mask = TRUE;
     if (device->index_buffer == buffer
             && device->base_vertex_index == base_vertex_index)
         return D3D_OK;
@@ -1827,6 +2325,8 @@ static HRESULT WINAPI device_set_vertex_shader(IDirect3DDevice8 *iface,
     /* The Maple 2D path supports FVF tokens. D3D8 shader handles use bit 0. */
     if (handle & 1u)
         return D3DERR_INVALIDCALL;
+    if (device->recording_state_block)
+        device->recording_state_block->state.vertex_shader_mask = TRUE;
     if (device->vertex_shader == handle)
         return D3D_OK;
     device->vertex_shader = handle;
@@ -2022,9 +2522,13 @@ static HRESULT WINAPI device_validate(IDirect3DDevice8 *iface, DWORD *passes)
 static HRESULT WINAPI vb_query_interface(IDirect3DVertexBuffer8 *iface,
         REFIID iid, void **object)
 {
-    (void)iid;
     if (!object)
         return E_POINTER;
+    *object = NULL;
+    if (!iid || (!iid_is_unknown(iid)
+            && !guid_equal(iid, &IID_IDirect3DResource8)
+            && !guid_equal(iid, &IID_IDirect3DVertexBuffer8)))
+        return E_NOINTERFACE;
     *object = iface;
     IDirect3DVertexBuffer8_AddRef(iface);
     return S_OK;
@@ -2040,12 +2544,16 @@ static ULONG WINAPI vb_release(IDirect3DVertexBuffer8 *iface)
     D8VertexBuffer *buffer = vb_from_iface(iface);
     ULONG refs = (ULONG)InterlockedDecrement(&buffer->refcount);
     if (!refs) {
+        D8VertexBuffer **link = &buffer->device->vertex_buffers;
         D8WGDestroyResource destroy;
+        while (*link && *link != buffer)
+            link = &(*link)->next_device_resource;
+        if (*link) *link = buffer->next_device_resource;
         destroy.resource_handle = buffer->handle;
         destroy.resource_kind = D8WG_RESOURCE_BUFFER_VERTEX;
         emit_command(D8WG_OP_DESTROY_RESOURCE, &destroy, sizeof(destroy));
         HeapFree(GetProcessHeap(), 0, buffer->shadow);
-        IDirect3DDevice8_Release(&buffer->device->iface);
+        device_child_release(buffer->device);
         HeapFree(GetProcessHeap(), 0, buffer);
     }
     return refs;
@@ -2172,9 +2680,13 @@ static HRESULT WINAPI vb_get_desc(IDirect3DVertexBuffer8 *iface,
 static HRESULT WINAPI ib_query_interface(IDirect3DIndexBuffer8 *iface,
         REFIID iid, void **object)
 {
-    (void)iid;
     if (!object)
         return E_POINTER;
+    *object = NULL;
+    if (!iid || (!iid_is_unknown(iid)
+            && !guid_equal(iid, &IID_IDirect3DResource8)
+            && !guid_equal(iid, &IID_IDirect3DIndexBuffer8)))
+        return E_NOINTERFACE;
     *object = iface;
     IDirect3DIndexBuffer8_AddRef(iface);
     return S_OK;
@@ -2190,12 +2702,16 @@ static ULONG WINAPI ib_release(IDirect3DIndexBuffer8 *iface)
     D8IndexBuffer *buffer = ib_from_iface(iface);
     ULONG refs = (ULONG)InterlockedDecrement(&buffer->refcount);
     if (!refs) {
+        D8IndexBuffer **link = &buffer->device->index_buffers;
         D8WGDestroyResource destroy;
+        while (*link && *link != buffer)
+            link = &(*link)->next_device_resource;
+        if (*link) *link = buffer->next_device_resource;
         destroy.resource_handle = buffer->handle;
         destroy.resource_kind = D8WG_RESOURCE_BUFFER_INDEX;
         emit_command(D8WG_OP_DESTROY_RESOURCE, &destroy, sizeof(destroy));
         HeapFree(GetProcessHeap(), 0, buffer->shadow);
-        IDirect3DDevice8_Release(&buffer->device->iface);
+        device_child_release(buffer->device);
         HeapFree(GetProcessHeap(), 0, buffer);
     }
     return refs;
@@ -2337,16 +2853,22 @@ static HRESULT WINAPI device_create_texture(IDirect3DDevice8 *iface,
 {
     D8Device *device = device_from_iface(iface);
     D8Texture *texture;
-    D8WGCreateTexture command;
     UINT full_levels;
     UINT level;
     UINT level_width;
     UINT level_height;
     HRESULT failure = E_OUTOFMEMORY;
 
-    if (!texture_out || !width || !height || width > 4096 || height > 4096
+    if (!texture_out)
+        return D3DERR_INVALIDCALL;
+    *texture_out = NULL;
+    if (!width || !height || width > 4096 || height > 4096
             || !supported_texture_format(format)
-            || (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))
+            || (usage & D3DUSAGE_DEPTHSTENCIL)
+            || (usage & D3DUSAGE_RENDERTARGET
+                && (pool != D3DPOOL_DEFAULT || levels != 1
+                    || (format != D3DFMT_A8R8G8B8
+                        && format != D3DFMT_X8R8G8B8)))
             || pool > D3DPOOL_SCRATCH)
         return D3DERR_INVALIDCALL;
     full_levels = full_mip_level_count(width, height);
@@ -2375,7 +2897,7 @@ static HRESULT WINAPI device_create_texture(IDirect3DDevice8 *iface,
     texture->usage = usage;
     texture->format = format;
     texture->pool = pool;
-    IDirect3DDevice8_AddRef(iface);
+    device_child_add_ref(device);
 
     level_width = width;
     level_height = height;
@@ -2397,18 +2919,12 @@ static HRESULT WINAPI device_create_texture(IDirect3DDevice8 *iface,
             level_height >>= 1;
     }
 
-    command.device_handle = device->handle;
-    command.resource_handle = texture->handle;
-    command.width = width;
-    command.height = height;
-    command.level_count = levels;
-    command.format = format;
-    command.usage = usage;
-    command.pool = pool;
-    if (!emit_command(D8WG_OP_CREATE_TEXTURE, &command, sizeof(command))) {
+    if (!emit_texture_create(device, texture)) {
         failure = D3DERR_DRIVERINTERNALERROR;
         goto allocation_failed;
     }
+    texture->next_device_resource = device->texture_resources;
+    device->texture_resources = texture;
     *texture_out = &texture->iface;
     return D3D_OK;
 
@@ -2417,7 +2933,7 @@ allocation_failed:
         if (texture->levels[level].shadow)
             HeapFree(GetProcessHeap(), 0, texture->levels[level].shadow);
     }
-    IDirect3DDevice8_Release(iface);
+    device_child_release(device);
     HeapFree(GetProcessHeap(), 0, texture->levels);
     HeapFree(GetProcessHeap(), 0, texture);
     return failure;
@@ -2434,7 +2950,9 @@ static HRESULT texture_lock_level(D8Texture *texture, UINT level,
     UINT block_x;
     UINT block_y;
 
-    if (!locked_rect || level >= texture->level_count)
+    if (!locked_rect || level >= texture->level_count
+            || ((texture->usage & D3DUSAGE_RENDERTARGET)
+                && !texture->lockable_render_target))
         return D3DERR_INVALIDCALL;
     level_data = &texture->levels[level];
     if (level_data->locked)
@@ -2493,9 +3011,14 @@ static HRESULT texture_unlock_level(D8Texture *texture, UINT level)
 static HRESULT WINAPI texture_query_interface(IDirect3DTexture8 *iface,
         REFIID iid, void **object)
 {
-    (void)iid;
     if (!object)
         return E_POINTER;
+    *object = NULL;
+    if (!iid || (!iid_is_unknown(iid)
+            && !guid_equal(iid, &IID_IDirect3DResource8)
+            && !guid_equal(iid, &IID_IDirect3DBaseTexture8)
+            && !guid_equal(iid, &IID_IDirect3DTexture8)))
+        return E_NOINTERFACE;
     *object = iface;
     IDirect3DTexture8_AddRef(iface);
     return S_OK;
@@ -2511,15 +3034,19 @@ static ULONG WINAPI texture_release(IDirect3DTexture8 *iface)
     D8Texture *texture = texture_from_iface(iface);
     ULONG refs = (ULONG)InterlockedDecrement(&texture->refcount);
     if (!refs) {
+        D8Texture **link = &texture->device->texture_resources;
         D8WGDestroyResource destroy;
         UINT level;
+        while (*link && *link != texture)
+            link = &(*link)->next_device_resource;
+        if (*link) *link = texture->next_device_resource;
         destroy.resource_handle = texture->handle;
         destroy.resource_kind = D8WG_RESOURCE_TEXTURE_2D;
         emit_command(D8WG_OP_DESTROY_RESOURCE, &destroy, sizeof(destroy));
         for (level = 0; level < texture->level_count; ++level)
             HeapFree(GetProcessHeap(), 0, texture->levels[level].shadow);
         HeapFree(GetProcessHeap(), 0, texture->levels);
-        IDirect3DDevice8_Release(&texture->device->iface);
+        device_child_release(texture->device);
         HeapFree(GetProcessHeap(), 0, texture);
     }
     return refs;
@@ -2627,7 +3154,10 @@ static HRESULT WINAPI texture_get_surface_level(IDirect3DTexture8 *iface,
 {
     D8Texture *texture = texture_from_iface(iface);
     D8Surface *surface;
-    if (!surface_out || level >= texture->level_count)
+    if (!surface_out)
+        return D3DERR_INVALIDCALL;
+    *surface_out = NULL;
+    if (level >= texture->level_count)
         return D3DERR_INVALIDCALL;
     surface = (D8Surface *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             sizeof(*surface));
@@ -2636,6 +3166,7 @@ static HRESULT WINAPI texture_get_surface_level(IDirect3DTexture8 *iface,
     surface->iface.lpVtbl = &g_surface_vtbl;
     surface->refcount = 1;
     surface->texture = texture;
+    surface->device = texture->device;
     surface->level = level;
     IDirect3DTexture8_AddRef(iface);
     *surface_out = &surface->iface;
@@ -2670,9 +3201,13 @@ static HRESULT WINAPI texture_add_dirty_rect(IDirect3DTexture8 *iface,
 static HRESULT WINAPI surface_query_interface(IDirect3DSurface8 *iface,
         REFIID iid, void **object)
 {
-    (void)iid;
     if (!object)
         return E_POINTER;
+    *object = NULL;
+    if (!iid || (!iid_is_unknown(iid)
+            && !guid_equal(iid, &IID_IDirect3DResource8)
+            && !guid_equal(iid, &IID_IDirect3DSurface8)))
+        return E_NOINTERFACE;
     *object = iface;
     IDirect3DSurface8_AddRef(iface);
     return S_OK;
@@ -2688,7 +3223,14 @@ static ULONG WINAPI surface_release(IDirect3DSurface8 *iface)
     D8Surface *surface = surface_from_iface(iface);
     ULONG refs = (ULONG)InterlockedDecrement(&surface->refcount);
     if (!refs) {
-        IDirect3DTexture8_Release(&surface->texture->iface);
+        if (surface->reset_blocker && surface->device
+                && surface->device->implicit_surface_count)
+            --surface->device->implicit_surface_count;
+        if (surface->texture)
+            IDirect3DTexture8_Release(&surface->texture->iface);
+        else if (surface->device)
+            device_child_release(surface->device);
+        HeapFree(GetProcessHeap(), 0, surface->shadow);
         HeapFree(GetProcessHeap(), 0, surface);
     }
     return refs;
@@ -2697,8 +3239,12 @@ static ULONG WINAPI surface_release(IDirect3DSurface8 *iface)
 static HRESULT WINAPI surface_get_device(IDirect3DSurface8 *iface,
         IDirect3DDevice8 **device_out)
 {
-    return texture_get_device(&surface_from_iface(iface)->texture->iface,
-            device_out);
+    D8Surface *surface = surface_from_iface(iface);
+    if (!device_out) return D3DERR_INVALIDCALL;
+    *device_out = surface->texture ? &surface->texture->device->iface
+            : &surface->device->iface;
+    IDirect3DDevice8_AddRef(*device_out);
+    return D3D_OK;
 }
 
 static HRESULT WINAPI surface_set_private_data(IDirect3DSurface8 *iface,
@@ -2726,11 +3272,24 @@ static HRESULT WINAPI surface_get_container(IDirect3DSurface8 *iface,
         REFIID iid, void **container)
 {
     D8Surface *surface = surface_from_iface(iface);
-    (void)iid;
     if (!container)
         return E_POINTER;
-    *container = &surface->texture->iface;
-    IDirect3DTexture8_AddRef(&surface->texture->iface);
+    *container = NULL;
+    if (surface->texture) {
+        if (!iid || (!iid_is_unknown(iid)
+                && !guid_equal(iid, &IID_IDirect3DResource8)
+                && !guid_equal(iid, &IID_IDirect3DBaseTexture8)
+                && !guid_equal(iid, &IID_IDirect3DTexture8)))
+            return E_NOINTERFACE;
+        *container = &surface->texture->iface;
+        IDirect3DTexture8_AddRef(&surface->texture->iface);
+    } else {
+        if (!iid || (!iid_is_unknown(iid)
+                && !guid_equal(iid, &IID_IDirect3DDevice8)))
+            return E_NOINTERFACE;
+        *container = &surface->device->iface;
+        IDirect3DDevice8_AddRef(&surface->device->iface);
+    }
     return S_OK;
 }
 
@@ -2738,22 +3297,52 @@ static HRESULT WINAPI surface_get_desc(IDirect3DSurface8 *iface,
         D3DSURFACE_DESC *desc)
 {
     D8Surface *surface = surface_from_iface(iface);
-    return texture_get_level_desc(&surface->texture->iface,
-            surface->level, desc);
+    if (!desc) return D3DERR_INVALIDCALL;
+    if (surface->texture)
+        return texture_get_level_desc(&surface->texture->iface,
+                surface->level, desc);
+    *desc = surface->desc;
+    return D3D_OK;
 }
 
 static HRESULT WINAPI surface_lock_rect(IDirect3DSurface8 *iface,
         D3DLOCKED_RECT *locked_rect, const RECT *rect, DWORD flags)
 {
     D8Surface *surface = surface_from_iface(iface);
-    return texture_lock_level(surface->texture, surface->level, locked_rect,
-            rect, flags);
+    RECT area;
+    if (surface->texture)
+        return texture_lock_level(surface->texture, surface->level,
+                locked_rect, rect, flags);
+    if (!locked_rect || !surface->shadow || surface->locked
+            || surface->backbuffer || surface->depth_stencil)
+        return D3DERR_INVALIDCALL;
+    if (rect) area = *rect;
+    else SetRect(&area, 0, 0, (int)surface->desc.Width,
+            (int)surface->desc.Height);
+    if (area.left < 0 || area.top < 0 || area.right <= area.left
+            || area.bottom <= area.top
+            || (UINT)area.right > surface->desc.Width
+            || (UINT)area.bottom > surface->desc.Height)
+        return D3DERR_INVALIDCALL;
+    surface->locked = TRUE;
+    surface->lock_rect = area;
+    surface->lock_flags = flags;
+    locked_rect->Pitch = surface->row_pitch;
+    locked_rect->pBits = surface->shadow + area.top * surface->row_pitch
+            + area.left * (surface->row_pitch / surface->desc.Width);
+    return D3D_OK;
 }
 
 static HRESULT WINAPI surface_unlock_rect(IDirect3DSurface8 *iface)
 {
     D8Surface *surface = surface_from_iface(iface);
-    return texture_unlock_level(surface->texture, surface->level);
+    if (surface->texture)
+        return texture_unlock_level(surface->texture, surface->level);
+    if (!surface->locked) return D3DERR_INVALIDCALL;
+    surface->locked = FALSE;
+    surface->lock_flags = 0;
+    ZeroMemory(&surface->lock_rect, sizeof(surface->lock_rect));
+    return D3D_OK;
 }
 
 static HRESULT WINAPI device_get_texture(IDirect3DDevice8 *iface,
@@ -2780,6 +3369,8 @@ static HRESULT WINAPI device_set_texture(IDirect3DDevice8 *iface,
             || (texture && (texture->iface.lpVtbl != &g_texture_vtbl
                 || texture->device != device)))
         return D3DERR_INVALIDCALL;
+    if (device->recording_state_block)
+        device->recording_state_block->state.texture_mask[stage] = 1;
     if (device->textures[stage] == texture)
         return D3D_OK;
     if (texture)
@@ -2828,6 +3419,161 @@ static HRESULT WINAPI device_update_texture(IDirect3DDevice8 *iface,
     return D3D_OK;
 }
 
+static HRESULT create_standalone_surface(D8Device *device, UINT width,
+        UINT height, D3DFORMAT format, DWORD usage, D3DPOOL pool,
+        BOOL lockable, BOOL backbuffer, BOOL depth_stencil,
+        BOOL reset_blocker, IDirect3DSurface8 **surface_out)
+{
+    D8Surface *surface;
+    UINT block_width;
+    UINT block_height;
+    UINT pixel_bytes;
+    UINT row_pitch;
+    UINT row_count;
+    UINT byte_count;
+    if (!surface_out)
+        return D3DERR_INVALIDCALL;
+    *surface_out = NULL;
+    if (!width || !height || width > 8192 || height > 8192)
+        return D3DERR_INVALIDCALL;
+    if (!depth_stencil) {
+        if (!texture_format_layout(format, &block_width, &block_height,
+                &pixel_bytes)
+                || (lockable && (block_width != 1 || block_height != 1))
+                || !texture_level_layout(format, width, height,
+                    &row_pitch, &row_count, &byte_count))
+            return D3DERR_INVALIDCALL;
+    }
+    if (depth_stencil) {
+        row_pitch = width * 4u;
+        row_count = height;
+        byte_count = row_pitch * row_count;
+    }
+    surface = (D8Surface *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+            sizeof(*surface));
+    if (!surface) return E_OUTOFMEMORY;
+    if (lockable) {
+        surface->shadow = (BYTE *)HeapAlloc(GetProcessHeap(),
+                HEAP_ZERO_MEMORY, byte_count);
+        if (!surface->shadow) {
+            HeapFree(GetProcessHeap(), 0, surface);
+            return E_OUTOFMEMORY;
+        }
+    }
+    surface->iface.lpVtbl = &g_surface_vtbl;
+    surface->refcount = 1;
+    surface->device = device;
+    device_child_add_ref(device);
+    surface->row_pitch = row_pitch;
+    surface->backbuffer = backbuffer;
+    surface->depth_stencil = depth_stencil;
+    surface->reset_blocker = reset_blocker;
+    if (reset_blocker) ++device->implicit_surface_count;
+    ZeroMemory(&surface->desc, sizeof(surface->desc));
+    surface->desc.Format = format;
+    surface->desc.Type = D3DRTYPE_SURFACE;
+    surface->desc.Usage = usage;
+    surface->desc.Pool = pool;
+    surface->desc.Size = byte_count;
+    surface->desc.MultiSampleType = D3DMULTISAMPLE_NONE;
+    surface->desc.Width = width;
+    surface->desc.Height = height;
+    *surface_out = &surface->iface;
+    return D3D_OK;
+}
+
+static HRESULT create_backbuffer_surface(D8Device *device,
+        const D3DPRESENT_PARAMETERS *present, BOOL reset_blocker,
+        IDirect3DSurface8 **surface_out)
+{
+    UINT width = present->BackBufferWidth ? present->BackBufferWidth
+            : device->display_mode.Width;
+    UINT height = present->BackBufferHeight ? present->BackBufferHeight
+            : device->display_mode.Height;
+    D3DFORMAT format = present->BackBufferFormat == D3DFMT_UNKNOWN
+            ? device->display_mode.Format : present->BackBufferFormat;
+    return create_standalone_surface(device, width, height, format,
+            D3DUSAGE_RENDERTARGET, D3DPOOL_DEFAULT, FALSE, TRUE, FALSE,
+            reset_blocker, surface_out);
+}
+
+static BYTE *surface_pixels(D8Surface *surface, UINT *pitch_out)
+{
+    if (surface->texture) {
+        D8TextureLevel *level = &surface->texture->levels[surface->level];
+        *pitch_out = level->row_pitch;
+        return level->shadow;
+    }
+    if (surface->backbuffer) {
+        *pitch_out = surface->device->front_shadow_pitch;
+        return surface->device->front_shadow;
+    }
+    *pitch_out = surface->row_pitch;
+    return surface->shadow;
+}
+
+static HRESULT copy_surface_rect(D8Surface *source, const RECT *source_rect,
+        D8Surface *destination, const POINT *destination_point)
+{
+    D3DSURFACE_DESC source_desc;
+    D3DSURFACE_DESC destination_desc;
+    RECT area;
+    POINT point;
+    BYTE *source_data;
+    BYTE *destination_data;
+    UINT source_pitch;
+    UINT destination_pitch;
+    UINT block_width, block_height, pixel_bytes;
+    UINT row;
+    if (FAILED(surface_get_desc(&source->iface, &source_desc))
+            || FAILED(surface_get_desc(&destination->iface,
+                    &destination_desc))
+            || (source_desc.Format != destination_desc.Format
+                && !((source_desc.Format == D3DFMT_A8R8G8B8
+                        || source_desc.Format == D3DFMT_X8R8G8B8)
+                    && (destination_desc.Format == D3DFMT_A8R8G8B8
+                        || destination_desc.Format == D3DFMT_X8R8G8B8)))
+            || !texture_format_layout(source_desc.Format, &block_width,
+                    &block_height, &pixel_bytes)
+            || block_width != 1 || block_height != 1)
+        return D3DERR_INVALIDCALL;
+    if (source_rect) area = *source_rect;
+    else SetRect(&area, 0, 0, (int)source_desc.Width,
+            (int)source_desc.Height);
+    if (destination_point) point = *destination_point;
+    else point.x = point.y = 0;
+    if (area.left < 0 || area.top < 0 || area.right <= area.left
+            || area.bottom <= area.top
+            || (UINT)area.right > source_desc.Width
+            || (UINT)area.bottom > source_desc.Height || point.x < 0
+            || point.y < 0
+            || (UINT)(point.x + area.right - area.left)
+                    > destination_desc.Width
+            || (UINT)(point.y + area.bottom - area.top)
+                    > destination_desc.Height)
+        return D3DERR_INVALIDCALL;
+    source_data = surface_pixels(source, &source_pitch);
+    destination_data = surface_pixels(destination, &destination_pitch);
+    if (!source_data || !destination_data) return D3DERR_INVALIDCALL;
+    for (row = 0; row < (UINT)(area.bottom - area.top); ++row) {
+        CopyMemory(destination_data + (point.y + row) * destination_pitch
+                + point.x * pixel_bytes,
+                source_data + (area.top + row) * source_pitch
+                + area.left * pixel_bytes,
+                (area.right - area.left) * pixel_bytes);
+    }
+    if (destination->texture) {
+        RECT dirty;
+        SetRect(&dirty, point.x, point.y,
+                point.x + area.right - area.left,
+                point.y + area.bottom - area.top);
+        if (!emit_texture_update(destination->texture, destination->level,
+                &dirty))
+            return D3DERR_DRIVERINTERNALERROR;
+    }
+    return D3D_OK;
+}
+
 /* Typed unsupported methods keep stdcall stack cleanup correct on 32-bit XP. */
 #define DEV_STUB0(name) \
     static HRESULT WINAPI device_##name(IDirect3DDevice8 *iface) \
@@ -2842,10 +3588,104 @@ static void WINAPI device_set_cursor_position(IDirect3DDevice8 *iface,
 { (void)iface; (void)x; (void)y; (void)flags; }
 static WINBOOL WINAPI device_show_cursor(IDirect3DDevice8 *iface, WINBOOL show)
 { (void)iface; (void)show; return FALSE; }
-DEV_STUB(create_swapchain, D3DPRESENT_PARAMETERS *p, IDirect3DSwapChain8 **s)
-{ (void)iface; (void)p; (void)s; return D3DERR_INVALIDCALL; }
-DEV_STUB(get_backbuffer, UINT n, D3DBACKBUFFER_TYPE type, IDirect3DSurface8 **s)
-{ (void)iface; (void)n; (void)type; (void)s; return D3DERR_INVALIDCALL; }
+
+static HRESULT WINAPI swapchain_query_interface(IDirect3DSwapChain8 *iface,
+        REFIID iid, void **object)
+{
+    if (!object) return E_POINTER;
+    *object = NULL;
+    if (!iid || (!iid_is_unknown(iid)
+            && !guid_equal(iid, &IID_IDirect3DSwapChain8)))
+        return E_NOINTERFACE;
+    *object = iface;
+    IDirect3DSwapChain8_AddRef(iface);
+    return S_OK;
+}
+
+static ULONG WINAPI swapchain_add_ref(IDirect3DSwapChain8 *iface)
+{
+    return (ULONG)InterlockedIncrement(&((D8SwapChain *)iface)->refcount);
+}
+
+static ULONG WINAPI swapchain_release(IDirect3DSwapChain8 *iface)
+{
+    D8SwapChain *chain = (D8SwapChain *)iface;
+    ULONG refs = (ULONG)InterlockedDecrement(&chain->refcount);
+    if (!refs) {
+        if (chain->device->additional_swap_chain_count)
+            --chain->device->additional_swap_chain_count;
+        device_child_release(chain->device);
+        HeapFree(GetProcessHeap(), 0, chain);
+    }
+    return refs;
+}
+
+static HRESULT WINAPI swapchain_present(IDirect3DSwapChain8 *iface,
+        const RECT *source, const RECT *destination, HWND override_window,
+        const RGNDATA *dirty_region)
+{
+    D8SwapChain *chain = (D8SwapChain *)iface;
+    HWND window = override_window ? override_window : chain->present.hDeviceWindow;
+    (void)source; (void)destination; (void)dirty_region;
+    return emit_present_and_flush(chain->device, window)
+            ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
+}
+
+static HRESULT WINAPI swapchain_get_backbuffer(IDirect3DSwapChain8 *iface,
+        UINT index, D3DBACKBUFFER_TYPE type, IDirect3DSurface8 **surface_out)
+{
+    D8SwapChain *chain = (D8SwapChain *)iface;
+    if (!surface_out)
+        return D3DERR_INVALIDCALL;
+    *surface_out = NULL;
+    if (index || type != D3DBACKBUFFER_TYPE_MONO)
+        return D3DERR_INVALIDCALL;
+    return create_backbuffer_surface(chain->device, &chain->present, TRUE,
+            surface_out);
+}
+
+static HRESULT WINAPI device_create_swapchain(IDirect3DDevice8 *iface,
+        D3DPRESENT_PARAMETERS *parameters, IDirect3DSwapChain8 **chain_out)
+{
+    D8Device *device = device_from_iface(iface);
+    D8SwapChain *chain;
+    if (!chain_out)
+        return D3DERR_INVALIDCALL;
+    *chain_out = NULL;
+    if (!parameters || !parameters->Windowed
+            || parameters->MultiSampleType != D3DMULTISAMPLE_NONE
+            || parameters->BackBufferCount > 1
+            || parameters->BackBufferWidth > 8192
+            || parameters->BackBufferHeight > 8192)
+        return D3DERR_INVALIDCALL;
+    if (parameters->BackBufferFormat != D3DFMT_UNKNOWN
+            && !supported_backbuffer_format(parameters->BackBufferFormat))
+        return D3DERR_NOTAVAILABLE;
+    chain = (D8SwapChain *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+            sizeof(*chain));
+    if (!chain) return E_OUTOFMEMORY;
+    chain->iface.lpVtbl = &g_swapchain_vtbl;
+    chain->refcount = 1;
+    chain->device = device;
+    chain->present = *parameters;
+    device_child_add_ref(device);
+    ++device->additional_swap_chain_count;
+    *chain_out = &chain->iface;
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_get_backbuffer(IDirect3DDevice8 *iface, UINT index,
+        D3DBACKBUFFER_TYPE type, IDirect3DSurface8 **surface_out)
+{
+    D8Device *device = device_from_iface(iface);
+    if (!surface_out)
+        return D3DERR_INVALIDCALL;
+    *surface_out = NULL;
+    if (index || type != D3DBACKBUFFER_TYPE_MONO)
+        return D3DERR_INVALIDCALL;
+    return create_backbuffer_surface(device, &device->present, TRUE,
+            surface_out);
+}
 DEV_STUB(get_raster_status, D3DRASTER_STATUS *s)
 { (void)iface; (void)s; return D3DERR_INVALIDCALL; }
 static void WINAPI device_set_gamma(IDirect3DDevice8 *iface, DWORD flags,
@@ -2855,30 +3695,183 @@ static void WINAPI device_get_gamma(IDirect3DDevice8 *iface, D3DGAMMARAMP *ramp)
 { (void)iface; if (ramp) ZeroMemory(ramp, sizeof(*ramp)); }
 DEV_STUB(create_volume_texture, UINT w, UINT h, UINT d, UINT levels, DWORD usage,
         D3DFORMAT format, D3DPOOL pool, IDirect3DVolumeTexture8 **out)
-{ (void)iface;(void)w;(void)h;(void)d;(void)levels;(void)usage;(void)format;(void)pool;(void)out; return D3DERR_INVALIDCALL; }
+{ (void)iface;(void)w;(void)h;(void)d;(void)levels;(void)usage;(void)format;(void)pool; if(out)*out=NULL; return D3DERR_INVALIDCALL; }
 DEV_STUB(create_cube_texture, UINT edge, UINT levels, DWORD usage,
         D3DFORMAT format, D3DPOOL pool, IDirect3DCubeTexture8 **out)
-{ (void)iface;(void)edge;(void)levels;(void)usage;(void)format;(void)pool;(void)out; return D3DERR_INVALIDCALL; }
-DEV_STUB(create_render_target, UINT w, UINT h, D3DFORMAT format,
-        D3DMULTISAMPLE_TYPE ms, WINBOOL lockable, IDirect3DSurface8 **out)
-{ (void)iface;(void)w;(void)h;(void)format;(void)ms;(void)lockable;(void)out; return D3DERR_INVALIDCALL; }
-DEV_STUB(create_depth_surface, UINT w, UINT h, D3DFORMAT format,
-        D3DMULTISAMPLE_TYPE ms, IDirect3DSurface8 **out)
-{ (void)iface;(void)w;(void)h;(void)format;(void)ms;(void)out; return D3DERR_INVALIDCALL; }
-DEV_STUB(create_image_surface, UINT w, UINT h, D3DFORMAT format,
-        IDirect3DSurface8 **out)
-{ (void)iface;(void)w;(void)h;(void)format;(void)out; return D3DERR_INVALIDCALL; }
-DEV_STUB(copy_rects, IDirect3DSurface8 *src, const RECT *rects, UINT count,
-        IDirect3DSurface8 *dst, const POINT *points)
-{ (void)iface;(void)src;(void)rects;(void)count;(void)dst;(void)points; return D3DERR_INVALIDCALL; }
-DEV_STUB(get_front_buffer, IDirect3DSurface8 *dst)
-{ (void)iface;(void)dst; return D3DERR_INVALIDCALL; }
-DEV_STUB(set_render_target, IDirect3DSurface8 *rt, IDirect3DSurface8 *ds)
-{ (void)iface;(void)rt;(void)ds; return D3DERR_INVALIDCALL; }
-DEV_STUB(get_render_target, IDirect3DSurface8 **rt)
-{ (void)iface;(void)rt; return D3DERR_INVALIDCALL; }
-DEV_STUB(get_depth_surface, IDirect3DSurface8 **ds)
-{ (void)iface;(void)ds; return D3DERR_INVALIDCALL; }
+{ (void)iface;(void)edge;(void)levels;(void)usage;(void)format;(void)pool; if(out)*out=NULL; return D3DERR_INVALIDCALL; }
+static HRESULT WINAPI device_create_render_target(IDirect3DDevice8 *iface,
+        UINT width, UINT height, D3DFORMAT format, D3DMULTISAMPLE_TYPE ms,
+        WINBOOL lockable, IDirect3DSurface8 **surface_out)
+{
+    IDirect3DTexture8 *texture_iface = NULL;
+    HRESULT hr;
+    if (!surface_out || ms != D3DMULTISAMPLE_NONE)
+        return D3DERR_INVALIDCALL;
+    *surface_out = NULL;
+    hr = device_create_texture(iface, width, height, 1,
+            D3DUSAGE_RENDERTARGET, format, D3DPOOL_DEFAULT, &texture_iface);
+    if (FAILED(hr)) return hr;
+    texture_from_iface(texture_iface)->lockable_render_target = !!lockable;
+    hr = IDirect3DTexture8_GetSurfaceLevel(texture_iface, 0, surface_out);
+    IDirect3DTexture8_Release(texture_iface);
+    return hr;
+}
+
+static HRESULT WINAPI device_create_depth_surface(IDirect3DDevice8 *iface,
+        UINT width, UINT height, D3DFORMAT format, D3DMULTISAMPLE_TYPE ms,
+        IDirect3DSurface8 **surface_out)
+{
+    if (!surface_out || (format != D3DFMT_D16 && format != D3DFMT_D24S8)
+            || ms != D3DMULTISAMPLE_NONE)
+        return D3DERR_INVALIDCALL;
+    *surface_out = NULL;
+    return create_standalone_surface(device_from_iface(iface), width, height,
+            format, D3DUSAGE_DEPTHSTENCIL, D3DPOOL_DEFAULT, FALSE, FALSE,
+            TRUE, TRUE, surface_out);
+}
+
+static HRESULT WINAPI device_create_image_surface(IDirect3DDevice8 *iface,
+        UINT width, UINT height, D3DFORMAT format,
+        IDirect3DSurface8 **surface_out)
+{
+    if (!surface_out) return D3DERR_INVALIDCALL;
+    *surface_out = NULL;
+    return create_standalone_surface(device_from_iface(iface), width, height,
+            format, 0, D3DPOOL_SYSTEMMEM, TRUE, FALSE, FALSE, FALSE,
+            surface_out);
+}
+
+static HRESULT WINAPI device_copy_rects(IDirect3DDevice8 *iface,
+        IDirect3DSurface8 *source_iface, const RECT *rects, UINT count,
+        IDirect3DSurface8 *destination_iface, const POINT *points)
+{
+    D8Device *device = device_from_iface(iface);
+    D8Surface *source;
+    D8Surface *destination;
+    UINT index;
+    if (!source_iface || !destination_iface
+            || source_iface->lpVtbl != &g_surface_vtbl
+            || destination_iface->lpVtbl != &g_surface_vtbl
+            || (count && (!rects || !points)))
+        return D3DERR_INVALIDCALL;
+    source = surface_from_iface(source_iface);
+    destination = surface_from_iface(destination_iface);
+    if ((source->texture ? source->texture->device : source->device) != device
+            || (destination->texture ? destination->texture->device
+                    : destination->device) != device)
+        return D3DERR_INVALIDCALL;
+    if (!count) return copy_surface_rect(source, NULL, destination, NULL);
+    for (index = 0; index < count; ++index) {
+        HRESULT hr = copy_surface_rect(source, &rects[index], destination,
+                &points[index]);
+        if (FAILED(hr)) return hr;
+    }
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_get_front_buffer(IDirect3DDevice8 *iface,
+        IDirect3DSurface8 *destination_iface)
+{
+    D8Device *device = device_from_iface(iface);
+    IDirect3DSurface8 *source_iface = NULL;
+    HRESULT hr;
+    if (!destination_iface || destination_iface->lpVtbl != &g_surface_vtbl)
+        return D3DERR_INVALIDCALL;
+    if ((surface_from_iface(destination_iface)->texture
+            ? surface_from_iface(destination_iface)->texture->device
+            : surface_from_iface(destination_iface)->device) != device)
+        return D3DERR_INVALIDCALL;
+    hr = create_backbuffer_surface(device, &device->present, FALSE,
+            &source_iface);
+    if (SUCCEEDED(hr)) {
+        hr = copy_surface_rect(surface_from_iface(source_iface), NULL,
+                surface_from_iface(destination_iface), NULL);
+        IDirect3DSurface8_Release(source_iface);
+    }
+    return hr;
+}
+
+static HRESULT WINAPI device_set_render_target(IDirect3DDevice8 *iface,
+        IDirect3DSurface8 *render_target_iface,
+        IDirect3DSurface8 *depth_iface)
+{
+    D8Device *device = device_from_iface(iface);
+    D8Surface *render_target;
+    D8Surface *depth = depth_iface ? surface_from_iface(depth_iface) : NULL;
+    D8Texture *texture;
+    D8WGSetRenderTarget command;
+    if (!render_target_iface
+            || render_target_iface->lpVtbl != &g_surface_vtbl
+            || (depth_iface && depth_iface->lpVtbl != &g_surface_vtbl))
+        return D3DERR_INVALIDCALL;
+    render_target = surface_from_iface(render_target_iface);
+    if ((render_target->texture ? render_target->texture->device
+            : render_target->device) != device || render_target->depth_stencil)
+        return D3DERR_INVALIDCALL;
+    texture = render_target->backbuffer ? NULL : render_target->texture;
+    if (texture && !(texture->usage & D3DUSAGE_RENDERTARGET))
+        return D3DERR_INVALIDCALL;
+    if (depth && ((depth->texture ? depth->texture->device : depth->device)
+                != device || !depth->depth_stencil))
+        return D3DERR_INVALIDCALL;
+    if (depth && (depth->desc.Width != (render_target->texture
+                    ? render_target->texture->levels[render_target->level].width
+                    : render_target->desc.Width)
+            || depth->desc.Height != (render_target->texture
+                    ? render_target->texture->levels[render_target->level].height
+                    : render_target->desc.Height)))
+        return D3DERR_INVALIDCALL;
+    if (texture) IDirect3DTexture8_AddRef(&texture->iface);
+    if (depth) IDirect3DSurface8_AddRef(&depth->iface);
+    if (device->render_target_texture)
+        IDirect3DTexture8_Release(&device->render_target_texture->iface);
+    if (device->depth_surface)
+        IDirect3DSurface8_Release(&device->depth_surface->iface);
+    device->render_target_texture = texture;
+    device->render_target_level = texture ? render_target->level : 0;
+    device->depth_surface = depth;
+    device->depth_surface_enabled = depth != NULL;
+    command.device_handle = device->handle;
+    command.color_texture_handle = texture ? texture->handle : 0;
+    command.color_level = texture ? render_target->level : 0;
+    command.depth_enabled = depth != NULL;
+    return emit_command(D8WG_OP_SET_RENDER_TARGET, &command, sizeof(command))
+            ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
+}
+
+static HRESULT WINAPI device_get_render_target(IDirect3DDevice8 *iface,
+        IDirect3DSurface8 **surface_out)
+{
+    D8Device *device = device_from_iface(iface);
+    if (!surface_out) return D3DERR_INVALIDCALL;
+    *surface_out = NULL;
+    if (device->render_target_texture)
+        return texture_get_surface_level(&device->render_target_texture->iface,
+                device->render_target_level, surface_out);
+    return create_backbuffer_surface(device, &device->present, TRUE,
+            surface_out);
+}
+
+static HRESULT WINAPI device_get_depth_surface(IDirect3DDevice8 *iface,
+        IDirect3DSurface8 **surface_out)
+{
+    D8Device *device = device_from_iface(iface);
+    if (!surface_out)
+        return D3DERR_INVALIDCALL;
+    *surface_out = NULL;
+    if (!device->depth_surface_enabled)
+        return D3DERR_INVALIDCALL;
+    if (device->depth_surface) {
+        *surface_out = &device->depth_surface->iface;
+        IDirect3DSurface8_AddRef(*surface_out);
+        return D3D_OK;
+    }
+    return create_standalone_surface(device, device->display_mode.Width,
+            device->display_mode.Height,
+            device->present.AutoDepthStencilFormat,
+            D3DUSAGE_DEPTHSTENCIL, D3DPOOL_DEFAULT, FALSE, FALSE, TRUE,
+            TRUE, surface_out);
+}
 static BOOL transform_slot(D3DTRANSFORMSTATETYPE state, UINT *slot)
 {
     UINT value = (UINT)state;
@@ -2950,6 +3943,8 @@ static HRESULT WINAPI device_set_transform(IDirect3DDevice8 *iface,
     UINT slot;
     if (!matrix || !transform_slot(state, &slot))
         return D3DERR_INVALIDCALL;
+    if (device->recording_state_block)
+        device->recording_state_block->state.transform_mask[slot] = 1;
     if (matrix_equal(&device->transforms[slot], matrix))
         return D3D_OK;
     device->transforms[slot] = *matrix;
@@ -2974,6 +3969,8 @@ static HRESULT WINAPI device_multiply_transform(IDirect3DDevice8 *iface,
     UINT slot;
     if (!matrix || !transform_slot(state, &slot))
         return D3DERR_INVALIDCALL;
+    if (device->recording_state_block)
+        device->recording_state_block->state.transform_mask[slot] = 1;
     matrix_multiply(&product, &device->transforms[slot], matrix);
     if (matrix_equal(&device->transforms[slot], &product))
         return D3D_OK;
@@ -2997,6 +3994,8 @@ static HRESULT WINAPI device_set_material(IDirect3DDevice8 *iface,
     D8Device *device = device_from_iface(iface);
     D8WGSetMaterial command;
     if (!material) return D3DERR_INVALIDCALL;
+    if (device->recording_state_block)
+        device->recording_state_block->state.material_mask = TRUE;
     if (bytes_equal(&device->material, material, sizeof(*material)))
         return D3D_OK;
     device->material = *material;
@@ -3026,6 +4025,8 @@ static HRESULT WINAPI device_set_light(IDirect3DDevice8 *iface, DWORD index,
     if (!light || index >= D8WG_MAX_LIGHTS || light->Type < D3DLIGHT_POINT
             || light->Type > D3DLIGHT_DIRECTIONAL)
         return D3DERR_INVALIDCALL;
+    if (device->recording_state_block)
+        device->recording_state_block->state.light_mask[index] = 1;
     if (device->light_set[index] &&
             bytes_equal(&device->lights[index], light, sizeof(*light)))
         return D3D_OK;
@@ -3066,6 +4067,8 @@ static HRESULT WINAPI device_light_enable(IDirect3DDevice8 *iface,
     D8Device *device = device_from_iface(iface);
     D8WGLightEnable command;
     if (index >= D8WG_MAX_LIGHTS) return D3DERR_INVALIDCALL;
+    if (device->recording_state_block)
+        device->recording_state_block->state.light_enable_mask[index] = 1;
     enable = !!enable;
     if (device->light_enabled[index] == enable) return D3D_OK;
     device->light_enabled[index] = enable;
@@ -3088,17 +4091,307 @@ DEV_STUB(set_clip_plane, DWORD index, const float *plane)
 { (void)iface;(void)index;(void)plane; return D3DERR_INVALIDCALL; }
 DEV_STUB(get_clip_plane, DWORD index, float *plane)
 { (void)iface;(void)index;(void)plane; return D3DERR_INVALIDCALL; }
-DEV_STUB0(begin_state_block)
-DEV_STUB(end_state_block, DWORD *token)
-{ (void)iface;(void)token; return D3DERR_INVALIDCALL; }
-DEV_STUB(apply_state_block, DWORD token)
-{ (void)iface;(void)token; return D3DERR_INVALIDCALL; }
-DEV_STUB(capture_state_block, DWORD token)
-{ (void)iface;(void)token; return D3DERR_INVALIDCALL; }
-DEV_STUB(delete_state_block, DWORD token)
-{ (void)iface;(void)token; return D3DERR_INVALIDCALL; }
-DEV_STUB(create_state_block, D3DSTATEBLOCKTYPE type, DWORD *token)
-{ (void)iface;(void)type;(void)token; return D3DERR_INVALIDCALL; }
+
+static void state_block_set_scope(D8StateBlock *block,
+        D3DSTATEBLOCKTYPE type)
+{
+    D8StateSnapshot *state = &block->state;
+    if (type == D3DSBT_ALL || type == D3DSBT_PIXELSTATE) {
+        FillMemory(state->render_mask, sizeof(state->render_mask), 1);
+        FillMemory(state->texture_stage_mask,
+                sizeof(state->texture_stage_mask), 1);
+        FillMemory(state->texture_mask, sizeof(state->texture_mask), 1);
+    }
+    if (type == D3DSBT_ALL || type == D3DSBT_VERTEXSTATE) {
+        /* D3D8 has render states in both predefined state-block classes. */
+        FillMemory(state->render_mask, sizeof(state->render_mask), 1);
+        FillMemory(state->stream_mask, sizeof(state->stream_mask), 1);
+        FillMemory(state->transform_mask, sizeof(state->transform_mask), 1);
+        FillMemory(state->light_mask, sizeof(state->light_mask), 1);
+        FillMemory(state->light_enable_mask,
+                sizeof(state->light_enable_mask), 1);
+        state->viewport_mask = TRUE;
+        state->material_mask = TRUE;
+        state->indices_mask = TRUE;
+        state->vertex_shader_mask = TRUE;
+    }
+}
+
+static void state_block_release_references(D8StateBlock *block)
+{
+    UINT index;
+    for (index = 0; index < D8WG_MAX_TEXTURE_STAGES; ++index) {
+        if (block->state.textures[index]) {
+            IDirect3DTexture8_Release(&block->state.textures[index]->iface);
+            block->state.textures[index] = NULL;
+        }
+    }
+    for (index = 0; index < D8WG_MAX_STREAMS; ++index) {
+        if (block->state.streams[index].buffer) {
+            IDirect3DVertexBuffer8_Release(
+                    &block->state.streams[index].buffer->iface);
+            block->state.streams[index].buffer = NULL;
+        }
+    }
+    if (block->state.index_buffer) {
+        IDirect3DIndexBuffer8_Release(&block->state.index_buffer->iface);
+        block->state.index_buffer = NULL;
+    }
+}
+
+static void state_block_capture(D8Device *device, D8StateBlock *block)
+{
+    D8StateSnapshot *state = &block->state;
+    UINT index;
+    UINT stage;
+
+    for (index = 0; index < D8WG_MAX_RENDER_STATES; ++index) {
+        if (state->render_mask[index])
+            state->render_states[index] = device->render_states[index];
+    }
+    for (stage = 0; stage < D8WG_MAX_TEXTURE_STAGES; ++stage) {
+        for (index = 0; index < D8WG_MAX_TEXTURE_STAGE_STATES; ++index) {
+            if (state->texture_stage_mask[stage][index])
+                state->texture_stage_states[stage][index] =
+                        device->texture_stage_states[stage][index];
+        }
+        if (state->texture_mask[stage]) {
+            D8Texture *texture = device->textures[stage];
+            if (texture)
+                IDirect3DTexture8_AddRef(&texture->iface);
+            if (state->textures[stage])
+                IDirect3DTexture8_Release(&state->textures[stage]->iface);
+            state->textures[stage] = texture;
+        }
+    }
+    for (index = 0; index < D8WG_MAX_STREAMS; ++index) {
+        if (state->stream_mask[index]) {
+            D8VertexBuffer *buffer = device->streams[index].buffer;
+            if (buffer)
+                IDirect3DVertexBuffer8_AddRef(&buffer->iface);
+            if (state->streams[index].buffer)
+                IDirect3DVertexBuffer8_Release(
+                        &state->streams[index].buffer->iface);
+            state->streams[index] = device->streams[index];
+            state->streams[index].buffer = buffer;
+        }
+    }
+    if (state->indices_mask) {
+        D8IndexBuffer *buffer = device->index_buffer;
+        if (buffer)
+            IDirect3DIndexBuffer8_AddRef(&buffer->iface);
+        if (state->index_buffer)
+            IDirect3DIndexBuffer8_Release(&state->index_buffer->iface);
+        state->index_buffer = buffer;
+        state->base_vertex_index = device->base_vertex_index;
+    }
+    if (state->vertex_shader_mask)
+        state->vertex_shader = device->vertex_shader;
+    if (state->viewport_mask)
+        state->viewport = device->viewport;
+    if (state->material_mask)
+        state->material = device->material;
+    for (index = 0; index < D8WG_MAX_TRANSFORMS; ++index) {
+        if (state->transform_mask[index])
+            state->transforms[index] = device->transforms[index];
+    }
+    for (index = 0; index < D8WG_MAX_LIGHTS; ++index) {
+        if (state->light_mask[index]) {
+            state->lights[index] = device->lights[index];
+            state->light_set[index] = device->light_set[index];
+        }
+        if (state->light_enable_mask[index])
+            state->light_enabled[index] = device->light_enabled[index];
+    }
+}
+
+static D8StateBlock *device_find_state_block(D8Device *device, DWORD token,
+        D8StateBlock ***link_out)
+{
+    D8StateBlock **link = &device->state_blocks;
+    while (*link) {
+        if ((*link)->token == token) {
+            if (link_out) *link_out = link;
+            return *link;
+        }
+        link = &(*link)->next;
+    }
+    return NULL;
+}
+
+static DWORD device_allocate_state_block_token(D8Device *device)
+{
+    DWORD token;
+    do {
+        token = ++device->next_state_block_token;
+        if (!token) token = ++device->next_state_block_token;
+    } while (device_find_state_block(device, token, NULL));
+    return token;
+}
+
+static D3DTRANSFORMSTATETYPE transform_state_from_slot(UINT slot)
+{
+    if (slot == D8WG_TRANSFORM_VIEW_SLOT) return D3DTS_VIEW;
+    if (slot == D8WG_TRANSFORM_PROJECTION_SLOT) return D3DTS_PROJECTION;
+    if (slot >= D8WG_TRANSFORM_TEXTURE_SLOT
+            && slot < D8WG_TRANSFORM_WORLD_SLOT)
+        return (D3DTRANSFORMSTATETYPE)((UINT)D3DTS_TEXTURE0
+                + slot - D8WG_TRANSFORM_TEXTURE_SLOT);
+    return (D3DTRANSFORMSTATETYPE)((UINT)D3DTS_WORLD
+            + slot - D8WG_TRANSFORM_WORLD_SLOT);
+}
+
+static HRESULT state_block_apply(D8Device *device, D8StateBlock *block)
+{
+    D8StateSnapshot *state = &block->state;
+    HRESULT hr;
+    UINT index;
+    UINT stage;
+#define APPLY_STATE(call) do { hr = (call); if (FAILED(hr)) return hr; } while (0)
+    for (index = 0; index < D8WG_MAX_RENDER_STATES; ++index) {
+        if (state->render_mask[index])
+            APPLY_STATE(device_set_render_state(&device->iface,
+                    (D3DRENDERSTATETYPE)index, state->render_states[index]));
+    }
+    for (stage = 0; stage < D8WG_MAX_TEXTURE_STAGES; ++stage) {
+        for (index = 0; index < D8WG_MAX_TEXTURE_STAGE_STATES; ++index) {
+            if (state->texture_stage_mask[stage][index])
+                APPLY_STATE(device_set_texture_stage_state(&device->iface,
+                        stage, (D3DTEXTURESTAGESTATETYPE)index,
+                        state->texture_stage_states[stage][index]));
+        }
+        if (state->texture_mask[stage])
+            APPLY_STATE(device_set_texture(&device->iface, stage,
+                    state->textures[stage]
+                    ? (IDirect3DBaseTexture8 *)&state->textures[stage]->iface
+                    : NULL));
+    }
+    if (state->viewport_mask)
+        APPLY_STATE(device_set_viewport(&device->iface, &state->viewport));
+    if (state->material_mask)
+        APPLY_STATE(device_set_material(&device->iface, &state->material));
+    for (index = 0; index < D8WG_MAX_TRANSFORMS; ++index) {
+        if (state->transform_mask[index])
+            APPLY_STATE(device_set_transform(&device->iface,
+                    transform_state_from_slot(index),
+                    &state->transforms[index]));
+    }
+    for (index = 0; index < D8WG_MAX_LIGHTS; ++index) {
+        if (state->light_mask[index] && state->light_set[index])
+            APPLY_STATE(device_set_light(&device->iface, index,
+                    &state->lights[index]));
+        if (state->light_enable_mask[index])
+            APPLY_STATE(device_light_enable(&device->iface, index,
+                    state->light_enabled[index]));
+    }
+    for (index = 0; index < D8WG_MAX_STREAMS; ++index) {
+        if (state->stream_mask[index])
+            APPLY_STATE(device_set_stream_source(&device->iface, index,
+                    state->streams[index].buffer
+                    ? &state->streams[index].buffer->iface : NULL,
+                    state->streams[index].stride));
+    }
+    if (state->indices_mask)
+        APPLY_STATE(device_set_indices(&device->iface,
+                state->index_buffer ? &state->index_buffer->iface : NULL,
+                state->base_vertex_index));
+    if (state->vertex_shader_mask)
+        APPLY_STATE(device_set_vertex_shader(&device->iface,
+                state->vertex_shader));
+#undef APPLY_STATE
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_begin_state_block(IDirect3DDevice8 *iface)
+{
+    D8Device *device = device_from_iface(iface);
+    D8StateBlock *block;
+    if (device->recording_state_block)
+        return D3DERR_INVALIDCALL;
+    block = (D8StateBlock *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+            sizeof(*block));
+    if (!block) return E_OUTOFMEMORY;
+    device->recording_state_block = block;
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_end_state_block(IDirect3DDevice8 *iface,
+        DWORD *token)
+{
+    D8Device *device = device_from_iface(iface);
+    D8StateBlock *block = device->recording_state_block;
+    if (!token || !block)
+        return D3DERR_INVALIDCALL;
+    block->token = device_allocate_state_block_token(device);
+    state_block_capture(device, block);
+    block->next = device->state_blocks;
+    device->state_blocks = block;
+    device->recording_state_block = NULL;
+    *token = block->token;
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_apply_state_block(IDirect3DDevice8 *iface,
+        DWORD token)
+{
+    D8Device *device = device_from_iface(iface);
+    D8StateBlock *block;
+    if (device->recording_state_block)
+        return D3DERR_INVALIDCALL;
+    block = device_find_state_block(device, token, NULL);
+    return block ? state_block_apply(device, block) : D3DERR_INVALIDCALL;
+}
+
+static HRESULT WINAPI device_capture_state_block(IDirect3DDevice8 *iface,
+        DWORD token)
+{
+    D8Device *device = device_from_iface(iface);
+    D8StateBlock *block;
+    if (device->recording_state_block)
+        return D3DERR_INVALIDCALL;
+    block = device_find_state_block(device, token, NULL);
+    if (!block) return D3DERR_INVALIDCALL;
+    state_block_capture(device, block);
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_delete_state_block(IDirect3DDevice8 *iface,
+        DWORD token)
+{
+    D8Device *device = device_from_iface(iface);
+    D8StateBlock **link;
+    D8StateBlock *block;
+    if (device->recording_state_block)
+        return D3DERR_INVALIDCALL;
+    block = device_find_state_block(device, token, &link);
+    if (!block) return D3DERR_INVALIDCALL;
+    *link = block->next;
+    state_block_release_references(block);
+    HeapFree(GetProcessHeap(), 0, block);
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_create_state_block(IDirect3DDevice8 *iface,
+        D3DSTATEBLOCKTYPE type, DWORD *token)
+{
+    D8Device *device = device_from_iface(iface);
+    D8StateBlock *block;
+    if (!token || device->recording_state_block
+            || (type != D3DSBT_ALL && type != D3DSBT_PIXELSTATE
+                && type != D3DSBT_VERTEXSTATE))
+        return D3DERR_INVALIDCALL;
+    block = (D8StateBlock *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+            sizeof(*block));
+    if (!block) return E_OUTOFMEMORY;
+    block->type = type;
+    block->token = device_allocate_state_block_token(device);
+    state_block_set_scope(block, type);
+    state_block_capture(device, block);
+    block->next = device->state_blocks;
+    device->state_blocks = block;
+    *token = block->token;
+    return D3D_OK;
+}
 DEV_STUB(set_clip_status, const D3DCLIPSTATUS8 *status)
 { (void)iface;(void)status; return D3DERR_INVALIDCALL; }
 DEV_STUB(get_clip_status, D3DCLIPSTATUS8 *status)
@@ -3118,7 +4411,7 @@ DEV_STUB(process_vertices, UINT src, UINT dst, UINT count,
 { (void)iface;(void)src;(void)dst;(void)count;(void)buffer;(void)flags; return D3DERR_INVALIDCALL; }
 DEV_STUB(create_vertex_shader, const DWORD *decl, const DWORD *code,
         DWORD *shader, DWORD usage)
-{ (void)iface;(void)decl;(void)code;(void)shader;(void)usage; return D3DERR_INVALIDCALL; }
+{ (void)iface;(void)decl;(void)code;(void)usage; if(shader)*shader=0; return D3DERR_INVALIDCALL; }
 DEV_STUB(delete_vertex_shader, DWORD shader)
 { (void)iface;(void)shader; return D3DERR_INVALIDCALL; }
 DEV_STUB(set_vs_constant, DWORD reg, const void *data, DWORD count)
@@ -3130,7 +4423,7 @@ DEV_STUB(get_vs_decl, DWORD shader, void *data, DWORD *size)
 DEV_STUB(get_vs_function, DWORD shader, void *data, DWORD *size)
 { (void)iface;(void)shader;(void)data;(void)size; return D3DERR_INVALIDCALL; }
 DEV_STUB(create_pixel_shader, const DWORD *code, DWORD *shader)
-{ (void)iface;(void)code;(void)shader; return D3DERR_INVALIDCALL; }
+{ (void)iface;(void)code; if(shader)*shader=0; return D3DERR_INVALIDCALL; }
 DEV_STUB(set_pixel_shader, DWORD shader)
 { (void)iface;(void)shader; return shader ? D3DERR_INVALIDCALL : D3D_OK; }
 DEV_STUB(get_pixel_shader, DWORD *shader)
@@ -3341,6 +4634,14 @@ static IDirect3DSurface8Vtbl g_surface_vtbl = {
     .UnlockRect = surface_unlock_rect
 };
 
+static IDirect3DSwapChain8Vtbl g_swapchain_vtbl = {
+    .QueryInterface = swapchain_query_interface,
+    .AddRef = swapchain_add_ref,
+    .Release = swapchain_release,
+    .Present = swapchain_present,
+    .GetBackBuffer = swapchain_get_backbuffer
+};
+
 IDirect3D8 *WINAPI Direct3DCreate8(UINT sdk_version)
 {
     D8Direct3D *d3d;
@@ -3369,6 +4670,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(instance);
+        initialize_session_id(instance);
         InitializeCriticalSection(&g_transport_lock);
     } else if (reason == DLL_PROCESS_DETACH) {
         EnterCriticalSection(&g_transport_lock);

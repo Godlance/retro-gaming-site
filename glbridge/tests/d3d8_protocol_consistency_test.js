@@ -34,7 +34,7 @@ function fields(structName) {
 
 const sharedValues = {
     D8WG_VERSION_MAJOR: 1,
-    D8WG_VERSION_MINOR: 4,
+    D8WG_VERSION_MINOR: 6,
     D8WG_OP_UPDATE_SURFACE: 8,
     D8WG_OP_CREATE_TEXTURE: 0x110,
     D8WG_OP_UPDATE_TEXTURE: 0x111,
@@ -45,6 +45,7 @@ const sharedValues = {
     D8WG_OP_SET_LIGHT: 0x206,
     D8WG_OP_LIGHT_ENABLE: 0x207,
     D8WG_OP_SET_INDICES: 0x209,
+    D8WG_OP_SET_RENDER_TARGET: 0x20B,
     D8WG_OP_DRAW_PRIMITIVE: 0x300,
     D8WG_OP_DRAW_INDEXED_PRIMITIVE: 0x301,
     D8WG_OP_DRAW_PRIMITIVE_UP: 0x302,
@@ -65,9 +66,24 @@ for (const [name, expected] of Object.entries(sharedValues)) {
 assert.deepEqual(fields("D8WGSetIndices"), [
     "device_handle", "buffer_handle", "base_vertex_index", "reserved",
 ]);
+assert.deepEqual(fields("D8WGBatchHeader"), [
+    "magic", "version_major", "version_minor", "frame_id", "flags",
+    "command_count", "command_bytes", "session_id_low", "session_id_high",
+]);
+assert.deepEqual(fields("D8WGHello"), [
+    "guest_pointer_bits", "feature_bits", "session_id_low", "session_id_high",
+]);
+assert.deepEqual(fields("D8WGSetRenderTarget"), [
+    "device_handle", "color_texture_handle", "color_level", "depth_enabled",
+]);
 assert.deepEqual(fields("D8WGCreateDevice"), [
     "device_handle", "hwnd", "x", "y", "width", "height",
     "backbuffer_format", "windowed", "behavior_flags",
+    "enable_auto_depth_stencil", "auto_depth_stencil_format",
+]);
+assert.deepEqual(fields("D8WGResetDevice"), [
+    "old_device_handle", "new_device_handle", "hwnd", "x", "y", "width",
+    "height", "backbuffer_format", "windowed", "behavior_flags",
     "enable_auto_depth_stencil", "auto_depth_stencil_format",
 ]);
 assert.deepEqual(fields("D8WGPresent"), [

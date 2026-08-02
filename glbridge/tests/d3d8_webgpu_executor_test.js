@@ -8,6 +8,7 @@ const {
 
 const OP_HELLO = 1;
 const OP_CREATE_DEVICE = 2;
+const OP_RESET = 3;
 const OP_PRESENT = 4;
 const OP_CLEAR = 5;
 const OP_BEGIN_SCENE = 6;
@@ -29,6 +30,7 @@ const OP_LIGHT_ENABLE = 0x207;
 const OP_SET_STREAM_SOURCE = 0x208;
 const OP_SET_INDICES = 0x209;
 const OP_SET_VERTEX_FORMAT = 0x20A;
+const OP_SET_RENDER_TARGET = 0x20B;
 const OP_DRAW_PRIMITIVE = 0x300;
 const OP_DRAW_INDEXED_PRIMITIVE = 0x301;
 const OP_DRAW_PRIMITIVE_UP = 0x302;
@@ -97,7 +99,11 @@ function lightPayload(deviceHandle, index, type, values) {
     return payload;
 }
 
-function batch(commandSpecs, frameId) {
+const DEFAULT_SESSION_LOW = 0xA0010001;
+const DEFAULT_SESSION_HIGH = 0x20260802;
+
+function batch(commandSpecs, frameId, sessionLow = DEFAULT_SESSION_LOW,
+        sessionHigh = DEFAULT_SESSION_HIGH) {
     let commandBytes = 0;
     for (const spec of commandSpecs) {
         const blobBytes = (spec.blobs || []).reduce(
@@ -110,11 +116,13 @@ function batch(commandSpecs, frameId) {
     const result = Buffer.alloc(32 + commandBytes);
     result.writeUInt32LE(D8WG_MAGIC, 0);
     result.writeUInt16LE(1, 4);
-    result.writeUInt16LE(4, 6);
+    result.writeUInt16LE(6, 6);
     result.writeUInt32LE(frameId, 8);
     result.writeUInt32LE(1, 12);
     result.writeUInt32LE(commandSpecs.length, 16);
     result.writeUInt32LE(commandBytes, 20);
+    result.writeUInt32LE(sessionLow >>> 0, 24);
+    result.writeUInt32LE(sessionHigh >>> 0, 28);
 
     let sequence = 1;
     for (const spec of commandSpecs) {
@@ -149,8 +157,9 @@ function commandWithBlobs(opcode, payload, blobs) {
     return { opcode, payload, blobs };
 }
 
-function makeFakeWebGPU() {
+function makeFakeWebGPU(options = {}) {
     const calls = [];
+    const submittedWorkResolvers = [];
     class FakeBuffer {
         constructor(descriptor) { this.descriptor = descriptor; this.destroyed = false; }
         destroy() { this.destroyed = true; calls.push(["destroyBuffer"]); }
@@ -212,13 +221,22 @@ function makeFakeWebGPU() {
         },
         writeTexture(...args) { calls.push(["writeTexture", ...args]); },
         submit(commandBuffers) { calls.push(["submit", commandBuffers]); },
+        onSubmittedWorkDone() {
+            calls.push(["onSubmittedWorkDone"]);
+            if (!options.deferSubmittedWork) return Promise.resolve();
+            return new Promise(resolve => submittedWorkResolvers.push(resolve));
+        },
     };
     const device = {
         queue,
         lost: new Promise(() => {}),
         createShaderModule(descriptor) { calls.push(["shader", descriptor]); return descriptor; },
         createBuffer(descriptor) { calls.push(["createBuffer", descriptor]); return new FakeBuffer(descriptor); },
-        createTexture(descriptor) { calls.push(["createTexture", descriptor]); return new FakeTexture(descriptor); },
+        createTexture(descriptor) {
+            const texture = new FakeTexture(descriptor);
+            calls.push(["createTexture", descriptor, texture]);
+            return texture;
+        },
         createSampler(descriptor) {
             const sampler = { descriptor };
             calls.push(["createSampler", descriptor]);
@@ -242,7 +260,12 @@ function makeFakeWebGPU() {
         async requestAdapter() { return { async requestDevice() { return device; } }; },
         getPreferredCanvasFormat() { return "bgra8unorm"; },
     };
-    return { calls, device, context, gpu };
+    return {
+        calls, device, context, gpu,
+        completeSubmittedWork() {
+            for (const resolve of submittedWorkResolvers.splice(0)) resolve();
+        },
+    };
 }
 
 async function main() {
@@ -321,7 +344,8 @@ async function main() {
     replacementColour.writeUInt32LE(0xFFFFFFFF, 0);
 
     const firstBatch = batch([
-        command(OP_HELLO, u32Payload(32, 0)),
+        command(OP_HELLO, u32Payload(32, 0,
+            DEFAULT_SESSION_LOW, DEFAULT_SESSION_HIGH)),
         command(OP_CREATE_DEVICE, createDevicePayload(deviceHandle, 640, 480)),
         command(OP_CREATE_BUFFER, createBuffer),
         command(OP_UPDATE_BUFFER, update, vertices),
@@ -772,6 +796,15 @@ async function main() {
     assert.equal(completeFixedPipeline.fragment.targets[0].blend.color.operation,
         "subtract", "D3DRS_BLENDOP must reach the WebGPU blend pipeline");
 
+    const resourcesBeforeRestore = executor.resources.size;
+    const stateCheckpoint = executor.serializeState();
+    assert.ok(stateCheckpoint.byteLength > 32,
+        "save-state checkpoint must contain canonical D3D8 commands");
+    executor.restoreState(stateCheckpoint);
+    assert.equal(executor.devices.has(deviceHandle), true);
+    assert.equal(executor.resources.size, resourcesBeforeRestore,
+        "state restore must rebuild each live resource exactly once");
+
     const bad = Buffer.from(secondBatch);
     bad.writeUInt32LE(bad.length, 20);
     assert.throws(() => executor.executeBatch(bad, {}), /truncated/);
@@ -815,9 +848,246 @@ async function main() {
     assert.equal(executor.devices.has(deviceHandle), false);
     assert.equal(executor.resources.size, 0,
         "destroying a device must release all of its host GPU resources");
-    assert.equal(destroys.length, 1);
-    assert.equal(destroys[0].reason, "device");
-    assert.equal(destroys[0].surface.x, 33);
+    assert.equal(destroys.length, 2);
+    assert.equal(destroys.at(-1).reason, "device");
+    assert.equal(destroys.at(-1).surface.x, 33);
+
+    const epochFake = makeFakeWebGPU();
+    const epochExecutor = new D3D8WebGPUExecutor(canvas, {
+        gpu: epochFake.gpu,
+        device: epochFake.device,
+        context: epochFake.context,
+    });
+    await epochExecutor.submit(batch([
+        command(OP_HELLO, u32Payload(32, 0,
+            DEFAULT_SESSION_LOW, DEFAULT_SESSION_HIGH)),
+        command(OP_CREATE_DEVICE, createDevicePayload(0x110001, 320, 240)),
+    ], 10), {});
+    const resetPayload = Buffer.concat([
+        u32Payload(0x110001), createDevicePayload(0x120001, 800, 600),
+    ]);
+    await epochExecutor.submit(batch([
+        command(OP_RESET, resetPayload),
+    ], 11), {});
+    assert.equal(epochExecutor.devices.has(0x110001), false,
+        "Reset must retire the old device namespace");
+    assert.equal(epochExecutor.devices.has(0x120001), true,
+        "Reset must create a fresh device namespace");
+    const renderTargetPayload = u32Payload(0x120001, 0x120101,
+        32, 32, 1, 21, 1, 0);
+    await epochExecutor.submit(batch([
+        command(OP_CREATE_TEXTURE, renderTargetPayload),
+        command(OP_SET_RENDER_TARGET,
+            u32Payload(0x120001, 0x120101, 0, 0)),
+        command(OP_CLEAR,
+            u32Payload(0x120001, 1, 0xFF18C448, 0x3F800000, 0, 0)),
+        command(OP_SET_RENDER_TARGET,
+            u32Payload(0x120001, 0, 0, 0)),
+    ], 12), {});
+    assert.ok(epochExecutor.resources.has(0x120101));
+    assert.ok(epochFake.calls.some(call => call[0] === "createTexture" &&
+        call[1].size.width === 32 && (call[1].usage & 0x10)),
+    "render-target textures must carry WebGPU RENDER_ATTACHMENT usage");
+    assert.deepEqual(Array.from(epochExecutor.resources.get(0x120101)
+        .shadowLevels[0].data.subarray(0, 4)), [0x48, 0xC4, 0x18, 0xFF],
+    "render-target Clear must update the canonical save-state shadow");
+    const recoveredFake = makeFakeWebGPU();
+    epochExecutor.pipelineCache.set("old-device-pipeline", {});
+    epochExecutor.samplerCache.set("old-device-sampler", {});
+    await epochExecutor.injectDeviceLoss(recoveredFake.device);
+    assert.equal(epochExecutor.failed, null);
+    assert.equal(epochExecutor.devices.has(0x120001), true,
+        "device-loss recovery must rebuild the current device epoch");
+    assert.equal(epochExecutor.resources.has(0x120101), true,
+        "device-loss recovery must rebuild render-target resources");
+    assert.deepEqual(Array.from(epochExecutor.resources.get(0x120101)
+        .shadowLevels[0].data.subarray(0, 4)), [0x48, 0xC4, 0x18, 0xFF],
+    "device-loss recovery must preserve render-target clear contents");
+    assert.equal(epochExecutor.pipelineCache.size, 0,
+        "device-loss recovery must discard pipelines owned by the lost GPUDevice");
+    assert.equal(epochExecutor.samplerCache.size, 0,
+        "device-loss recovery must discard samplers owned by the lost GPUDevice");
+    assert.equal(epochExecutor.getStats().deviceRecoveries, 1);
+
+    const resourceBaseline = epochExecutor.resources.size;
+    for (let iteration = 0; iteration < 192; iteration++) {
+        const handle = 0x130000 + iteration;
+        await epochExecutor.submit(batch([
+            command(OP_CREATE_BUFFER, u32Payload(0x120001, handle,
+                1, 256, 0, 0, 1, 0)),
+            command(OP_DESTROY_RESOURCE, u32Payload(handle, 1)),
+        ], 20 + iteration), {});
+    }
+    assert.equal(epochExecutor.resources.size, resourceBaseline,
+        "192 create/destroy cycles must not grow the live GPU resource map");
+
+    let currentEpoch = 0x120001;
+    for (let iteration = 0; iteration < 24; iteration++) {
+        const oldEpoch = currentEpoch;
+        const nextEpoch = 0x140000 + iteration;
+        const childHandle = 0x150000 + iteration;
+        await epochExecutor.submit(batch([
+            command(OP_CREATE_BUFFER, u32Payload(oldEpoch, childHandle,
+                1, 128, 0, 0, 1, 0)),
+            command(OP_RESET, Buffer.concat([
+                u32Payload(oldEpoch),
+                createDevicePayload(nextEpoch, 400 + iteration, 300),
+            ])),
+        ], 300 + iteration), {});
+        await epochExecutor.submit(batch([
+            command(OP_UPDATE_BUFFER, u32Payload(childHandle, 0, 4,
+                0, 0, 0)),
+            command(OP_SET_STREAM_SOURCE,
+                u32Payload(oldEpoch, 0, childHandle, 20)),
+            command(OP_DRAW_PRIMITIVE,
+                u32Payload(oldEpoch, 4, 0, 1, 0, 0)),
+        ], 400 + iteration), {});
+        currentEpoch = nextEpoch;
+    }
+    assert.equal(epochExecutor.devices.size, 1,
+        "repeated Reset must retain exactly one live device epoch");
+    assert.equal(epochExecutor.resources.size, 0,
+        "repeated Reset must destroy every child from the retired epoch");
+    assert.ok(epochExecutor.getStats().staleCommandsDropped >= 24 * 3,
+        "stale batches must be dropped before they can touch a new epoch");
+
+    const clearFake = makeFakeWebGPU({ deferSubmittedWork: true });
+    const clearExecutor = new D3D8WebGPUExecutor(canvas, {
+        gpu: clearFake.gpu,
+        device: clearFake.device,
+        context: clearFake.context,
+    });
+    const clearDevice = 0x1C0001;
+    const clearSession = [0xC1EA0001, 0x20260802];
+    const rectangleClear = Buffer.alloc(40);
+    rectangleClear.writeUInt32LE(clearDevice, 0);
+    rectangleClear.writeUInt32LE(7, 4);
+    rectangleClear.writeUInt32LE(0xFF23DC5A, 8);
+    rectangleClear.writeFloatLE(0.25, 12);
+    rectangleClear.writeUInt32LE(0x5A, 16);
+    rectangleClear.writeUInt32LE(1, 20);
+    rectangleClear.writeInt32LE(12, 24);
+    rectangleClear.writeInt32LE(18, 28);
+    rectangleClear.writeInt32LE(112, 32);
+    rectangleClear.writeInt32LE(98, 36);
+    await clearExecutor.submit(batch([
+        command(OP_HELLO, u32Payload(32, 0,
+            clearSession[0], clearSession[1])),
+        command(OP_CREATE_DEVICE, createDevicePayload(clearDevice, 320, 240)),
+        command(OP_CLEAR, u32Payload(clearDevice, 7, 0xFF000000,
+            0x3F800000, 0, 0)),
+        command(OP_CLEAR, rectangleClear),
+        command(OP_PRESENT, surfacePayload(clearDevice, 11, 22, 320, 240)),
+    ], 1, clearSession[0], clearSession[1]), {});
+    assert.equal(clearExecutor.failed, null);
+    assert.equal(clearExecutor.getStats().rectangularClears, 1,
+        "a D3DRECT Clear must be executed as a scoped GPU clear draw");
+    assert.ok(clearFake.calls.some(call => call[0] === "setScissorRect" &&
+        call.slice(1).join(",") === "12,18,100,80"),
+    "rectangular Clear must preserve the requested D3DRECT");
+    const clearPipeline = clearFake.calls.find(call =>
+        call[0] === "createPipeline" &&
+        String(call[1].label).includes("rectangular Clear"));
+    assert.equal(clearPipeline[1].depthStencil.depthWriteEnabled, true);
+    assert.equal(clearPipeline[1].depthStencil.stencilFront.passOp, "replace");
+    assert.match(clearPipeline[1].vertex.module.code,
+        /depth:\s*vec4<f32>/,
+        "ClearData must remain two vec4 values so its WGSL size is 32 bytes");
+    const clearBindGroup = clearFake.calls.find(call =>
+        call[0] === "createBindGroup" &&
+        call[1].entries?.[0]?.resource?.buffer?.descriptor?.label ===
+            "D3D8 rectangular Clear uniforms");
+    assert.equal(clearBindGroup[1].entries[0].resource.size, 32,
+        "the rectangular Clear bind group must bind the complete 32-byte uniform");
+
+    const retiredTextureHandle = 0x1C0002;
+    const retiredPixel = Buffer.from([0x20, 0x80, 0xF0, 0xFF]);
+    const retiredVertices = vertices.subarray(0, 60);
+    await clearExecutor.submit(batch([
+        command(OP_CREATE_TEXTURE, u32Payload(clearDevice,
+            retiredTextureHandle, 1, 1, 1, 21, 0, 1)),
+        commandWithBlobs(OP_UPDATE_TEXTURE,
+            u32Payload(retiredTextureHandle, 0, 0, 0,
+                1, 1, 4, 4, 0, 0),
+            [{ offsetField: 32, data: retiredPixel }]),
+        command(OP_SET_VERTEX_FORMAT, u32Payload(clearDevice, 0x44)),
+        command(OP_CLEAR, u32Payload(clearDevice, 1, 0xFF000000,
+            0x3F800000, 0, 0)),
+        command(OP_BEGIN_SCENE, u32Payload(clearDevice, 0)),
+        command(OP_SET_TEXTURE, u32Payload(clearDevice, 0,
+            retiredTextureHandle, 0)),
+        commandWithBlobs(OP_DRAW_PRIMITIVE_UP,
+            u32Payload(clearDevice, 4, 1, 20, 3,
+                retiredVertices.length, 0, 0),
+            [{ offsetField: 24, data: retiredVertices }]),
+        command(OP_SET_TEXTURE, u32Payload(clearDevice, 0, 0, 0)),
+        command(OP_DESTROY_RESOURCE, u32Payload(retiredTextureHandle, 3)),
+        command(OP_END_SCENE, u32Payload(clearDevice, 0)),
+        command(OP_PRESENT, surfacePayload(clearDevice, 11, 22, 320, 240)),
+    ], 2, clearSession[0], clearSession[1]), {});
+    const retiredTexture = clearFake.calls.find(call =>
+        call[0] === "createTexture" &&
+        call[1].label === "D3D8 texture " +
+            retiredTextureHandle.toString(16))[2];
+    assert.equal(retiredTexture.destroyed, false,
+        "a texture referenced by an uncompleted submit must remain alive");
+    clearFake.completeSubmittedWork();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(retiredTexture.destroyed, true,
+        "retired textures must be destroyed after queue completion");
+
+    const sessionFake = makeFakeWebGPU();
+    const sessionExecutor = new D3D8WebGPUExecutor(canvas, {
+        gpu: sessionFake.gpu,
+        device: sessionFake.device,
+        context: sessionFake.context,
+    });
+    const reusedDevice = 0x00100001;
+    const reusedTexture = 0x00100002;
+    const sessionA = [0x11111111, 0xAAAAAAAA];
+    const sessionB = [0x22222222, 0xBBBBBBBB];
+    const createReusedTexture = u32Payload(reusedDevice, reusedTexture,
+        8, 8, 1, 21, 0, 1);
+    for (const [low, high] of [sessionA, sessionB]) {
+        await sessionExecutor.submit(batch([
+            command(OP_HELLO, u32Payload(32, 0, low, high)),
+            command(OP_CREATE_DEVICE,
+                createDevicePayload(reusedDevice, 320, 240)),
+            command(OP_CREATE_TEXTURE, createReusedTexture),
+        ], low & 0xFFFF, low, high), {});
+    }
+    assert.equal(sessionExecutor.failed, null);
+    assert.equal(sessionExecutor.getStats().sessionsLive, 2,
+        "identical handles from two guest processes must occupy two sessions");
+    assert.equal(sessionExecutor.getStats().devicesLive, 2);
+    assert.equal(sessionExecutor.getStats().resourcesLive, 2);
+
+    const multiSessionCheckpoint = sessionExecutor.serializeState();
+    sessionExecutor.restoreState(multiSessionCheckpoint);
+    assert.equal(sessionExecutor.getStats().sessionsLive, 2,
+        "save/load must restore every live D3D8 process session");
+    assert.equal(sessionExecutor.getStats().devicesLive, 2);
+    assert.equal(sessionExecutor.getStats().resourcesLive, 2);
+
+    await sessionExecutor.submit(batch([
+        command(OP_DESTROY_RESOURCE, u32Payload(reusedDevice, 0)),
+    ], 30, sessionA[0], sessionA[1]), {});
+    assert.equal(sessionExecutor.getStats().devicesLive, 1);
+    assert.equal(sessionExecutor.getStats().resourcesLive, 1);
+    const sessionBState = sessionExecutor.sessions.get(
+        sessionExecutor.sessionKey(sessionB[0], sessionB[1]));
+    assert.equal(sessionBState.devices.has(reusedDevice), true,
+        "destroying an old process must not destroy a new process using the same handle");
+    assert.equal(sessionBState.resources.has(reusedTexture), true);
+
+    // A delayed duplicate teardown from session A is stale only in session A.
+    await sessionExecutor.submit(batch([
+        command(OP_DESTROY_RESOURCE, u32Payload(reusedDevice, 0)),
+    ], 31, sessionA[0], sessionA[1]), {});
+    assert.equal(sessionExecutor.failed, null);
+    assert.equal(sessionBState.devices.has(reusedDevice), true);
+    assert.equal(sessionBState.resources.has(reusedTexture), true);
 
     console.log("d3d8_webgpu_executor_test: ok");
 }

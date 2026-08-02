@@ -6,7 +6,7 @@ DMA arena. The VGL2 descriptor is only the transport envelope; command
 `0xFFE0` carries a versioned D8WG batch decoded by
 `../d3d8-webgpu/d3d8_executor.js`.
 
-Implemented Maple fixed-function core (D8WG protocol v1.4):
+Implemented Maple fixed-function and lifecycle core (D8WG protocol v1.6):
 
 - adapter enumeration, MapleStory v83 format probes, caps, and `CreateDevice`;
 - `Clear`, `BeginScene`, `EndScene`, and `Present`;
@@ -51,15 +51,38 @@ Implemented Maple fixed-function core (D8WG protocol v1.4):
   that render only one frame;
 - immediate device/window teardown notification so the host overlay is hidden
   when the program closes;
+- recorded and predefined state blocks, including capture/apply/delete and
+  retained COM references for texture, stream and index bindings;
+- epoch-changing `Reset`, strict DEFAULT-pool/lock/surface blockers, managed
+  buffer/texture shadow reconstruction, resize tracking and stale-handle
+  rejection on the host;
+- automatic WebGPU device-loss recovery from a canonical CPU checkpoint,
+  including replacement-device resource uploads and invalidation of all
+  old-device pipeline/sampler objects;
+- additional swap-chain lifetime/back-buffer compatibility and `Present`
+  routing to its target window;
+- explicit render targets, depth surfaces, image surfaces, lockable render
+  targets, `Set/GetRenderTarget`, `CopyRects` and clear/front-buffer CPU
+  readback mirrors;
+- `QueryInterface`, `GetDevice`, Surface `GetContainer`, failed-output
+  nulling, parent references and device-owned resource list boundaries;
+- v86 save/load integration that serializes a canonical D3D8 device/resource/
+  state checkpoint and rebuilds the exact saved epoch before guest work resumes;
+- a 64-bit per-process session namespace carried by every D8WG batch and
+  verified by `HELLO`; identical numeric handles from sequential or concurrent
+  XP processes cannot alias, and late teardown from an old process cannot
+  destroy resources or hide the canvas owned by a newer process;
 - one main PCI submit at `Present` (extra submits occur only when the DMA arena
   fills or when a window lifecycle event must reach the host immediately).
 
-The current v1.4 boundary is deliberate: explicit render/depth surfaces,
-render-to-texture, `CopyRects`, clip planes, cube/volume textures, state blocks,
-and programmable shaders are not implemented yet. Unsupported calls return
-`D3DERR_INVALIDCALL`; cube/volume and explicit render-target capability probes
-are not advertised. Maple runtime acceptance is still required before this
-core is called game-ready.
+The current v1.6 boundary remains conservative: clip planes, cube/volume
+textures and programmable shaders are not implemented, and their caps are not
+advertised. Unsupported calls return `D3DERR_INVALIDCALL`. Because WebGPU has
+no synchronous texture mapping API, CPU readback is exact for uploads,
+`Clear` and `CopyRects`; pixels produced only by an arbitrary GPU draw are not
+synchronously reflected into the guest shadow. Maple does not use that cold
+readback path, but another title that depends on it needs an asynchronous
+guest-stall/readback protocol before its compatibility gate can be closed.
 
 Build an XP-compatible DLL without a C runtime dependency:
 
@@ -85,8 +108,31 @@ Build the XP Stage 4 fixed-function acceptance tests:
 ```
 
 This builds transform/depth, raster/stencil, lighting/material, fog, and
-textured-cube tests. Run them with the v1.4 DLL beside each executable before
+textured-cube tests. Run them with the current v1.6 DLL beside each executable before
 testing MapleStory itself.
+
+Build the XP Stage 5 lifecycle acceptance tests:
+
+```sh
+./glbridge/d3d8proxy/build_stage5_tests.sh /private/tmp/d3d8-stage5-tests
+```
+
+The four executables cover state blocks, repeated Reset and managed-resource
+reconstruction, additional swap-chain/reset blockers, render/depth/image
+surfaces, lockable render-target copy/readback, COM parent/container identity,
+invalid-call outputs, 96 create/destroy cycles, eight device epochs, and final
+collection of a device/bound-resource COM reference cycle. The capability audit
+also enforces an honest Stage 5 boundary: core/DXT/render-target texture paths
+must be advertised, while cube/volume textures, SM1.1, and more than two active
+texture stages remain hidden until their Stage 6 implementations exist.
+Device-loss, save/load reconstruction, stale batches, and the host resource-map
+stress loop are covered by `d3d8_webgpu_executor_test.js` and
+`v86_network_bridge_state_test.js`. The executor regression also creates two
+guest sessions with identical numeric device/resource handles and verifies that
+delayed teardown from one session cannot destroy or hide the other, including
+after a multi-session save/load round trip. It additionally validates scoped
+color/depth/stencil rectangle clears and queue-fenced physical resource
+destruction after logical D3D8 release.
 
 Host-side protocol/executor tests:
 
@@ -101,7 +147,7 @@ localhost and open it in a WebGPU-enabled browser. It reports `PASS` only
 after creating both pre-transformed and XYZ/normal/texture-transform pipelines
 without WebGPU validation errors.
 
-The v1.4 guest DLL and host executor must be deployed together. The executor
+The v1.6 guest DLL and host executor must be deployed together. The executor
 rejects a different protocol minor version instead of silently skipping newer
 texture or fixed-function commands.
 

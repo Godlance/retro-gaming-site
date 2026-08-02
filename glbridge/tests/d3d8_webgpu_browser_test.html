@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>D3D8 WebGPU stage 4 browser test</title>
+<title>D3D8 WebGPU browser validation test</title>
 <style>
 body { margin: 0; background: #111; color: #eee; font: 14px monospace; }
 canvas { width: 640px; height: 480px; }
@@ -13,6 +13,8 @@ canvas { width: 640px; height: 480px; }
 (async () => {
     "use strict";
     const result = document.getElementById("result");
+    const sessionLow = 0xB0010001;
+    const sessionHigh = 0x20260802;
     const u32 = (...values) => {
         const payload = new Uint8Array(values.length * 4);
         const view = new DataView(payload.buffer);
@@ -47,11 +49,13 @@ canvas { width: 640px; height: 480px; }
         const view = new DataView(bytes.buffer);
         view.setUint32(0, 0x47573844, true);
         view.setUint16(4, 1, true);
-        view.setUint16(6, 4, true);
+        view.setUint16(6, 6, true);
         view.setUint32(8, 1, true);
         view.setUint32(12, 1, true);
         view.setUint32(16, commands.length, true);
         view.setUint32(20, commandBytes, true);
+        view.setUint32(24, sessionLow, true);
+        view.setUint32(28, sessionHigh, true);
         commands.forEach((item, index) => {
             view.setUint16(item.offset, item.opcode, true);
             view.setUint32(item.offset + 4, item.size, true);
@@ -126,6 +130,7 @@ canvas { width: 640px; height: 480px; }
         ]);
         executor.device.pushErrorScope("validation");
         await executor.submit(batch([
+            command(1, u32(32, 0, sessionLow, sessionHigh)),
             command(2, createDevice(deviceHandle, 640, 480)),
             command(0x110, u32(deviceHandle, textureHandle,
                 16, 16, 1, 21, 0, 1)),
@@ -154,6 +159,8 @@ canvas { width: 640px; height: 480px; }
             command(0x20A, u32(deviceHandle, 0x2C4)),
             command(5, u32(deviceHandle, 1, 0xFF101820,
                 0x3F800000, 0, 0)),
+            command(5, u32(deviceHandle, 7, 0xFF204080,
+                0x3E800000, 0x5A, 1, 24, 32, 160, 144)),
             command(0x302, u32(deviceHandle, 4, 1, 40, 3,
                 vertices.byteLength, 0, 0),
                 [{ offsetField: 24, data: vertices }]),
@@ -170,13 +177,17 @@ canvas { width: 640px; height: 480px; }
             command(0x302, u32(deviceHandle, 4, 1, 36, 3,
                 fixedVertices.byteLength, 0, 0),
                 [{ offsetField: 24, data: fixedVertices }]),
+            command(0x202, u32(deviceHandle, 0, 0, 0)),
+            command(0x202, u32(deviceHandle, 1, 0, 0)),
+            command(0x103, u32(textureHandle, 3)),
             command(4, surface(deviceHandle, 640, 480)),
         ]));
         const validation = await executor.device.popErrorScope();
         if (executor.failed) throw executor.failed;
         if (validation) throw validation;
         const stats = executor.getStats();
-        if (stats.drawCalls !== 2 || stats.presents !== 1)
+        if (stats.drawCalls !== 2 || stats.presents !== 1 ||
+                stats.rectangularClears !== 1)
             throw new Error("unexpected stats " + JSON.stringify(stats));
         result.textContent = "PASS\n" + JSON.stringify(stats, null, 2);
         result.dataset.status = "pass";
