@@ -158,6 +158,9 @@ async function main() {
     const listeners = Object.create(null);
     let resetCount = 0;
     let restoreGate = null;
+    let d3d8InitializeGate = null;
+    let d3d8InitializeCount = 0;
+    let failNextD3D8Initialize = false;
     let d3d8SerializeCount = 0;
     const restoredD3D8States = [];
     const d3d8LifecycleEvents = [];
@@ -165,6 +168,29 @@ async function main() {
         0x44, 0x38, 0x57, 0x47, 1, 0, 5, 0, 0x51, 0x52, 0x53, 0x54,
     ]);
     const d3d8Executor = {
+        initialize() {
+            d3d8InitializeCount++;
+            d3d8LifecycleEvents.push("initialize:start");
+            if (failNextD3D8Initialize) {
+                failNextD3D8Initialize = false;
+                d3d8LifecycleEvents.push("initialize:failed");
+                return Promise.reject(new Error(
+                    "injected WebGPU initialization failure"));
+            }
+            if (d3d8InitializeCount !== 1) {
+                d3d8LifecycleEvents.push("initialize:done");
+                return Promise.resolve();
+            }
+            return new Promise((resolve, reject) => {
+                d3d8InitializeGate = {
+                    resolve() {
+                        d3d8LifecycleEvents.push("initialize:done");
+                        resolve();
+                    },
+                    reject,
+                };
+            });
+        },
         serializeState() {
             d3d8SerializeCount++;
             return d3d8Checkpoint.slice();
@@ -378,7 +404,18 @@ async function main() {
     assert.equal(d3d8LifecycleEvents.length, 0,
         "a queued D3D8 batch must not run against the pre-restore device epoch");
     restoreGate.resolve(restoreGate.module);
-    const restored = await bridge.finishStateRestore();
+    const restoreCompletion = bridge.finishStateRestore();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(d3d8InitializeGate,
+        "state restore must initialize a cold D3D8 executor");
+    assert.deepEqual(d3d8LifecycleEvents, ["initialize:start"],
+        "checkpoint replay must wait for asynchronous WebGPU initialization");
+    assert.equal(bridge.pendingPCIBatches.length, 2,
+        "guest GL and D3D8 work must remain queued during WebGPU initialization");
+    assert.equal(restoredD3D8States.length, 0,
+        "CREATE_DEVICE replay must not run against a null GPUCanvasContext");
+    d3d8InitializeGate.resolve();
+    const restored = await restoreCompletion;
     assert.equal(restored.hasGLState, true);
     assert.equal(bridge.lastPresentedFrameId, 0,
                  "restored guest frame ids must not be rejected as stale");
@@ -389,7 +426,8 @@ async function main() {
     assert.deepEqual(Array.from(restoredD3D8States[0]),
         Array.from(d3d8Checkpoint),
         "state restore must pass the exact saved D3D8 epoch checkpoint");
-    assert.deepEqual(d3d8LifecycleEvents, ["restore", "submit:165"],
+    assert.deepEqual(d3d8LifecycleEvents, ["initialize:start",
+        "initialize:done", "restore", "submit:165"],
         "the D3D8 checkpoint must restore before queued guest batches resume");
 
     const restoredModule = modules.at(-1);
@@ -436,6 +474,39 @@ async function main() {
                  "legacy guest work must wait for the clean renderer");
     assert.equal(modules.at(-1).calls.filter(call => call[0] === "drawArraysDirect").length, 1,
                  "legacy restores must resume guest rendering after the reset");
+    assert.equal(restoredD3D8States.at(-1).byteLength, 0,
+        "legacy state restore must clear a live D3D8 namespace");
+
+    const restoreCallsBeforeFailure = restoredD3D8States.length;
+    const submitCallsBeforeFailure = d3d8LifecycleEvents.filter(event =>
+        event.startsWith("submit:")).length;
+    failNextD3D8Initialize = true;
+    bridge.beginStateRestore();
+    pci.set_state(savedPCIState);
+    listeners["v86gl-pci-frame"]({
+        bytes: d3d8Envelope(Uint8Array.of(0xC7)),
+        frameId: 12,
+        submitCount: 3,
+        commandCount: 1,
+        flags: 0,
+    });
+    const savedConsoleError = console.error;
+    console.error = () => {};
+    try {
+        await assert.rejects(bridge.finishStateRestore(),
+            /injected WebGPU initialization failure/);
+    } finally {
+        console.error = savedConsoleError;
+    }
+    assert.equal(restoredD3D8States.length, restoreCallsBeforeFailure,
+        "failed WebGPU initialization must not start checkpoint replay");
+    assert.equal(d3d8LifecycleEvents.filter(event =>
+        event.startsWith("submit:")).length, submitCallsBeforeFailure,
+        "guest D3D8 batches must not resume after restore initialization fails");
+    assert.equal(bridge.pendingPCIBatches.length, 0,
+        "failed restore must discard commands from the partial timeline");
+    assert.equal(bridge.restoringState, false,
+        "failed restore must leave the bridge paused but not internally wedged");
 
     console.log("v86_network_bridge_state_test: ok");
 }

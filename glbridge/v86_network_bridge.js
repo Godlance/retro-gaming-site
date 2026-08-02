@@ -6,7 +6,7 @@
 (function(global) {
     "use strict";
 
-    const V86GL_BRIDGE_VERSION = "webgl-clean-v1-20260801-packed-arena-v1-packed-blob-v1-wasm-batch-v1-d8wg-m6-session-v3-20260802";
+    const V86GL_BRIDGE_VERSION = "webgl-clean-v1-20260801-packed-arena-v1-packed-blob-v1-wasm-batch-v1-d8wg-m6-session-v4-20260802";
     global.V86GL_BRIDGE_VERSION = V86GL_BRIDGE_VERSION;
     console.info("[v86gl] bridge version", V86GL_BRIDGE_VERSION);
 
@@ -4746,14 +4746,28 @@
             }
         }
 
-        async restoreStateJournal(checkpoint, operation) {
-            const parsed = this.parseStateJournal(checkpoint);
+        async restoreD3D8Checkpoint(checkpoint) {
+            if (!this.d3d8Executor ||
+                    typeof this.d3d8Executor.restoreState !== "function") {
+                return;
+            }
+            const bytes = checkpoint instanceof Uint8Array ? checkpoint :
+                new Uint8Array(checkpoint || []);
+            // A downloaded state may be loaded before the first live D3D8 batch
+            // has initialized WebGPU. Never let CREATE_DEVICE replay against a
+            // null GPUCanvasContext. The executor repeats this guard for direct
+            // callers, while the bridge-level await keeps guest work paused.
+            if (bytes.byteLength &&
+                    typeof this.d3d8Executor.initialize === "function") {
+                await this.d3d8Executor.initialize();
+            }
+            await this.d3d8Executor.restoreState(bytes);
+        }
+
+        async completeStateRestore(parsed, operation) {
             await this.replaceRendererForStateRestore(parsed, operation, true);
             try {
-                if (this.d3d8Executor &&
-                        typeof this.d3d8Executor.restoreState === "function") {
-                    this.d3d8Executor.restoreState(parsed.d3d8State);
-                }
+                await this.restoreD3D8Checkpoint(parsed.d3d8State);
                 if (operation === this.activeRestoreOperation) {
                     this.restoringState = false;
                     this.drainPendingCommands();
@@ -4767,8 +4781,13 @@
             }
         }
 
+        async restoreStateJournal(checkpoint, operation) {
+            const parsed = this.parseStateJournal(checkpoint);
+            await this.completeStateRestore(parsed, operation);
+        }
+
         async resetAfterLegacyStateRestore(operation) {
-            await this.replaceRendererForStateRestore({
+            await this.completeStateRestore({
                 entries: [],
                 journalBytes: 0,
                 d3d8State: new Uint8Array(0),

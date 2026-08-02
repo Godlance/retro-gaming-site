@@ -800,7 +800,49 @@ async function main() {
     const stateCheckpoint = executor.serializeState();
     assert.ok(stateCheckpoint.byteLength > 32,
         "save-state checkpoint must contain canonical D3D8 commands");
-    executor.restoreState(stateCheckpoint);
+
+    const coldFake = makeFakeWebGPU();
+    let coldContextRequests = 0;
+    const coldExecutor = new D3D8WebGPUExecutor({
+        width: 1,
+        height: 1,
+        getContext(name) {
+            assert.equal(name, "webgpu");
+            coldContextRequests++;
+            return coldFake.context;
+        },
+    }, { gpu: coldFake.gpu });
+    assert.equal(coldExecutor.context, null,
+        "the cold-restore regression must begin before WebGPU initialization");
+    await coldExecutor.restoreState(stateCheckpoint);
+    assert.equal(coldContextRequests, 1,
+        "cold restore must acquire a WebGPU canvas context exactly once");
+    assert.equal(coldExecutor.devices.has(deviceHandle), true,
+        "cold restore must replay CREATE_DEVICE only after initialization");
+    assert.equal(coldExecutor.resources.size, resourcesBeforeRestore,
+        "cold restore must rebuild every saved GPU resource");
+
+    const failedFake = makeFakeWebGPU();
+    const failedExecutor = new D3D8WebGPUExecutor({
+        width: 1,
+        height: 1,
+        getContext() { return null; },
+    }, { gpu: failedFake.gpu });
+    const preservedSession = { marker: "must survive initialization failure" };
+    failedExecutor.sessions.set("preserved", preservedSession);
+    const savedConsoleError = console.error;
+    console.error = () => {};
+    try {
+        await assert.rejects(failedExecutor.restoreState(stateCheckpoint),
+            /could not acquire a WebGPU canvas context/);
+    } finally {
+        console.error = savedConsoleError;
+    }
+    assert.strictEqual(failedExecutor.sessions.get("preserved"),
+        preservedSession,
+        "initialization failure must not clear the existing logical namespace");
+
+    await executor.restoreState(stateCheckpoint);
     assert.equal(executor.devices.has(deviceHandle), true);
     assert.equal(executor.resources.size, resourcesBeforeRestore,
         "state restore must rebuild each live resource exactly once");
@@ -1064,7 +1106,7 @@ async function main() {
     assert.equal(sessionExecutor.getStats().resourcesLive, 2);
 
     const multiSessionCheckpoint = sessionExecutor.serializeState();
-    sessionExecutor.restoreState(multiSessionCheckpoint);
+    await sessionExecutor.restoreState(multiSessionCheckpoint);
     assert.equal(sessionExecutor.getStats().sessionsLive, 2,
         "save/load must restore every live D3D8 process session");
     assert.equal(sessionExecutor.getStats().devicesLive, 2);

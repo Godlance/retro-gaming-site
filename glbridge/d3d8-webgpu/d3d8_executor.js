@@ -1159,7 +1159,7 @@ ${fragment.join("\n")}
             this.readyPromise = null;
             this.failed = null;
             await this.initialize();
-            this.restoreState(checkpoint);
+            this.restoreStateInitialized(checkpoint);
             this.stats.deviceRecoveries++;
             if (typeof this.options.onDeviceRecovered === "function")
                 this.options.onDeviceRecovered(info || {});
@@ -3089,9 +3089,7 @@ struct VertexOutput {
             this.retiredResourceHandles = new Set();
         }
 
-        restoreState(checkpoint) {
-            if (this.pendingSubmissions)
-                throw new Error("D3D8 commands are still in flight during restore");
+        restoreStateInitialized(checkpoint) {
             this.clearAllSessions();
             const bytes = checkpoint instanceof Uint8Array ? checkpoint :
                 new Uint8Array(checkpoint || []);
@@ -3123,6 +3121,25 @@ struct VertexOutput {
             }
             if (offset !== bytes.byteLength)
                 throw new Error("D3D8 checkpoint has trailing data");
+        }
+
+        restoreState(checkpoint) {
+            const owned = checkpoint instanceof Uint8Array ? checkpoint.slice() :
+                new Uint8Array(checkpoint || []).slice();
+            // Serialize restore against already accepted submissions. Callers may
+            // invoke this on a brand-new executor, so acquire/configure WebGPU
+            // before clearAllSessions() can mutate the live logical namespace.
+            // Assign the guarded barrier to `work` immediately: any later submit
+            // is forced behind the complete checkpoint replay.
+            const operation = this.work.then(async () => {
+                if (owned.byteLength) await this.initialize();
+                this.restoreStateInitialized(owned);
+                this.failed = null;
+            });
+            this.work = operation.catch(error => {
+                this.failed = error;
+            });
+            return operation;
         }
 
         getStats() {

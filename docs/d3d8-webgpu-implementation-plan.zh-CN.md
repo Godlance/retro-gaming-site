@@ -1024,7 +1024,7 @@ cache 必须有计数、命中率和上限。不要无界增长；场景切换�
 - 已实现 additional swap chain 的 COM 生命周期、backbuffer、Present window 路由和 Reset blocker；浏览器仍只有一个 D3D8 canvas，因此它提供兼容的单显示面路由，不模拟多 canvas 同时显示。
 - 已实现 render target/depth/image surface、lockable render target、`CopyRects`、`GetFrontBuffer`、`Set/GetRenderTarget`、`GetDepthStencilSurface`，以及 clear/copy/upload 路径的 CPU readback shadow。
 - `QueryInterface`、`GetDevice`、Surface `GetContainer`、parent/refcount、失败输出置空、跨 device 对象拒绝和常用尺寸/格式/锁参数边界已经收紧。
-- v86 save state 现在在 GL journal 后附带 canonical D3D8 checkpoint；load state 先清理当前 GPU namespace，再恢复保存时的 device/resource/state epoch，随后才释放排队的 guest 命令。
+- v86 save state 现在在 GL journal 后附带 canonical D3D8 checkpoint；load state 会先等待冷启动 WebGPU executor 取得并配置 `GPUCanvasContext`，再清理当前 GPU namespace、恢复保存时的 device/resource/state epoch，且只有初始化和回放全部成功后才释放排队的 guest 命令。初始化失败不会提前清除现有 D3D8 session。
 - 每个 XP D3D8 进程现在生成独立的 64 位 session cookie，并由每个 batch header 和 `HELLO` 双重声明；host 的 device/resource/retired-handle 表按 session 隔离。不同 EXE 即使从完全相同的数值 handle 起步，也不会互相销毁、Reset 或隐藏对方的 canvas；多 session checkpoint 会分记录保存和恢复。
 - WebGPU 没有同步 texture mapping。当前 readback 对 CPU upload、`Clear` 和 `CopyRects` 是精确的；仅由任意 GPU draw 产生的像素不会同步回写 guest shadow。Maple 不使用该冷路径；依赖它的其他游戏需要另行实现可暂停 guest 的异步 GPU readback 协议。
 
@@ -1061,7 +1061,7 @@ cache 必须有计数、命中率和上限。不要无界增长；场景切换�
 - host executor：192 次 create/destroy 后 live resource 数不增长，24 次 Reset 后只有一个 device 且零旧资源，72 条旧 epoch 命令被丢弃，并覆盖 device-lost 注入。
 - host executor：矩形 color/depth/stencil `Clear` 通过带 scissor 的 GPU clear draw 保持区域语义；被当前 command buffer 引用的 texture/buffer/depth/uniform 在 queue fence 完成后才物理销毁。
 - cross-process session：两个客体进程使用完全相同的 device/resource 数值句柄时仍可并存；销毁或延迟重放其中一个会话不会影响另一个，多会话 save/load 后隔离关系保持不变。
-- bridge state test：D3D8 checkpoint 字节随 v86 state 保存，恢复时只重建一次且字节完全一致，旧时间线的排队命令被清除。
+- bridge state test：D3D8 checkpoint 字节随 v86 state 保存；覆盖全新 executor 冷恢复、异步初始化失败不破坏 session、初始化期间 guest 命令继续排队，恢复时只重建一次且字节完全一致，旧时间线的排队命令被清除。
 
 发布门槛仍需一次真实 XP/browser 人工运行：四个 Stage 5 exe 标题均为 `PASS`，随后执行 Maple 登录、连续切图、save/load 后继续绘制及 10–30 分钟资源曲线观察。自动测试通过代表实现已落地，不替代这项最终长时间验收。
 
@@ -1539,7 +1539,7 @@ WebGPU 对象和 AudioWorklet 状态不能直接序列化进 v86 save state。
 
 下一步按以下顺序关闭阶段 5 的真实运行门槛：
 
-1. 同步部署 v1.6 `d3d8.dll`、`d3d8_executor.js` 和 bridge，硬刷新并确认版本串包含 `d8wg-m6-session-v3-20260802`。
+1. 同步部署 v1.6 `d3d8.dll`、`d3d8_executor.js` 和 bridge，硬刷新并确认版本串包含 `d8wg-m6-session-v4-20260802`。
 2. 运行 `build_stage5_tests.sh` 生成的四个 exe，确认标题均为 `PASS`；特别观察第二次 Reset、additional swap-chain blocker 和 RT readback。
 3. 启动 MapleStory，完成登录、角色选择、至少十次地图切换和 10–30 分钟运行，记录 `resourcesLive`、pipeline/cache 和浏览器 GPU memory 是否回到稳定平台。
 4. 保存 v86 state，继续改变地图/资源后再加载，确认恢复的画面和逻辑可继续绘制，且旧时间线没有闪回或 stale-handle warning。
