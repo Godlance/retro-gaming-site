@@ -6,7 +6,7 @@
     <meta name="description" content="Play a preserved classic PC game in your browser with v86.">
     <title>Play — Retro Gaming Site</title>
     <link rel="icon" href="data:,">
-    <link rel="stylesheet" href="styles.css?v=grid-layout-fix-20260712">
+    <link rel="stylesheet" href="styles.css?v=maplestory-accounts-20260802">
 </head>
 <body class="game-page">
     <header class="site-header">
@@ -86,6 +86,15 @@
                 </div>
             </section>
 
+            <section class="game-account-panel" id="game_account_panel" hidden aria-labelledby="game_account_title">
+                <div>
+                    <p class="section-kicker">Online account</p>
+                    <h2 id="game_account_title">New to MapleStory?</h2>
+                    <p>Create a game account before signing in from the client.</p>
+                </div>
+                <a class="button button-small button-warm" href="register.html">Register account</a>
+            </section>
+
             <section class="game-about">
                 <div>
                     <p class="section-kicker">About this game</p>
@@ -110,7 +119,8 @@
     <script src="glbridge/libglwasm/gl4es_loader.js?v=webgl-clean-v1-20260801"></script>
     <script src="glbridge/d3d8-webgpu/d3d8_executor.js?v=direct-webgpu-m6-session-v4-20260802"></script>
     <script src="glbridge/v86_network_bridge.js?v=direct-webgpu-m6-session-v4-20260802"></script>
-    <script src="game-assets.js?v=cube2-skinning-fix-20260718"></script>
-    <script src="app.js?v=cube2-skinning-fix-20260718"></script>
+    <script src="game-assets.js?v=maplestory-20260802"></script>
+    <script src="guest-automation.js?v=network-restore-20260802"></script>
+    <script src="app.js?v=maplestory-network-restore-20260802"></script>
 </body>
 </html>

@@ -3,6 +3,9 @@
 *.iso
 *.bin.zst
 .DS_Store
+.env
+node_modules/
+npm-debug.log*
 
 bios/
 game/

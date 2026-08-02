@@ -198,68 +198,15 @@ const GAMES = {
         size: 4294967296,
         stateurl: R2_URL_2 + '/windows98/states/windows98_audio_vga_2d_multidisk_residentevil2.bin.zst',
     },
-    'metal_slug_1': {
-        name: 'Metal Slug 1',
-        memorySize: 256 * 1024 * 1024,
+    'maplestory': {
+        name: 'MapleStory v83',
+        memorySize: 1024 * 1024 * 1024,
         systemDisk: '/windowsxp/windowsxpmultidisk/windowsxp_multidisk_C_2G.img.zst',
         systemDiskSize: 2147483648,
-        disk: R2_URL_2 + '/game/metalslug/metalslug.img.zst',
-        size: 1073741824,
-        stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_metalslug1.bin.zst',
-    },
-    'metal_slug_2': {
-        name: 'Metal Slug 2',
-        memorySize: 256 * 1024 * 1024,
-        systemDisk: '/windowsxp/windowsxpmultidisk/windowsxp_multidisk_C_2G.img.zst',
-        systemDiskSize: 2147483648,
-        disk: R2_URL_2 + '/game/metalslug/metalslug.img.zst',
-        size: 1073741824,
-        stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_metalslug2.bin.zst',
-    },
-    'metal_slug_3': {
-        name: 'Metal Slug 3',
-        memorySize: 256 * 1024 * 1024,
-        systemDisk: '/windowsxp/windowsxpmultidisk/windowsxp_multidisk_C_2G.img.zst',
-        systemDiskSize: 2147483648,
-        disk: R2_URL_2 + '/game/metalslug/metalslug.img.zst',
-        size: 1073741824,
-        stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_metalslug3.bin.zst',
-    },
-    'metal_slug_4': {
-        name: 'Metal Slug 4',
-        memorySize: 256 * 1024 * 1024,
-        systemDisk: '/windowsxp/windowsxpmultidisk/windowsxp_multidisk_C_2G.img.zst',
-        systemDiskSize: 2147483648,
-        disk: R2_URL_2 + '/game/metalslug/metalslug.img.zst',
-        size: 1073741824,
-        stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_metalslug4.bin.zst',
-    },
-    'metal_slug_5': {
-        name: 'Metal Slug 5',
-        memorySize: 256 * 1024 * 1024,
-        systemDisk: '/windowsxp/windowsxpmultidisk/windowsxp_multidisk_C_2G.img.zst',
-        systemDiskSize: 2147483648,
-        disk: R2_URL_2 + '/game/metalslug/metalslug.img.zst',
-        size: 1073741824,
-        stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_metalslug5.bin.zst',
-    },
-    'metal_slug_x': {
-        name: 'Metal Slug X',
-        memorySize: 256 * 1024 * 1024,
-        systemDisk: '/windowsxp/windowsxpmultidisk/windowsxp_multidisk_C_2G.img.zst',
-        systemDiskSize: 2147483648,
-        disk: R2_URL_2 + '/game/metalslug/metalslug.img.zst',
-        size: 1073741824,
-        stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_metalslugx.bin.zst',
-    },
-    'warcraft3': {
-        name: 'Warcraft III',
-        memorySize: 512 * 1024 * 1024,
-        systemDisk: '/windowsxp/windowsxpmultidisk/windowsxp_multidisk_C_2G.img.zst',
-        systemDiskSize: 2147483648,
-        disk: R2_URL_2 + '/game/warcraft3/warcraft3.img.zst',
-        size: 2634022912,
-        stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_warcraft3.bin.zst',
+        disk: R2_URL_2 + '/game/maplestory/maplestory.img.zst',
+        size: 2202009600,
+        networkRestoreCommand: 'cmd.exe /c "D:\\restore-network.bat"',
+        stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_maplestory.bin.zst',
     }    
 };
 
@@ -276,9 +223,7 @@ const GAME_PAGE_META = {
     age_of_empires_2: ["1999", "Strategy"], civilization_2: ["1996", "Strategy"], planescape_torment: ["1999", "RPG"],
     simcity_3000: ["1999", "Simulation"], icewind_dale_1: ["2000", "RPG"], icewind_dale_2: ["2002", "RPG"],
     need_for_speed_3: ["1998", "Racing"], dino_crisis: ["2000", "Survival"], resident_evil_2: ["1999", "Survival"],
-    metal_slug_1: ["1996", "Arcade"], metal_slug_2: ["1998", "Arcade"], metal_slug_3: ["2000", "Arcade"],
-    metal_slug_4: ["2002", "Arcade"], metal_slug_5: ["2003", "Arcade"], metal_slug_x: ["1999", "Arcade"],
-    warcraft3: ["2002", "Strategy"]
+    maplestory: ["2003", "MMORPG"]
 };
 const COVER_PALETTES = [
     ["#2c351b", "#a4cf54"], ["#321c1b", "#d3614f"], ["#172f35", "#55abc2"], ["#312541", "#9c70d2"],
@@ -316,6 +261,8 @@ function populateGamePage(gameId, game) {
     document.getElementById("play_count").textContent = count;
     document.getElementById("about_title").textContent = `${game.name}, preserved.`;
     document.getElementById("game_description").textContent = `${game.name} is preserved in a ready-to-play ${platform} environment. The complete system runs locally in your browser through v86 and WebAssembly, with downloadable emulator states so you can return to your session later.`;
+    const accountPanel = document.getElementById("game_account_panel");
+    if (accountPanel) accountPanel.hidden = gameId !== "maplestory";
     const cover = document.getElementById("mini_cover");
     cover.setAttribute("style", gameCoverStyle(gameId));
     const coverPath = GAME_COVERS[gameId];
@@ -438,6 +385,7 @@ function startEmulator9xMultiDisk(gameId) {
             type : "ne2k",
             relay_url: "wss://relay.widgetry.org/"
         },
+        preserve_mac_from_state_image: true,
         v86gl_pci: {
             port: 0xF100,
             maxBatchBytes: 16 * 1024 * 1024
@@ -644,8 +592,8 @@ window.onload = function() {
         const activeEmulator = emulator;
         const activeBridge = v86gl;
         const wasRunning = activeEmulator.is_running();
-        let restorePrepared = false;
-        let restoredLegacyState = false;
+        let bridgeRestorePending = false;
+        let restoreCompleted = false;
         stateOperationInProgress = true;
         updateStatus("Restoring state...");
         try {
@@ -655,30 +603,46 @@ window.onload = function() {
             }
             if (activeBridge && typeof activeBridge.beginStateRestore === "function") {
                 activeBridge.beginStateRestore();
-                restorePrepared = true;
+                bridgeRestorePending = true;
             }
 
             await activeEmulator.restore_state(stateData);
             if (activeBridge && typeof activeBridge.finishStateRestore === "function") {
-                const result = await activeBridge.finishStateRestore();
-                restoredLegacyState = !result.hasGLState;
+                await activeBridge.finishStateRestore();
+                bridgeRestorePending = false;
+            }
+            restoreCompleted = true;
+
+            if (emulator !== activeEmulator) {
+                throw new Error("The active emulator changed during state restore");
             }
 
-            if (wasRunning && emulator === activeEmulator) {
+            if (wasRunning || selectedGame.networkRestoreCommand) {
                 await activeEmulator.run();
             }
-            if (restoredLegacyState) {
-                updateStatus("Legacy state restored — save again to upgrade it");
+
+            if (selectedGame.networkRestoreCommand) {
+                if (!window.RetroGuestAutomation ||
+                    typeof window.RetroGuestAutomation.runWindowsCommand !== "function") {
+                    throw new Error("Guest command automation is unavailable");
+                }
+                updateStatus("State restored — recovering guest network...");
+                await window.RetroGuestAutomation.runWindowsCommand(
+                    activeEmulator,
+                    selectedGame.networkRestoreCommand
+                );
+                updateStatus("State restored — network recovery started");
             } else {
                 updateStatus("State Restored!");
             }
         } catch (err) {
-            if (restorePrepared && activeBridge &&
+            if (bridgeRestorePending && activeBridge &&
                 typeof activeBridge.cancelStateRestore === "function") {
                 activeBridge.cancelStateRestore();
             }
             console.error("Failed to restore emulator state:", err);
-            updateStatus("Restore Failed: " + (err && err.message || err));
+            updateStatus((restoreCompleted ? "State restored, but network recovery failed: " : "Restore Failed: ") +
+                (err && err.message || err));
             // A partially restored VM must stay paused; running it with an
             // incomplete WebGL reconstruction would recreate the corruption.
         } finally {

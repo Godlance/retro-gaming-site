@@ -24,13 +24,7 @@ const GAMES_LIBRARY = {
     need_for_speed_3: ["Need for Speed 3", "1998", "Racing", "Windows 98"],
     dino_crisis: ["Dino Crisis", "2000", "Survival", "Windows 98"],
     resident_evil_2: ["Resident Evil 2", "1999", "Survival", "Windows 98"],
-    metal_slug_1: ["Metal Slug 1", "1996", "Arcade", "Windows XP"],
-    metal_slug_2: ["Metal Slug 2", "1998", "Arcade", "Windows XP"],
-    metal_slug_3: ["Metal Slug 3", "2000", "Arcade", "Windows XP"],
-    metal_slug_4: ["Metal Slug 4", "2002", "Arcade", "Windows XP"],
-    metal_slug_5: ["Metal Slug 5", "2003", "Arcade", "Windows XP"],
-    metal_slug_x: ["Metal Slug X", "1999", "Arcade", "Windows XP"],
-    warcraft3: ["Warcraft III", "2002", "Strategy", "Windows XP"]
+    maplestory: ["MapleStory v83", "2003", "MMORPG", "Windows XP"]
 };
 
 const COVER_PALETTES = [

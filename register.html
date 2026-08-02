@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Create an account for the MapleStory v83 server.">
+    <title>Register for MapleStory — Retro Gaming Site</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="styles.css?v=maplestory-accounts-20260802">
+</head>
+<body class="register-page">
+    <header class="site-header">
+        <a class="brand" href="index.html" aria-label="Retro Gaming Site home">
+            <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+            <span>Retro Gaming Site</span>
+        </a>
+        <nav class="header-actions" aria-label="Registration navigation">
+            <a class="text-link" href="game.html?id=maplestory">Back to MapleStory</a>
+        </nav>
+    </header>
+
+    <main class="registration-shell">
+        <section class="registration-intro">
+            <p class="section-kicker">MapleStory v83</p>
+            <h1>Create your account.</h1>
+            <p>Register once, then return to the browser game and sign in with the same username and password.</p>
+        </section>
+
+        <section class="registration-card" aria-labelledby="registration_title">
+            <h2 id="registration_title">Account details</h2>
+            <form id="registration_form" novalidate>
+                <label for="username">Username</label>
+                <input id="username" name="username" type="text" minlength="4" maxlength="13"
+                       pattern="[A-Za-z0-9]{4,13}" autocomplete="username" required
+                       aria-describedby="username_help">
+                <p class="field-help" id="username_help">4–13 letters or numbers.</p>
+
+                <label for="password">Password</label>
+                <input id="password" name="password" type="password" minlength="6" maxlength="32"
+                       autocomplete="new-password" required aria-describedby="password_help">
+                <p class="field-help" id="password_help">6–32 characters, with no spaces. Do not reuse another password.</p>
+
+                <label for="confirm_password">Confirm password</label>
+                <input id="confirm_password" name="confirmPassword" type="password" minlength="6" maxlength="32"
+                       autocomplete="new-password" required>
+
+                <button class="button button-warm registration-submit" id="registration_submit" type="submit">
+                    Create account
+                </button>
+                <p class="registration-status" id="registration_status" role="status" aria-live="polite"></p>
+            </form>
+        </section>
+    </main>
+
+    <footer class="site-footer compact-footer">
+        <p>Credentials are sent only to this site's registration service.</p>
+        <a href="privacy.html">Privacy</a>
+    </footer>
+
+    <script src="register.js?v=maplestory-accounts-20260802"></script>
+</body>
+</html>

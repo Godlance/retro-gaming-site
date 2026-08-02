@@ -1,6 +1,6 @@
-retrogaming.dpdns.org
+# Retro Gaming Site
 
-A site for retrogaming based on Github V86 project.
+A browser-based retro gaming site built on v86, with a direct D3D8-to-WebGPU path.
 
 ## Site structure
 
@@ -8,8 +8,42 @@ A site for retrogaming based on Github V86 project.
 - `game.html?id=<game-id>` + `app.js`: shared game detail/emulator page. Every game has its own stable URL without duplicating the v86 UI.
 - Common emulator controls: save state, load state, insert CD, eject CD, and full screen.
 - Game-specific controls: add entries in `populateGamePage()` in `app.js`. Diablo II currently exposes a `retro:game-action` event hook for future save-file integration.
+- MapleStory uses `game/maplestory.img` as its secondary disk and exposes an account-registration link below the emulator.
 
 For site-wide popularity across all visitors, replace the local play-count storage with a backend analytics endpoint while keeping the same sorting interface.
+
+## MapleStory state restore networking
+
+Copy [`guest/restore-network.bat`](guest/restore-network.bat) into the root of the MapleStory disk so that Windows XP sees it as `D:\restore-network.bat` (the secondary hard disk; the driver CD is normally `E:`). After a user loads a state, the page waits for the v86 and D3D8 restore to finish, resumes the VM, opens the Windows Run dialog, and executes the batch file.
+
+The emulator also preserves the NIC MAC address from the state image. The batch assumes that the adapter is named `Local Area Connection`. If the image uses another name, either rename the connection in Windows or change `networkRestoreCommand` in `app.js` to pass that name as the first argument.
+
+## MapleStory account registration service
+
+The browser never connects directly to MariaDB. `register.html` posts to the same-origin Node endpoint, which validates the input, applies Cosmic-compatible password hashing, and inserts the account with a parameterized query.
+
+1. Create a dedicated MariaDB user restricted to the web server host. It only needs `INSERT` on `cosmic.accounts`; do not use the MariaDB root account.
+2. Copy `.env.example` to `.env` and set `COSMIC_DB_USER`, `COSMIC_DB_PASSWORD`, and the public HTTPS origin.
+3. Install dependencies with `npm install`.
+4. Start the site and registration endpoint together with `npm start`.
+
+Example least-privilege database setup, replacing both placeholders:
+
+```sql
+CREATE USER 'retro_registration'@'<web-server-ip>' IDENTIFIED BY '<long-random-password>';
+GRANT INSERT ON cosmic.accounts TO 'retro_registration'@'<web-server-ip>';
+FLUSH PRIVILEGES;
+```
+
+Cosmic currently defaults to bcrypt password migration. The service therefore uses bcrypt cost 12 by default, matching Cosmic's registration code. If the deployed server has `BCRYPT_MIGRATION: false`, set `COSMIC_PASSWORD_ALGORITHM=sha512` before registering accounts.
+
+MariaDB must not be exposed to arbitrary internet clients. Firewall port 3306 so only the web server can reach it, and serve the registration form over HTTPS.
+
+Run the Node regression suite with:
+
+```sh
+npm test
+```
 
 Games:
 Heros Of Might and Magic III
@@ -26,3 +60,4 @@ Fallout 2
 Age Of Empire II
 Civilization II
 CounterStrike 1.5
+MapleStory v83

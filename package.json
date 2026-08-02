@@ -1,0 +1,20 @@
+{
+  "name": "retro-gaming-site",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser-based classic PC games with a MapleStory account registration service.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "bcryptjs": "3.0.2",
+    "dotenv": "16.6.1",
+    "express": "5.1.0",
+    "mysql2": "3.14.3"
+  }
+}

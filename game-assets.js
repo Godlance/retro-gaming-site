@@ -23,11 +23,5 @@ window.RETRO_GAME_COVERS = Object.freeze({
     need_for_speed_3: "images/nfs3.jpeg",
     dino_crisis: "images/dinocrisis.jpeg",
     resident_evil_2: "images/residentevil2.jpeg",
-    metal_slug_1: "images/metalslug1.jpeg",
-    metal_slug_2: "images/metalslug2.jpeg",
-    metal_slug_3: "images/metalslug3.jpeg",
-    metal_slug_4: "images/metalslug4.jpeg",
-    metal_slug_5: "images/metalslug5.jpeg",
-    metal_slug_x: "images/metalslugx.jpeg",
-    warcraft3: "images/warcraft3.jpeg"
+    maplestory: "images/maplestory.jpeg"
 });

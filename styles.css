@@ -896,6 +896,41 @@ input:focus-visible {
     border-bottom: 1px solid var(--line);
 }
 
+.game-account-panel {
+    display: flex;
+    margin-top: 18px;
+    padding: 22px 24px;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+    border: 1px solid rgba(200, 255, 101, 0.22);
+    border-radius: 6px;
+    background: linear-gradient(110deg, rgba(200, 255, 101, 0.075), rgba(255, 255, 255, 0.018));
+}
+
+.game-account-panel[hidden] {
+    display: none;
+}
+
+.game-account-panel h2,
+.game-account-panel p {
+    margin: 0;
+}
+
+.game-account-panel h2 {
+    font-size: 1.15rem;
+}
+
+.game-account-panel > div > p:last-child {
+    margin-top: 7px;
+    color: var(--muted);
+    font-size: 0.76rem;
+}
+
+.game-account-panel .button {
+    flex: 0 0 auto;
+}
+
 .game-about .section-kicker {
     margin-bottom: 9px;
 }
@@ -909,6 +944,106 @@ input:focus-visible {
 
 .compact-footer {
     min-height: 92px;
+}
+
+.registration-shell {
+    display: grid;
+    width: min(calc(100% - 48px), 980px);
+    min-height: calc(100vh - 170px);
+    margin: 0 auto;
+    padding: 72px 0;
+    grid-template-columns: minmax(0, 0.85fr) minmax(340px, 1fr);
+    align-items: center;
+    gap: 72px;
+}
+
+.registration-intro h1 {
+    max-width: 560px;
+    margin: 8px 0 20px;
+    font-size: clamp(2.8rem, 7vw, 5.4rem);
+    line-height: 0.94;
+    letter-spacing: -0.07em;
+}
+
+.registration-intro > p:last-child {
+    max-width: 500px;
+    color: var(--muted);
+    font-size: 0.9rem;
+    line-height: 1.75;
+}
+
+.registration-card {
+    padding: 34px;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    box-shadow: 0 30px 90px rgba(0, 0, 0, 0.22);
+}
+
+.registration-card h2 {
+    margin: 0 0 28px;
+    font-size: 1.25rem;
+}
+
+.registration-card form {
+    display: grid;
+}
+
+.registration-card label {
+    margin-bottom: 8px;
+    color: var(--ink);
+    font-size: 0.74rem;
+    font-weight: 700;
+}
+
+.registration-card input {
+    width: 100%;
+    min-height: 48px;
+    padding: 0 14px;
+    border: 1px solid var(--line-strong);
+    border-radius: 5px;
+    background: #0f100e;
+    color: var(--ink);
+}
+
+.registration-card input:focus {
+    border-color: rgba(200, 255, 101, 0.55);
+}
+
+.field-help {
+    min-height: 17px;
+    margin: 7px 0 20px;
+    color: var(--muted-2);
+    font-size: 0.66rem;
+}
+
+.registration-submit {
+    width: 100%;
+    margin-top: 8px;
+    border: 0;
+    cursor: pointer;
+}
+
+.registration-submit:disabled {
+    cursor: wait;
+    opacity: 0.58;
+}
+
+.registration-status {
+    min-height: 22px;
+    margin: 18px 0 0;
+    color: var(--muted);
+    font-size: 0.74rem;
+    line-height: 1.5;
+    text-align: center;
+}
+
+.registration-status.is-error {
+    color: #ff9b8e;
+}
+
+.registration-status.is-success {
+    color: var(--acid);
 }
 
 @media (max-width: 1460px) {
@@ -954,6 +1089,11 @@ input:focus-visible {
     .custom-controls:not(:empty) {
         margin-left: 0;
     }
+
+    .registration-shell {
+        grid-template-columns: 1fr;
+        gap: 38px;
+    }
 }
 
 @media (max-width: 720px) {
@@ -961,7 +1101,8 @@ input:focus-visible {
     .library-hero,
     .site-footer,
     .library-shell,
-    .game-layout {
+    .game-layout,
+    .registration-shell {
         width: min(calc(100% - 28px), var(--page-width));
     }
 
@@ -1090,6 +1231,20 @@ input:focus-visible {
         padding-top: 40px;
         grid-template-columns: 1fr;
         gap: 0;
+    }
+
+    .game-account-panel {
+        padding: 18px;
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .registration-shell {
+        padding: 48px 0;
+    }
+
+    .registration-card {
+        padding: 24px 18px;
     }
 }
 
