@@ -335,6 +335,43 @@ function hideProgress() {
     progressContainer.classList.add("hidden");
 }
 
+function waitForGuest(milliseconds) {
+    return new Promise(function(resolve) {
+        setTimeout(resolve, milliseconds);
+    });
+}
+
+async function refreshMapleStoryNetwork(activeEmulator) {
+    try {
+        await waitForGuest(4000);
+        if (emulator !== activeEmulator) return;
+
+        await activeEmulator.keyboard_send_scancodes([
+            0xE0, 0x5B,
+            0x13, 0x93,
+            0xE0, 0xDB,
+        ], 50);
+        await waitForGuest(800);
+        if (emulator !== activeEmulator) return;
+
+        await activeEmulator.keyboard_send_text("cmd", 50);
+        await activeEmulator.keyboard_send_keys([13]);
+        await waitForGuest(1500);
+        if (emulator !== activeEmulator) return;
+
+        await activeEmulator.keyboard_send_text("ipconfig /release", 35);
+        await activeEmulator.keyboard_send_keys([13]);
+        await waitForGuest(2500);
+        if (emulator !== activeEmulator) return;
+
+        await activeEmulator.keyboard_send_text("ipconfig /renew", 35);
+        await activeEmulator.keyboard_send_keys([13]);
+        console.info("MapleStory guest network refresh commands sent");
+    } catch (error) {
+        console.error("Failed to refresh MapleStory guest network:", error);
+    }
+}
+
 function startEmulator9xMultiDisk(gameId) {
 
     const game = GAMES[gameId];
@@ -384,7 +421,8 @@ function startEmulator9xMultiDisk(gameId) {
             type : "ne2k",
             relay_url: "wss://relay.widgetry.org/"
         },
-        preserve_mac_from_state_image: true,
+        preserve_mac_from_state_image: false,
+        mac_address_translation: true,
         v86gl_pci: {
             port: 0xF100,
             maxBatchBytes: 16 * 1024 * 1024
@@ -394,10 +432,10 @@ function startEmulator9xMultiDisk(gameId) {
         audio: true,
         autostart: true
     });
-    attachEmulatorListeners(emulator);
+    attachEmulatorListeners(emulator, gameId);
 }
 
-function attachEmulatorListeners(emulator) {
+function attachEmulatorListeners(emulator, gameId) {
     const glCanvas = document.getElementById("v86gl_canvas");
     const d3d8Canvas = document.getElementById("d3d8_webgpu_canvas");
     let glCanvasObserver = null;
@@ -445,6 +483,9 @@ function attachEmulatorListeners(emulator) {
         const pci = emulator.v86 && emulator.v86.cpu && emulator.v86.cpu.devices.v86gl_pci;
         if (!pci) {
             console.error("[v86gl] PCI device is missing from this libv86.js build");
+        }
+        if (gameId === "maplestory") {
+            refreshMapleStoryNetwork(emulator);
         }
     });
 
