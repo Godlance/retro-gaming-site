@@ -205,7 +205,6 @@ const GAMES = {
         systemDiskSize: 2147483648,
         disk: R2_URL_2 + '/game/maplestory/maplestory.img.zst',
         size: 2202009600,
-        networkRestoreCommand: 'cmd.exe /c "D:\\restore-network.bat"',
         stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_maplestory.bin.zst',
     }    
 };
@@ -617,31 +616,18 @@ window.onload = function() {
                 throw new Error("The active emulator changed during state restore");
             }
 
-            if (wasRunning || selectedGame.networkRestoreCommand) {
+            if (wasRunning) {
                 await activeEmulator.run();
             }
 
-            if (selectedGame.networkRestoreCommand) {
-                if (!window.RetroGuestAutomation ||
-                    typeof window.RetroGuestAutomation.runWindowsCommand !== "function") {
-                    throw new Error("Guest command automation is unavailable");
-                }
-                updateStatus("State restored — recovering guest network...");
-                await window.RetroGuestAutomation.runWindowsCommand(
-                    activeEmulator,
-                    selectedGame.networkRestoreCommand
-                );
-                updateStatus("State restored — network recovery started");
-            } else {
-                updateStatus("State Restored!");
-            }
+            updateStatus("State Restored!");
         } catch (err) {
             if (bridgeRestorePending && activeBridge &&
                 typeof activeBridge.cancelStateRestore === "function") {
                 activeBridge.cancelStateRestore();
             }
             console.error("Failed to restore emulator state:", err);
-            updateStatus((restoreCompleted ? "State restored, but network recovery failed: " : "Restore Failed: ") +
+            updateStatus((restoreCompleted ? "State restored, but resume failed: " : "Restore Failed: ") +
                 (err && err.message || err));
             // A partially restored VM must stay paused; running it with an
             // incomplete WebGL reconstruction would recreate the corruption.

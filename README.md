@@ -12,12 +12,6 @@ A browser-based retro gaming site built on v86, with a direct D3D8-to-WebGPU pat
 
 For site-wide popularity across all visitors, replace the local play-count storage with a backend analytics endpoint while keeping the same sorting interface.
 
-## MapleStory state restore networking
-
-Copy [`guest/restore-network.bat`](guest/restore-network.bat) into the root of the MapleStory disk so that Windows XP sees it as `D:\restore-network.bat` (the secondary hard disk; the driver CD is normally `E:`). After a user loads a state, the page waits for the v86 and D3D8 restore to finish, resumes the VM, opens the Windows Run dialog, and executes the batch file.
-
-The emulator also preserves the NIC MAC address from the state image. The batch assumes that the adapter is named `Local Area Connection`. If the image uses another name, either rename the connection in Windows or change `networkRestoreCommand` in `app.js` to pass that name as the first argument.
-
 ## MapleStory account registration service
 
 The browser never connects directly to MariaDB. `register.html` posts to the same-origin Node endpoint, which validates the input, applies Cosmic-compatible password hashing, and inserts the account with a parameterized query.
