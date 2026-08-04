@@ -12,7 +12,7 @@
     const D8WG_CHECKPOINT_MAGIC = 0x43533844; // "D8SC"
     const D8WG_CHECKPOINT_VERSION = 1;
     const D8WG_VERSION_MAJOR = 1;
-    const D8WG_VERSION_MINOR = 6;
+    const D8WG_VERSION_MINOR = 7;
     const D8WG_BATCH_HEADER_BYTES = 32;
     const D8WG_COMMAND_HEADER_BYTES = 16;
 
@@ -29,6 +29,8 @@
     const OP_DESTROY_RESOURCE = 0x103;
     const OP_CREATE_TEXTURE = 0x110;
     const OP_UPDATE_TEXTURE = 0x111;
+    const OP_CREATE_VERTEX_SHADER = 0x120;
+    const OP_CREATE_PIXEL_SHADER = 0x121;
     const OP_SET_RENDER_STATE = 0x200;
     const OP_SET_TEXTURE_STAGE_STATE = 0x201;
     const OP_SET_TEXTURE = 0x202;
@@ -41,6 +43,10 @@
     const OP_SET_INDICES = 0x209;
     const OP_SET_VERTEX_FORMAT = 0x20A;
     const OP_SET_RENDER_TARGET = 0x20B;
+    const OP_SET_VERTEX_SHADER = 0x20C;
+    const OP_SET_PIXEL_SHADER = 0x20D;
+    const OP_SET_VERTEX_SHADER_CONSTANT = 0x20E;
+    const OP_SET_PIXEL_SHADER_CONSTANT = 0x20F;
     const OP_DRAW_PRIMITIVE = 0x300;
     const OP_DRAW_INDEXED_PRIMITIVE = 0x301;
     const OP_DRAW_PRIMITIVE_UP = 0x302;
@@ -49,6 +55,10 @@
     const RESOURCE_BUFFER_VERTEX = 1;
     const RESOURCE_BUFFER_INDEX = 2;
     const RESOURCE_TEXTURE_2D = 3;
+    const RESOURCE_VERTEX_SHADER = 4;
+    const RESOURCE_PIXEL_SHADER = 5;
+    const D8WG_MAX_VS_CONSTANTS = 96;
+    const D8WG_MAX_PS_CONSTANTS = 8;
     const D3DUSAGE_RENDERTARGET = 0x1;
     const D3DFMT_A8R8G8B8 = 21;
     const D3DFMT_X8R8G8B8 = 22;
@@ -798,6 +808,581 @@ ${fragment.join("\n")}
 `;
     }
 
+    // ---- Stage 6: D3D8 shader model 1.x bytecode -> WGSL translation ----
+    //
+    // Token layout constants mirror the real D3D8 SDK bit patterns exactly
+    // (see d3d8types.h) since guest-compiled shader bytecode is genuine
+    // Microsoft-format SM1.x tokens, not a project-invented encoding. The
+    // guest (d3d8_proxy.c: validate_shader_body) enforces the identical
+    // supported-instruction table before a shader is ever created, so this
+    // translator should never actually see an unsupported opcode from a
+    // well-behaved guest build -- but it re-checks independently rather than
+    // trusting the wire, per the "host validates before executing" rule.
+    const D3DSI_OPCODE_MASK = 0x0000FFFF;
+    const D3DSI_COMMENTSIZE_SHIFT = 16;
+    const D3DSI_COMMENTSIZE_MASK = 0x7FFF << D3DSI_COMMENTSIZE_SHIFT;
+    const D3DSP_REGNUM_MASK = 0x000007FF;
+    const D3DSP_DSTMOD_SHIFT = 20;
+    const D3DSP_DSTMOD_MASK = 0xF << D3DSP_DSTMOD_SHIFT;
+    const D3DSPDM_SATURATE = 1;
+    const D3DSP_DSTSHIFT_SHIFT = 24;
+    const D3DSP_DSTSHIFT_MASK = 0xF << D3DSP_DSTSHIFT_SHIFT;
+    const D3DSP_REGTYPE_SHIFT = 28;
+    const D3DSP_REGTYPE_MASK = 0x7 << D3DSP_REGTYPE_SHIFT;
+    const D3DSPR_TEMP = 0 << D3DSP_REGTYPE_SHIFT;
+    const D3DSPR_INPUT = 1 << D3DSP_REGTYPE_SHIFT;
+    const D3DSPR_CONST = 2 << D3DSP_REGTYPE_SHIFT;
+    const D3DSPR_TEXTURE = 3 << D3DSP_REGTYPE_SHIFT; // == D3DSPR_ADDR
+    const D3DSPR_RASTOUT = 4 << D3DSP_REGTYPE_SHIFT;
+    const D3DSPR_ATTROUT = 5 << D3DSP_REGTYPE_SHIFT;
+    const D3DSPR_TEXCRDOUT = 6 << D3DSP_REGTYPE_SHIFT;
+    const D3DSP_SWIZZLE_SHIFT = 16;
+    const D3DSP_SRCMOD_SHIFT = 24;
+    const D3DSP_SRCMOD_MASK = 0xF << D3DSP_SRCMOD_SHIFT;
+
+    const D3DSIO_NOP = 0, D3DSIO_MOV = 1, D3DSIO_ADD = 2, D3DSIO_SUB = 3,
+        D3DSIO_MAD = 4, D3DSIO_MUL = 5, D3DSIO_RCP = 6, D3DSIO_RSQ = 7,
+        D3DSIO_DP3 = 8, D3DSIO_DP4 = 9, D3DSIO_MIN = 10, D3DSIO_MAX = 11,
+        D3DSIO_SLT = 12, D3DSIO_SGE = 13, D3DSIO_EXP = 14, D3DSIO_LOG = 15,
+        D3DSIO_LIT = 16, D3DSIO_DST = 17, D3DSIO_LRP = 18, D3DSIO_FRC = 19,
+        D3DSIO_TEXCOORD = 64, D3DSIO_TEXKILL = 65, D3DSIO_TEX = 66,
+        D3DSIO_EXPP = 78, D3DSIO_LOGP = 79, D3DSIO_CND = 80, D3DSIO_DEF = 81,
+        D3DSIO_CMP = 88, D3DSIO_PHASE = 0xFFFD, D3DSIO_COMMENT = 0xFFFE,
+        D3DSIO_END = 0xFFFF;
+
+    const D3DVSD_TOKENTYPESHIFT = 29;
+    const D3DVSD_TOKEN_STREAMDATA = 2;
+    const D3DVSD_TOKEN_END = 7;
+    const D3DVSD_DATATYPESHIFT = 16;
+    const D3DVSD_VERTEXREGMASK = 0x1F;
+    const D3DVSD_SKIPFLAG = 0x10000000;
+
+    // Number of DWORD parameter tokens following the opcode token. DEF's
+    // four trailing tokens are raw float32 immediates, not registers,
+    // flagged via isDef. Returns null for anything outside the Stage 6
+    // supported instruction set for this shader type/version -- matches
+    // shader_opcode_supported() in d3d8_proxy.c exactly.
+    function shaderOpcodeInfo(opcode, isPixelShader, minor) {
+        switch (opcode) {
+        case D3DSIO_NOP: return { operandWords: 0 };
+        case D3DSIO_MOV: return { operandWords: 2 };
+        case D3DSIO_ADD: case D3DSIO_SUB: case D3DSIO_MUL:
+        case D3DSIO_MIN: case D3DSIO_MAX: case D3DSIO_DP3: case D3DSIO_DP4:
+            return { operandWords: 3 };
+        case D3DSIO_MAD: return { operandWords: 4 };
+        case D3DSIO_RCP: case D3DSIO_RSQ: case D3DSIO_EXP: case D3DSIO_LOG:
+        case D3DSIO_LIT: case D3DSIO_FRC: case D3DSIO_EXPP: case D3DSIO_LOGP:
+            return isPixelShader ? null : { operandWords: 2 };
+        case D3DSIO_SLT: case D3DSIO_SGE: case D3DSIO_DST:
+            return isPixelShader ? null : { operandWords: 3 };
+        case D3DSIO_DEF: return { operandWords: 5, isDef: true };
+        case D3DSIO_LRP:
+            return isPixelShader ? { operandWords: 4 } : null;
+        case D3DSIO_CND:
+            return (isPixelShader && minor <= 3) ? { operandWords: 4 } : null;
+        case D3DSIO_CMP:
+            return (isPixelShader && minor >= 2) ? { operandWords: 4 } : null;
+        case D3DSIO_TEXCOORD:
+            return isPixelShader ? { operandWords: 1 } : null;
+        case D3DSIO_TEX:
+            return isPixelShader ?
+                { operandWords: minor >= 4 ? 2 : 1 } : null;
+        case D3DSIO_TEXKILL:
+            return isPixelShader ? { operandWords: 1 } : null;
+        case D3DSIO_PHASE:
+            return (isPixelShader && minor === 4) ? { operandWords: 0 } : null;
+        default:
+            return null;
+        }
+    }
+
+    function regType(token) { return (token & D3DSP_REGTYPE_MASK) >>> 0; }
+    function regNum(token) { return (token & D3DSP_REGNUM_MASK) >>> 0; }
+    function dstWriteMaskBits(token) { return (token >>> 16) & 0xF; }
+    function dstSaturates(token) {
+        return ((token & D3DSP_DSTMOD_MASK) >>> D3DSP_DSTMOD_SHIFT) ===
+            D3DSPDM_SATURATE;
+    }
+    function dstShiftAmount(token) {
+        let shift = (token & D3DSP_DSTSHIFT_MASK) >>> D3DSP_DSTSHIFT_SHIFT;
+        if (shift >= 8) shift -= 16; // 4-bit two's-complement nibble
+        return shift;
+    }
+    function srcSwizzleByte(token) { return (token >>> D3DSP_SWIZZLE_SHIFT) & 0xFF; }
+    function srcModifierBits(token) {
+        return (token & D3DSP_SRCMOD_MASK) >>> D3DSP_SRCMOD_SHIFT;
+    }
+
+    function swizzleSuffix(swizzleByte) {
+        const letters = "xyzw";
+        let suffix = "";
+        for (let i = 0; i < 4; i++)
+            suffix += letters[(swizzleByte >>> (i * 2)) & 3];
+        return suffix;
+    }
+
+    function writeMaskSuffix(mask) {
+        let suffix = "";
+        if (mask & 1) suffix += "x";
+        if (mask & 2) suffix += "y";
+        if (mask & 4) suffix += "z";
+        if (mask & 8) suffix += "w";
+        return suffix;
+    }
+
+    function applySourceModifier(expr, modifier) {
+        switch (modifier) {
+        case 0x0: return expr; // D3DSPSM_NONE
+        case 0x1: return "(-" + expr + ")"; // D3DSPSM_NEG
+        case 0x2: return "(" + expr + " - vec4<f32>(0.5))"; // D3DSPSM_BIAS
+        case 0x6: return "(vec4<f32>(1.0) - " + expr + ")"; // D3DSPSM_COMP
+        case 0xB: return "abs(" + expr + ")"; // D3DSPSM_ABS
+        default:
+            throw new Error("unsupported D3D8 source register modifier 0x" +
+                modifier.toString(16));
+        }
+    }
+
+    function applyDestModifiers(resultExpr, dstToken) {
+        const shift = dstShiftAmount(dstToken);
+        const shiftFactor = { 0: null, 1: 2, 2: 4, 3: 8,
+            "-1": 0.5, "-2": 0.25, "-3": 0.125 }[shift];
+        if (shift !== 0) {
+            if (shiftFactor === undefined)
+                throw new Error("unsupported D3D8 destination shift " + shift);
+            resultExpr = "(" + resultExpr + " * " + shiftFactor + ")";
+        }
+        if (dstSaturates(dstToken))
+            resultExpr = "clamp(" + resultExpr +
+                ", vec4<f32>(0.0), vec4<f32>(1.0))";
+        return resultExpr;
+    }
+
+    // Walks one D3D8 SM1.x token stream starting right after the version
+    // token. `registerExpr(token)` returns the WGSL base expression (before
+    // swizzle/modifier) for a register-encoded operand token; throwing from
+    // it (e.g. an undeclared vertex input, an out-of-range constant) aborts
+    // translation the same way an unsupported opcode does. `emitInstruction`
+    // receives (opcode, dstToken, [sourceExprStrings], rawTokens) and pushes
+    // WGSL statement(s) for one instruction; DEF is intercepted before this
+    // callback runs. Returns nothing; throws on anything outside the Stage 6
+    // supported instruction set or a truncated/malformed stream.
+    function walkShaderBody(tokens, isPixelShader, minor, registerExpr,
+            emitInstruction) {
+        const defConstants = new Map();
+        // Pre-pass: shader-embedded constants (DEF) override whatever the
+        // application sets via Set{Vertex,Pixel}ShaderConstant for that
+        // register, per D3D8 semantics, so the main pass needs to know about
+        // them before it ever emits a read of a constant register.
+        for (let offset = 0; offset < tokens.length;) {
+            const token = tokens[offset] >>> 0;
+            if (token === D3DSIO_END) break;
+            const opcode = token & D3DSI_OPCODE_MASK;
+            if (opcode === D3DSIO_COMMENT) {
+                offset += 1 + ((token & D3DSI_COMMENTSIZE_MASK) >>>
+                    D3DSI_COMMENTSIZE_SHIFT);
+                continue;
+            }
+            const info = shaderOpcodeInfo(opcode, isPixelShader, minor);
+            if (!info)
+                throw new Error("unsupported D3D8 shader opcode 0x" +
+                    opcode.toString(16));
+            if (offset + 1 + info.operandWords > tokens.length)
+                throw new Error("truncated D3D8 shader instruction 0x" +
+                    opcode.toString(16));
+            if (opcode === D3DSIO_DEF) {
+                const dst = tokens[offset + 1] >>> 0;
+                defConstants.set(regNum(dst), [
+                    dwordFloat(tokens[offset + 2] >>> 0),
+                    dwordFloat(tokens[offset + 3] >>> 0),
+                    dwordFloat(tokens[offset + 4] >>> 0),
+                    dwordFloat(tokens[offset + 5] >>> 0),
+                ]);
+            }
+            offset += 1 + info.operandWords;
+        }
+
+        const constExpr = (token) => {
+            if (regType(token) === D3DSPR_CONST) {
+                const literal = defConstants.get(regNum(token));
+                if (literal)
+                    return "vec4<f32>(" + literal.map(v =>
+                        Number.isFinite(v) ? v.toExponential() : "0.0")
+                        .join(", ") + ")";
+            }
+            return registerExpr(token);
+        };
+
+        for (let offset = 0; offset < tokens.length;) {
+            const token = tokens[offset] >>> 0;
+            if (token === D3DSIO_END) return;
+            const opcode = token & D3DSI_OPCODE_MASK;
+            if (opcode === D3DSIO_COMMENT) {
+                offset += 1 + ((token & D3DSI_COMMENTSIZE_MASK) >>>
+                    D3DSI_COMMENTSIZE_SHIFT);
+                continue;
+            }
+            const info = shaderOpcodeInfo(opcode, isPixelShader, minor);
+            if (!info)
+                throw new Error("unsupported D3D8 shader opcode 0x" +
+                    opcode.toString(16));
+            if (offset + 1 + info.operandWords > tokens.length)
+                throw new Error("truncated D3D8 shader instruction 0x" +
+                    opcode.toString(16));
+            if (opcode !== D3DSIO_DEF && opcode !== D3DSIO_NOP &&
+                    opcode !== D3DSIO_PHASE) {
+                const dstToken = tokens[offset + 1] >>> 0;
+                const sourceCount = info.operandWords - 1;
+                const sources = [];
+                for (let i = 0; i < sourceCount; i++) {
+                    const srcToken = tokens[offset + 2 + i] >>> 0;
+                    const base = constExpr(srcToken) + "." +
+                        swizzleSuffix(srcSwizzleByte(srcToken));
+                    sources.push(applySourceModifier(base,
+                        srcModifierBits(srcToken)));
+                }
+                emitInstruction(opcode, dstToken, sources, tokens, offset);
+            }
+            offset += 1 + info.operandWords;
+        }
+        // Running off the end of the token array terminates the body just
+        // like an explicit D3DSIO_END. The D8WG wire format carries an exact
+        // instruction_token_count and the guest strips the trailing END
+        // sentinel before sending (see d3d8_proxy.c), so the array bounds --
+        // not a sentinel search -- are what actually delimit the stream.
+        // Truncation is still caught, by the per-instruction bounds check
+        // above.
+    }
+
+    function instructionExpression(opcode, sources) {
+        const [s0, s1, s2] = sources;
+        switch (opcode) {
+        case D3DSIO_MOV: return s0;
+        case D3DSIO_ADD: return "(" + s0 + " + " + s1 + ")";
+        case D3DSIO_SUB: return "(" + s0 + " - " + s1 + ")";
+        case D3DSIO_MUL: return "(" + s0 + " * " + s1 + ")";
+        case D3DSIO_MAD: return "(" + s0 + " * " + s1 + " + " + s2 + ")";
+        case D3DSIO_RCP: return "vec4<f32>(1.0 / (" + s0 + ").x)";
+        case D3DSIO_RSQ:
+            return "vec4<f32>(inverseSqrt(max(abs((" + s0 + ").x), 1e-12)))";
+        case D3DSIO_DP3:
+            return "vec4<f32>(dot((" + s0 + ").xyz, (" + s1 + ").xyz))";
+        case D3DSIO_DP4: return "vec4<f32>(dot(" + s0 + ", " + s1 + "))";
+        case D3DSIO_MIN: return "min(" + s0 + ", " + s1 + ")";
+        case D3DSIO_MAX: return "max(" + s0 + ", " + s1 + ")";
+        case D3DSIO_SLT:
+            return "select(vec4<f32>(0.0), vec4<f32>(1.0), " + s0 + " < " + s1 + ")";
+        case D3DSIO_SGE:
+            return "select(vec4<f32>(0.0), vec4<f32>(1.0), " + s0 + " >= " + s1 + ")";
+        case D3DSIO_EXP: case D3DSIO_EXPP:
+            return "vec4<f32>(exp2((" + s0 + ").x))";
+        case D3DSIO_LOG: case D3DSIO_LOGP:
+            return "vec4<f32>(log2(max(abs((" + s0 + ").x), 1e-12)))";
+        case D3DSIO_FRC: return "fract(" + s0 + ")";
+        case D3DSIO_DST:
+            return "vec4<f32>(1.0, (" + s0 + ").y * (" + s1 + ").y, (" +
+                s0 + ").z, (" + s1 + ").w)";
+        case D3DSIO_LIT: {
+            const n = "(" + s0 + ")";
+            return "vec4<f32>(1.0, max(" + n + ".x, 0.0), " +
+                "select(0.0, pow(max(" + n + ".y, 0.0), clamp(" + n +
+                ".w, -128.0, 128.0)), " + n + ".x > 0.0 && " + n +
+                ".y > 0.0), 1.0)";
+        }
+        case D3DSIO_LRP: return "mix(" + s2 + ", " + s1 + ", " + s0 + ")";
+        case D3DSIO_CND:
+            return "select(" + s2 + ", " + s1 + ", " + s0 + " > vec4<f32>(0.5))";
+        case D3DSIO_CMP:
+            return "select(" + s2 + ", " + s1 + ", " + s0 + " >= vec4<f32>(0.0))";
+        default:
+            throw new Error("no WGSL expression for opcode 0x" +
+                opcode.toString(16));
+        }
+    }
+
+    function emitDestinationWrite(lines, destBaseExpr, dstToken, resultExpr) {
+        const mask = dstWriteMaskBits(dstToken);
+        if (!mask) return;
+        resultExpr = applyDestModifiers(resultExpr, dstToken);
+        const suffix = writeMaskSuffix(mask);
+        if (suffix === "xyzw") {
+            lines.push(destBaseExpr + " = " + resultExpr + ";");
+        } else {
+            lines.push(destBaseExpr + "." + suffix + " = (" + resultExpr +
+                ")." + suffix + ";");
+        }
+    }
+
+    // Parses a D3DVSD_* vertex declaration into a WebGPU vertex buffer
+    // layout keyed by vertex-shader input register number. Per this
+    // project's convention (matching the reference d3d8_caps_audit_test.c
+    // audit_shader_pipeline() shader, which reads v0/v1 from a declaration
+    // whose D3DVSD_REG entries use the D3DVSDE_POSITION=0/D3DVSDE_DIFFUSE=5
+    // symbolic slots), a bound vertex shader's input registers are numbered
+    // sequentially by the D3DVSD_REG entry's position in the declaration
+    // stream, not by the raw D3DVSDE_* register field -- that field is a
+    // fixed-function semantic hint the guest also uses for its own shadow
+    // bookkeeping, but it is not the shader-visible register index. Only
+    // D3DVSD_REG entries in stream 0 are honored -- D3DVSD_SKIP, multiple
+    // streams, and the tessellator token type are outside Stage 6's scope
+    // and rejected outright rather than silently ignored, so a declaration
+    // that needs them fails shader creation instead of producing a shader
+    // that reads garbage vertex data.
+    function parseVertexDeclaration(tokens) {
+        const attributes = [];
+        const registers = new Map();
+        let cursor = 0;
+        let nextRegister = 0;
+        for (let i = 0; i < tokens.length; i++) {
+            const token = tokens[i] >>> 0;
+            const type = (token >>> D3DVSD_TOKENTYPESHIFT) & 0x7;
+            if (type !== D3DVSD_TOKEN_STREAMDATA)
+                continue;
+            if (token & D3DVSD_SKIPFLAG)
+                throw new Error("D3DVSD_SKIP is not supported in Stage 6");
+            const register = nextRegister++;
+            const dataType = (token >>> D3DVSD_DATATYPESHIFT) & 0xF;
+            const shapes = {
+                0: { format: "float32", size: 4, wgslType: "f32", extend: 3 },
+                1: { format: "float32x2", size: 8, wgslType: "vec2<f32>", extend: 2 },
+                2: { format: "float32x3", size: 12, wgslType: "vec3<f32>", extend: 1 },
+                3: { format: "float32x4", size: 16, wgslType: "vec4<f32>", extend: 0 },
+                4: { format: "unorm8x4", size: 4, wgslType: "vec4<f32>", extend: 0 },
+            };
+            const shape = shapes[dataType];
+            if (!shape)
+                throw new Error("unsupported D3DVSD data type " + dataType +
+                    " in Stage 6 vertex declaration");
+            attributes.push({ shaderLocation: register, offset: cursor,
+                format: shape.format });
+            registers.set(register, shape);
+            cursor += shape.size;
+        }
+        if (!attributes.length)
+            throw new Error("vertex declaration has no D3DVSD_REG entries");
+        return { attributes, registers, stride: cursor };
+    }
+
+    function vertexShaderWgsl(codeTokens, declaration) {
+        const minor = codeTokens[0] & 0xFF;
+        if (((codeTokens[0] >>> 16) & 0xFFFF) !== 0xFFFE || minor !== 1)
+            throw new Error("unsupported vertex shader version token");
+        const registerExpr = (token) => {
+            const type = regType(token);
+            const num = regNum(token);
+            switch (type) {
+            case D3DSPR_TEMP: return "r" + num;
+            case D3DSPR_INPUT: {
+                const shape = declaration.registers.get(num);
+                if (!shape)
+                    throw new Error("vertex shader reads undeclared input v" + num);
+                if (shape.extend === 0) return "input.v" + num;
+                const pad = ["1.0", "0.0, 1.0", "0.0, 0.0, 1.0"][shape.extend - 1];
+                return "vec4<f32>(input.v" + num + ", " + pad + ")";
+            }
+            case D3DSPR_CONST:
+                if (num >= D8WG_MAX_VS_CONSTANTS)
+                    throw new Error("vertex shader constant c" + num +
+                        " is out of range");
+                return "constants.vs[" + num + "]";
+            case D3DSPR_RASTOUT:
+                if (num !== 0)
+                    throw new Error("unsupported vertex shader oRastOut index " + num);
+                return "output.position";
+            case D3DSPR_ATTROUT:
+                if (num > 1)
+                    throw new Error("unsupported vertex shader oD index " + num);
+                return num === 0 ? "output.diffuse" : "output.specular";
+            case D3DSPR_TEXCRDOUT:
+                if (num > 7)
+                    throw new Error("unsupported vertex shader oT index " + num);
+                return "output.texcoord" + num;
+            default:
+                throw new Error("unsupported vertex shader register type 0x" +
+                    type.toString(16));
+            }
+        };
+        const temps = new Set();
+        const body = [];
+        walkShaderBody(codeTokens.slice(1), false, 1, registerExpr,
+            (opcode, dstToken, sources) => {
+                if (regType(dstToken) === D3DSPR_TEMP)
+                    temps.add("r" + regNum(dstToken));
+                const expr = instructionExpression(opcode, sources);
+                emitDestinationWrite(body, registerExpr(dstToken), dstToken,
+                    expr);
+            });
+        const inputFields = [...declaration.registers.entries()]
+            .sort((a, b) => a[0] - b[0])
+            .map(([register, shape]) => "    @location(" + register + ") v" +
+                register + ": " + shape.wgslType + ",").join("\n");
+        const tempDecls = [...temps].map(name =>
+            "    var " + name + ": vec4<f32>;").join("\n");
+        return `
+struct VSInput {
+${inputFields}
+};
+struct VSOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) diffuse: vec4<f32>,
+    @location(1) specular: vec4<f32>,
+    @location(2) texcoord0: vec4<f32>,
+    @location(3) texcoord1: vec4<f32>,
+    @location(4) texcoord2: vec4<f32>,
+    @location(5) texcoord3: vec4<f32>,
+    @location(6) texcoord4: vec4<f32>,
+    @location(7) texcoord5: vec4<f32>,
+    @location(8) texcoord6: vec4<f32>,
+    @location(9) texcoord7: vec4<f32>,
+};
+struct D8WGShaderConstants {
+    vs: array<vec4<f32>, ${D8WG_MAX_VS_CONSTANTS}>,
+    ps: array<vec4<f32>, ${D8WG_MAX_PS_CONSTANTS}>,
+};
+@group(0) @binding(0) var<uniform> constants: D8WGShaderConstants;
+@vertex fn vs_main(input: VSInput) -> VSOutput {
+    var output: VSOutput;
+    output.position = vec4<f32>(0.0);
+    output.diffuse = vec4<f32>(1.0);
+    output.specular = vec4<f32>(0.0);
+    output.texcoord0 = vec4<f32>(0.0);
+    output.texcoord1 = vec4<f32>(0.0);
+    output.texcoord2 = vec4<f32>(0.0);
+    output.texcoord3 = vec4<f32>(0.0);
+    output.texcoord4 = vec4<f32>(0.0);
+    output.texcoord5 = vec4<f32>(0.0);
+    output.texcoord6 = vec4<f32>(0.0);
+    output.texcoord7 = vec4<f32>(0.0);
+${tempDecls}
+${body.join("\n")}
+    return output;
+}
+`;
+    }
+
+    function pixelShaderWgsl(codeTokens) {
+        const minor = codeTokens[0] & 0xFF;
+        if (((codeTokens[0] >>> 16) & 0xFFFF) !== 0xFFFF || minor < 1 || minor > 4)
+            throw new Error("unsupported pixel shader version token");
+        const stageOf = (num) => {
+            if (num > 1)
+                throw new Error("texture stage t" + num +
+                    " exceeds this backend's 2-stage binding limit");
+            return num;
+        };
+        const registerExpr = (token) => {
+            const type = regType(token);
+            const num = regNum(token);
+            switch (type) {
+            case D3DSPR_TEMP: return "r" + num;
+            case D3DSPR_INPUT:
+                if (num > 1)
+                    throw new Error("unsupported pixel shader v index " + num);
+                return num === 0 ? "input.diffuse" : "input.specular";
+            case D3DSPR_CONST:
+                if (num >= D8WG_MAX_PS_CONSTANTS)
+                    throw new Error("pixel shader constant c" + num +
+                        " is out of range");
+                return "constants.ps[" + num + "]";
+            case D3DSPR_TEXTURE:
+                stageOf(num);
+                return "t" + num;
+            default:
+                throw new Error("unsupported pixel shader register type 0x" +
+                    type.toString(16));
+            }
+        };
+        const temps = new Set();
+        const texRegisters = new Set();
+        const body = [];
+        walkShaderBody(codeTokens.slice(1), true, minor, registerExpr,
+            (opcode, dstToken, sources, tokens, offset) => {
+                const dstType = regType(dstToken);
+                const dstNum = regNum(dstToken);
+                if (dstType === D3DSPR_TEMP) temps.add("r" + dstNum);
+                if (dstType === D3DSPR_TEXTURE) texRegisters.add(dstNum);
+                if (opcode === D3DSIO_TEXCOORD) {
+                    const stage = stageOf(dstNum);
+                    texRegisters.add(dstNum);
+                    body.push("    t" + dstNum + " = vec4<f32>(input.texcoord" +
+                        stage + ".xy, 0.0, 1.0);");
+                    return;
+                }
+                if (opcode === D3DSIO_TEX) {
+                    texRegisters.add(dstNum);
+                    if (minor >= 4) {
+                        const srcToken = tokens[offset + 2] >>> 0;
+                        const srcStage = stageOf(regNum(srcToken));
+                        body.push("    r" + dstNum + " = textureSample(stage" +
+                            srcStage + "Texture, stage" + srcStage +
+                            "Sampler, t" + srcStage + ".xy);");
+                    } else {
+                        const stage = stageOf(dstNum);
+                        body.push("    t" + dstNum + " = textureSample(stage" +
+                            stage + "Texture, stage" + stage +
+                            "Sampler, t" + stage + ".xy);");
+                    }
+                    return;
+                }
+                if (opcode === D3DSIO_TEXKILL) {
+                    const stage = stageOf(dstNum);
+                    texRegisters.add(dstNum);
+                    body.push("    if (any(vec3<f32>(t" + stage +
+                        ".x, t" + stage + ".y, t" + stage +
+                        ".z) < vec3<f32>(0.0))) { discard; }");
+                    return;
+                }
+                const expr = instructionExpression(opcode, sources);
+                emitDestinationWrite(body, registerExpr(dstToken), dstToken,
+                    expr);
+            });
+        // r0 is always the implicit ps.1.x output register (its final value
+        // becomes the fragment color) whether or not the shader body ever
+        // names it explicitly, so it must be declared exactly once even for
+        // a (degenerate) shader that never writes r0.
+        temps.add("r0");
+        const tempDecls = [...temps].map(name =>
+            "    var " + name + ": vec4<f32>;").join("\n");
+        const texDecls = [...texRegisters].sort().map(num =>
+            "    var t" + num + ": vec4<f32> = vec4<f32>(input.texcoord" +
+            num + ".xy, 0.0, 1.0);").join("\n");
+        return `
+struct D8WGShaderConstants {
+    vs: array<vec4<f32>, ${D8WG_MAX_VS_CONSTANTS}>,
+    ps: array<vec4<f32>, ${D8WG_MAX_PS_CONSTANTS}>,
+};
+@group(0) @binding(0) var<uniform> constants: D8WGShaderConstants;
+@group(0) @binding(1) var stage0Texture: texture_2d<f32>;
+@group(0) @binding(2) var stage0Sampler: sampler;
+@group(0) @binding(3) var stage1Texture: texture_2d<f32>;
+@group(0) @binding(4) var stage1Sampler: sampler;
+@fragment fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
+${texDecls}
+${tempDecls}
+${body.join("\n")}
+    return r0;
+}
+`;
+    }
+
+    // Combines a translated vertex shader and pixel shader into one WGSL
+    // module sharing the VSOutput/D8WGShaderConstants definitions. Either
+    // half may be null (no vertex/pixel shader bound uses the fixed-function
+    // path instead -- see D3D8WebGPUExecutor.pipelineFor), but Stage 6 only
+    // wires the combination where both are real shaders, matching the
+    // Maple-relevant usage the doc anticipates (real VS + real PS together).
+    function shaderPipelineWgsl(vertexResource, declaration, pixelResource) {
+        const vs = vertexShaderWgsl(vertexResource.codeTokens, declaration);
+        const ps = pixelShaderWgsl(pixelResource.codeTokens);
+        // pixelShaderWgsl's `input: VSOutput` refers to the struct defined
+        // in vs; strip its duplicate D8WGShaderConstants block so the
+        // combined module only declares each binding once.
+        const psBody = ps.replace(
+            /struct D8WGShaderConstants[\s\S]*?@binding\(0\) var<uniform> constants: D8WGShaderConstants;\n/,
+            "");
+        return vs + psBody;
+    }
+
     function identityMatrix() {
         return new Float32Array([
             1, 0, 0, 0,
@@ -889,6 +1474,13 @@ ${fragment.join("\n")}
             uniformSerial: 0,
             uniformVariants: new Map(),
             bindGroups: new Map(),
+            // Stage 6: D3D8 shader model 1.x. vertexShader/pixelShader are
+            // D8WG resource handles (0 = fixed-function / no pixel shader).
+            vertexShader: 0,
+            pixelShader: 0,
+            vsConstants: new Float32Array(D8WG_MAX_VS_CONSTANTS * 4),
+            psConstants: new Float32Array(D8WG_MAX_PS_CONSTANTS * 4),
+            shaderConstantSerial: 0,
         };
     }
 
@@ -918,6 +1510,12 @@ ${fragment.join("\n")}
             this.retiredResourceHandles = new Set();
             this.pipelineCache = new Map();
             this.samplerCache = new Map();
+            // Stage 6 shader pipelines use an explicit bind group layout
+            // rather than layout:"auto" (see shaderBindGroupLayoutFor). Both
+            // objects belong to the current GPUDevice and are dropped with the
+            // pipeline/sampler caches when a device is lost.
+            this.shaderBindGroupLayout = null;
+            this.shaderPipelineLayout = null;
             this.maxPipelines = Math.max(32, this.options.maxPipelines || 512);
             this.maxSamplers = Math.max(8, this.options.maxSamplers || 64);
             this.maxUniformVariants = Math.max(16,
@@ -1154,6 +1752,8 @@ ${fragment.join("\n")}
             // logical D3D8 cache keys are identical.
             this.pipelineCache.clear();
             this.samplerCache.clear();
+            this.shaderBindGroupLayout = null;
+            this.shaderPipelineLayout = null;
             this.device = replacementDevice || null;
             if (!replacementDevice) this.adapter = null;
             this.readyPromise = null;
@@ -1671,6 +2271,12 @@ struct VertexOutput {
         }
 
         pipelineFor(state, topology, stride, indexFormat) {
+            // A real vertex shader handle always carries bit 0 (see
+            // D8WG_SHADER_HANDLE_BASE); state.fvf stays whatever it was last
+            // set to (unused) once a real shader is bound.
+            if (state.vertexShader & 1)
+                return this.shaderPipelineFor(state, topology, stride,
+                    indexFormat);
             const vertexLayout = parseFVF(state.fvf >>> 0, stride >>> 0);
             if (!vertexLayout) return null;
             const cull = state.renderStates[D3DRS_CULLMODE] >>> 0;
@@ -1811,6 +2417,255 @@ struct VertexOutput {
             return pipeline;
         }
 
+        // Stage 6: D3D8 shader model 1.x pipeline path. Reuses the same
+        // pipelineCache Map as the fixed-function path (pipelineFor above) --
+        // the key's leading tag keeps the two namespaces from ever
+        // colliding -- and the same cull/blend/depth/stencil/color-write
+        // render-state fields, since those aren't shader-specific. Only the
+        // vertex-layout/fragment-combiner half of the key differs: real
+        // shader mode keys on the bound (vertexShader, pixelShader) handle
+        // pair instead of (fvf, texture-stage-state). Handles are never
+        // reused within a session (see allocate_shader_handle in
+        // d3d8_proxy.c), so the raw handle number is already a stable cache
+        // key with no separate generation counter needed.
+        // Stage 6 shader pipelines cannot use layout:"auto". WebGPU derives an
+        // automatic layout from the resources a shader *statically uses*, and
+        // a translated SM1.x shader may legitimately use none of them -- a
+        // passthrough `mov oPos, v0 / mov oD0, v1` reads no constant bank and
+        // samples no texture, so the derived group(0) layout comes back empty
+        // and every CreateBindGroup against it fails validation. (The
+        // fixed-function shader never hits this because it unconditionally
+        // samples both stage textures and reads surface.texture_factor.)
+        // Declaring the layout explicitly keeps all five bindings present
+        // regardless of shader content; WebGPU permits an explicit layout to
+        // contain bindings the shader does not reference.
+        shaderBindGroupLayoutFor() {
+            if (this.shaderBindGroupLayout) return this.shaderBindGroupLayout;
+            const VERTEX = 1;
+            const FRAGMENT = 2;
+            this.shaderBindGroupLayout = this.device.createBindGroupLayout({
+                label: "D3D8 shader bind group layout",
+                entries: [
+                    { binding: 0, visibility: VERTEX | FRAGMENT,
+                        buffer: { type: "uniform" } },
+                    { binding: 1, visibility: FRAGMENT,
+                        texture: { sampleType: "float", viewDimension: "2d" } },
+                    { binding: 2, visibility: FRAGMENT,
+                        sampler: { type: "filtering" } },
+                    { binding: 3, visibility: FRAGMENT,
+                        texture: { sampleType: "float", viewDimension: "2d" } },
+                    { binding: 4, visibility: FRAGMENT,
+                        sampler: { type: "filtering" } },
+                ],
+            });
+            this.shaderPipelineLayout = this.device.createPipelineLayout({
+                label: "D3D8 shader pipeline layout",
+                bindGroupLayouts: [this.shaderBindGroupLayout],
+            });
+            return this.shaderBindGroupLayout;
+        }
+
+        shaderPipelineFor(state, topology, stride, indexFormat) {
+            const vertexResource = this.resources.get(state.vertexShader);
+            const pixelResource = state.pixelShader &&
+                this.resources.get(state.pixelShader);
+            if (!vertexResource || vertexResource.kind !== RESOURCE_VERTEX_SHADER)
+                throw new Error("draw with an unresolved vertex shader handle");
+            if (!pixelResource || pixelResource.kind !== RESOURCE_PIXEL_SHADER)
+                throw new Error("draw with an unresolved pixel shader handle");
+            const declaration = vertexResource.declaration;
+            if (stride < declaration.stride)
+                throw new Error("vertex buffer stride is smaller than the " +
+                    "bound vertex shader's declaration requires");
+            const cull = state.renderStates[D3DRS_CULLMODE] >>> 0;
+            const blend = state.renderStates[D3DRS_ALPHABLENDENABLE] >>> 0;
+            const stripIndexFormat = topology.endsWith("-strip") ?
+                indexFormat : undefined;
+            const targetFormat = state.renderTarget.handle ?
+                "rgba8unorm" : this.format;
+            const key = ["shader", state.vertexShader, state.pixelShader,
+                targetFormat, topology, stripIndexFormat || "none",
+                stride >>> 0, cull, blend,
+                state.renderStates[D3DRS_SRCBLEND] >>> 0,
+                state.renderStates[D3DRS_DESTBLEND] >>> 0,
+                state.renderStates[D3DRS_BLENDOP] >>> 0,
+                state.renderStates[D3DRS_COLORWRITEENABLE] >>> 0,
+                state.depthView && state.depthSurfaceEnabled &&
+                    !state.renderTarget.handle ? 1 : 0,
+                state.renderStates[D3DRS_ZENABLE] >>> 0,
+                state.renderStates[D3DRS_ZWRITEENABLE] >>> 0,
+                state.renderStates[D3DRS_ZFUNC] >>> 0,
+                state.renderStates[D3DRS_ZBIAS] >>> 0,
+                state.renderStates[D3DRS_STENCILENABLE] >>> 0,
+                state.renderStates[D3DRS_STENCILFAIL] >>> 0,
+                state.renderStates[D3DRS_STENCILZFAIL] >>> 0,
+                state.renderStates[D3DRS_STENCILPASS] >>> 0,
+                state.renderStates[D3DRS_STENCILFUNC] >>> 0,
+                state.renderStates[D3DRS_STENCILMASK] >>> 0,
+                state.renderStates[D3DRS_STENCILWRITEMASK] >>> 0].join(":");
+            let pipeline = this.pipelineCache.get(key);
+            if (pipeline) {
+                this.pipelineCache.delete(key);
+                this.pipelineCache.set(key, pipeline);
+                return pipeline;
+            }
+            const shaderModule = this.device.createShaderModule({
+                label: "D3D8 shader " + state.vertexShader.toString(16) +
+                    "/" + state.pixelShader.toString(16),
+                code: shaderPipelineWgsl(vertexResource, declaration,
+                    pixelResource),
+            });
+            this.shaderBindGroupLayoutFor();
+            pipeline = this.device.createRenderPipeline({
+                label: "D3D8 shader pipeline " + key,
+                layout: this.shaderPipelineLayout,
+                vertex: {
+                    module: shaderModule,
+                    entryPoint: "vs_main",
+                    buffers: [{
+                        arrayStride: stride,
+                        stepMode: "vertex",
+                        attributes: declaration.attributes,
+                    }],
+                },
+                fragment: {
+                    module: shaderModule,
+                    entryPoint: "fs_main",
+                    targets: [{
+                        format: targetFormat,
+                        ...(blend ? { blend: blendState(state) } : {}),
+                        writeMask: state.renderStates[D3DRS_COLORWRITEENABLE] & 0xF,
+                    }],
+                },
+                primitive: {
+                    topology,
+                    ...(stripIndexFormat ? { stripIndexFormat } : {}),
+                    cullMode: cull === D3DCULL_NONE ? "none" : "back",
+                    frontFace: cull === D3DCULL_CCW ? "cw" : "ccw",
+                },
+                ...(state.depthView && state.depthSurfaceEnabled &&
+                        !state.renderTarget.handle ? { depthStencil: {
+                    format: "depth24plus-stencil8",
+                    depthWriteEnabled: !!state.renderStates[D3DRS_ZENABLE] &&
+                        !!state.renderStates[D3DRS_ZWRITEENABLE],
+                    depthCompare: state.renderStates[D3DRS_ZENABLE] ?
+                        compareFunction(state.renderStates[D3DRS_ZFUNC]) :
+                        "always",
+                    stencilFront: state.renderStates[D3DRS_STENCILENABLE] ? {
+                        compare: compareFunction(
+                            state.renderStates[D3DRS_STENCILFUNC]),
+                        failOp: stencilOperation(
+                            state.renderStates[D3DRS_STENCILFAIL]),
+                        depthFailOp: stencilOperation(
+                            state.renderStates[D3DRS_STENCILZFAIL]),
+                        passOp: stencilOperation(
+                            state.renderStates[D3DRS_STENCILPASS]),
+                    } : {},
+                    stencilBack: state.renderStates[D3DRS_STENCILENABLE] ? {
+                        compare: compareFunction(
+                            state.renderStates[D3DRS_STENCILFUNC]),
+                        failOp: stencilOperation(
+                            state.renderStates[D3DRS_STENCILFAIL]),
+                        depthFailOp: stencilOperation(
+                            state.renderStates[D3DRS_STENCILZFAIL]),
+                        passOp: stencilOperation(
+                            state.renderStates[D3DRS_STENCILPASS]),
+                    } : {},
+                    stencilReadMask: state.renderStates[D3DRS_STENCILENABLE] ?
+                        state.renderStates[D3DRS_STENCILMASK] >>> 0 : 0,
+                    stencilWriteMask: state.renderStates[D3DRS_STENCILENABLE] ?
+                        state.renderStates[D3DRS_STENCILWRITEMASK] >>> 0 : 0,
+                    depthBias: -Math.min(16,
+                        state.renderStates[D3DRS_ZBIAS] >>> 0),
+                } } : {}),
+            });
+            pipeline._d8wgId = this.nextPipelineId++;
+            if (this.pipelineCache.size >= this.maxPipelines) {
+                this.pipelineCache.delete(this.pipelineCache.keys().next().value);
+                this.stats.pipelineCacheEvictions++;
+            }
+            this.pipelineCache.set(key, pipeline);
+            this.stats.pipelineCreations++;
+            return pipeline;
+        }
+
+        // Constant-register uniform buffer for real-shader-mode draws,
+        // mirroring uniformFor's cache-by-serial pattern. Packs both vs and
+        // ps constant banks into one buffer matching D8WGShaderConstants'
+        // WGSL layout (vs: array<vec4<f32>, 96> then ps: array<vec4<f32>, 8>).
+        shaderUniformFor(state) {
+            // The "sc:" tag keeps this out of uniformFor's key space: both
+            // share state.uniformVariants but count separate serials, so a
+            // bare number could hand a fixed-function draw this buffer (which
+            // is a different size and layout entirely).
+            const key = "sc:" + state.shaderConstantSerial;
+            let buffer = state.uniformVariants.get(key);
+            if (buffer) {
+                state.uniformVariants.delete(key);
+                state.uniformVariants.set(key, buffer);
+                return { buffer, key };
+            }
+            if (state.uniformVariants.size >= this.maxUniformVariants) {
+                const oldestKey = state.uniformVariants.keys().next().value;
+                const oldest = state.uniformVariants.get(oldestKey);
+                state.uniformVariants.delete(oldestKey);
+                state.bindGroups.clear();
+                if (this.frame)
+                    this.frame.transientBuffers.push(oldest);
+                else
+                    this.retireGPUObjects(oldest);
+                this.stats.uniformCacheEvictions++;
+            }
+            const byteLength = (D8WG_MAX_VS_CONSTANTS + D8WG_MAX_PS_CONSTANTS) * 16;
+            buffer = this.device.createBuffer({
+                label: "D3D8 shader constants " + state.handle.toString(16) +
+                    " " + key,
+                size: byteLength,
+                usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
+            });
+            const values = new Float32Array(
+                (D8WG_MAX_VS_CONSTANTS + D8WG_MAX_PS_CONSTANTS) * 4);
+            values.set(state.vsConstants, 0);
+            values.set(state.psConstants, D8WG_MAX_VS_CONSTANTS * 4);
+            this.device.queue.writeBuffer(buffer, 0, values);
+            state.uniformVariants.set(key, buffer);
+            return { buffer, key };
+        }
+
+        shaderBindGroupFor(state, pipeline) {
+            const uniforms = this.shaderUniformFor(state);
+            const texture0 = this.textureViewFor(state, 0);
+            const texture1 = this.textureViewFor(state, 1);
+            const sampler0 = this.samplerFor(state, 0);
+            const sampler1 = this.samplerFor(state, 1);
+            const key = ["shader", pipeline._d8wgId, uniforms.key,
+                texture0.key, sampler0._d8wgKey,
+                texture1.key, sampler1._d8wgKey].join(":");
+            let group = state.bindGroups.get(key);
+            if (group) {
+                state.bindGroups.delete(key);
+                state.bindGroups.set(key, group);
+                return group;
+            }
+            group = this.device.createBindGroup({
+                label: "D3D8 shader bind group",
+                // The explicit layout, not pipeline.getBindGroupLayout(0):
+                // see shaderBindGroupLayoutFor for why "auto" cannot work here.
+                layout: this.shaderBindGroupLayoutFor(),
+                entries: [
+                    { binding: 0, resource: { buffer: uniforms.buffer } },
+                    { binding: 1, resource: texture0.view },
+                    { binding: 2, resource: sampler0 },
+                    { binding: 3, resource: texture1.view },
+                    { binding: 4, resource: sampler1 },
+                ],
+            });
+            if (state.bindGroups.size >= this.maxBindGroups)
+                state.bindGroups.delete(state.bindGroups.keys().next().value);
+            state.bindGroups.set(key, group);
+            return group;
+        }
+
         samplerFor(state, stage) {
             const values = state.textureStageStates[stage];
             const address = value => value === 1 ? "repeat" :
@@ -1867,6 +2722,8 @@ struct VertexOutput {
         }
 
         bindGroupFor(state, pipeline) {
+            if (state.vertexShader & 1)
+                return this.shaderBindGroupFor(state, pipeline);
             const uniforms = this.uniformFor(state);
             const texture0 = this.textureViewFor(state, 0);
             const texture1 = this.textureViewFor(state, 1);
@@ -1898,6 +2755,18 @@ struct VertexOutput {
         }
 
         validateGeometryState(state, stride) {
+            if (state.vertexShader & 1) {
+                const resource = this.resources.get(state.vertexShader);
+                if (!resource || resource.kind !== RESOURCE_VERTEX_SHADER ||
+                        stride < resource.declaration.stride) {
+                    this.warnOnce("vs-" + state.vertexShader,
+                        "draw with an unresolved/incompatible vertex shader",
+                        "0x" + state.vertexShader.toString(16));
+                    this.stats.unsupportedCommands++;
+                    return false;
+                }
+                return true;
+            }
             const layout = parseFVF(state.fvf >>> 0, stride >>> 0);
             if (!layout) {
                 this.warnOnce("fvf-" + state.fvf,
@@ -2088,6 +2957,85 @@ struct VertexOutput {
                 }, extent);
             }
             this.stats.uploadBytes += dataBytes;
+        }
+
+        // Stage 6: D3D8 shader model 1.x. Both creators translate the
+        // bytecode eagerly (discarding the WGSL text here; shaderPipelineFor
+        // regenerates and caches it per pipeline variant) so a genuinely
+        // unsupported/malformed shader fails CreateVertexShader/
+        // CreatePixelShader itself rather than surfacing later at the first
+        // draw that binds it -- matches the "illegal bytecode is rejected up
+        // front" rule the guest-side validator already enforces.
+        createVertexShaderResource(bytes, payloadOffset, commandEnd) {
+            if (commandEnd - payloadOffset < 24)
+                throw new Error("short CREATE_VERTEX_SHADER");
+            const deviceHandle = u32(bytes, payloadOffset);
+            const handle = u32(bytes, payloadOffset + 4);
+            const declCount = u32(bytes, payloadOffset + 8);
+            const declOffset = u32(bytes, payloadOffset + 12);
+            const codeCount = u32(bytes, payloadOffset + 16);
+            const codeOffset = u32(bytes, payloadOffset + 20);
+            if (!this.devices.has(deviceHandle))
+                throw new Error(
+                    "CREATE_VERTEX_SHADER references an unknown device");
+            if (!codeCount)
+                throw new Error("CREATE_VERTEX_SHADER has an empty code blob");
+            const declBytes = checkedDataRange(bytes, declOffset,
+                declCount * 4, "CREATE_VERTEX_SHADER declaration");
+            const codeBytes = checkedDataRange(bytes, codeOffset,
+                codeCount * 4, "CREATE_VERTEX_SHADER code");
+            const declTokens = [];
+            for (let i = 0; i < declCount; i++)
+                declTokens.push(u32(declBytes, i * 4));
+            const codeTokens = [];
+            for (let i = 0; i < codeCount; i++)
+                codeTokens.push(u32(codeBytes, i * 4));
+            const declaration = parseVertexDeclaration(declTokens);
+            vertexShaderWgsl(codeTokens, declaration);
+            this.destroyResource(handle);
+            // Reset keeps app-visible shader handles stable (see
+            // recreate_device_resources in d3d8_proxy.c), so a handle retired
+            // with the previous device epoch is legitimately live again once
+            // the guest re-creates it under the new one.
+            this.retiredResourceHandles.delete(handle);
+            this.resources.set(handle, {
+                handle,
+                deviceHandle,
+                kind: RESOURCE_VERTEX_SHADER,
+                codeTokens,
+                // Kept verbatim so serializeSession can replay the original
+                // CREATE_VERTEX_SHADER after a v86 save/load.
+                declTokens,
+                declaration,
+            });
+        }
+
+        createPixelShaderResource(bytes, payloadOffset, commandEnd) {
+            if (commandEnd - payloadOffset < 16)
+                throw new Error("short CREATE_PIXEL_SHADER");
+            const deviceHandle = u32(bytes, payloadOffset);
+            const handle = u32(bytes, payloadOffset + 4);
+            const codeCount = u32(bytes, payloadOffset + 8);
+            const codeOffset = u32(bytes, payloadOffset + 12);
+            if (!this.devices.has(deviceHandle))
+                throw new Error(
+                    "CREATE_PIXEL_SHADER references an unknown device");
+            if (!codeCount)
+                throw new Error("CREATE_PIXEL_SHADER has an empty code blob");
+            const codeBytes = checkedDataRange(bytes, codeOffset,
+                codeCount * 4, "CREATE_PIXEL_SHADER code");
+            const codeTokens = [];
+            for (let i = 0; i < codeCount; i++)
+                codeTokens.push(u32(codeBytes, i * 4));
+            pixelShaderWgsl(codeTokens);
+            this.destroyResource(handle);
+            this.retiredResourceHandles.delete(handle);
+            this.resources.set(handle, {
+                handle,
+                deviceHandle,
+                kind: RESOURCE_PIXEL_SHADER,
+                codeTokens,
+            });
         }
 
         sequentialFanIndices(vertexCount) {
@@ -2554,6 +3502,14 @@ struct VertexOutput {
             case OP_UPDATE_TEXTURE:
                 this.updateTextureResource(bytes, payloadOffset, commandEnd);
                 break;
+            case OP_CREATE_VERTEX_SHADER:
+                this.createVertexShaderResource(bytes, payloadOffset,
+                    commandEnd);
+                break;
+            case OP_CREATE_PIXEL_SHADER:
+                this.createPixelShaderResource(bytes, payloadOffset,
+                    commandEnd);
+                break;
             case OP_DESTROY_RESOURCE:
                 if (commandEnd - payloadOffset < 8) {
                     throw new Error("short DESTROY_RESOURCE");
@@ -2755,6 +3711,54 @@ struct VertexOutput {
                 state.depthSurfaceEnabled = !!u32(bytes, payloadOffset + 12);
                 break;
             }
+            case OP_SET_VERTEX_SHADER: {
+                if (commandEnd - payloadOffset < 8)
+                    throw new Error("short SET_VERTEX_SHADER");
+                const state = this.devices.get(u32(bytes, payloadOffset));
+                const handle = u32(bytes, payloadOffset + 4);
+                const resource = handle ? this.resources.get(handle) : null;
+                if (!state || (handle && (!resource ||
+                        resource.kind !== RESOURCE_VERTEX_SHADER ||
+                        resource.deviceHandle !== state.handle)))
+                    throw new Error("invalid SET_VERTEX_SHADER");
+                state.vertexShader = handle;
+                break;
+            }
+            case OP_SET_PIXEL_SHADER: {
+                if (commandEnd - payloadOffset < 8)
+                    throw new Error("short SET_PIXEL_SHADER");
+                const state = this.devices.get(u32(bytes, payloadOffset));
+                const handle = u32(bytes, payloadOffset + 4);
+                const resource = handle ? this.resources.get(handle) : null;
+                if (!state || (handle && (!resource ||
+                        resource.kind !== RESOURCE_PIXEL_SHADER ||
+                        resource.deviceHandle !== state.handle)))
+                    throw new Error("invalid SET_PIXEL_SHADER");
+                state.pixelShader = handle;
+                break;
+            }
+            case OP_SET_VERTEX_SHADER_CONSTANT:
+            case OP_SET_PIXEL_SHADER_CONSTANT: {
+                if (commandEnd - payloadOffset < 16)
+                    throw new Error("short SET_SHADER_CONSTANT");
+                const state = this.devices.get(u32(bytes, payloadOffset));
+                const startRegister = u32(bytes, payloadOffset + 4);
+                const vectorCount = u32(bytes, payloadOffset + 8);
+                const dataOffset = u32(bytes, payloadOffset + 12);
+                const isVertex = opcode === OP_SET_VERTEX_SHADER_CONSTANT;
+                const maxRegisters = isVertex ?
+                    D8WG_MAX_VS_CONSTANTS : D8WG_MAX_PS_CONSTANTS;
+                if (!state || startRegister > maxRegisters ||
+                        vectorCount > maxRegisters - startRegister)
+                    throw new Error("invalid SET_SHADER_CONSTANT range");
+                const data = checkedDataRange(bytes, dataOffset,
+                    vectorCount * 16, "SET_SHADER_CONSTANT data");
+                const target = isVertex ? state.vsConstants : state.psConstants;
+                for (let i = 0; i < vectorCount * 4; i++)
+                    target[startRegister * 4 + i] = f32(data, i * 4);
+                state.shaderConstantSerial++;
+                break;
+            }
             case OP_DRAW_PRIMITIVE:
                 if (commandEnd - payloadOffset < 16) throw new Error("short DRAW_PRIMITIVE");
                 this.drawPrimitive(bytes, payloadOffset);
@@ -2870,9 +3874,25 @@ struct VertexOutput {
                     index * 4, value));
                 return payload;
             };
+            // dataOffsetField is either a single payload offset to patch with
+            // the blob's batch-relative address, or an array of
+            // {field, delta} for a payload that points at several regions
+            // inside one concatenated blob (CREATE_VERTEX_SHADER).
             const add = (opcode, payload, blob, dataOffsetField) => {
                 records.push({ opcode, payload, blob: blob || null,
                     dataOffsetField });
+            };
+            const tokenBlob = tokens => {
+                const blob = makePayload(tokens.length * 4);
+                tokens.forEach((token, index) =>
+                    putU32(blob, index * 4, token));
+                return blob;
+            };
+            const concatBlobs = (first, second) => {
+                const blob = makePayload(first.byteLength + second.byteLength);
+                blob.set(first, 0);
+                blob.set(second, first.byteLength);
+                return blob;
             };
             const addTransform = (handle, transformState, matrix) => {
                 const payload = makePayload(72);
@@ -2925,6 +3945,19 @@ struct VertexOutput {
                                 level.rowPitch, level.data.byteLength, 0, 0),
                                 level.data, 32);
                         });
+                    } else if (resource.kind === RESOURCE_VERTEX_SHADER) {
+                        const declaration = tokenBlob(resource.declTokens);
+                        const code = tokenBlob(resource.codeTokens);
+                        add(OP_CREATE_VERTEX_SHADER, u32Payload(state.handle,
+                            resource.handle, resource.declTokens.length, 0,
+                            resource.codeTokens.length, 0),
+                            concatBlobs(declaration, code),
+                            [{ field: 12, delta: 0 },
+                                { field: 20, delta: declaration.byteLength }]);
+                    } else if (resource.kind === RESOURCE_PIXEL_SHADER) {
+                        add(OP_CREATE_PIXEL_SHADER, u32Payload(state.handle,
+                            resource.handle, resource.codeTokens.length, 0),
+                            tokenBlob(resource.codeTokens), 12);
                     }
                 }
 
@@ -2995,6 +4028,26 @@ struct VertexOutput {
                 add(OP_SET_INDICES, u32Payload(state.handle,
                     state.indices.handle, state.indices.baseVertex, 0));
                 add(OP_SET_VERTEX_FORMAT, u32Payload(state.handle, state.fvf));
+                // Constant banks first: a restored shader must see the same
+                // constants it had at save time before anything draws with it.
+                const constantBlob = values => {
+                    const blob = makePayload(values.byteLength);
+                    values.forEach((value, index) =>
+                        putF32(blob, index * 4, value));
+                    return blob;
+                };
+                add(OP_SET_VERTEX_SHADER_CONSTANT, u32Payload(state.handle, 0,
+                    D8WG_MAX_VS_CONSTANTS, 0),
+                    constantBlob(state.vsConstants), 12);
+                add(OP_SET_PIXEL_SHADER_CONSTANT, u32Payload(state.handle, 0,
+                    D8WG_MAX_PS_CONSTANTS, 0),
+                    constantBlob(state.psConstants), 12);
+                if (state.vertexShader)
+                    add(OP_SET_VERTEX_SHADER, u32Payload(state.handle,
+                        state.vertexShader));
+                if (state.pixelShader)
+                    add(OP_SET_PIXEL_SHADER, u32Payload(state.handle,
+                        state.pixelShader));
                 add(OP_SET_RENDER_TARGET, u32Payload(state.handle,
                     state.renderTarget.handle, state.renderTarget.level,
                     state.depthSurfaceEnabled ? 1 : 0));
@@ -3023,9 +4076,14 @@ struct VertexOutput {
             let sequence = 1;
             for (const record of records) {
                 if (record.blob && record.dataOffsetField !== undefined) {
-                    putU32(record.payload, record.dataOffsetField,
-                        record.offset + D8WG_COMMAND_HEADER_BYTES +
-                        record.payload.byteLength);
+                    const blobBase = record.offset + D8WG_COMMAND_HEADER_BYTES +
+                        record.payload.byteLength;
+                    if (Array.isArray(record.dataOffsetField)) {
+                        for (const { field, delta } of record.dataOffsetField)
+                            putU32(record.payload, field, blobBase + delta);
+                    } else {
+                        putU32(record.payload, record.dataOffsetField, blobBase);
+                    }
                 }
                 view.setUint16(record.offset, record.opcode, true);
                 view.setUint32(record.offset + 4, record.size, true);
@@ -3185,6 +4243,13 @@ struct VertexOutput {
             D8WG_VERSION_MINOR,
             D8WG_BATCH_HEADER_BYTES,
             D8WG_COMMAND_HEADER_BYTES,
+            // Stage 6: exposed for direct unit testing of the VS1.1/PS1.1-1.4
+            // -> WGSL translator, independent of a real WebGPU device.
+            shaderOpcodeInfo,
+            parseVertexDeclaration,
+            vertexShaderWgsl,
+            pixelShaderWgsl,
+            shaderPipelineWgsl,
         };
     }
 })(typeof window !== "undefined" ? window : globalThis);

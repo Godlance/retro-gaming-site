@@ -34,10 +34,12 @@ function fields(structName) {
 
 const sharedValues = {
     D8WG_VERSION_MAJOR: 1,
-    D8WG_VERSION_MINOR: 6,
+    D8WG_VERSION_MINOR: 7,
     D8WG_OP_UPDATE_SURFACE: 8,
     D8WG_OP_CREATE_TEXTURE: 0x110,
     D8WG_OP_UPDATE_TEXTURE: 0x111,
+    D8WG_OP_CREATE_VERTEX_SHADER: 0x120,
+    D8WG_OP_CREATE_PIXEL_SHADER: 0x121,
     D8WG_OP_SET_TEXTURE: 0x202,
     D8WG_OP_SET_VIEWPORT: 0x203,
     D8WG_OP_SET_TRANSFORM: 0x204,
@@ -46,6 +48,10 @@ const sharedValues = {
     D8WG_OP_LIGHT_ENABLE: 0x207,
     D8WG_OP_SET_INDICES: 0x209,
     D8WG_OP_SET_RENDER_TARGET: 0x20B,
+    D8WG_OP_SET_VERTEX_SHADER: 0x20C,
+    D8WG_OP_SET_PIXEL_SHADER: 0x20D,
+    D8WG_OP_SET_VERTEX_SHADER_CONSTANT: 0x20E,
+    D8WG_OP_SET_PIXEL_SHADER_CONSTANT: 0x20F,
     D8WG_OP_DRAW_PRIMITIVE: 0x300,
     D8WG_OP_DRAW_INDEXED_PRIMITIVE: 0x301,
     D8WG_OP_DRAW_PRIMITIVE_UP: 0x302,
@@ -53,6 +59,8 @@ const sharedValues = {
     D8WG_RESOURCE_BUFFER_VERTEX: 1,
     D8WG_RESOURCE_BUFFER_INDEX: 2,
     D8WG_RESOURCE_TEXTURE_2D: 3,
+    D8WG_RESOURCE_VERTEX_SHADER: 4,
+    D8WG_RESOURCE_PIXEL_SHADER: 5,
 };
 
 for (const [name, expected] of Object.entries(sharedValues)) {
@@ -135,6 +143,20 @@ assert.deepEqual(fields("D8WGDrawIndexedPrimitiveUP"), [
     "primitive_count", "index_format", "stride", "index_count",
     "index_bytes", "vertex_bytes", "index_data_offset", "vertex_data_offset",
 ]);
+assert.deepEqual(fields("D8WGCreateVertexShader"), [
+    "device_handle", "resource_handle", "declaration_token_count",
+    "declaration_offset", "instruction_token_count", "code_offset",
+]);
+assert.deepEqual(fields("D8WGCreatePixelShader"), [
+    "device_handle", "resource_handle", "instruction_token_count",
+    "code_offset",
+]);
+assert.deepEqual(fields("D8WGSetShader"), [
+    "device_handle", "shader_handle",
+]);
+assert.deepEqual(fields("D8WGSetShaderConstant"), [
+    "device_handle", "start_register", "vector_count", "data_offset",
+]);
 
 for (const size of [
     "D8WGAssertBatchHeaderSize",
@@ -152,6 +174,10 @@ for (const size of [
     "D8WGAssertSetLightSize",
     "D8WGAssertLightEnableSize",
     "D8WGAssertSetIndicesSize",
+    "D8WGAssertCreateVertexShaderSize",
+    "D8WGAssertCreatePixelShaderSize",
+    "D8WGAssertSetShaderSize",
+    "D8WGAssertSetShaderConstantSize",
     "D8WGAssertDrawIndexedPrimitiveSize",
     "D8WGAssertDrawPrimitiveUPSize",
     "D8WGAssertDrawIndexedPrimitiveUPSize",

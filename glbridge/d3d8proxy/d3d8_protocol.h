@@ -12,7 +12,7 @@
 
 #define D8WG_MAGIC 0x47573844u /* "D8WG" */
 #define D8WG_VERSION_MAJOR 1u
-#define D8WG_VERSION_MINOR 6u
+#define D8WG_VERSION_MINOR 7u
 
 #define D8WG_BATCH_FLAG_PRESENT (1u << 0)
 
@@ -31,6 +31,10 @@ enum D8WGOpcode {
     D8WG_OP_DESTROY_RESOURCE = 0x103,
     D8WG_OP_CREATE_TEXTURE = 0x110,
     D8WG_OP_UPDATE_TEXTURE = 0x111,
+    /* Stage 6: shader model 1.x. Shaders share the DESTROY_RESOURCE opcode via
+     * D8WG_RESOURCE_VERTEX_SHADER / D8WG_RESOURCE_PIXEL_SHADER kinds. */
+    D8WG_OP_CREATE_VERTEX_SHADER = 0x120,
+    D8WG_OP_CREATE_PIXEL_SHADER = 0x121,
 
     D8WG_OP_SET_RENDER_STATE = 0x200,
     D8WG_OP_SET_TEXTURE_STAGE_STATE = 0x201,
@@ -44,6 +48,10 @@ enum D8WGOpcode {
     D8WG_OP_SET_INDICES = 0x209,
     D8WG_OP_SET_VERTEX_FORMAT = 0x20A,
     D8WG_OP_SET_RENDER_TARGET = 0x20B,
+    D8WG_OP_SET_VERTEX_SHADER = 0x20C,
+    D8WG_OP_SET_PIXEL_SHADER = 0x20D,
+    D8WG_OP_SET_VERTEX_SHADER_CONSTANT = 0x20E,
+    D8WG_OP_SET_PIXEL_SHADER_CONSTANT = 0x20F,
 
     D8WG_OP_DRAW_PRIMITIVE = 0x300,
     D8WG_OP_DRAW_INDEXED_PRIMITIVE = 0x301,
@@ -54,6 +62,15 @@ enum D8WGOpcode {
 #define D8WG_RESOURCE_BUFFER_VERTEX 1u
 #define D8WG_RESOURCE_BUFFER_INDEX 2u
 #define D8WG_RESOURCE_TEXTURE_2D 3u
+#define D8WG_RESOURCE_VERTEX_SHADER 4u
+#define D8WG_RESOURCE_PIXEL_SHADER 5u
+
+/* Vertex/pixel shader handles always carry bit 0 set (D3D8 convention that
+ * distinguishes a real shader handle from a raw FVF token, which never has
+ * bit 0 set). Shader handles are allocated from a namespace disjoint from
+ * buffer and texture resource handles so both kinds can live in a single
+ * host-side resource table without collision. */
+#define D8WG_SHADER_HANDLE_BASE 0x40000001u
 
 #pragma pack(push, 1)
 typedef struct D8WGBatchHeader {
@@ -292,6 +309,47 @@ typedef struct D8WGSetVertexFormat {
     uint32_t fvf;
 } D8WGSetVertexFormat;
 
+/* declaration_offset/code_offset are relative to the batch base, like
+ * D8WGUpdateBuffer::data_offset. Both counts exclude the trailing
+ * D3DVSD_END()/D3DVS_END()/D3DPS_END() sentinel -- the host derives the
+ * exact span from the count, not from scanning for END. instruction_token_count
+ * counts the code blob starting from the leading D3DVS_VERSION()/
+ * D3DPS_VERSION() token (i.e. code_tokens[0] is the version token, so
+ * instruction_token_count is always >= 1); the host reads the shader
+ * major/minor version from that first token rather than a separate field. */
+typedef struct D8WGCreateVertexShader {
+    uint32_t device_handle;
+    uint32_t resource_handle;
+    uint32_t declaration_token_count;
+    uint32_t declaration_offset;
+    uint32_t instruction_token_count;
+    uint32_t code_offset;
+} D8WGCreateVertexShader;
+
+typedef struct D8WGCreatePixelShader {
+    uint32_t device_handle;
+    uint32_t resource_handle;
+    uint32_t instruction_token_count;
+    uint32_t code_offset;
+} D8WGCreatePixelShader;
+
+/* Used for both D8WG_OP_SET_VERTEX_SHADER and D8WG_OP_SET_PIXEL_SHADER.
+ * shader_handle == 0 means "no programmable shader bound" (fixed function). */
+typedef struct D8WGSetShader {
+    uint32_t device_handle;
+    uint32_t shader_handle;
+} D8WGSetShader;
+
+/* Used for both D8WG_OP_SET_VERTEX_SHADER_CONSTANT and
+ * D8WG_OP_SET_PIXEL_SHADER_CONSTANT. data_offset points to
+ * vector_count * 16 bytes of float4 data, relative to the batch base. */
+typedef struct D8WGSetShaderConstant {
+    uint32_t device_handle;
+    uint32_t start_register;
+    uint32_t vector_count;
+    uint32_t data_offset;
+} D8WGSetShaderConstant;
+
 typedef struct D8WGDrawPrimitive {
     uint32_t device_handle;
     uint32_t primitive_type;
@@ -371,6 +429,14 @@ typedef char D8WGAssertLightEnableSize[
         sizeof(D8WGLightEnable) == 16 ? 1 : -1];
 typedef char D8WGAssertSetIndicesSize[
         sizeof(D8WGSetIndices) == 16 ? 1 : -1];
+typedef char D8WGAssertCreateVertexShaderSize[
+        sizeof(D8WGCreateVertexShader) == 24 ? 1 : -1];
+typedef char D8WGAssertCreatePixelShaderSize[
+        sizeof(D8WGCreatePixelShader) == 16 ? 1 : -1];
+typedef char D8WGAssertSetShaderSize[
+        sizeof(D8WGSetShader) == 8 ? 1 : -1];
+typedef char D8WGAssertSetShaderConstantSize[
+        sizeof(D8WGSetShaderConstant) == 16 ? 1 : -1];
 typedef char D8WGAssertDrawIndexedPrimitiveSize[
         sizeof(D8WGDrawIndexedPrimitive) == 24 ? 1 : -1];
 typedef char D8WGAssertDrawPrimitiveUPSize[

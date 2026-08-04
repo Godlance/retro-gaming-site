@@ -4,6 +4,12 @@ const assert = require("node:assert/strict");
 const {
     D3D8WebGPUExecutor,
     D8WG_MAGIC,
+    D8WG_VERSION_MAJOR,
+    D8WG_VERSION_MINOR,
+    parseVertexDeclaration,
+    vertexShaderWgsl,
+    pixelShaderWgsl,
+    shaderPipelineWgsl,
 } = require("../d3d8-webgpu/d3d8_executor.js");
 
 const OP_HELLO = 1;
@@ -19,6 +25,8 @@ const OP_UPDATE_BUFFER = 0x101;
 const OP_DESTROY_RESOURCE = 0x103;
 const OP_CREATE_TEXTURE = 0x110;
 const OP_UPDATE_TEXTURE = 0x111;
+const OP_CREATE_VERTEX_SHADER = 0x120;
+const OP_CREATE_PIXEL_SHADER = 0x121;
 const OP_SET_RENDER_STATE = 0x200;
 const OP_SET_TEXTURE_STAGE_STATE = 0x201;
 const OP_SET_TEXTURE = 0x202;
@@ -31,6 +39,10 @@ const OP_SET_STREAM_SOURCE = 0x208;
 const OP_SET_INDICES = 0x209;
 const OP_SET_VERTEX_FORMAT = 0x20A;
 const OP_SET_RENDER_TARGET = 0x20B;
+const OP_SET_VERTEX_SHADER = 0x20C;
+const OP_SET_PIXEL_SHADER = 0x20D;
+const OP_SET_VERTEX_SHADER_CONSTANT = 0x20E;
+const OP_SET_PIXEL_SHADER_CONSTANT = 0x20F;
 const OP_DRAW_PRIMITIVE = 0x300;
 const OP_DRAW_INDEXED_PRIMITIVE = 0x301;
 const OP_DRAW_PRIMITIVE_UP = 0x302;
@@ -115,8 +127,8 @@ function batch(commandSpecs, frameId, sessionLow = DEFAULT_SESSION_LOW,
     }
     const result = Buffer.alloc(32 + commandBytes);
     result.writeUInt32LE(D8WG_MAGIC, 0);
-    result.writeUInt16LE(1, 4);
-    result.writeUInt16LE(6, 6);
+    result.writeUInt16LE(D8WG_VERSION_MAJOR, 4);
+    result.writeUInt16LE(D8WG_VERSION_MINOR, 6);
     result.writeUInt32LE(frameId, 8);
     result.writeUInt32LE(1, 12);
     result.writeUInt32LE(commandSpecs.length, 16);
@@ -227,10 +239,37 @@ function makeFakeWebGPU(options = {}) {
             return new Promise(resolve => submittedWorkResolvers.push(resolve));
         },
     };
+    // WebGPU derives an automatic bind group layout from the resources a
+    // shader *statically uses*: a binding that is declared but never
+    // referenced is stripped, and creating a bind group that supplies it then
+    // fails validation ("binding index N not present in the bind group
+    // layout"). Emulating that here is what makes the fake device able to
+    // catch a layout:"auto" pipeline whose shader does not touch every
+    // binding -- a real failure mode for translated SM1.x shaders, which may
+    // legitimately reference no constants and sample no textures.
+    function usedBindings(code) {
+        const used = new Set();
+        const declaration =
+            /@group\(0\)\s*@binding\((\d+)\)\s*var(?:<[^>]*>)?\s+(\w+)\s*:/g;
+        let match;
+        while ((match = declaration.exec(code)) !== null) {
+            const binding = Number(match[1]);
+            const name = match[2];
+            // Count references outside the declaration itself.
+            const references = code.match(
+                new RegExp("\\b" + name + "\\b", "g")) || [];
+            if (references.length > 1) used.add(binding);
+        }
+        return used;
+    }
+
     const device = {
         queue,
         lost: new Promise(() => {}),
-        createShaderModule(descriptor) { calls.push(["shader", descriptor]); return descriptor; },
+        createShaderModule(descriptor) {
+            calls.push(["shader", descriptor]);
+            return { ...descriptor, _code: descriptor.code };
+        },
         createBuffer(descriptor) { calls.push(["createBuffer", descriptor]); return new FakeBuffer(descriptor); },
         createTexture(descriptor) {
             const texture = new FakeTexture(descriptor);
@@ -243,11 +282,49 @@ function makeFakeWebGPU(options = {}) {
             return sampler;
         },
         createCommandEncoder() { calls.push(["createEncoder"]); return new FakeEncoder(); },
+        createBindGroupLayout(descriptor) {
+            calls.push(["createBindGroupLayout", descriptor]);
+            return {
+                descriptor,
+                bindings: new Set(descriptor.entries.map(e => e.binding)),
+            };
+        },
+        createPipelineLayout(descriptor) {
+            calls.push(["createPipelineLayout", descriptor]);
+            return { descriptor, bindGroupLayouts: descriptor.bindGroupLayouts };
+        },
         createRenderPipeline(descriptor) {
             calls.push(["createPipeline", descriptor]);
-            return { descriptor, getBindGroupLayout() { return { index: 0 }; } };
+            let layout;
+            if (descriptor.layout === "auto") {
+                // Dedupe: the vertex and fragment entry points usually come
+                // from one shared module, and counting that source twice
+                // would make every declaration look referenced.
+                const sources = new Set();
+                sources.add(descriptor.vertex.module._code);
+                if (descriptor.fragment)
+                    sources.add(descriptor.fragment.module._code);
+                const code = [...sources].filter(Boolean).join("\n");
+                layout = { bindings: usedBindings(code), auto: true };
+            } else {
+                layout = descriptor.layout.bindGroupLayouts[0];
+            }
+            return { descriptor, getBindGroupLayout() { return layout; } };
         },
-        createBindGroup(descriptor) { calls.push(["createBindGroup", descriptor]); return descriptor; },
+        createBindGroup(descriptor) {
+            calls.push(["createBindGroup", descriptor]);
+            const layout = descriptor.layout;
+            if (layout && layout.bindings) {
+                for (const entry of descriptor.entries) {
+                    if (!layout.bindings.has(entry.binding)) {
+                        throw new Error("In entries[" + entry.binding +
+                            "], binding index " + entry.binding +
+                            " not present in the bind group layout");
+                    }
+                }
+            }
+            return descriptor;
+        },
     };
     const context = {
         configure(descriptor) { calls.push(["configure", descriptor]); },
@@ -1131,7 +1208,473 @@ async function main() {
     assert.equal(sessionBState.devices.has(reusedDevice), true);
     assert.equal(sessionBState.resources.has(reusedTexture), true);
 
+    await testShaderModel1x();
+
     console.log("d3d8_webgpu_executor_test: ok");
+}
+
+// ---- Stage 6: D3D8 shader model 1.x ----
+
+const VS_1_1 = 0xFFFE0101;
+const PS_1_1 = 0xFFFF0101;
+const PS_1_2 = 0xFFFF0102;
+const PS_1_4 = 0xFFFF0104;
+const SHADER_END = 0x0000FFFF;
+// Every register-encoded parameter token sets bit 31 in real D3D8 bytecode.
+const PARAM = 0x80000000;
+const WRITEMASK_ALL = 0x000F0000;
+const NOSWIZZLE = 0xE4 << 16;
+const REG_TEMP = 0 << 28;
+const REG_INPUT = 1 << 28;
+const REG_CONST = 2 << 28;
+const REG_TEXTURE = 3 << 28;
+const REG_RASTOUT = 4 << 28;
+const REG_ATTROUT = 5 << 28;
+const REG_TEXCRDOUT = 6 << 28;
+const SATURATE = 1 << 20;
+
+const SIO = {
+    NOP: 0, MOV: 1, ADD: 2, SUB: 3, MAD: 4, MUL: 5, RCP: 6, RSQ: 7,
+    DP3: 8, DP4: 9, MIN: 10, MAX: 11, SLT: 12, SGE: 13, EXP: 14, LOG: 15,
+    LIT: 16, DST: 17, LRP: 18, FRC: 19, M4x4: 20,
+    TEXCOORD: 64, TEXKILL: 65, TEX: 66, EXPP: 78, LOGP: 79, CND: 80,
+    DEF: 81, CMP: 88,
+};
+
+function dst(type, num, extra = 0) {
+    return (PARAM | type | num | WRITEMASK_ALL | extra) >>> 0;
+}
+
+function src(type, num, extra = 0) {
+    return (PARAM | type | num | NOSWIZZLE | extra) >>> 0;
+}
+
+// The declaration the guest's own reference shader test uses: a float4
+// position plus a D3DCOLOR diffuse, which the executor numbers v0/v1 by
+// stream order.
+const REFERENCE_DECL = [
+    0x20000000,          // D3DVSD_STREAM(0)
+    0x40030000,          // D3DVSD_REG(D3DVSDE_POSITION, D3DVSDT_FLOAT4)
+    0x40040005,          // D3DVSD_REG(D3DVSDE_DIFFUSE,  D3DVSDT_D3DCOLOR)
+    0xFFFFFFFF,          // D3DVSD_END()
+];
+
+function vsWgsl(bodyTokens, declTokens = REFERENCE_DECL) {
+    return vertexShaderWgsl([VS_1_1, ...bodyTokens, SHADER_END],
+        parseVertexDeclaration(declTokens));
+}
+
+function psWgsl(bodyTokens, version = PS_1_1) {
+    return pixelShaderWgsl([version, ...bodyTokens, SHADER_END]);
+}
+
+function assertRejects(label, run) {
+    assert.throws(run, Error, label + " must be rejected, not mistranslated");
+}
+
+async function testShaderModel1x() {
+    // --- vertex declaration parsing ---
+    const decl = parseVertexDeclaration(REFERENCE_DECL);
+    assert.deepEqual(decl.attributes, [
+        { shaderLocation: 0, offset: 0, format: "float32x4" },
+        { shaderLocation: 1, offset: 16, format: "unorm8x4" },
+    ], "declaration must map D3DVSD_REG entries to sequential v0/v1 inputs");
+    assert.equal(decl.stride, 20);
+
+    // Narrower input types must declare the matching WGSL type and be
+    // widened to vec4 on read, or the generated module would not compile.
+    const narrow = parseVertexDeclaration([
+        0x20000000, 0x40020000 /* FLOAT3 */, 0x40000005 /* FLOAT1 */,
+        0xFFFFFFFF,
+    ]);
+    assert.deepEqual(narrow.attributes.map(a => a.format),
+        ["float32x3", "float32"]);
+    const narrowWgsl = vertexShaderWgsl(
+        [VS_1_1, SIO.MOV, dst(REG_RASTOUT, 0), src(REG_INPUT, 0),
+            SIO.MOV, dst(REG_ATTROUT, 0), src(REG_INPUT, 1), SHADER_END],
+        narrow);
+    assert.match(narrowWgsl, /@location\(0\) v0: vec3<f32>/);
+    assert.match(narrowWgsl, /@location\(1\) v1: f32/);
+    assert.match(narrowWgsl, /vec4<f32>\(input\.v0, 1\.0\)/,
+        "a FLOAT3 input must be widened to vec4 with w=1");
+    assert.match(narrowWgsl, /vec4<f32>\(input\.v1, 0\.0, 0\.0, 1\.0\)/);
+
+    assertRejects("D3DVSD_SKIP",
+        () => parseVertexDeclaration([0x20000000, 0x50010000, 0xFFFFFFFF]));
+    assertRejects("declaration with no D3DVSD_REG entries",
+        () => parseVertexDeclaration([0x20000000, 0xFFFFFFFF]));
+
+    // --- per-instruction VS1.1 numeric translation ---
+    // Each supported opcode gets its own assertion on the emitted WGSL
+    // expression, per the doc's "every supported instruction has its own
+    // numeric test" exit criterion.
+    const v0 = src(REG_INPUT, 0);
+    const v1 = src(REG_INPUT, 1);
+    const c0 = src(REG_CONST, 0);
+    const r0d = dst(REG_TEMP, 0);
+    const vsCases = [
+        [[SIO.MOV, r0d, v0], /r0 = input\.v0\.xyzw;/],
+        [[SIO.ADD, r0d, v0, v1], /input\.v0\.xyzw \+ input\.v1\.xyzw/],
+        [[SIO.SUB, r0d, v0, v1], /input\.v0\.xyzw - input\.v1\.xyzw/],
+        [[SIO.MUL, r0d, v0, v1], /input\.v0\.xyzw \* input\.v1\.xyzw/],
+        [[SIO.MAD, r0d, v0, v1, c0],
+            /input\.v0\.xyzw \* input\.v1\.xyzw \+ constants\.vs\[0\]\.xyzw/],
+        [[SIO.RCP, r0d, v0], /1\.0 \/ \(input\.v0\.xyzw\)\.x/],
+        [[SIO.RSQ, r0d, v0], /inverseSqrt\(max\(abs\(\(input\.v0\.xyzw\)\.x\), 1e-12\)\)/],
+        [[SIO.DP3, r0d, v0, v1],
+            /dot\(\(input\.v0\.xyzw\)\.xyz, \(input\.v1\.xyzw\)\.xyz\)/],
+        [[SIO.DP4, r0d, v0, v1], /dot\(input\.v0\.xyzw, input\.v1\.xyzw\)/],
+        [[SIO.MIN, r0d, v0, v1], /min\(input\.v0\.xyzw, input\.v1\.xyzw\)/],
+        [[SIO.MAX, r0d, v0, v1], /max\(input\.v0\.xyzw, input\.v1\.xyzw\)/],
+        [[SIO.SLT, r0d, v0, v1], /select\(vec4<f32>\(0\.0\), vec4<f32>\(1\.0\), input\.v0\.xyzw < input\.v1\.xyzw\)/],
+        [[SIO.SGE, r0d, v0, v1], /select\(vec4<f32>\(0\.0\), vec4<f32>\(1\.0\), input\.v0\.xyzw >= input\.v1\.xyzw\)/],
+        [[SIO.EXP, r0d, v0], /exp2\(\(input\.v0\.xyzw\)\.x\)/],
+        [[SIO.LOG, r0d, v0], /log2\(max\(abs\(\(input\.v0\.xyzw\)\.x\), 1e-12\)\)/],
+        [[SIO.EXPP, r0d, v0], /exp2\(/],
+        [[SIO.LOGP, r0d, v0], /log2\(/],
+        [[SIO.FRC, r0d, v0], /fract\(input\.v0\.xyzw\)/],
+        [[SIO.DST, r0d, v0, v1], /vec4<f32>\(1\.0, \(input\.v0\.xyzw\)\.y \* \(input\.v1\.xyzw\)\.y/],
+        [[SIO.LIT, r0d, v0], /pow\(max\(/],
+    ];
+    for (const [body, pattern] of vsCases) {
+        const wgsl = vsWgsl(body);
+        assert.match(wgsl, pattern,
+            "VS opcode " + body[0] + " translated unexpectedly");
+    }
+
+    // Output register mapping: oPos/oD0/oD1/oT0..oT7.
+    assert.match(vsWgsl([SIO.MOV, dst(REG_RASTOUT, 0), v0]),
+        /output\.position = /);
+    assert.match(vsWgsl([SIO.MOV, dst(REG_ATTROUT, 0), v0]),
+        /output\.diffuse = /);
+    assert.match(vsWgsl([SIO.MOV, dst(REG_ATTROUT, 1), v0]),
+        /output\.specular = /);
+    assert.match(vsWgsl([SIO.MOV, dst(REG_TEXCRDOUT, 3), v0]),
+        /output\.texcoord3 = /);
+
+    // Write masks, saturate, and destination shift.
+    assert.match(
+        vsWgsl([SIO.MOV, (PARAM | REG_TEMP | 0 | 0x00030000) >>> 0, v0]),
+        /r0\.xy = \(input\.v0\.xyzw\)\.xy;/,
+        "a partial write mask must only assign the masked components");
+    assert.match(vsWgsl([SIO.MOV, dst(REG_TEMP, 0, SATURATE), v0]),
+        /clamp\(input\.v0\.xyzw, vec4<f32>\(0\.0\), vec4<f32>\(1\.0\)\)/);
+    assert.match(
+        vsWgsl([SIO.MOV, dst(REG_TEMP, 0, 1 << 24 /* _x2 */), v0]),
+        /\* 2\)/, "destination shift _x2 must scale the result");
+
+    // Source modifiers.
+    assert.match(vsWgsl([SIO.MOV, r0d, src(REG_INPUT, 0, 1 << 24 /* neg */)]),
+        /\(-input\.v0\.xyzw\)/);
+    assert.match(vsWgsl([SIO.MOV, r0d, src(REG_INPUT, 0, 2 << 24 /* bias */)]),
+        /input\.v0\.xyzw - vec4<f32>\(0\.5\)/);
+    assert.match(vsWgsl([SIO.MOV, r0d, src(REG_INPUT, 0, 6 << 24 /* comp */)]),
+        /vec4<f32>\(1\.0\) - input\.v0\.xyzw/);
+
+    // Arbitrary swizzles must survive verbatim. Each component is a 2-bit
+    // selector, low pair first: 0x1B = 0b00_01_10_11 -> .wzyx (compare
+    // D3DVS_NOSWIZZLE 0xE4 = 0b11_10_01_00 -> .xyzw).
+    assert.match(
+        vsWgsl([SIO.MOV, r0d, (PARAM | REG_INPUT | 0 | (0x1B << 16)) >>> 0]),
+        /input\.v0\.wzyx/);
+    assert.match(
+        vsWgsl([SIO.MOV, r0d, (PARAM | REG_INPUT | 0 | (0x00 << 16)) >>> 0]),
+        /input\.v0\.xxxx/, "an all-zero swizzle byte replicates .x");
+
+    // DEF must fold into a literal and win over the uniform constant bank.
+    const defBody = [
+        SIO.DEF, dst(REG_CONST, 5),
+        0x3F800000, 0x40000000, 0x40400000, 0x40800000, // 1,2,3,4
+        SIO.MOV, r0d, src(REG_CONST, 5),
+    ];
+    const defWgsl = vsWgsl(defBody);
+    assert.doesNotMatch(defWgsl, /constants\.vs\[5\]/,
+        "a DEF-ed register must inline as a literal, not read the uniform bank");
+    assert.match(defWgsl, /vec4<f32>\(1e\+0, 2e\+0, 3e\+0, 4e\+0\)/);
+
+    // --- VS rejection cases ---
+    assertRejects("vs_1_0", () => vertexShaderWgsl(
+        [0xFFFE0100, SHADER_END], decl));
+    assertRejects("a pixel-shader version token in CreateVertexShader",
+        () => vertexShaderWgsl([PS_1_1, SHADER_END], decl));
+    assertRejects("D3DSIO_M4x4 (legal D3D8, outside Stage 6)",
+        () => vsWgsl([SIO.M4x4, r0d, v0]));
+    assertRejects("a pixel-only opcode in a vertex shader",
+        () => vsWgsl([SIO.TEX, dst(REG_TEXTURE, 0)]));
+    // The D8WG wire format carries an exact instruction_token_count and the
+    // guest strips the trailing END sentinel, so reaching the end of the
+    // token array is a normal, complete body -- but an instruction whose
+    // operands run past that end is truncation and must be rejected.
+    assert.match(vertexShaderWgsl([VS_1_1, SIO.MOV, r0d, v0], decl),
+        /r0 = input\.v0\.xyzw;/,
+        "a body that ends without an explicit END token is still complete");
+    assertRejects("a truncated final instruction",
+        () => vertexShaderWgsl([VS_1_1, SIO.MOV, r0d], decl));
+    assertRejects("a truncated DEF immediate block",
+        () => vertexShaderWgsl(
+            [VS_1_1, SIO.DEF, dst(REG_CONST, 0), 0x3F800000], decl));
+    assertRejects("a read of an undeclared vertex input",
+        () => vsWgsl([SIO.MOV, r0d, src(REG_INPUT, 7)]));
+    assertRejects("an out-of-range vertex constant register",
+        () => vsWgsl([SIO.MOV, r0d, src(REG_CONST, 96)]));
+    assertRejects("an unsupported source modifier",
+        () => vsWgsl([SIO.MOV, r0d, src(REG_INPUT, 0, 9 << 24 /* _dz */)]));
+
+    // --- per-instruction PS1.1-1.4 translation ---
+    const t0 = src(REG_TEXTURE, 0);
+    assert.match(psWgsl([SIO.MOV, r0d, src(REG_INPUT, 0)]),
+        /r0 = input\.diffuse\.xyzw;/);
+    assert.match(psWgsl([SIO.MOV, r0d, src(REG_INPUT, 1)]),
+        /r0 = input\.specular\.xyzw;/);
+    assert.match(psWgsl([SIO.MOV, r0d, src(REG_CONST, 3)]),
+        /constants\.ps\[3\]/);
+    assert.match(psWgsl([SIO.TEXCOORD, dst(REG_TEXTURE, 0)]),
+        /t0 = vec4<f32>\(input\.texcoord0\.xy, 0\.0, 1\.0\);/);
+    assert.match(psWgsl([SIO.TEX, dst(REG_TEXTURE, 0)]),
+        /t0 = textureSample\(stage0Texture, stage0Sampler, t0\.xy\);/,
+        "ps_1_1 tex samples into the texture register itself");
+    assert.match(psWgsl([SIO.TEX, dst(REG_TEMP, 0), t0], PS_1_4),
+        /r0 = textureSample\(stage0Texture, stage0Sampler, t0\.xy\);/,
+        "ps_1_4 texld takes an explicit coordinate source");
+    assert.match(psWgsl([SIO.TEXKILL, dst(REG_TEXTURE, 0)]), /discard;/);
+    assert.match(
+        psWgsl([SIO.LRP, r0d, src(REG_CONST, 0), src(REG_INPUT, 0),
+            src(REG_INPUT, 1)]),
+        /mix\(input\.specular\.xyzw, input\.diffuse\.xyzw, constants\.ps\[0\]\.xyzw\)/,
+        "D3D8 lrp is mix(src2, src1, src0), not mix(src0, src1, src2)");
+    assert.match(
+        psWgsl([SIO.CND, r0d, src(REG_CONST, 0), src(REG_INPUT, 0),
+            src(REG_INPUT, 1)]),
+        /> vec4<f32>\(0\.5\)/, "cnd compares against 0.5");
+    assert.match(
+        psWgsl([SIO.CMP, r0d, src(REG_CONST, 0), src(REG_INPUT, 0),
+            src(REG_INPUT, 1)], PS_1_2),
+        />= vec4<f32>\(0\.0\)/, "cmp compares against 0");
+
+    // r0 is the implicit ps.1.x output register and must be declared exactly
+    // once even when the body also names it.
+    const psDecls = psWgsl([SIO.MOV, r0d, src(REG_INPUT, 0)])
+        .match(/var r0: vec4<f32>/g);
+    assert.equal(psDecls.length, 1, "r0 must be declared exactly once");
+    assert.match(psWgsl([SIO.NOP]), /var r0: vec4<f32>/,
+        "r0 must still be declared for a shader that never writes it");
+
+    // --- PS rejection cases ---
+    assertRejects("ps_1_5", () => psWgsl([SIO.NOP], 0xFFFF0105));
+    assertRejects("ps_2_0", () => psWgsl([SIO.NOP], 0xFFFF0200));
+    assertRejects("cmp on ps_1_1 (needs 1.2+)",
+        () => psWgsl([SIO.CMP, r0d, src(REG_CONST, 0), src(REG_INPUT, 0),
+            src(REG_INPUT, 1)], PS_1_1));
+    assertRejects("cnd on ps_1_4 (removed after 1.3)",
+        () => psWgsl([SIO.CND, r0d, src(REG_CONST, 0), src(REG_INPUT, 0),
+            src(REG_INPUT, 1)], PS_1_4));
+    assertRejects("a vertex-only opcode in a pixel shader",
+        () => psWgsl([SIO.RCP, r0d, src(REG_INPUT, 0)]));
+    assertRejects("a texture stage beyond this backend's 2-stage limit",
+        () => psWgsl([SIO.TEXCOORD, dst(REG_TEXTURE, 4)]));
+    assertRejects("an out-of-range pixel constant register",
+        () => psWgsl([SIO.MOV, r0d, src(REG_CONST, 8)]));
+
+    // Comments must be skipped by length, not by scanning for the next
+    // recognizable opcode -- a comment payload can contain anything.
+    const commentToken = ((2 << 16) | 0xFFFE) >>> 0; // 2-DWORD comment
+    const withComment = vsWgsl([
+        commentToken, SIO.M4x4 /* payload, not an instruction */, 0xDEADBEEF,
+        SIO.MOV, r0d, v0,
+    ]);
+    assert.match(withComment, /r0 = input\.v0\.xyzw;/,
+        "comment payloads must be skipped without being decoded");
+
+    // --- end-to-end: create, bind, draw through the executor ---
+    const fake = makeFakeWebGPU();
+    const canvas = {
+        width: 1, height: 1,
+        getContext(name) { assert.equal(name, "webgpu"); return fake.context; },
+    };
+    const executor = new D3D8WebGPUExecutor(canvas, { gpu: fake.gpu });
+    const deviceHandle = 0x00100010;
+    const vsHandle = 0x40000001; // real shader handles always carry bit 0
+    const psHandle = 0x40000003;
+    const vertexBuffer = 0x00100011;
+
+    const vsBody = Buffer.alloc(8 * 4);
+    [VS_1_1,
+        SIO.MOV, dst(REG_RASTOUT, 0), src(REG_INPUT, 0),
+        SIO.MOV, dst(REG_ATTROUT, 0), src(REG_INPUT, 1),
+    ].forEach((token, i) => vsBody.writeUInt32LE(token >>> 0, i * 4));
+    const declBuffer = Buffer.alloc(3 * 4);
+    [0x20000000, 0x40030000, 0x40040005].forEach((token, i) =>
+        declBuffer.writeUInt32LE(token >>> 0, i * 4));
+    const psBody = Buffer.alloc(4 * 4);
+    [PS_1_1, SIO.MOV, dst(REG_TEMP, 0), src(REG_INPUT, 0)]
+        .forEach((token, i) => psBody.writeUInt32LE(token >>> 0, i * 4));
+
+    const createVs = Buffer.alloc(24);
+    createVs.writeUInt32LE(deviceHandle, 0);
+    createVs.writeUInt32LE(vsHandle, 4);
+    createVs.writeUInt32LE(declBuffer.length / 4, 8);
+    createVs.writeUInt32LE(vsBody.length / 4, 16);
+    const createPs = Buffer.alloc(16);
+    createPs.writeUInt32LE(deviceHandle, 0);
+    createPs.writeUInt32LE(psHandle, 4);
+    createPs.writeUInt32LE(psBody.length / 4, 8);
+
+    const vertexData = Buffer.alloc(3 * 20);
+    for (let i = 0; i < 3; i++) {
+        vertexData.writeFloatLE(i * 10, i * 20);
+        vertexData.writeFloatLE(i * 10, i * 20 + 4);
+        vertexData.writeFloatLE(0.5, i * 20 + 8);
+        vertexData.writeFloatLE(1, i * 20 + 12);
+        vertexData.writeUInt32LE(0xFFFFFFFF, i * 20 + 16);
+    }
+    const createVb = Buffer.alloc(32);
+    createVb.writeUInt32LE(deviceHandle, 0);
+    createVb.writeUInt32LE(vertexBuffer, 4);
+    createVb.writeUInt32LE(1, 8);
+    createVb.writeUInt32LE(vertexData.length, 12);
+    const updateVb = Buffer.alloc(24);
+    updateVb.writeUInt32LE(vertexBuffer, 0);
+    updateVb.writeUInt32LE(0, 4);
+    updateVb.writeUInt32LE(vertexData.length, 8);
+
+    const vsConstants = Buffer.alloc(2 * 16);
+    vsConstants.writeFloatLE(0.25, 0);
+    const setVsConstant = Buffer.alloc(16);
+    setVsConstant.writeUInt32LE(deviceHandle, 0);
+    setVsConstant.writeUInt32LE(0, 4);
+    setVsConstant.writeUInt32LE(2, 8);
+
+    await executor.submit(batch([
+        command(OP_HELLO, u32Payload(32, 0,
+            DEFAULT_SESSION_LOW, DEFAULT_SESSION_HIGH)),
+        command(OP_CREATE_DEVICE, createDevicePayload(deviceHandle, 320, 240)),
+        commandWithBlobs(OP_CREATE_VERTEX_SHADER, createVs, [
+            { offsetField: 12, data: declBuffer },
+            { offsetField: 20, data: vsBody },
+        ]),
+        commandWithBlobs(OP_CREATE_PIXEL_SHADER, createPs, [
+            { offsetField: 12, data: psBody },
+        ]),
+        command(OP_CREATE_BUFFER, createVb),
+        command(OP_UPDATE_BUFFER, updateVb, vertexData),
+        commandWithBlobs(OP_SET_VERTEX_SHADER_CONSTANT, setVsConstant, [
+            { offsetField: 12, data: vsConstants },
+        ]),
+        command(OP_SET_VERTEX_SHADER, u32Payload(deviceHandle, vsHandle)),
+        command(OP_SET_PIXEL_SHADER, u32Payload(deviceHandle, psHandle)),
+        command(OP_SET_STREAM_SOURCE,
+            u32Payload(deviceHandle, 0, vertexBuffer, 20)),
+        command(OP_BEGIN_SCENE, u32Payload(deviceHandle, 0)),
+        command(OP_DRAW_PRIMITIVE, u32Payload(deviceHandle, 4, 0, 1)),
+        command(OP_END_SCENE, u32Payload(deviceHandle, 0)),
+        command(OP_PRESENT, surfacePayload(deviceHandle, 0, 0, 320, 240)),
+    ], 1), { submitCount: 1 });
+
+    assert.equal(executor.failed, null, "a real SM1.x draw must not fail");
+    assert.equal(executor.getStats().drawCalls, 1);
+    assert.equal(executor.getStats().pipelineCreations, 1);
+    assert.equal(executor.getStats().unsupportedCommands, 0,
+        "a real shader draw must not fall into the unsupported-FVF path");
+
+    // The generated module must come from the shader path, and the vertex
+    // layout must follow the declaration rather than any FVF.
+    const shaderCalls = fake.calls.filter(call => call[0] === "shader");
+    assert.equal(shaderCalls.length, 1);
+    assert.match(shaderCalls[0][1].code, /@vertex fn vs_main/);
+    assert.match(shaderCalls[0][1].code, /@fragment fn fs_main/);
+    assert.equal(
+        (shaderCalls[0][1].code.match(/struct D8WGShaderConstants/g) || []).length,
+        1, "the combined module must declare its uniform block exactly once");
+    const pipelineCalls = fake.calls.filter(call => call[0] === "createPipeline");
+    assert.deepEqual(pipelineCalls[0][1].vertex.buffers[0].attributes, [
+        { shaderLocation: 0, offset: 0, format: "float32x4" },
+        { shaderLocation: 1, offset: 16, format: "unorm8x4" },
+    ]);
+
+    // A second identical draw must reuse the cached pipeline: the doc's
+    // "steady-state pipeline creation = 0/frame" budget applies to the
+    // shader path too.
+    await executor.submit(batch([
+        command(OP_BEGIN_SCENE, u32Payload(deviceHandle, 0)),
+        command(OP_DRAW_PRIMITIVE, u32Payload(deviceHandle, 4, 0, 1)),
+        command(OP_END_SCENE, u32Payload(deviceHandle, 0)),
+        command(OP_PRESENT, surfacePayload(deviceHandle, 0, 0, 320, 240)),
+    ], 2), { submitCount: 2 });
+    assert.equal(executor.failed, null);
+    assert.equal(executor.getStats().drawCalls, 2);
+    assert.equal(executor.getStats().pipelineCreations, 1,
+        "rebinding the same shader pair must not rebuild the pipeline");
+
+    // A v86 save/load must carry shaders, their bindings, and their constant
+    // banks across the checkpoint; otherwise the first draw after a restore
+    // hits an unresolved shader handle.
+    const checkpoint = executor.serializeState();
+    await executor.restoreState(checkpoint);
+    assert.equal(executor.failed, null, "restoring a shader session must work");
+    const restored = executor.devices.get(deviceHandle);
+    assert.equal(restored.vertexShader, vsHandle,
+        "the bound vertex shader must survive save/load");
+    assert.equal(restored.pixelShader, psHandle);
+    assert.equal(restored.vsConstants[0], 0.25,
+        "shader constants must survive save/load");
+    assert.equal(executor.resources.get(vsHandle).kind, 4);
+    assert.equal(executor.resources.get(psHandle).kind, 5);
+
+    // ...and the restored session must still be able to draw.
+    await executor.submit(batch([
+        command(OP_BEGIN_SCENE, u32Payload(deviceHandle, 0)),
+        command(OP_DRAW_PRIMITIVE, u32Payload(deviceHandle, 4, 0, 1)),
+        command(OP_END_SCENE, u32Payload(deviceHandle, 0)),
+        command(OP_PRESENT, surfacePayload(deviceHandle, 0, 0, 320, 240)),
+    ], 4), { submitCount: 4 });
+    assert.equal(executor.failed, null,
+        "a restored shader session must keep drawing");
+    assert.equal(executor.getStats().unsupportedCommands, 0);
+
+    // Reset keeps app-visible shader handles stable (unlike buffer/texture
+    // handles, which are private to the guest and get renumbered), because
+    // the application still holds the DWORD it got from CreateVertexShader.
+    // The host must therefore accept the same handle being re-created under
+    // the new device epoch even though Reset retired it.
+    const resetDevice = 0x00100020;
+    await executor.submit(batch([
+        command(OP_RESET, Buffer.concat([
+            u32Payload(deviceHandle),
+            createDevicePayload(resetDevice, 320, 240),
+        ])),
+        commandWithBlobs(OP_CREATE_VERTEX_SHADER, (() => {
+            const p = Buffer.alloc(24);
+            p.writeUInt32LE(resetDevice, 0);
+            p.writeUInt32LE(vsHandle, 4);
+            p.writeUInt32LE(declBuffer.length / 4, 8);
+            p.writeUInt32LE(vsBody.length / 4, 16);
+            return p;
+        })(), [
+            { offsetField: 12, data: declBuffer },
+            { offsetField: 20, data: vsBody },
+        ]),
+        commandWithBlobs(OP_CREATE_PIXEL_SHADER, (() => {
+            const p = Buffer.alloc(16);
+            p.writeUInt32LE(resetDevice, 0);
+            p.writeUInt32LE(psHandle, 4);
+            p.writeUInt32LE(psBody.length / 4, 8);
+            return p;
+        })(), [{ offsetField: 12, data: psBody }]),
+        command(OP_SET_VERTEX_SHADER, u32Payload(resetDevice, vsHandle)),
+        command(OP_SET_PIXEL_SHADER, u32Payload(resetDevice, psHandle)),
+    ], 5), {});
+    assert.equal(executor.failed, null,
+        "re-creating a stable shader handle after Reset must be accepted");
+    assert.equal(executor.devices.get(resetDevice).vertexShader, vsHandle);
+    assert.equal(executor.devices.get(resetDevice).pixelShader, psHandle);
+
+    // Binding a handle the host never created is a protocol error, not a
+    // silently-skipped draw.
+    await executor.submit(batch([
+        command(OP_SET_PIXEL_SHADER, u32Payload(resetDevice, 0x40000099)),
+    ], 6), {});
+    assert.notEqual(executor.failed, null,
+        "an unknown pixel shader handle must fail the batch");
 }
 
 main().catch(error => {

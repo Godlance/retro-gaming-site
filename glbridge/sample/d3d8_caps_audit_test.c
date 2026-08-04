@@ -228,8 +228,13 @@ static void audit_caps(void)
     require_value("VolumeTextureAddressCaps", g_caps.VolumeTextureAddressCaps,
             0, 3);
     require_value("MaxVolumeExtent", g_caps.MaxVolumeExtent, 0, 3);
-    require_value("VertexShaderVersion", g_caps.VertexShaderVersion, 0, 3);
-    require_value("PixelShaderVersion", g_caps.PixelShaderVersion, 0, 3);
+    /* Stage 6: shader model 1.x is honestly advertised now that
+     * CreateVertexShader/CreatePixelShader actually validate and translate
+     * bytecode instead of rejecting every real shader handle. */
+    require_value("VertexShaderVersion", g_caps.VertexShaderVersion,
+            D3DVS_VERSION(1, 1), 3);
+    require_value("PixelShaderVersion", g_caps.PixelShaderVersion,
+            D3DPS_VERSION(1, 4), 3);
     require_value("MaxSimultaneousTextures",
             g_caps.MaxSimultaneousTextures, 2, 3);
     require_value("MaxTextureBlendStages", g_caps.MaxTextureBlendStages,
@@ -412,9 +417,63 @@ static void audit_dxt_format(D3DFORMAT format, UINT block_bytes, const char *nam
     IDirect3DTexture8_Release(texture);
 }
 
-/* Positive cube/volume/SM1.1/eight-stage probes belong to Stage 6. Keep the
- * source beside the audit so it can be enabled when those caps are honestly
- * advertised, but do not compile it into the Stage 5 acceptance executable. */
+static void audit_shader_pipeline(void)
+{
+    static const DWORD declaration[] =
+    {
+        D3DVSD_STREAM(0),
+        D3DVSD_REG(D3DVSDE_POSITION, D3DVSDT_FLOAT4),
+        D3DVSD_REG(D3DVSDE_DIFFUSE, D3DVSDT_D3DCOLOR),
+        D3DVSD_END()
+    };
+    static const DWORD vertex_shader[] =
+    {
+        D3DVS_VERSION(1, 1),
+        D3DSIO_MOV, AUDIT_SHADER_PARAM | D3DSPR_RASTOUT | D3DSRO_POSITION | D3DSP_WRITEMASK_ALL,
+                AUDIT_SHADER_PARAM | D3DSPR_INPUT | D3DVS_NOSWIZZLE,
+        D3DSIO_MOV, AUDIT_SHADER_PARAM | D3DSPR_ATTROUT | D3DSP_WRITEMASK_ALL,
+                AUDIT_SHADER_PARAM | D3DSPR_INPUT | D3DVS_NOSWIZZLE | 1,
+        D3DVS_END()
+    };
+    static const DWORD pixel_shader[] =
+    {
+        D3DPS_VERSION(1, 1),
+        D3DSIO_MOV, AUDIT_SHADER_PARAM | D3DSPR_TEMP | D3DSP_WRITEMASK_ALL,
+                AUDIT_SHADER_PARAM | D3DSPR_INPUT | D3DSP_NOSWIZZLE,
+        D3DPS_END()
+    };
+    static const struct { float x, y, z, w; DWORD color; } vertices[3] =
+    {
+        {-0.8f, -0.8f, 0.0f, 1.0f, 0xffff0000},
+        {-0.4f, -0.8f, 0.0f, 1.0f, 0xff00ff00},
+        {-0.8f, -0.4f, 0.0f, 1.0f, 0xff0000ff}
+    };
+    DWORD vs = 0;
+    DWORD ps = 0;
+    HRESULT hr = IDirect3DDevice8_CreateVertexShader(g_device, declaration,
+            vertex_shader, &vs, 0);
+    if (FAILED(hr)) resource_failure("vertex shader create", hr, 3);
+    if (SUCCEEDED(hr))
+    {
+        hr = IDirect3DDevice8_CreatePixelShader(g_device, pixel_shader, &ps);
+        if (FAILED(hr)) resource_failure("pixel shader create", hr, 3);
+    }
+    if (SUCCEEDED(hr)) hr = IDirect3DDevice8_SetVertexShader(g_device, vs);
+    if (SUCCEEDED(hr)) hr = IDirect3DDevice8_SetPixelShader(g_device, ps);
+    if (SUCCEEDED(hr)) hr = IDirect3DDevice8_DrawPrimitiveUP(g_device,
+            D3DPT_TRIANGLELIST, 1, vertices, sizeof(vertices[0]));
+    if (FAILED(hr) && vs && ps) resource_failure("shader draw", hr, 3);
+    IDirect3DDevice8_SetPixelShader(g_device, 0);
+    IDirect3DDevice8_SetVertexShader(g_device, D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    if (ps) IDirect3DDevice8_DeletePixelShader(g_device, ps);
+    if (vs) IDirect3DDevice8_DeleteVertexShader(g_device, vs);
+}
+
+/* Positive cube/volume/eight-stage probes still belong to a later stage.
+ * Keep the source beside the audit so it can be enabled when those caps are
+ * honestly advertised, but do not compile it into the Stage 6 acceptance
+ * executable. Shader model 1.x (audit_shader_pipeline above) graduated out
+ * of this block when Stage 6 landed. */
 #if 0
 static void audit_cube_texture(void)
 {
@@ -503,58 +562,6 @@ static void audit_volume_texture(void)
     IDirect3DVolumeTexture8_Release(texture);
 }
 
-static void audit_shader_pipeline(void)
-{
-    static const DWORD declaration[] =
-    {
-        D3DVSD_STREAM(0),
-        D3DVSD_REG(D3DVSDE_POSITION, D3DVSDT_FLOAT4),
-        D3DVSD_REG(D3DVSDE_DIFFUSE, D3DVSDT_D3DCOLOR),
-        D3DVSD_END()
-    };
-    static const DWORD vertex_shader[] =
-    {
-        D3DVS_VERSION(1, 1),
-        D3DSIO_MOV, AUDIT_SHADER_PARAM | D3DSPR_RASTOUT | D3DSRO_POSITION | D3DSP_WRITEMASK_ALL,
-                AUDIT_SHADER_PARAM | D3DSPR_INPUT | D3DVS_NOSWIZZLE,
-        D3DSIO_MOV, AUDIT_SHADER_PARAM | D3DSPR_ATTROUT | D3DSP_WRITEMASK_ALL,
-                AUDIT_SHADER_PARAM | D3DSPR_INPUT | D3DVS_NOSWIZZLE | 1,
-        D3DVS_END()
-    };
-    static const DWORD pixel_shader[] =
-    {
-        D3DPS_VERSION(1, 1),
-        D3DSIO_MOV, AUDIT_SHADER_PARAM | D3DSPR_TEMP | D3DSP_WRITEMASK_ALL,
-                AUDIT_SHADER_PARAM | D3DSPR_INPUT | D3DSP_NOSWIZZLE,
-        D3DPS_END()
-    };
-    static const struct { float x, y, z, w; DWORD color; } vertices[3] =
-    {
-        {-0.8f, -0.8f, 0.0f, 1.0f, 0xffff0000},
-        {-0.4f, -0.8f, 0.0f, 1.0f, 0xff00ff00},
-        {-0.8f, -0.4f, 0.0f, 1.0f, 0xff0000ff}
-    };
-    DWORD vs = 0;
-    DWORD ps = 0;
-    HRESULT hr = IDirect3DDevice8_CreateVertexShader(g_device, declaration,
-            vertex_shader, &vs, 0);
-    if (FAILED(hr)) resource_failure("vertex shader create", hr, 3);
-    if (SUCCEEDED(hr))
-    {
-        hr = IDirect3DDevice8_CreatePixelShader(g_device, pixel_shader, &ps);
-        if (FAILED(hr)) resource_failure("pixel shader create", hr, 3);
-    }
-    if (SUCCEEDED(hr)) hr = IDirect3DDevice8_SetVertexShader(g_device, vs);
-    if (SUCCEEDED(hr)) hr = IDirect3DDevice8_SetPixelShader(g_device, ps);
-    if (SUCCEEDED(hr)) hr = IDirect3DDevice8_DrawPrimitiveUP(g_device,
-            D3DPT_TRIANGLELIST, 1, vertices, sizeof(vertices[0]));
-    if (FAILED(hr) && vs && ps) resource_failure("shader draw", hr, 3);
-    IDirect3DDevice8_SetPixelShader(g_device, 0);
-    IDirect3DDevice8_SetVertexShader(g_device, D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
-    if (ps) IDirect3DDevice8_DeletePixelShader(g_device, ps);
-    if (vs) IDirect3DDevice8_DeleteVertexShader(g_device, vs);
-}
-
 typedef struct EightStageVertex
 {
     float x, y, z, rhw;
@@ -635,14 +642,14 @@ static void audit_eight_texture_stages(void)
 }
 #endif
 
-static void audit_hidden_stage6_paths(void)
+/* Cube/volume textures and more than two simultaneous texture stages are
+ * still unimplemented past Stage 6; shader model 1.x graduated out of this
+ * check when Stage 6 landed (see audit_shader_pipeline). */
+static void audit_still_hidden_paths(void)
 {
     IDirect3DCubeTexture8 *cube = (IDirect3DCubeTexture8 *)(ULONG_PTR)1;
     IDirect3DVolumeTexture8 *volume =
             (IDirect3DVolumeTexture8 *)(ULONG_PTR)1;
-    DWORD shader = 0xCCCCCCCCu;
-    static const DWORD declaration[] = { D3DVSD_END() };
-    static const DWORD vertex_shader[] = { D3DVS_VERSION(1, 1), D3DVS_END() };
     HRESULT hr;
 
     hr = IDirect3DDevice8_CreateCubeTexture(g_device, 8, 1, 0,
@@ -653,10 +660,38 @@ static void audit_hidden_stage6_paths(void)
             D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &volume);
     if (hr != D3DERR_INVALIDCALL || volume != NULL)
         mismatch("unadvertised volume texture was not rejected/null", 3);
+}
+
+/* A shader that claims an unsupported/unadvertised version, or one built
+ * from an opcode outside the Stage 6 instruction set, must still be
+ * rejected outright -- Stage 6 only advertises vs_1_1/ps_1_1..1_4. */
+static void audit_unsupported_shader_bytecode_rejected(void)
+{
+    DWORD shader = 0xCCCCCCCCu;
+    static const DWORD declaration[] = { D3DVSD_END() };
+    /* vs_1_0 is not the version this backend advertises via GetDeviceCaps. */
+    static const DWORD wrong_version[] = { D3DVS_VERSION(1, 0), D3DVS_END() };
+    /* D3DSIO_M4x4 (a matrix macro) is legal D3D8 bytecode but outside the
+     * Stage 6 supported instruction set -- must be rejected, not guessed at. */
+    static const DWORD unsupported_opcode[] =
+    {
+        D3DVS_VERSION(1, 1),
+        D3DSIO_M4x4, AUDIT_SHADER_PARAM | D3DSPR_TEMP | D3DSP_WRITEMASK_ALL,
+                AUDIT_SHADER_PARAM | D3DSPR_INPUT | D3DVS_NOSWIZZLE,
+        D3DVS_END()
+    };
+    HRESULT hr;
+
     hr = IDirect3DDevice8_CreateVertexShader(g_device, declaration,
-            vertex_shader, &shader, 0);
+            wrong_version, &shader, 0);
     if (hr != D3DERR_INVALIDCALL || shader != 0)
-        mismatch("unadvertised vertex shader was not rejected/zeroed", 3);
+        mismatch("wrong-version vertex shader was not rejected/zeroed", 3);
+    shader = 0xCCCCCCCCu;
+    hr = IDirect3DDevice8_CreateVertexShader(g_device, declaration,
+            unsupported_opcode, &shader, 0);
+    if (hr != D3DERR_INVALIDCALL || shader != 0)
+        mismatch("unsupported-opcode vertex shader was not rejected/zeroed",
+                3);
 }
 
 static void audit_supported_resources(void)
@@ -675,7 +710,9 @@ static void audit_supported_resources(void)
     audit_dxt_format(D3DFMT_DXT5, 16, "DXT5 mip-chain upload/draw");
     hr = IDirect3DDevice8_EndScene(g_device);
     if (FAILED(hr)) resource_failure("extended-path EndScene", hr, 3);
-    audit_hidden_stage6_paths();
+    audit_still_hidden_paths();
+    audit_unsupported_shader_bytecode_rejected();
+    audit_shader_pipeline();
 }
 
 static HRESULT create_dashboard_device(void)

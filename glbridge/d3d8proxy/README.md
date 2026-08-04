@@ -6,7 +6,8 @@ DMA arena. The VGL2 descriptor is only the transport envelope; command
 `0xFFE0` carries a versioned D8WG batch decoded by
 `../d3d8-webgpu/d3d8_executor.js`.
 
-Implemented Maple fixed-function and lifecycle core (D8WG protocol v1.6):
+Implemented Maple fixed-function, lifecycle and shader-model-1.x core
+(D8WG protocol v1.7):
 
 - adapter enumeration, MapleStory v83 format probes, caps, and `CreateDevice`;
 - `Clear`, `BeginScene`, `EndScene`, and `Present`;
@@ -72,12 +73,19 @@ Implemented Maple fixed-function and lifecycle core (D8WG protocol v1.6):
   verified by `HELLO`; identical numeric handles from sequential or concurrent
   XP processes cannot alias, and late teardown from an old process cannot
   destroy resources or hide the canvas owned by a newer process;
+- vertex shader 1.1 and pixel shader 1.1-1.4: COM-free shader handles,
+  declaration parsing, bytecode validation, translation to WGSL, constant
+  register banks, state-block capture and `Reset` reconstruction;
 - one main PCI submit at `Present` (extra submits occur only when the DMA arena
   fills or when a window lifecycle event must reach the host immediately).
 
-The current v1.6 boundary remains conservative: clip planes, cube/volume
-textures and programmable shaders are not implemented, and their caps are not
-advertised. Unsupported calls return `D3DERR_INVALIDCALL`. Because WebGPU has
+The current v1.7 boundary remains conservative: clip planes and cube/volume
+textures are not implemented, and their caps are not advertised. Within shader
+model 1.x, the supported instruction set covers the common ALU, texture-
+addressing and comparison opcodes; matrix macros (`m4x4` and friends) and the
+bump-mapping/`texm3x3` family are deliberately rejected rather than
+approximated, and more than two simultaneous texture stages remain
+unsupported. Unsupported calls return `D3DERR_INVALIDCALL`. Because WebGPU has
 no synchronous texture mapping API, CPU readback is exact for uploads,
 `Clear` and `CopyRects`; pixels produced only by an arbitrary GPU draw are not
 synchronously reflected into the guest shadow. Maple does not use that cold
@@ -108,7 +116,7 @@ Build the XP Stage 4 fixed-function acceptance tests:
 ```
 
 This builds transform/depth, raster/stencil, lighting/material, fog, and
-textured-cube tests. Run them with the current v1.6 DLL beside each executable before
+textured-cube tests. Run them with the current v1.7 DLL beside each executable before
 testing MapleStory itself.
 
 Build the XP Stage 5 lifecycle acceptance tests:
@@ -124,7 +132,8 @@ invalid-call outputs, 96 create/destroy cycles, eight device epochs, and final
 collection of a device/bound-resource COM reference cycle. The capability audit
 also enforces an honest Stage 5 boundary: core/DXT/render-target texture paths
 must be advertised, while cube/volume textures, SM1.1, and more than two active
-texture stages remain hidden until their Stage 6 implementations exist.
+texture stages remain hidden until their implementations exist. Shader model
+1.x graduated out of that hidden set in Stage 6 (see below).
 Device-loss, save/load reconstruction, stale batches, and the host resource-map
 stress loop are covered by `d3d8_webgpu_executor_test.js` and
 `v86_network_bridge_state_test.js`. The executor regression also creates two
@@ -134,6 +143,25 @@ after a multi-session save/load round trip. It additionally validates scoped
 color/depth/stencil rectangle clears and queue-fenced physical resource
 destruction after logical D3D8 release.
 
+Build the XP Stage 6 shader-model-1.x acceptance test:
+
+```sh
+./glbridge/d3d8proxy/build_stage6_tests.sh /private/tmp/d3d8-stage6-tests
+```
+
+Stage 6 implements D3D8 shader model 1.x: `CreateVertexShader`/
+`CreatePixelShader`, `SetVertexShader` with a real shader handle (FVF tokens
+still take the fixed-function path), `Set/Get{Vertex,Pixel}ShaderConstant`,
+`Get{Vertex,Pixel}ShaderFunction`, `GetVertexShaderDeclaration`, and
+`Delete{Vertex,Pixel}Shader`. `GetDeviceCaps` now advertises `vs_1_1` and
+`ps_1_4` accordingly. Both the guest DLL and the host executor validate the
+token stream against the same supported-instruction table before a shader is
+created, so unsupported-but-legal D3D8 opcodes (matrix macros, bump-mapping
+texture ops) and malformed bytecode are rejected up front rather than
+mistranslated into wrong WGSL. Shaders survive `Reset` by being re-created
+under the new device epoch from the guest's token shadow, and constant banks
+are resent with them.
+
 Host-side protocol/executor tests:
 
 ```sh
@@ -141,13 +169,21 @@ node glbridge/tests/d3d8_protocol_consistency_test.js
 node --test glbridge/tests/d3d8_webgpu_executor_test.js
 ```
 
+`d3d8_webgpu_executor_test.js` carries the per-instruction numeric coverage
+for the VS1.1/PS1.1-1.4 to WGSL translator (one assertion per supported
+opcode, plus write masks, saturate/shift destination modifiers, source
+modifiers, swizzles, and `def` constant folding), the rejection cases for
+unsupported versions/opcodes/registers and truncated bytecode, and an
+end-to-end real-shader draw that also proves the shader pipeline is cached
+rather than rebuilt per frame.
+
 The real-GPU validation page is
 `glbridge/tests/d3d8_webgpu_browser_test.html`; serve the repository over
 localhost and open it in a WebGPU-enabled browser. It reports `PASS` only
 after creating both pre-transformed and XYZ/normal/texture-transform pipelines
 without WebGPU validation errors.
 
-The v1.6 guest DLL and host executor must be deployed together. The executor
+The v1.7 guest DLL and host executor must be deployed together. The executor
 rejects a different protocol minor version instead of silently skipping newer
 texture or fixed-function commands.
 
