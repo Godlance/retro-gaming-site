@@ -1987,8 +1987,13 @@ static HRESULT WINAPI d3d_create_device(IDirect3D8 *iface, UINT adapter,
             && !supported_backbuffer_format(parameters->BackBufferFormat))
         return D3DERR_NOTAVAILABLE;
     if (parameters->BackBufferWidth > 8192
-            || parameters->BackBufferHeight > 8192
-            || parameters->BackBufferCount > 1)
+            || parameters->BackBufferHeight > 8192)
+        return D3DERR_INVALIDCALL;
+    /* D3D8 permits 0..3 back buffers (0 meaning 1). The host always presents
+     * through a single WebGPU surface, so extra back buffers are a
+     * presentation detail we can satisfy with one target; only a request
+     * beyond the D3D8 maximum is a genuine error. */
+    if (parameters->BackBufferCount > 3)
         return D3DERR_INVALIDCALL;
 
     device = (D8Device *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
@@ -5307,12 +5312,23 @@ static IDirect3DSwapChain8Vtbl g_swapchain_vtbl = {
     .GetBackBuffer = swapchain_get_backbuffer
 };
 
+/*
+ * Both SDK version tokens seen in the wild must be accepted, exactly as the
+ * real d3d8.dll does. Titles compiled against the DirectX 8.0 SDK pass 120
+ * and titles compiled against 8.1 pass 220 (D3D_SDK_VERSION); rejecting 120
+ * makes Direct3DCreate8 return NULL at the very first call, which a game can
+ * only report as a generic "unable to initialize DirectX".
+ */
+#define D3D_SDK_VERSION_DX80 120u
+#define D3D_SDK_VERSION_DX81 220u
+
 IDirect3D8 *WINAPI Direct3DCreate8(UINT sdk_version)
 {
     D8Direct3D *d3d;
     BOOL transport_ready;
 
-    if (sdk_version != D3D_SDK_VERSION)
+    if (sdk_version != D3D_SDK_VERSION_DX80
+            && sdk_version != D3D_SDK_VERSION_DX81)
         return NULL;
     EnterCriticalSection(&g_transport_lock);
     transport_ready = open_transport_locked();
@@ -5328,6 +5344,41 @@ IDirect3D8 *WINAPI Direct3DCreate8(UINT sdk_version)
     d3d->refcount = 1;
     emit_hello_once();
     return &d3d->iface;
+}
+
+/*
+ * Secondary d3d8.dll exports.
+ *
+ * These exist only so that a title which statically imports them can load at
+ * all; omitting them makes the loader reject the DLL before Direct3DCreate8 is
+ * ever reached. The shader validators accept everything: real validation
+ * already happens in CreateVertexShader/CreatePixelShader, which parse the
+ * token stream against the Stage 6 supported-instruction table and reject
+ * anything they cannot translate.
+ */
+HRESULT WINAPI ValidateVertexShader(const DWORD *shader, const DWORD *declaration,
+        const D3DCAPS8 *caps, WINBOOL return_error, char **errors)
+{
+    (void)shader;
+    (void)declaration;
+    (void)caps;
+    (void)return_error;
+    if (errors) *errors = NULL;
+    return S_OK;
+}
+
+HRESULT WINAPI ValidatePixelShader(const DWORD *shader, const D3DCAPS8 *caps,
+        WINBOOL return_error, char **errors)
+{
+    (void)shader;
+    (void)caps;
+    (void)return_error;
+    if (errors) *errors = NULL;
+    return S_OK;
+}
+
+void WINAPI DebugSetMute(void)
+{
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
