@@ -1103,6 +1103,46 @@ cache 必须有计数、命中率和上限。不要无界增长；场景切换�
 
 ### 阶段 7：性能硬化
 
+当前落地状态（2026-08-05）：
+
+先按第 5 节的要求建立可复现基线，再动手。基线用一个计数型 fake WebGPU device
+测量「150 draw + 300 次 render state 变化」的稳态帧，结果如下（每帧）：
+
+| 指标 | 优化前 | 优化后 | 12.1 预算 |
+|---|---:|---:|---|
+| GPU buffer 创建 | 150 | **0** | 0 |
+| bind group 创建 | 150 | **0** | 接近 0 |
+| pipeline 创建 | 0 | 0 | 0 |
+| uniform 上传次数 | 150 | **1** | 最少 |
+| uniform 上传字节 | 208,800 | **1,392** | 最少 |
+| render pass / submit | 1 / 1 | 1 / 1 | 1 |
+
+两处根因与修复：
+
+- **uniform ring + dynamic offset。** 原 `uniformFor` 以单调递增的
+  `uniformSerial` 作为 cache key，该 key 永远不会被再次命中，因此每次状态变化
+  都会新建一个 `GPUBuffer` 并让 bind group 失效。现在改为一条常驻 uniform ring
+  buffer，按 256 字节对齐 suballocate，并用 dynamic offset 绑定；按 §9.7 的要求
+  uniform 不再进入 bind group identity，bind group 只由 (ring buffer, textures,
+  samplers) 决定。固定管线与 shader 两条路径都改用显式
+  `GPUBindGroupLayout`（`hasDynamicOffset: true`），不再使用 `layout: "auto"`。
+- **dead-store elimination。** `SET_RENDER_STATE` 过去对任何 render state 都会
+  `uniformSerial++`，但 blend/cull/depth/stencil 等属于 pipeline state，并不在
+  uniform block 内。现在用一张按 `D3DRENDERSTATETYPE` 索引的 `Uint8Array` 做
+  O(1) 判定，只有 uniform block 真正包含的 7 个 render state 才会触发重新打包；
+  同时对「写入值与当前值相同」的冗余写入直接丢弃并计数。
+
+其他已落地项：
+
+- uniform 打包改为复用 scratch `Float32Array`，去掉了每次打包的临时数组、
+  展开运算符和 `d3dColor()` 临时对象；`setBindGroup` 的 dynamic offset 复用一个
+  共享 `Uint32Array`，热路径零分配。
+- 新增计数器：`bindGroupCreations`、`bindGroupHits`、`uniformSlotReuses`、
+  `uniformUploadBytes`、`uniformRingOverflows`、`redundantStateWrites`。
+  `uniformRingOverflows` 持续为 0 表示 ring 容量对当前负载足够。
+- ring 与显式 layout 都属于当前 `GPUDevice`，device lost 时与
+  pipeline/sampler cache 一并作废重建。
+
 工作项：
 
 - guest state change 合并和 dead-store elimination。
@@ -1122,6 +1162,29 @@ cache 必须有计数、命中率和上限。不要无界增长；场景切换�
 - 提交数和上传字节数满足预算。
 - 10–30 分钟运行无持续内存增长和周期性 GC 卡顿。
 - 性能数据证明瓶颈已经离开旧图形转换链。
+
+自动验收覆盖（`glbridge/tests/d3d8_webgpu_perf_test.js`）：
+
+- 稳态帧断言 pipeline / bind group / buffer / texture 创建均为 0，render pass
+  与 queue submit 均为 1，`copyTextureToBuffer` 与 `mapAsync` 均为 0（正常帧无
+  readback）。
+- 断言 blend factor 抖动不会重打包 uniform，而 `D3DRS_TEXTUREFACTOR`（uniform
+  block 真正包含的状态）必须重打包——这条用于防止 dead-store elimination 优化
+  过头导致渲染读到过期 uniform。
+- 第二个场景让 uniform 每个 draw 都变化，断言 bind group 缓存规模不随 uniform
+  状态增长（≤4），证明 uniform 确实没有进入 bind group identity；仅靠「每帧创建
+  数」无法捕获这类回归，因为 ring 游标每帧重置会让 offset 重复出现。
+- 断言所有 dynamic offset 均为 256 的整数倍。
+- 上述两项优化都做过反向验证：分别把 dead-store 过滤和 bind-group key 改回旧
+  写法，测试确实失败。
+
+尚未完成（需要真实运行环境，无法用 fake device 断言）：
+
+- Maple 实机 A/B 性能数据与分层耗时（第 12.3 节）。
+- 10–30 分钟长跑的内存增长与 GC 卡顿曲线。
+- worker/main-thread 调度与 `OffscreenCanvas` 迁移评估（第 8.2 节要求先测量再
+  决定，不应盲目重构）。
+- pipeline 预热策略：当前冷启动仍会在首帧创建 pipeline，稳态为 0。
 
 ### 阶段 8：DirectSound → WebAudio
 
@@ -1575,7 +1638,7 @@ v1.7（阶段 6）新增：
 6. 用测试注入一次 device lost，确认 replacement device 恢复后仍可 Present；任何恢复失败都必须作为明确错误上报，不能静默黑屏。
 7. 若目标游戏真的调用 draw-generated GPU readback，再设计可暂停 v86 guest 的异步 readback 握手；不要在主线程用忙等或每帧 readback 破坏性能。
 
-因此当前准确状态是：“阶段 4 已完成；阶段 5 与阶段 6 的代码和自动回归已落地，等待真实 XP 的 Stage 5/6 exe、真实 WebGPU 下的 shader 校验、save/load、device-lost 和长时间切图验收后关闭发布门槛”。
+因此当前准确状态是：“阶段 4、5、6 已由真实 XP/浏览器验收（MapleStory v83 与 `d3d8_caps_audit_test.exe` 均通过）；阶段 7 的稳态预算优化与自动回归已落地，等待 Maple 实机 A/B 性能数据与 10–30 分钟长跑曲线后关闭阶段 7”。
 
 ## 21. 参考资料与许可边界
 

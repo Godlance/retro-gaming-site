@@ -171,6 +171,38 @@
     const TRANSIENT_BUFFER_BYTES = 16 * 1024 * 1024;
     const D3DLOCK_DISCARD = 0x2000;
 
+    // Stage 7: uniform ring. Uniform data is suballocated from one persistent
+    // ring buffer and bound with a dynamic offset, instead of minting a fresh
+    // GPUBuffer per state change. WebGPU requires a dynamic uniform offset to
+    // be a multiple of minUniformBufferOffsetAlignment; 256 is the spec's
+    // maximum allowed value for that limit, so it is safe on every adapter.
+    const UNIFORM_OFFSET_ALIGNMENT = 256;
+    const FIXED_UNIFORM_BYTES = 1392;
+    const SHADER_UNIFORM_BYTES =
+        (D8WG_MAX_VS_CONSTANTS + D8WG_MAX_PS_CONSTANTS) * 16;
+    const UNIFORM_RING_BYTES = 4 * 1024 * 1024;
+
+    function alignUniform(value) {
+        return (value + (UNIFORM_OFFSET_ALIGNMENT - 1)) &
+            ~(UNIFORM_OFFSET_ALIGNMENT - 1);
+    }
+
+    // Which render states actually appear in the fixed-function uniform block
+    // (see uniformFor / SurfaceUniforms). Everything else is pipeline state and
+    // must not invalidate the packed uniform slot. Indexed by D3DRENDERSTATETYPE
+    // for an O(1) integer test on the hot command path.
+    const UNIFORM_RENDER_STATES = new Uint8Array(256);
+    for (const renderState of [
+        D3DRS_TEXTUREFACTOR, D3DRS_ALPHAREF, D3DRS_FOGCOLOR, D3DRS_FOGSTART,
+        D3DRS_FOGEND, D3DRS_FOGDENSITY, D3DRS_AMBIENT,
+    ]) UNIFORM_RENDER_STATES[renderState] = 1;
+
+    // Reused across every setBindGroup so the hot draw path allocates nothing.
+    // WebGPU's (data, start, length) overload reads the offsets out of this
+    // array synchronously, so a single shared instance is safe.
+    const DYNAMIC_OFFSETS = new Uint32Array(1);
+    let uniformRingSerial = 0;
+
     function u16(bytes, offset) {
         return bytes[offset] | bytes[offset + 1] << 8;
     }
@@ -1472,7 +1504,16 @@ ${body.join("\n")}
             renderTarget: { handle: 0, level: 0 },
             depthSurfaceEnabled: surface.autoDepthStencil,
             uniformSerial: 0,
-            uniformVariants: new Map(),
+            // Stage 7: the current uniform-ring slot for this device, and the
+            // (serial, frame) it was packed for. -1 forces a repack.
+            uniformSlotSerial: -1,
+            uniformSlotFrame: -1,
+            uniformSlotBuffer: null,
+            uniformSlotOffset: 0,
+            shaderConstantSlotSerial: -1,
+            shaderConstantSlotFrame: -1,
+            shaderConstantSlotBuffer: null,
+            shaderConstantSlotOffset: 0,
             bindGroups: new Map(),
             // Stage 6: D3D8 shader model 1.x. vertexShader/pixelShader are
             // D8WG resource handles (0 = fixed-function / no pixel shader).
@@ -1518,8 +1559,6 @@ ${body.join("\n")}
             this.shaderPipelineLayout = null;
             this.maxPipelines = Math.max(32, this.options.maxPipelines || 512);
             this.maxSamplers = Math.max(8, this.options.maxSamplers || 64);
-            this.maxUniformVariants = Math.max(16,
-                this.options.maxUniformVariants || 256);
             this.maxBindGroups = Math.max(64,
                 this.options.maxBindGroups || 1024);
             this.nextPipelineId = 1;
@@ -1529,6 +1568,22 @@ ${body.join("\n")}
             this.transientCapacity = Math.max(1024 * 1024,
                 this.options.transientBufferBytes || TRANSIENT_BUFFER_BYTES);
             this.transientCursor = 0;
+            // Stage 7: one persistent uniform ring per executor, suballocated
+            // with dynamic offsets so a state change costs a ring write rather
+            // than a new GPUBuffer plus a new bind group.
+            this.uniformRing = null;
+            this.uniformRingCapacity = Math.max(64 * 1024,
+                this.options.uniformRingBytes || UNIFORM_RING_BYTES);
+            this.uniformRingCursor = 0;
+            // Reused packing scratch: the fixed-function uniform block is
+            // rebuilt per distinct state, and allocating it per draw was a
+            // measurable GC source.
+            this.uniformScratch = new Float32Array(FIXED_UNIFORM_BYTES / 4);
+            this.shaderConstantScratch =
+                new Float32Array(SHADER_UNIFORM_BYTES / 4);
+            this.fixedBindGroupLayout = null;
+            this.fixedPipelineLayout = null;
+            this.frameSerial = 0;
             this.frame = null;
             this.readyPromise = null;
             this.work = Promise.resolve();
@@ -1551,6 +1606,16 @@ ${body.join("\n")}
                 pipelineCreations: 0,
                 pipelineCacheEvictions: 0,
                 uniformCacheEvictions: 0,
+                // Stage 7 counters (doc 12.2). bindGroupCreations must reach
+                // 0/frame in steady state; uniformRingOverflows staying at 0
+                // means the ring is large enough for the workload.
+                bindGroupCreations: 0,
+                bindGroupHits: 0,
+                pipelineHits: 0,
+                uniformSlotReuses: 0,
+                uniformUploadBytes: 0,
+                uniformRingOverflows: 0,
+                redundantStateWrites: 0,
                 malformedBatches: 0,
                 unsupportedCommands: 0,
                 deviceRecoveries: 0,
@@ -1661,6 +1726,13 @@ ${body.join("\n")}
                     usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_INDEX |
                         BUFFER_USAGE_COPY_SRC | BUFFER_USAGE_COPY_DST,
                 });
+                this.uniformRing = this.device.createBuffer({
+                    label: "D3D8 uniform ring",
+                    size: this.uniformRingCapacity,
+                    usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
+                });
+                this.uniformRing._d8wgRingId = ++uniformRingSerial;
+                this.uniformRingCursor = 0;
                 if (this.device.lost && typeof this.device.lost.then === "function") {
                     this.device.lost.then(info => {
                         this.scheduleDeviceRecovery(info);
@@ -1744,9 +1816,14 @@ ${body.join("\n")}
             const checkpoint = this.serializeState();
             if (this.fallbackTexture) this.fallbackTexture.destroy();
             if (this.transientBuffer) this.transientBuffer.destroy();
+            if (this.uniformRing) this.uniformRing.destroy();
             this.fallbackTexture = null;
             this.fallbackView = null;
             this.transientBuffer = null;
+            this.uniformRing = null;
+            this.uniformRingCursor = 0;
+            this.fixedBindGroupLayout = null;
+            this.fixedPipelineLayout = null;
             // GPU pipelines and samplers are owned by the lost GPUDevice and
             // must never be reused by the replacement device, even when their
             // logical D3D8 cache keys are identical.
@@ -1808,8 +1885,11 @@ ${body.join("\n")}
         }
 
         createSurfaceUniform(state) {
-            this.retireGPUObjects(...state.uniformVariants.values());
-            state.uniformVariants.clear();
+            // Surface size feeds the uniform block, so any cached ring slot is
+            // stale. Bind groups do not embed the uniform contents (only the
+            // ring buffer identity), but clearing them is cheap and keeps
+            // resize behaviour obviously correct.
+            state.uniformSlotSerial = -1;
             state.bindGroups.clear();
         }
 
@@ -1831,79 +1911,113 @@ ${body.join("\n")}
             state.depthView = state.depthTexture.createView();
         }
 
-        uniformFor(state) {
-            const factorValue = state.renderStates[D3DRS_TEXTUREFACTOR] >>> 0;
-            const alphaReference = state.renderStates[D3DRS_ALPHAREF] & 255;
-            const key = String(state.uniformSerial);
-            let buffer = state.uniformVariants.get(key);
-            if (buffer) {
-                state.uniformVariants.delete(key);
-                state.uniformVariants.set(key, buffer);
-                return { buffer, key };
+        // Suballocate `byteCount` from the uniform ring and return the buffer
+        // plus a 256-byte-aligned dynamic offset. The cursor resets at frame
+        // start; a frame that outruns the ring falls back to a dedicated
+        // buffer retired with that frame, so in-flight data is never
+        // overwritten before its command buffer is submitted.
+        allocateUniformSlot(byteCount) {
+            const size = alignUniform(byteCount);
+            const offset = alignUniform(this.uniformRingCursor);
+            if (this.uniformRing &&
+                    size <= this.uniformRingCapacity - offset) {
+                this.uniformRingCursor = offset + size;
+                return { buffer: this.uniformRing, offset };
             }
-            if (state.uniformVariants.size >= this.maxUniformVariants) {
-                const oldestKey = state.uniformVariants.keys().next().value;
-                const oldest = state.uniformVariants.get(oldestKey);
-                state.uniformVariants.delete(oldestKey);
-                state.bindGroups.clear();
-                if (this.frame)
-                    this.frame.transientBuffers.push(oldest);
-                else
-                    this.retireGPUObjects(oldest);
-                this.stats.uniformCacheEvictions++;
-            }
-            const width = Math.max(1, state.surface.width);
-            const height = Math.max(1, state.surface.height);
-            const factor = d3dColor(factorValue);
-            buffer = this.device.createBuffer({
-                label: "D3D8 fixed uniforms " + state.handle.toString(16) +
-                    " " + key,
-                size: 1392,
+            const overflow = this.device.createBuffer({
+                label: "D3D8 uniform ring overflow",
+                size,
                 usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
             });
-            const fogColor = d3dColor(
-                state.renderStates[D3DRS_FOGCOLOR] >>> 0);
-            const globalAmbient = d3dColor(
-                state.renderStates[D3DRS_AMBIENT] >>> 0);
-            const values = new Float32Array(348);
-            values.set([
-                width, height, 1 / width, 1 / height,
-                factor.r, factor.g, factor.b, factor.a,
-                alphaReference, 0, 0, 0,
-            ]);
+            overflow._d8wgRingId = ++uniformRingSerial;
+            if (this.frame) this.frame.transientBuffers.push(overflow);
+            else this.retireGPUObjects(overflow);
+            this.stats.uniformRingOverflows++;
+            return { buffer: overflow, offset: 0 };
+        }
+
+        // Packs the fixed-function uniform block into a reusable scratch array
+        // and parks it in the uniform ring. Reuses the previous slot when no
+        // state that feeds the block has changed since the last draw of this
+        // frame, so a run of draws sharing one state costs a single upload.
+        uniformFor(state) {
+            if (state.uniformSlotSerial === state.uniformSerial &&
+                    state.uniformSlotFrame === this.frameSerial &&
+                    state.uniformSlotBuffer) {
+                this.stats.uniformSlotReuses++;
+                return { buffer: state.uniformSlotBuffer,
+                    offset: state.uniformSlotOffset };
+            }
+            const values = this.uniformScratch;
+            const width = Math.max(1, state.surface.width);
+            const height = Math.max(1, state.surface.height);
+            const factorValue = state.renderStates[D3DRS_TEXTUREFACTOR] >>> 0;
+            values[0] = width;
+            values[1] = height;
+            values[2] = 1 / width;
+            values[3] = 1 / height;
+            values[4] = ((factorValue >>> 16) & 0xFF) / 255;
+            values[5] = ((factorValue >>> 8) & 0xFF) / 255;
+            values[6] = (factorValue & 0xFF) / 255;
+            values[7] = ((factorValue >>> 24) & 0xFF) / 255;
+            values[8] = state.renderStates[D3DRS_ALPHAREF] & 255;
+            values[9] = 0; values[10] = 0; values[11] = 0;
             values.set(state.transforms.world, 12);
             values.set(state.transforms.view, 28);
             values.set(state.transforms.projection, 44);
-            values.set([fogColor.r, fogColor.g, fogColor.b, fogColor.a], 60);
-            values.set([
-                dwordFloat(state.renderStates[D3DRS_FOGSTART]),
-                dwordFloat(state.renderStates[D3DRS_FOGEND]),
-                dwordFloat(state.renderStates[D3DRS_FOGDENSITY]),
-                0,
-            ], 64);
+            const fogColorValue = state.renderStates[D3DRS_FOGCOLOR] >>> 0;
+            values[60] = ((fogColorValue >>> 16) & 0xFF) / 255;
+            values[61] = ((fogColorValue >>> 8) & 0xFF) / 255;
+            values[62] = (fogColorValue & 0xFF) / 255;
+            values[63] = ((fogColorValue >>> 24) & 0xFF) / 255;
+            values[64] = dwordFloat(state.renderStates[D3DRS_FOGSTART]);
+            values[65] = dwordFloat(state.renderStates[D3DRS_FOGEND]);
+            values[66] = dwordFloat(state.renderStates[D3DRS_FOGDENSITY]);
+            values[67] = 0;
             values.set(state.material.diffuse, 68);
             values.set(state.material.ambient, 72);
             values.set(state.material.specular, 76);
             values.set(state.material.emissive, 80);
-            values.set([state.material.power, 0, 0, 0], 84);
-            values.set([globalAmbient.r, globalAmbient.g,
-                globalAmbient.b, globalAmbient.a], 88);
-            state.lights.forEach((light, index) => {
+            values[84] = state.material.power;
+            values[85] = 0; values[86] = 0; values[87] = 0;
+            const ambientValue = state.renderStates[D3DRS_AMBIENT] >>> 0;
+            values[88] = ((ambientValue >>> 16) & 0xFF) / 255;
+            values[89] = ((ambientValue >>> 8) & 0xFF) / 255;
+            values[90] = (ambientValue & 0xFF) / 255;
+            values[91] = ((ambientValue >>> 24) & 0xFF) / 255;
+            for (let index = 0; index < 8; index++) {
+                const light = state.lights[index];
                 const offset = 92 + index * 28;
                 values.set(light.diffuse, offset);
                 values.set(light.specular, offset + 4);
                 values.set(light.ambient, offset + 8);
-                values.set([...light.position, light.type], offset + 12);
-                values.set([...light.direction, light.range], offset + 16);
-                values.set([...light.attenuation, light.falloff], offset + 20);
-                values.set([light.theta, light.phi,
-                    light.enabled ? 1 : 0, 0], offset + 24);
-            });
+                values[offset + 12] = light.position[0];
+                values[offset + 13] = light.position[1];
+                values[offset + 14] = light.position[2];
+                values[offset + 15] = light.type;
+                values[offset + 16] = light.direction[0];
+                values[offset + 17] = light.direction[1];
+                values[offset + 18] = light.direction[2];
+                values[offset + 19] = light.range;
+                values[offset + 20] = light.attenuation[0];
+                values[offset + 21] = light.attenuation[1];
+                values[offset + 22] = light.attenuation[2];
+                values[offset + 23] = light.falloff;
+                values[offset + 24] = light.theta;
+                values[offset + 25] = light.phi;
+                values[offset + 26] = light.enabled ? 1 : 0;
+                values[offset + 27] = 0;
+            }
             values.set(state.transforms.textures[0], 316);
             values.set(state.transforms.textures[1], 332);
-            this.device.queue.writeBuffer(buffer, 0, values);
-            state.uniformVariants.set(key, buffer);
-            return { buffer, key };
+            const slot = this.allocateUniformSlot(FIXED_UNIFORM_BYTES);
+            this.device.queue.writeBuffer(slot.buffer, slot.offset, values);
+            this.stats.uniformUploadBytes += FIXED_UNIFORM_BYTES;
+            state.uniformSlotSerial = state.uniformSerial;
+            state.uniformSlotFrame = this.frameSerial;
+            state.uniformSlotBuffer = slot.buffer;
+            state.uniformSlotOffset = slot.offset;
+            return slot;
         }
 
         createOrResetDevice(bytes, payloadOffset, reset, surfaceReason) {
@@ -1911,10 +2025,7 @@ ${body.join("\n")}
             const surface = this.parseSurface(bytes, payloadOffset);
             let state = this.devices.get(handle);
             if (!state || !reset) {
-                if (state) {
-                    this.retireGPUObjects(...state.uniformVariants.values(),
-                        state.depthTexture);
-                }
+                if (state) this.retireGPUObjects(state.depthTexture);
                 state = freshDeviceState(handle, surface);
                 this.devices.set(handle, state);
             } else {
@@ -2179,6 +2290,10 @@ struct VertexOutput {
                     deferredDestroy: [],
                 };
                 this.transientCursor = 0;
+                // Both rings restart each frame; the previous frame's slots are
+                // already encoded into a submitted command buffer.
+                this.uniformRingCursor = 0;
+                this.frameSerial++;
             }
             if (clearOptions !== undefined) this.endPass();
             if (!this.frame.pass) {
@@ -2253,8 +2368,7 @@ struct VertexOutput {
                 if (this.frame && this.frame.deviceHandle === handle) {
                     this.discardFrame();
                 }
-                this.retireGPUObjects(...state.uniformVariants.values(),
-                    state.depthTexture);
+                this.retireGPUObjects(state.depthTexture);
                 for (const [resourceHandle, child] of this.resources) {
                     if (child.deviceHandle !== handle) continue;
                     this.retireHandle(this.retiredResourceHandles,
@@ -2344,7 +2458,8 @@ struct VertexOutput {
             });
             pipeline = this.device.createRenderPipeline({
                 label: "D3D8 fixed pipeline " + key,
-                layout: "auto",
+                layout: (this.fixedBindGroupLayoutFor(),
+                    this.fixedPipelineLayout),
                 vertex: {
                     module: shaderModule,
                     entryPoint: "vs_main",
@@ -2439,15 +2554,20 @@ struct VertexOutput {
         // Declaring the layout explicitly keeps all five bindings present
         // regardless of shader content; WebGPU permits an explicit layout to
         // contain bindings the shader does not reference.
-        shaderBindGroupLayoutFor() {
-            if (this.shaderBindGroupLayout) return this.shaderBindGroupLayout;
+        // Builds the five-entry layout shared by both draw paths. binding 0 is
+        // a dynamic-offset uniform so one persistent ring buffer can back
+        // every state variant (Stage 7): the bind group then depends only on
+        // the bound textures and samplers, not on the uniform contents, which
+        // is what keeps steady-state bind group creation at zero.
+        buildBindGroupLayout(label, minBindingSize) {
             const VERTEX = 1;
             const FRAGMENT = 2;
-            this.shaderBindGroupLayout = this.device.createBindGroupLayout({
-                label: "D3D8 shader bind group layout",
+            return this.device.createBindGroupLayout({
+                label,
                 entries: [
                     { binding: 0, visibility: VERTEX | FRAGMENT,
-                        buffer: { type: "uniform" } },
+                        buffer: { type: "uniform", hasDynamicOffset: true,
+                            minBindingSize } },
                     { binding: 1, visibility: FRAGMENT,
                         texture: { sampleType: "float", viewDimension: "2d" } },
                     { binding: 2, visibility: FRAGMENT,
@@ -2458,6 +2578,23 @@ struct VertexOutput {
                         sampler: { type: "filtering" } },
                 ],
             });
+        }
+
+        fixedBindGroupLayoutFor() {
+            if (this.fixedBindGroupLayout) return this.fixedBindGroupLayout;
+            this.fixedBindGroupLayout = this.buildBindGroupLayout(
+                "D3D8 fixed-function bind group layout", FIXED_UNIFORM_BYTES);
+            this.fixedPipelineLayout = this.device.createPipelineLayout({
+                label: "D3D8 fixed-function pipeline layout",
+                bindGroupLayouts: [this.fixedBindGroupLayout],
+            });
+            return this.fixedBindGroupLayout;
+        }
+
+        shaderBindGroupLayoutFor() {
+            if (this.shaderBindGroupLayout) return this.shaderBindGroupLayout;
+            this.shaderBindGroupLayout = this.buildBindGroupLayout(
+                "D3D8 shader bind group layout", SHADER_UNIFORM_BYTES);
             this.shaderPipelineLayout = this.device.createPipelineLayout({
                 label: "D3D8 shader pipeline layout",
                 bindGroupLayouts: [this.shaderBindGroupLayout],
@@ -2589,47 +2726,30 @@ struct VertexOutput {
             return pipeline;
         }
 
-        // Constant-register uniform buffer for real-shader-mode draws,
-        // mirroring uniformFor's cache-by-serial pattern. Packs both vs and
-        // ps constant banks into one buffer matching D8WGShaderConstants'
-        // WGSL layout (vs: array<vec4<f32>, 96> then ps: array<vec4<f32>, 8>).
+        // Constant-register uniforms for real-shader-mode draws. Packs both vs
+        // and ps banks into one uniform-ring slot matching
+        // D8WGShaderConstants' WGSL layout (vs: array<vec4<f32>, 96> then
+        // ps: array<vec4<f32>, 8>), reusing the slot while the constants are
+        // unchanged within a frame.
         shaderUniformFor(state) {
-            // The "sc:" tag keeps this out of uniformFor's key space: both
-            // share state.uniformVariants but count separate serials, so a
-            // bare number could hand a fixed-function draw this buffer (which
-            // is a different size and layout entirely).
-            const key = "sc:" + state.shaderConstantSerial;
-            let buffer = state.uniformVariants.get(key);
-            if (buffer) {
-                state.uniformVariants.delete(key);
-                state.uniformVariants.set(key, buffer);
-                return { buffer, key };
+            if (state.shaderConstantSlotSerial === state.shaderConstantSerial &&
+                    state.shaderConstantSlotFrame === this.frameSerial &&
+                    state.shaderConstantSlotBuffer) {
+                this.stats.uniformSlotReuses++;
+                return { buffer: state.shaderConstantSlotBuffer,
+                    offset: state.shaderConstantSlotOffset };
             }
-            if (state.uniformVariants.size >= this.maxUniformVariants) {
-                const oldestKey = state.uniformVariants.keys().next().value;
-                const oldest = state.uniformVariants.get(oldestKey);
-                state.uniformVariants.delete(oldestKey);
-                state.bindGroups.clear();
-                if (this.frame)
-                    this.frame.transientBuffers.push(oldest);
-                else
-                    this.retireGPUObjects(oldest);
-                this.stats.uniformCacheEvictions++;
-            }
-            const byteLength = (D8WG_MAX_VS_CONSTANTS + D8WG_MAX_PS_CONSTANTS) * 16;
-            buffer = this.device.createBuffer({
-                label: "D3D8 shader constants " + state.handle.toString(16) +
-                    " " + key,
-                size: byteLength,
-                usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
-            });
-            const values = new Float32Array(
-                (D8WG_MAX_VS_CONSTANTS + D8WG_MAX_PS_CONSTANTS) * 4);
+            const values = this.shaderConstantScratch;
             values.set(state.vsConstants, 0);
             values.set(state.psConstants, D8WG_MAX_VS_CONSTANTS * 4);
-            this.device.queue.writeBuffer(buffer, 0, values);
-            state.uniformVariants.set(key, buffer);
-            return { buffer, key };
+            const slot = this.allocateUniformSlot(SHADER_UNIFORM_BYTES);
+            this.device.queue.writeBuffer(slot.buffer, slot.offset, values);
+            this.stats.uniformUploadBytes += SHADER_UNIFORM_BYTES;
+            state.shaderConstantSlotSerial = state.shaderConstantSerial;
+            state.shaderConstantSlotFrame = this.frameSerial;
+            state.shaderConstantSlotBuffer = slot.buffer;
+            state.shaderConstantSlotOffset = slot.offset;
+            return slot;
         }
 
         shaderBindGroupFor(state, pipeline) {
@@ -2638,14 +2758,19 @@ struct VertexOutput {
             const texture1 = this.textureViewFor(state, 1);
             const sampler0 = this.samplerFor(state, 0);
             const sampler1 = this.samplerFor(state, 1);
-            const key = ["shader", pipeline._d8wgId, uniforms.key,
-                texture0.key, sampler0._d8wgKey,
-                texture1.key, sampler1._d8wgKey].join(":");
+            // The uniform slot is addressed by dynamic offset, so it is
+            // deliberately NOT part of the bind group identity (doc 9.7).
+            // The ring buffer object itself is, because an overflow
+            // allocation is a different GPUBuffer.
+            const key = "s:" + uniforms.buffer._d8wgRingId + ":" +
+                texture0.key + ":" + sampler0._d8wgKey + ":" +
+                texture1.key + ":" + sampler1._d8wgKey;
             let group = state.bindGroups.get(key);
             if (group) {
                 state.bindGroups.delete(key);
                 state.bindGroups.set(key, group);
-                return group;
+                this.stats.bindGroupHits++;
+                return { group, offset: uniforms.offset };
             }
             group = this.device.createBindGroup({
                 label: "D3D8 shader bind group",
@@ -2653,7 +2778,8 @@ struct VertexOutput {
                 // see shaderBindGroupLayoutFor for why "auto" cannot work here.
                 layout: this.shaderBindGroupLayoutFor(),
                 entries: [
-                    { binding: 0, resource: { buffer: uniforms.buffer } },
+                    { binding: 0, resource: { buffer: uniforms.buffer,
+                        offset: 0, size: SHADER_UNIFORM_BYTES } },
                     { binding: 1, resource: texture0.view },
                     { binding: 2, resource: sampler0 },
                     { binding: 3, resource: texture1.view },
@@ -2663,7 +2789,8 @@ struct VertexOutput {
             if (state.bindGroups.size >= this.maxBindGroups)
                 state.bindGroups.delete(state.bindGroups.keys().next().value);
             state.bindGroups.set(key, group);
-            return group;
+            this.stats.bindGroupCreations++;
+            return { group, offset: uniforms.offset };
         }
 
         samplerFor(state, stage) {
@@ -2729,19 +2856,27 @@ struct VertexOutput {
             const texture1 = this.textureViewFor(state, 1);
             const sampler0 = this.samplerFor(state, 0);
             const sampler1 = this.samplerFor(state, 1);
-            const key = [pipeline._d8wgId, uniforms.key,
-                texture0.key, sampler0._d8wgKey,
-                texture1.key, sampler1._d8wgKey].join(":");
+            // Neither the pipeline nor the uniform contents belong in this key:
+            // every fixed-function pipeline shares one explicit bind group
+            // layout, and the uniform slot is reached by dynamic offset. What
+            // remains is the ring buffer identity plus the bound textures and
+            // samplers, which is what makes steady-state creation zero.
+            const key = "f:" + uniforms.buffer._d8wgRingId + ":" +
+                texture0.key + ":" + sampler0._d8wgKey + ":" +
+                texture1.key + ":" + sampler1._d8wgKey;
             let group = state.bindGroups.get(key);
             if (group) {
                 state.bindGroups.delete(key);
                 state.bindGroups.set(key, group);
-                return group;
+                this.stats.bindGroupHits++;
+                return { group, offset: uniforms.offset };
             }
             group = this.device.createBindGroup({
-                layout: pipeline.getBindGroupLayout(0),
+                label: "D3D8 fixed-function bind group",
+                layout: this.fixedBindGroupLayoutFor(),
                 entries: [
-                    { binding: 0, resource: { buffer: uniforms.buffer } },
+                    { binding: 0, resource: { buffer: uniforms.buffer,
+                        offset: 0, size: FIXED_UNIFORM_BYTES } },
                     { binding: 1, resource: texture0.view },
                     { binding: 2, resource: sampler0 },
                     { binding: 3, resource: texture1.view },
@@ -2751,7 +2886,8 @@ struct VertexOutput {
             if (state.bindGroups.size >= this.maxBindGroups)
                 state.bindGroups.delete(state.bindGroups.keys().next().value);
             state.bindGroups.set(key, group);
-            return group;
+            this.stats.bindGroupCreations++;
+            return { group, offset: uniforms.offset };
         }
 
         validateGeometryState(state, stride) {
@@ -3101,7 +3237,9 @@ struct VertexOutput {
             const pass = this.ensureFrame(state);
             if (!this.preparePass(state, pass)) return;
             pass.setPipeline(pipeline);
-            pass.setBindGroup(0, this.bindGroupFor(state, pipeline));
+            const binding = this.bindGroupFor(state, pipeline);
+            DYNAMIC_OFFSETS[0] = binding.offset;
+            pass.setBindGroup(0, binding.group, DYNAMIC_OFFSETS, 0, 1);
             pass.setVertexBuffer(0, resource.gpuBuffer);
             if (primitive.fan) {
                 const fan = this.sequentialFanIndices(primitive.vertices);
@@ -3157,7 +3295,9 @@ struct VertexOutput {
             const pass = this.ensureFrame(state);
             if (!this.preparePass(state, pass)) return;
             pass.setPipeline(pipeline);
-            pass.setBindGroup(0, this.bindGroupFor(state, pipeline));
+            const binding = this.bindGroupFor(state, pipeline);
+            DYNAMIC_OFFSETS[0] = binding.offset;
+            pass.setBindGroup(0, binding.group, DYNAMIC_OFFSETS, 0, 1);
             pass.setVertexBuffer(0, vertexResource.gpuBuffer);
             if (primitive.fan) {
                 const sourceOffset = startIndex * formatInfo.bytes;
@@ -3207,7 +3347,9 @@ struct VertexOutput {
             const vertexBuffer = this.createTransientBuffer(data,
                 BUFFER_USAGE_VERTEX, "D3D8 DrawPrimitiveUP vertices");
             pass.setPipeline(pipeline);
-            pass.setBindGroup(0, this.bindGroupFor(state, pipeline));
+            const binding = this.bindGroupFor(state, pipeline);
+            DYNAMIC_OFFSETS[0] = binding.offset;
+            pass.setBindGroup(0, binding.group, DYNAMIC_OFFSETS, 0, 1);
             pass.setVertexBuffer(0, vertexBuffer.buffer, vertexBuffer.offset,
                 vertexBuffer.size);
             if (primitive.fan) {
@@ -3275,7 +3417,9 @@ struct VertexOutput {
             const indexBuffer = this.createTransientBuffer(indexData,
                 BUFFER_USAGE_INDEX, "D3D8 DrawIndexedPrimitiveUP indices");
             pass.setPipeline(pipeline);
-            pass.setBindGroup(0, this.bindGroupFor(state, pipeline));
+            const binding = this.bindGroupFor(state, pipeline);
+            DYNAMIC_OFFSETS[0] = binding.offset;
+            pass.setBindGroup(0, binding.group, DYNAMIC_OFFSETS, 0, 1);
             pass.setVertexBuffer(0, vertexBuffer.buffer, vertexBuffer.offset,
                 vertexBuffer.size);
             pass.setIndexBuffer(indexBuffer.buffer, webgpuFormat,
@@ -3522,8 +3666,20 @@ struct VertexOutput {
                 if (!state || index >= state.renderStates.length) {
                     throw new Error("invalid SET_RENDER_STATE");
                 }
-                state.renderStates[index] = u32(bytes, payloadOffset + 8);
-                state.uniformSerial++;
+                const value = u32(bytes, payloadOffset + 8);
+                if (state.renderStates[index] === value) {
+                    // Host-side dead-store elimination. The guest already
+                    // suppresses redundant setters, but state-block replay and
+                    // Reset restoration legitimately resend whole banks.
+                    this.stats.redundantStateWrites++;
+                    break;
+                }
+                state.renderStates[index] = value;
+                // Only bump the uniform serial for render states the uniform
+                // block actually contains; blend/cull/depth/stencil and the
+                // rest are pipeline state and would otherwise force a
+                // needless uniform repack and upload on every change.
+                if (UNIFORM_RENDER_STATES[index]) state.uniformSerial++;
                 break;
             }
             case OP_SET_TEXTURE_STAGE_STATE: {
@@ -4201,7 +4357,6 @@ struct VertexOutput {
         }
 
         getStats() {
-            let uniformsCached = 0;
             let bindGroupsCached = 0;
             let devicesLive = 0;
             let resourcesLive = 0;
@@ -4212,7 +4367,6 @@ struct VertexOutput {
                 if (session.devices.size || session.resources.size)
                     sessionsLive++;
                 for (const state of session.devices.values()) {
-                    uniformsCached += state.uniformVariants.size;
                     bindGroupsCached += state.bindGroups.size;
                 }
             }
@@ -4224,7 +4378,6 @@ struct VertexOutput {
                 resourcesLive,
                 pipelinesCached: this.pipelineCache.size,
                 samplersCached: this.samplerCache.size,
-                uniformsCached,
                 bindGroupsCached,
             };
         }

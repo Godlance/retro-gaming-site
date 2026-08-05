@@ -167,7 +167,18 @@ Host-side protocol/executor tests:
 ```sh
 node glbridge/tests/d3d8_protocol_consistency_test.js
 node --test glbridge/tests/d3d8_webgpu_executor_test.js
+node glbridge/tests/d3d8_webgpu_perf_test.js
 ```
+
+`d3d8_webgpu_perf_test.js` pins the stage 7 steady-state budgets against a
+counting fake device: zero pipeline, bind group, buffer and texture creations
+per frame, one render pass and one queue submit, no GPU readback, and uniform
+upload traffic proportional to distinct uniform state rather than to draw count.
+Uniform data comes from a persistent ring bound with a dynamic offset, so the
+bind group depends only on the bound textures and samplers; the test also
+asserts the bind group cache does not grow with uniform state, which is the
+only way to catch a regression that puts the uniform back into bind group
+identity.
 
 `d3d8_webgpu_executor_test.js` carries the per-instruction numeric coverage
 for the VS1.1/PS1.1-1.4 to WGSL translator (one assertion per supported
