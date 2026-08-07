@@ -808,7 +808,7 @@ input:focus-visible {
 }
 
 #v86gl_canvas,
-#d3d8_webgpu_canvas {
+#d3d_webgpu_canvas {
     position: absolute;
     z-index: 5;
     top: 0;

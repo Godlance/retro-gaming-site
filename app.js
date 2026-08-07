@@ -198,7 +198,7 @@ const GAMES = {
         size: 4294967296,
         stateurl: R2_URL_2 + '/windows98/states/windows98_audio_vga_2d_multidisk_residentevil2.bin.zst',
     },
-    'maplestory': {
+        'maplestory': {
         name: 'MapleStory v83',
         memorySize: 1024 * 1024 * 1024,
         systemDisk: '/windowsxp/windowsxpmultidisk/windowsxp_multidisk_C_2G.img.zst',
@@ -206,7 +206,7 @@ const GAMES = {
         disk: R2_URL_2 + '/game/maplestory/maplestory.img.zst',
         size: 2202009600,
         stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_maplestory.bin.zst',
-    }    
+    }   
 };
 
 const progressContainer = document.getElementById("progress_container");
@@ -386,9 +386,9 @@ function startEmulator9xMultiDisk(gameId) {
         if (glCanvas) {
             glCanvas.style.display = "none";
         }
-        const d3d8Canvas = document.getElementById("d3d8_webgpu_canvas");
-        if (d3d8Canvas) {
-            d3d8Canvas.style.display = "none";
+        const d3dCanvas = document.getElementById("d3d_webgpu_canvas");
+        if (d3dCanvas) {
+            d3dCanvas.style.display = "none";
         }
     }
 
@@ -437,7 +437,14 @@ function startEmulator9xMultiDisk(gameId) {
 
 function attachEmulatorListeners(emulator, gameId) {
     const glCanvas = document.getElementById("v86gl_canvas");
-    const d3d8Canvas = document.getElementById("d3d8_webgpu_canvas");
+    // A game directory only ever loads one of d3d8.dll/d3d9.dll/opengl32
+    // proxy (see docs/d3d9-webgpu-implementation-plan.zh-CN.md section 4.6),
+    // so the D3D8 and D3D9 executors share this one overlay canvas rather
+    // than each getting a dedicated element. Both bridge-side executor
+    // instances are lazy (no WebGPU context is touched until the first real
+    // batch arrives), so only the backend the guest actually drives ever
+    // configures the shared canvas.
+    const d3dCanvas = document.getElementById("d3d_webgpu_canvas");
     let glCanvasObserver = null;
 
     function syncGLCanvasPosition() {
@@ -457,12 +464,12 @@ function attachEmulatorListeners(emulator, gameId) {
         try {
             v86gl = installV86GLBridge(emulator, glCanvas, {
                 gl4es: window.GL4ES,
-                d3d8Canvas: d3d8Canvas,
+                d3dCanvas: d3dCanvas,
             });
             window.v86gl = v86gl;
 
             const screenCanvas = document.querySelector(
-                "#screen_container canvas:not(#v86gl_canvas):not(#d3d8_webgpu_canvas)");
+                "#screen_container canvas:not(#v86gl_canvas):not(#d3d_webgpu_canvas)");
             if (screenCanvas && typeof ResizeObserver === "function") {
                 glCanvasObserver = new ResizeObserver(function() {
                     requestAnimationFrame(syncGLCanvasPosition);

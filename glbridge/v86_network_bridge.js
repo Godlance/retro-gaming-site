@@ -32,6 +32,7 @@
     const V86GL_CTRL_RELEASE_CURRENT = 0xFFF1;
     const V86GL_CTRL_DESTROY_CONTEXT = 0xFFF2;
     const V86GL_CTRL_D3D8_BATCH = 0xFFE0;
+    const V86GL_CTRL_D3D9_BATCH = 0xFFE1;
     const V86GL_EXTENDED_RECORD_SIZE = 0xFFFF;
     const DEFAULT_WASM_BATCH_ARENA_INITIAL_BYTES = 1024 * 1024;
     const DEFAULT_WASM_BATCH_ARENA_MAX_BYTES = 64 * 1024 * 1024;
@@ -3793,13 +3794,26 @@
             this.emulator = emulator;
             this.canvas = canvas;
             this.options = options || {};
-            this.d3d8Canvas = this.options.d3d8Canvas ||
+            // A game directory only ever loads one of d3d8.dll/d3d9.dll (see
+            // docs/d3d9-webgpu-implementation-plan.zh-CN.md section 4.6), so
+            // both executors normally share one overlay element and callers
+            // only need `d3dCanvas` -- or nothing at all, since that in turn
+            // defaults to #d3d_webgpu_canvas. The per-API d3d8Canvas /
+            // d3d9Canvas options remain for the cases that genuinely want two
+            // separate elements (the route tests drive exactly one API each).
+            const sharedD3DCanvas = this.options.d3dCanvas ||
                 (typeof document !== "undefined" ?
-                    document.getElementById("d3d8_webgpu_canvas") : null);
+                    document.getElementById("d3d_webgpu_canvas") : null);
+            this.d3d8Canvas = this.options.d3d8Canvas || sharedD3DCanvas;
             this.d3d8Executor = null;
             this.d3d8Surface = { hwnd: 0, x: 0, y: 0, width: 0, height: 0 };
             this.d3d8OwnerSessionKey = null;
             this.d3d8Visible = false;
+            this.d3d9Canvas = this.options.d3d9Canvas || sharedD3DCanvas;
+            this.d3d9Executor = null;
+            this.d3d9Surface = { hwnd: 0, x: 0, y: 0, width: 0, height: 0 };
+            this.d3d9OwnerSessionKey = null;
+            this.d3d9Visible = false;
             this.buf = [];
             this.pendingPackets = [];
             this.pendingPCIBatches = [];
@@ -3840,6 +3854,7 @@
             this.pendingStateRestore = Promise.resolve();
 
             this.setD3D8ExecutorFromOptions();
+            this.setD3D9ExecutorFromOptions();
             this.setRendererFromOptions();
             emulator.add_listener("v86gl-pci-frame", event => this.pushPCIBatch(event));
             emulator.add_listener("emulator-loaded", () => this.attachPCIStateHooks());
@@ -3901,6 +3916,63 @@
                 }
             };
             this.d3d8Executor = install(this.d3d8Canvas, executorOptions);
+        }
+
+        setD3D9ExecutorFromOptions() {
+            if (this.options.d3d9Executor) {
+                this.d3d9Executor = this.options.d3d9Executor;
+                return;
+            }
+            const install = this.options.installD3D9WebGPUExecutor ||
+                global.installD3D9WebGPUExecutor;
+            if (!this.d3d9Canvas || typeof install !== "function") {
+                return;
+            }
+            const executorOptions = { ...(this.options.d3d9 || {}) };
+            const userSurface = executorOptions.onSurface;
+            const userPresent = executorOptions.onPresent;
+            const userDestroy = executorOptions.onDestroy;
+            executorOptions.onSurface = (surface, reason) => {
+                const sessionKey = surface.sessionKey || null;
+                if (reason === "hide" || surface.visible === false) {
+                    if (!sessionKey || sessionKey === this.d3d9OwnerSessionKey) {
+                        this.d3d9Surface = { ...this.d3d9Surface, ...surface };
+                        this.hideD3D9Canvas();
+                    }
+                } else {
+                    this.d3d9OwnerSessionKey = sessionKey;
+                    this.d3d9Surface = { ...this.d3d9Surface, ...surface };
+                    this.positionD3D9Canvas();
+                }
+                if (typeof userSurface === "function") {
+                    userSurface(surface, reason);
+                }
+            };
+            executorOptions.onPresent = (surface, stats) => {
+                this.d3d9OwnerSessionKey = surface.sessionKey || null;
+                this.d3d9Surface = { ...this.d3d9Surface, ...surface };
+                if (surface.visible === false) {
+                    this.hideD3D9Canvas();
+                } else {
+                    this.showD3D9Canvas();
+                }
+                if (typeof userPresent === "function") {
+                    userPresent(surface, stats);
+                }
+            };
+            executorOptions.onDestroy = (surface, reason) => {
+                const sessionKey = surface.sessionKey || null;
+                if (!sessionKey || sessionKey === this.d3d9OwnerSessionKey) {
+                    this.d3d9Surface = { ...this.d3d9Surface, ...surface,
+                        visible: false };
+                    this.d3d9OwnerSessionKey = null;
+                    this.hideD3D9Canvas();
+                }
+                if (typeof userDestroy === "function") {
+                    userDestroy(surface, reason);
+                }
+            };
+            this.d3d9Executor = install(this.d3d9Canvas, executorOptions);
         }
 
         setRendererFromOptions() {
@@ -3970,7 +4042,8 @@
             const canvases = this.container.getElementsByTagName("canvas");
             for (let i = 0; i < canvases.length; i++) {
                 if (canvases[i] !== this.canvas &&
-                        canvases[i] !== this.d3d8Canvas) {
+                        canvases[i] !== this.d3d8Canvas &&
+                        canvases[i] !== this.d3d9Canvas) {
                     return canvases[i];
                 }
             }
@@ -5060,6 +5133,17 @@
                 this.pushD3D8PCIBatch(event, incomingBytes);
                 return;
             }
+            if (this.isD3D9BatchStream(incomingBytes)) {
+                if (this.restoringState) {
+                    this.pendingPCIBatches.push({
+                        ...event,
+                        bytes: incomingBytes.slice(),
+                    });
+                    return;
+                }
+                this.pushD3D9PCIBatch(event, incomingBytes);
+                return;
+            }
             if (!this.renderer || this.restoringState) {
                 const bytes = incomingBytes.slice();
                 this.pendingPCIBatches.push({
@@ -5100,6 +5184,24 @@
             }
         }
 
+        // Sharing one canvas between the two executors is safe only because a
+        // guest process loads exactly one of d3d8.dll/d3d9.dll. If both ever
+        // drove batches at once they would each hold their own GPUDevice and
+        // fight over the single canvas context -- whichever configured last
+        // would win and the other's frames would silently stop appearing.
+        // That would be baffling to debug, so say so plainly the first time.
+        warnOnSharedD3DCanvasConflict(active) {
+            if (this.d3d8Canvas !== this.d3d9Canvas) return;
+            const other = active === "d3d8" ? this.d3d9Executor : this.d3d8Executor;
+            if (!other || !other.context) return;
+            if (this.sharedD3DCanvasConflictReported) return;
+            this.sharedD3DCanvasConflictReported = true;
+            console.error("[v86gl] both the D3D8 and D3D9 executors are live on " +
+                "the same overlay canvas; they own separate GPUDevices and " +
+                "cannot share one canvas context. A game directory must " +
+                "contain only one of d3d8.dll/d3d9.dll (see plan section 4.6).");
+        }
+
         isD3D8BatchStream(bytes) {
             return bytes.length >= 8 &&
                 u16(bytes, 0) === V86GL_CTRL_D3D8_BATCH &&
@@ -5122,7 +5224,38 @@
                 });
                 return;
             }
+            this.warnOnSharedD3DCanvasConflict("d3d8");
             this.d3d8Executor.submit(bytes.subarray(8), {
+                pciFrameId: event.frameId >>> 0,
+                submitCount: event.submitCount >>> 0,
+                descriptorCommandCount: event.commandCount >>> 0,
+            });
+        }
+
+        isD3D9BatchStream(bytes) {
+            return bytes.length >= 8 &&
+                u16(bytes, 0) === V86GL_CTRL_D3D9_BATCH &&
+                u16(bytes, 2) === V86GL_EXTENDED_RECORD_SIZE;
+        }
+
+        pushD3D9PCIBatch(event, bytes) {
+            if (!this.d3d9Executor ||
+                    typeof this.d3d9Executor.submit !== "function") {
+                console.error("[d3d9-webgpu] executor is unavailable; " +
+                    "load d3d9_executor.js and provide a WebGPU canvas");
+                return;
+            }
+            const payloadBytes = u32(bytes, 4);
+            if (payloadBytes > bytes.length - 8 || payloadBytes + 8 !== bytes.length) {
+                console.error("[d3d9-webgpu] malformed VGL2 D9WG envelope", {
+                    payloadBytes,
+                    availableBytes: bytes.length - 8,
+                    frameId: event.frameId >>> 0,
+                });
+                return;
+            }
+            this.warnOnSharedD3DCanvasConflict("d3d9");
+            this.d3d9Executor.submit(bytes.subarray(8), {
                 pciFrameId: event.frameId >>> 0,
                 submitCount: event.submitCount >>> 0,
                 descriptorCommandCount: event.commandCount >>> 0,
@@ -5396,6 +5529,9 @@
             if (this.d3d8Canvas) {
                 this.positionD3D8Canvas();
             }
+            if (this.d3d9Canvas) {
+                this.positionD3D9Canvas();
+            }
         }
 
         positionD3D8Canvas(visible) {
@@ -5430,6 +5566,38 @@
             this.d3d8Canvas.style.visibility = shouldShow ? "visible" : "hidden";
         }
 
+        positionD3D9Canvas(visible) {
+            if (!this.d3d9Canvas) {
+                return;
+            }
+            const surface = this.d3d9Surface;
+            const w = surface.displayWidth || surface.width ||
+                this.d3d9Canvas.width || 640;
+            const h = surface.displayHeight || surface.height ||
+                this.d3d9Canvas.height || 480;
+            let left = surface.x || 0;
+            let top = surface.y || 0;
+            let width = w;
+            let height = h;
+            const shouldShow = visible === undefined ? this.d3d9Visible : !!visible;
+
+            if (this.container && this.screenCanvas &&
+                    this.screenCanvas.width && this.screenCanvas.height) {
+                const containerRect = this.container.getBoundingClientRect();
+                const screenRect = this.screenCanvas.getBoundingClientRect();
+                const scaleX = screenRect.width / this.screenCanvas.width;
+                const scaleY = screenRect.height / this.screenCanvas.height;
+                left = screenRect.left - containerRect.left + (surface.x || 0) * scaleX;
+                top = screenRect.top - containerRect.top + (surface.y || 0) * scaleY;
+                width = w * scaleX;
+                height = h * scaleY;
+            }
+
+            this.styleOverlayCanvas(this.d3d9Canvas, left, top,
+                width, height, shouldShow);
+            this.d3d9Canvas.style.visibility = shouldShow ? "visible" : "hidden";
+        }
+
         cancelOverlayHide() {
             if (this.overlayHideTimer) {
                 clearTimeout(this.overlayHideTimer);
@@ -5440,6 +5608,7 @@
         showOverlayCanvas() {
             this.cancelOverlayHide();
             this.hideD3D8Canvas();
+            this.hideD3D9Canvas();
             this.overlayVisible = true;
             this.positionCanvas(true);
         }
@@ -5455,6 +5624,7 @@
             this.overlayVisible = false;
             this.styleOverlayCanvas(this.canvas, 0, 0, 0, 0, false);
             this.canvas.style.visibility = "hidden";
+            this.hideD3D9Canvas();
             this.d3d8Visible = true;
             this.positionD3D8Canvas(true);
         }
@@ -5465,6 +5635,24 @@
             }
             this.d3d8Visible = false;
             this.positionD3D8Canvas(false);
+        }
+
+        showD3D9Canvas() {
+            this.cancelOverlayHide();
+            this.overlayVisible = false;
+            this.styleOverlayCanvas(this.canvas, 0, 0, 0, 0, false);
+            this.canvas.style.visibility = "hidden";
+            this.hideD3D8Canvas();
+            this.d3d9Visible = true;
+            this.positionD3D9Canvas(true);
+        }
+
+        hideD3D9Canvas() {
+            if (!this.d3d9Canvas) {
+                return;
+            }
+            this.d3d9Visible = false;
+            this.positionD3D9Canvas(false);
         }
 
         scheduleOverlayHide(delayMs) {
