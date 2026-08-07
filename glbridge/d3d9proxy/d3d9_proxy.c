@@ -32,6 +32,21 @@
 #define D9_MAX_LIGHTS 8u
 #define D9_MAX_SAMPLERS 16u
 #define D9_MAX_SAMPLER_STATES 14u
+/* Constant-register file sizes for the shader model fill_caps() reports.
+ * vs_2_0 guarantees 256 float constants and ps_2_0 guarantees 32; the 224
+ * here is the ps_3_0 ceiling, so the shadow is large enough for any shader
+ * the host translator will accept without needing a second size later. */
+#define D9_MAX_VS_CONST_F 256u
+#define D9_MAX_PS_CONST_F 224u
+#define D9_MAX_CONST_I 16u
+#define D9_MAX_CONST_B 16u
+/* A shader's token stream carries no length: the app hands over a bare
+ * pointer and the terminator has to be found by walking it. This bounds that
+ * walk so a malformed/non-shader pointer cannot read arbitrarily far past the
+ * app's allocation. Real D3D9 shaders are limited to 512 (vs_2_0) / 32768
+ * (vs_3_0 with flow control) instruction slots, so this is far above any
+ * legitimate input. */
+#define D9_MAX_SHADER_TOKENS 65536u
 
 /*
  * Reported adapter identity (see d3d_get_adapter_identifier).
@@ -46,12 +61,14 @@
  * if it still walks away, hardware recognition is definitively not the
  * gate.
  *
- * D9_ADAPTER_GEFORCE4_MX is the honest choice for that test rather than a
- * faster card: the GeForce4 MX (NV17) has hardware T&L but no programmable
- * vertex/pixel shaders, which is exactly the capability profile fill_caps()
- * already reports (VertexShaderVersion/PixelShaderVersion = 0.0). Claiming
- * a shader-capable card would invite the game down code paths this
- * milestone cannot serve.
+ * The identity must stay consistent with what fill_caps() reports, because a
+ * game that recognises the card knows what that card can do. M1 paired
+ * D9_ADAPTER_GEFORCE4_MX (NV17: hardware T&L, no programmable shaders) with
+ * VertexShaderVersion/PixelShaderVersion = 0.0. M2 implements SM2.0, so the
+ * default moved to D9_ADAPTER_GEFORCEFX_5200 (NV34), the entry-level card of
+ * the first NVIDIA generation with vs_2_0/ps_2_0 -- claiming a GeForce4 MX
+ * while advertising shader model 2.0 is exactly the inconsistency an engine's
+ * hardware-detection table would trip over.
  *
  * Set D9_ADAPTER_IDENTITY to D9_ADAPTER_NATIVE to go back to advertising
  * ourselves honestly once the question is settled.
@@ -59,8 +76,9 @@
 #define D9_ADAPTER_NATIVE       0
 #define D9_ADAPTER_GEFORCE4_MX  1
 #define D9_ADAPTER_VMWARE_SVGA  2
+#define D9_ADAPTER_GEFORCEFX_5200 3
 
-#define D9_ADAPTER_IDENTITY D9_ADAPTER_GEFORCE4_MX
+#define D9_ADAPTER_IDENTITY D9_ADAPTER_GEFORCEFX_5200
 #define D9_VGL2_RECORD_HEADER_BYTES 8u
 #define D9_HANDLE_GENERATION_ONE (1u << 20)
 
@@ -71,6 +89,7 @@ typedef struct D9IndexBuffer D9IndexBuffer;
 typedef struct D9Texture D9Texture;
 typedef struct D9VertexDeclaration D9VertexDeclaration;
 typedef struct D9Surface D9Surface;
+typedef struct D9Shader D9Shader;
 
 typedef struct D9TextureLevel {
     BYTE *shadow;
@@ -124,7 +143,58 @@ struct D9Device {
     D9IndexBuffer *index_buffers;
     D9Texture *texture_resources;
     D9VertexDeclaration *vertex_declarations;
+    D9Shader *shaders;
+    D9Shader *vertex_shader;
+    D9Shader *pixel_shader;
+    BOOL cursor_ready;
+    BOOL cursor_visible;
+    /* Set once the application drives the D3D9 hardware cursor itself, which
+     * takes precedence over the GDI capture fallback. */
+    BOOL app_cursor;
+    HCURSOR system_cursor;
+    BOOL display_mode_changed;
+    BOOL window_state_sent;
+    uint32_t last_window_flags;
+    uint32_t last_foreground;
+    /*
+     * D3D9's constant registers are device state, not shader state: they
+     * survive SetVertexShader and are what the app expects to still be there
+     * after a Reset. Holding the authoritative copy here (rather than only on
+     * the host) is what lets set_shader_constant_f() suppress the very common
+     * "set the same matrix palette again every frame" traffic and lets
+     * recreate_device_resources() replay the live values after a Reset.
+     */
+    float vs_const_f[D9_MAX_VS_CONST_F][4];
+    int vs_const_i[D9_MAX_CONST_I][4];
+    BOOL vs_const_b[D9_MAX_CONST_B];
+    float ps_const_f[D9_MAX_PS_CONST_F][4];
+    int ps_const_i[D9_MAX_CONST_I][4];
+    BOOL ps_const_b[D9_MAX_CONST_B];
     uint32_t reset_epoch;
+};
+
+/*
+ * IDirect3DVertexShader9 and IDirect3DPixelShader9 have byte-for-byte
+ * identical vtable layouts (IUnknown + GetDevice + GetFunction), so one
+ * struct backs both; only `is_pixel` and which vtable pointer is installed
+ * differ. The guest keeps the raw token stream and never interprets it
+ * beyond counting tokens and hashing (plan 4.2) -- all translation happens
+ * host-side in d3d9_shader_pipeline.js.
+ */
+struct D9Shader {
+    union {
+        IDirect3DVertexShader9 vertex;
+        IDirect3DPixelShader9 pixel;
+    } iface;
+    LONG refcount;
+    D9Device *device;
+    uint32_t handle;
+    BOOL is_pixel;
+    DWORD *code;
+    UINT token_count;
+    uint32_t hash_low;
+    uint32_t hash_high;
+    D9Shader *next_device_resource;
 };
 
 struct D9VertexBuffer {
@@ -212,6 +282,15 @@ struct D9Surface {
     UINT width;
     UINT height;
     D3DFORMAT format;
+    /* Non-NULL for a standalone CPU surface from
+     * CreateOffscreenPlainSurface: it owns its pixels and has no GPU resource
+     * behind it at all. That is exactly what a cursor bitmap is -- the app
+     * builds one, fills it, hands it to SetCursorProperties, and the surface
+     * itself is never rendered with. */
+    BYTE *shadow;
+    UINT row_pitch;
+    UINT byte_count;
+    BOOL locked;
 };
 
 static IDirect3D9Vtbl g_d3d_vtbl;
@@ -221,6 +300,8 @@ static IDirect3DIndexBuffer9Vtbl g_ib_vtbl;
 static IDirect3DTexture9Vtbl g_texture_vtbl;
 static IDirect3DVertexDeclaration9Vtbl g_decl_vtbl;
 static IDirect3DSurface9Vtbl g_surface_vtbl;
+static IDirect3DVertexShader9Vtbl g_vertex_shader_vtbl;
+static IDirect3DPixelShader9Vtbl g_pixel_shader_vtbl;
 
 static void device_clear_bindings(D9Device *device);
 static BOOL device_has_reset_blockers(D9Device *device);
@@ -228,6 +309,16 @@ static void device_release_owned_references(D9Device *device);
 static BOOL recreate_device_resources(D9Device *device);
 static void device_child_add_ref(D9Device *device);
 static void device_child_release(D9Device *device);
+static BOOL shader_model_enabled(void);
+static D9Surface *surface_from_iface(IDirect3DSurface9 *iface)
+{
+    return (D9Surface *)iface;
+}
+static void emit_cursor_position(D9Device *device, int x, int y, DWORD flags);
+static void update_system_cursor(D9Device *device, HWND window);
+static void emit_window_state(D9Device *device, HWND window);
+static void claim_fullscreen_foreground(D9Device *device, HWND window);
+static void restore_display_mode(D9Device *device);
 
 static D9Direct3D *d3d_from_iface(IDirect3D9 *iface)
 {
@@ -428,6 +519,20 @@ static uint32_t allocate_handle(void)
     if (!handle)
         handle = (uint32_t)InterlockedIncrement((LONG *)&g_next_handle);
     return handle;
+}
+
+/*
+ * Shaders draw from a disjoint numeric range with bit 0 always set (see
+ * D9WG_SHADER_HANDLE_BASE in d3d9_protocol.h), stepping by two so that
+ * property holds for every handle. The host keeps one flat resource table,
+ * so this is what guarantees a shader handle can never alias a buffer,
+ * texture or declaration handle allocated by allocate_handle().
+ */
+static uint32_t g_next_shader_handle = D9WG_SHADER_HANDLE_BASE;
+
+static uint32_t allocate_shader_handle(void)
+{
+    return (uint32_t)InterlockedExchangeAdd((LONG *)&g_next_shader_handle, 2);
 }
 
 /* ---- VGL2 transport / D9WG batch buffer ---- */
@@ -973,10 +1078,17 @@ static BOOL declaration_element_supported(const D3DVERTEXELEMENT9 *e)
     case D3DDECLUSAGE_COLOR:
     case D3DDECLUSAGE_TEXCOORD:
     case D3DDECLUSAGE_PSIZE:
+    /* M2: a programmable vertex shader binds its inputs by semantic, so any
+     * usage the host can name is now bindable even though the fixed-function
+     * path still ignores most of them. */
+    case D3DDECLUSAGE_BLENDWEIGHT:
+    case D3DDECLUSAGE_BLENDINDICES:
+    case D3DDECLUSAGE_TANGENT:
+    case D3DDECLUSAGE_BINORMAL:
+    case D3DDECLUSAGE_FOG:
         break;
     default:
-        /* BLENDWEIGHT/BLENDINDICES/TANGENT/BINORMAL/TESSFACTOR/FOG/DEPTH/
-         * SAMPLE wait on the skinning/shader milestones (M2/M5). */
+        /* TESSFACTOR/DEPTH/SAMPLE have no consumer on this path. */
         return FALSE;
     }
     switch (e->Type) {
@@ -985,8 +1097,25 @@ static BOOL declaration_element_supported(const D3DVERTEXELEMENT9 *e)
     case D3DDECLTYPE_FLOAT3:
     case D3DDECLTYPE_FLOAT4:
     case D3DDECLTYPE_D3DCOLOR:
+    /* The remaining compact formats D3D9 delivers to a shader as floats and
+     * WebGPU has an exact vertex-format equivalent for. */
+    case D3DDECLTYPE_UBYTE4N:
+    case D3DDECLTYPE_SHORT2N:
+    case D3DDECLTYPE_SHORT4N:
+    case D3DDECLTYPE_USHORT2N:
+    case D3DDECLTYPE_USHORT4N:
+    case D3DDECLTYPE_FLOAT16_2:
+    case D3DDECLTYPE_FLOAT16_4:
         return TRUE;
     default:
+        /*
+         * UBYTE4/SHORT2/SHORT4 reach a D3D9 shader as unnormalised floats
+         * (0..255, -32768..32767); WebGPU's uint8x4/sint16x2 deliver integer
+         * vectors instead, which would need the shader module to know the
+         * declaration and so break one-module-per-shader caching. UDEC3/DEC3N
+         * are packed 10:10:10 with no WebGPU format at all. All of these show
+         * up mainly in skinned meshes, so they are grouped with M5.
+         */
         return FALSE;
     }
 }
@@ -1111,6 +1240,169 @@ static BOOL emit_set_fvf(D9Device *device, DWORD fvf,
     return result;
 }
 
+/* ---- shader bytecode: length, hash, upload ----
+ *
+ * CreateVertexShader/CreatePixelShader receive a bare `const DWORD *` with no
+ * length. The stream has to be walked to its D3DVS_END()/D3DPS_END()
+ * terminator (0x0000FFFF) to know how many bytes to copy and send.
+ *
+ * The walk cannot be a naive "scan for 0x0000FFFF": `def`/`defi` embed four
+ * raw literal DWORDs, and an integer constant of 65535 or a denormal float
+ * would be indistinguishable from the terminator. Those three opcodes are
+ * therefore skipped by their known fixed size. Everything else is safe to
+ * step over one token at a time, because every operand token has bit 31 set
+ * and so can never be mistaken for the terminator -- which is also why this
+ * needs no per-opcode operand table on the guest side. Instruction lengths
+ * (SM2.0+) are used when present purely to skip faster.
+ */
+#define D9_SIO_OPCODE_MASK 0x0000FFFFu
+#define D9_SIO_COMMENT 0xFFFEu
+#define D9_SIO_END 0xFFFFu
+#define D9_SIO_DEF 81u
+#define D9_SIO_DEFI 48u
+#define D9_SIO_DEFB 47u
+
+static BOOL shader_token_count(const DWORD *code, UINT *count_out,
+        BOOL *is_pixel_out)
+{
+    UINT index;
+    DWORD version;
+    UINT major;
+
+    if (!code)
+        return FALSE;
+    version = code[0];
+    if ((version >> 16) == 0xFFFEu)
+        *is_pixel_out = FALSE;
+    else if ((version >> 16) == 0xFFFFu)
+        *is_pixel_out = TRUE;
+    else
+        return FALSE;
+    major = (version >> 8) & 0xFFu;
+    if (major < 1 || major > 3)
+        return FALSE;
+
+    for (index = 1; index < D9_MAX_SHADER_TOKENS; ) {
+        DWORD token = code[index];
+        DWORD opcode = token & D9_SIO_OPCODE_MASK;
+
+        if (opcode == D9_SIO_END) {
+            *count_out = index + 1;
+            return TRUE;
+        }
+        if (opcode == D9_SIO_COMMENT) {
+            index += 1 + ((token >> 16) & 0x7FFFu);
+            continue;
+        }
+        if (!(token & 0x80000000u)
+                && (opcode == D9_SIO_DEF || opcode == D9_SIO_DEFI)) {
+            index += 6; /* instruction + destination + four literals */
+            continue;
+        }
+        if (!(token & 0x80000000u) && opcode == D9_SIO_DEFB) {
+            index += 3; /* instruction + destination + one literal */
+            continue;
+        }
+        if (!(token & 0x80000000u) && major >= 2 && ((token >> 24) & 0xFu)) {
+            index += 1 + ((token >> 24) & 0xFu);
+            continue;
+        }
+        ++index;
+    }
+    return FALSE;
+}
+
+/* 64-bit FNV-1a over the raw token bytes. Kept byte-oriented (rather than
+ * hashing DWORDs directly) so hashTokens() in d3d9_shader_pipeline.js can
+ * reproduce it exactly in JavaScript, letting the host reuse the hash the
+ * guest already computed as its translation-cache key. */
+static void shader_bytecode_hash(const DWORD *code, UINT token_count,
+        uint32_t *low_out, uint32_t *high_out)
+{
+    uint32_t low = 0x84222325u;
+    uint32_t high = 0xCBF29CE4u;
+    UINT index;
+    UINT byte_index;
+
+    for (index = 0; index < token_count; ++index) {
+        DWORD token = code[index];
+        for (byte_index = 0; byte_index < 4; ++byte_index) {
+            uint32_t l0, l1, h0, h1, r0, r1, r2, r3;
+            low ^= (token >> (byte_index * 8)) & 0xFFu;
+            /* Multiply the 64-bit accumulator by the FNV prime
+             * 0x100000001B3 in 16-bit limbs. The 0x100000000 part of the
+             * prime contributes `low` into the high half. */
+            l0 = low & 0xFFFFu;
+            l1 = low >> 16;
+            h0 = high & 0xFFFFu;
+            h1 = high >> 16;
+            r0 = l0 * 0x1B3u;
+            r1 = l1 * 0x1B3u + (r0 >> 16);
+            r2 = h0 * 0x1B3u + (r1 >> 16) + l0;
+            r3 = h1 * 0x1B3u + (r2 >> 16) + l1;
+            low = ((r1 & 0xFFFFu) << 16) | (r0 & 0xFFFFu);
+            high = ((r3 & 0xFFFFu) << 16) | (r2 & 0xFFFFu);
+        }
+    }
+    *low_out = low;
+    *high_out = high;
+}
+
+static BOOL emit_shader_create(D9Device *device, D9Shader *shader)
+{
+    D9WGCreateVertexShader command;
+    uint8_t *payload;
+    uint8_t *blob;
+    uint32_t code_bytes = (uint32_t)shader->token_count * 4u;
+    BOOL result;
+
+    ZeroMemory(&command, sizeof(command));
+    EnterCriticalSection(&g_transport_lock);
+    result = reserve_command_locked(shader->is_pixel
+                    ? D9WG_OP_CREATE_PIXEL_SHADER
+                    : D9WG_OP_CREATE_VERTEX_SHADER,
+            sizeof(command), code_bytes, NULL, &payload, &blob);
+    if (result) {
+        command.device_handle = device->handle;
+        command.resource_handle = shader->handle;
+        command.instruction_token_count = shader->token_count;
+        command.code_offset = (uint32_t)(blob - batch_base());
+        command.bytecode_hash_low = shader->hash_low;
+        command.bytecode_hash_high = shader->hash_high;
+        CopyMemory(payload, &command, sizeof(command));
+        CopyMemory(blob, shader->code, code_bytes);
+    }
+    LeaveCriticalSection(&g_transport_lock);
+    return result;
+}
+
+/* SET_*_SHADER_CONSTANT_F/I/B all use the same header shape, with the payload
+ * blob holding vector_count * 16 bytes (float4 / int4) or, for the bool form,
+ * one 32-bit slot per register. */
+static BOOL emit_shader_constants(D9Device *device, uint16_t opcode,
+        UINT start_register, UINT vector_count, const void *data,
+        uint32_t data_bytes)
+{
+    D9WGSetShaderConstantF command;
+    uint8_t *payload;
+    uint8_t *blob;
+    BOOL result;
+
+    EnterCriticalSection(&g_transport_lock);
+    result = reserve_command_locked(opcode, sizeof(command), data_bytes,
+            NULL, &payload, &blob);
+    if (result) {
+        command.device_handle = device->handle;
+        command.start_register = start_register;
+        command.vector_count = vector_count;
+        command.data_offset = (uint32_t)(blob - batch_base());
+        CopyMemory(payload, &command, sizeof(command));
+        CopyMemory(blob, data, data_bytes);
+    }
+    LeaveCriticalSection(&g_transport_lock);
+    return result;
+}
+
 static BOOL emit_draw_primitive_up(const D9WGDrawPrimitiveUP *draw,
         const void *vertices)
 {
@@ -1170,7 +1462,10 @@ static void emit_hello_once(void)
     if (InterlockedCompareExchange((LONG *)&g_hello_emitted, TRUE, FALSE))
         return;
     hello.guest_pointer_bits = 32;
-    hello.feature_bits = 0;
+    /* Reports what this build's caps advertise, so the host's stats can say
+     * which DLL the guest actually loaded (see D9WG_FEATURE_* in the
+     * protocol header). */
+    hello.feature_bits = shader_model_enabled() ? D9WG_FEATURE_SHADER_MODEL_2 : 0;
     hello.session_id_low = g_session_id_low;
     hello.session_id_high = g_session_id_high;
     emit_command(D9WG_OP_HELLO, &hello, sizeof(hello));
@@ -1206,11 +1501,36 @@ static void fill_display_mode(D3DDISPLAYMODE *mode, UINT width, UINT height,
 }
 
 /*
- * M1 caps are deliberately honest about what is not implemented yet:
- * VertexShaderVersion/PixelShaderVersion report (0,0) -- no programmable
- * shader support until M2 -- and MaxVertexShaderConst/MaxSimultaneousTextures
- * reflect only what the fixed pipeline in this milestone can actually do.
+ * Caps stay honest about what is actually implemented. M2 adds shader model
+ * 2.0, so VertexShaderVersion/PixelShaderVersion now report (2,0) and the
+ * VS20Caps/PS20Caps sub-structures describe what the host translator
+ * (d3d9_shader_pipeline.js) genuinely handles rather than the model minimum.
+ * Notably PS20Caps.DynamicFlowControlDepth stays 0: data-dependent branching
+ * in a pixel shader translates, but WGSL forbids implicit-derivative texture
+ * sampling inside it, so any sample in such a branch silently loses mip
+ * selection -- claiming the capability would invite exactly the shaders that
+ * hit that degradation.
+ *
+ * D9WG_SHADER_MODEL=0 in the environment forces the M1 profile back (no
+ * programmable shaders at all). That exists so a rendering regression can be
+ * bisected against the known-good fixed-function path without rebuilding the
+ * DLL, not as a supported configuration.
  */
+static BOOL shader_model_enabled(void)
+{
+    static LONG cached = -1;
+    char value[8];
+    DWORD length;
+
+    if (cached >= 0)
+        return cached != 0;
+    length = GetEnvironmentVariableA("D9WG_SHADER_MODEL", value, sizeof(value));
+    cached = (length == 1 && value[0] == '0') ? 0 : 1;
+    if (!cached)
+        d9wg_log("D9WG_SHADER_MODEL=0: reporting the M1 fixed-function caps");
+    return cached != 0;
+}
+
 static void fill_caps(D3DCAPS9 *caps)
 {
     ZeroMemory(caps, sizeof(*caps));
@@ -1270,11 +1590,38 @@ static void fill_caps(D3DCAPS9 *caps)
     caps->MaxVertexIndex = 0xFFFFFFu;
     caps->MaxStreams = D9_MAX_STREAMS;
     caps->MaxStreamStride = 255;
-    /* No programmable shader support until M2: report the honest (0,0)
-     * version rather than a real driver's non-zero-but-unsupported value. */
-    caps->VertexShaderVersion = (DWORD)D3DVS_VERSION(0, 0);
-    caps->MaxVertexShaderConst = 0;
-    caps->PixelShaderVersion = (DWORD)D3DPS_VERSION(0, 0);
+    if (shader_model_enabled()) {
+        caps->VertexShaderVersion = (DWORD)D3DVS_VERSION(2, 0);
+        caps->MaxVertexShaderConst = D9_MAX_VS_CONST_F;
+        caps->PixelShaderVersion = (DWORD)D3DPS_VERSION(2, 0);
+        /* The largest absolute value a ps_1_x register can hold. 8.0 is what
+         * SM1.4-class hardware reported; anything smaller makes an engine
+         * pre-scale its constants. */
+        caps->PixelShader1xMaxValue = 8.0f;
+        caps->DevCaps |= D3DDEVCAPS_PUREDEVICE;
+        /* r0..r31 and four levels of static nesting are what the translator
+         * emits WGSL for; predication is handled by guarding the instruction. */
+        caps->VS20Caps.Caps = D3DVS20CAPS_PREDICATION;
+        caps->VS20Caps.DynamicFlowControlDepth = D3DVS20_MAX_DYNAMICFLOWCONTROLDEPTH;
+        caps->VS20Caps.NumTemps = 32;
+        caps->VS20Caps.StaticFlowControlDepth = 4;
+        caps->PS20Caps.Caps = D3DPS20CAPS_ARBITRARYSWIZZLE
+                | D3DPS20CAPS_GRADIENTINSTRUCTIONS
+                | D3DPS20CAPS_PREDICATION
+                | D3DPS20CAPS_NODEPENDENTREADLIMIT
+                | D3DPS20CAPS_NOTEXINSTRUCTIONLIMIT;
+        caps->PS20Caps.DynamicFlowControlDepth = 0; /* see the note above */
+        caps->PS20Caps.NumTemps = 32;
+        caps->PS20Caps.StaticFlowControlDepth = 4;
+        caps->PS20Caps.NumInstructionSlots = 512;
+        caps->MaxVShaderInstructionsExecuted = 65535;
+        caps->MaxPShaderInstructionsExecuted = 65535;
+        caps->VertexTextureFilterCaps = 0; /* vs_3_0 vertex texture fetch: 9.9 */
+    } else {
+        caps->VertexShaderVersion = (DWORD)D3DVS_VERSION(0, 0);
+        caps->MaxVertexShaderConst = 0;
+        caps->PixelShaderVersion = (DWORD)D3DPS_VERSION(0, 0);
+    }
     caps->FVFCaps = 8u & D3DFVFCAPS_TEXCOORDCOUNTMASK;
     caps->MaxTextureBlendStages = D9_MAX_TEXTURE_STAGES;
     caps->MaxSimultaneousTextures = D9_MAX_TEXTURE_STAGES;
@@ -1340,6 +1687,16 @@ static void device_clear_bindings(D9Device *device)
         device->vertex_declaration = NULL;
         IDirect3DVertexDeclaration9_Release(&decl->iface);
     }
+    if (device->vertex_shader) {
+        D9Shader *shader = device->vertex_shader;
+        device->vertex_shader = NULL;
+        IDirect3DVertexShader9_Release(&shader->iface.vertex);
+    }
+    if (device->pixel_shader) {
+        D9Shader *shader = device->pixel_shader;
+        device->pixel_shader = NULL;
+        IDirect3DPixelShader9_Release(&shader->iface.pixel);
+    }
     device->fvf = 0;
 }
 
@@ -1354,6 +1711,7 @@ static BOOL recreate_device_resources(D9Device *device)
     D9IndexBuffer *ib;
     D9Texture *texture;
     D9VertexDeclaration *decl;
+    D9Shader *shader;
     UINT level;
 
     for (vb = device->vertex_buffers; vb; vb = vb->next_device_resource) {
@@ -1396,6 +1754,46 @@ static BOOL recreate_device_resources(D9Device *device)
         }
         if (!emit_vertex_declaration_create(device, decl->handle, wire,
                 decl->element_count))
+            return FALSE;
+    }
+    /*
+     * Shaders and their constant registers are not pool-bound resources and
+     * so survive Reset from the app's point of view -- but the host's
+     * resource table is rebuilt from scratch, so both have to be replayed
+     * here or the first draw after a Reset binds a handle the host has never
+     * heard of. The constants go out unconditionally (bypassing the
+     * dirty-range suppression in set_constant_*, which compares against a
+     * shadow the host no longer shares) because after a Reset the host's
+     * copy is empty, not stale.
+     */
+    for (shader = device->shaders; shader; shader = shader->next_device_resource) {
+        shader->handle = allocate_shader_handle();
+        if (!emit_shader_create(device, shader))
+            return FALSE;
+    }
+    if (!emit_shader_constants(device, D9WG_OP_SET_VERTEX_SHADER_CONSTANT_F,
+                    0, D9_MAX_VS_CONST_F, device->vs_const_f,
+                    D9_MAX_VS_CONST_F * 16u)
+            || !emit_shader_constants(device, D9WG_OP_SET_PIXEL_SHADER_CONSTANT_F,
+                    0, D9_MAX_PS_CONST_F, device->ps_const_f,
+                    D9_MAX_PS_CONST_F * 16u)
+            || !emit_shader_constants(device, D9WG_OP_SET_VERTEX_SHADER_CONSTANT_I,
+                    0, D9_MAX_CONST_I, device->vs_const_i, D9_MAX_CONST_I * 16u)
+            || !emit_shader_constants(device, D9WG_OP_SET_PIXEL_SHADER_CONSTANT_I,
+                    0, D9_MAX_CONST_I, device->ps_const_i, D9_MAX_CONST_I * 16u))
+        return FALSE;
+    {
+        uint32_t packed[D9_MAX_CONST_B];
+        UINT index;
+        for (index = 0; index < D9_MAX_CONST_B; ++index)
+            packed[index] = device->vs_const_b[index] ? 1u : 0u;
+        if (!emit_shader_constants(device, D9WG_OP_SET_VERTEX_SHADER_CONSTANT_B,
+                0, D9_MAX_CONST_B, packed, D9_MAX_CONST_B * 4u))
+            return FALSE;
+        for (index = 0; index < D9_MAX_CONST_B; ++index)
+            packed[index] = device->ps_const_b[index] ? 1u : 0u;
+        if (!emit_shader_constants(device, D9WG_OP_SET_PIXEL_SHADER_CONSTANT_B,
+                0, D9_MAX_CONST_B, packed, D9_MAX_CONST_B * 4u))
             return FALSE;
     }
     return TRUE;
@@ -1513,7 +1911,21 @@ static HRESULT WINAPI d3d_get_adapter_identifier(IDirect3D9 *iface,
      */
     lstrcpynA(identifier->DeviceName, "\\\\.\\DISPLAY1",
             sizeof(identifier->DeviceName));
-#if D9_ADAPTER_IDENTITY == D9_ADAPTER_GEFORCE4_MX
+#if D9_ADAPTER_IDENTITY == D9_ADAPTER_GEFORCEFX_5200
+    /* NV34. The entry-level card of the first NVIDIA generation with
+     * vs_2_0/ps_2_0, matching the shader model fill_caps() reports from M2
+     * on. */
+    lstrcpynA(identifier->Driver, "nv4_disp.dll", sizeof(identifier->Driver));
+    lstrcpynA(identifier->Description, "NVIDIA GeForce FX 5200",
+            sizeof(identifier->Description));
+    identifier->VendorId = 0x10DE;
+    identifier->DeviceId = 0x0322;
+    identifier->SubSysId = 0x032210DE;
+    identifier->Revision = 0xA1;
+    /* ForceWare 66.93, a real XP driver revision for this card. */
+    identifier->DriverVersion.HighPart = (6 << 16) | 14;
+    identifier->DriverVersion.LowPart = (10 << 16) | 6693;
+#elif D9_ADAPTER_IDENTITY == D9_ADAPTER_GEFORCE4_MX
     /* NV17. Hardware T&L, no programmable shaders -- the one widely-known
      * card whose real capabilities match what fill_caps() reports. */
     lstrcpynA(identifier->Driver, "nv4_disp.dll", sizeof(identifier->Driver));
@@ -1918,6 +2330,8 @@ static HRESULT WINAPI d3d_create_device(IDirect3D9 *iface, UINT adapter,
         HeapFree(GetProcessHeap(), 0, device);
         return D3DERR_DRIVERINTERNALERROR;
     }
+    claim_fullscreen_foreground(device, window);
+    emit_window_state(device, window);
     {
         char line[128];
         wsprintfA(line,
@@ -1969,6 +2383,7 @@ static ULONG WINAPI device_release(IDirect3DDevice9 *iface)
     }
     if (!refs) {
         D9WGDestroyResource destroy;
+        restore_display_mode(device);
         destroy.resource_handle = device->handle;
         destroy.resource_kind = 0;
         emit_command(D9WG_OP_DESTROY_RESOURCE, &destroy, sizeof(destroy));
@@ -2040,13 +2455,518 @@ static HRESULT WINAPI device_get_creation_parameters(IDirect3DDevice9 *iface,
     return D3D_OK;
 }
 
+/* ---- D3D9 hardware cursor ----
+ *
+ * A fullscreen D3D9 game draws its pointer through these three calls, not
+ * through GDI, so nothing about it ever reaches the VGA framebuffer the page
+ * composites underneath the WebGPU overlay. With them stubbed the pointer is
+ * simply invisible -- and the site hides the browser's own cursor, on the
+ * assumption the guest draws one.
+ *
+ * D3D9's hardware cursor follows the OS pointer by itself once ShowCursor is
+ * on; SetCursorPosition only warps it. emit_present_and_flush() therefore
+ * re-sends the live pointer position every frame rather than relying on the
+ * app to call SetCursorPosition.
+ */
+static HRESULT WINAPI device_set_cursor_properties(IDirect3DDevice9 *iface,
+        UINT hotspot_x, UINT hotspot_y, IDirect3DSurface9 *bitmap)
+{
+    D9Device *device = device_from_iface(iface);
+    D9Surface *surface;
+    D9WGSetCursorProperties command;
+    const BYTE *pixels;
+    UINT row_pitch;
+    uint8_t *payload;
+    uint8_t *blob;
+    UINT byte_count;
+    BOOL result;
+
+    /*
+     * Every rejection below is traced with its reason. This method failing
+     * silently is precisely what hid the real problem for a whole debugging
+     * round: WineD3D turns this call into a real Win32 cursor, so the OpenGL
+     * path shows Warcraft III's own hand cursor -- while here the call was
+     * refused, the game fell back to the plain arrow, and nothing anywhere
+     * said so.
+     */
+    TRACE_ONCE("device_set_cursor_properties: first call");
+    if (!bitmap || bitmap->lpVtbl != &g_surface_vtbl) {
+        TRACE_FIRST({
+            d9wg_log("set_cursor_properties REJECTED: the bitmap is not a "
+                    "surface this DLL created");
+        });
+        return D3DERR_INVALIDCALL;
+    }
+    surface = surface_from_iface(bitmap);
+    if (surface->shadow) {
+        pixels = surface->shadow;
+        row_pitch = surface->row_pitch;
+    } else if (surface->texture
+            && surface->level < surface->texture->level_count
+            && surface->texture->levels[surface->level].shadow) {
+        /* A cursor built as a texture level rather than a plain surface. */
+        pixels = surface->texture->levels[surface->level].shadow;
+        row_pitch = surface->texture->levels[surface->level].row_pitch;
+    } else {
+        TRACE_FIRST({
+            char line[192];
+            wsprintfA(line, "set_cursor_properties REJECTED: no pixels "
+                    "(standalone=%d texture=%d level=%lu levels=%lu)",
+                    surface->shadow ? 1 : 0, surface->texture ? 1 : 0,
+                    (unsigned long)surface->level,
+                    (unsigned long)(surface->texture
+                            ? surface->texture->level_count : 0));
+            d9wg_log(line);
+        });
+        return D3DERR_INVALIDCALL;
+    }
+    if (surface->format != D3DFMT_A8R8G8B8 && surface->format != D3DFMT_X8R8G8B8) {
+        TRACE_FIRST({
+            char line[160];
+            wsprintfA(line, "set_cursor_properties REJECTED: format=%lu "
+                    "(only A8R8G8B8/X8R8G8B8 are handled) size=%lux%lu",
+                    (unsigned long)surface->format,
+                    (unsigned long)surface->width,
+                    (unsigned long)surface->height);
+            d9wg_log(line);
+        });
+        return D3DERR_INVALIDCALL;
+    }
+    if (!multiply_u32(surface->width * 4u, surface->height, &byte_count))
+        return D3DERR_INVALIDCALL;
+
+    ZeroMemory(&command, sizeof(command));
+    EnterCriticalSection(&g_transport_lock);
+    result = reserve_command_locked(D9WG_OP_SET_CURSOR_PROPERTIES,
+            sizeof(command), byte_count, NULL, &payload, &blob);
+    if (result) {
+        UINT row;
+        command.device_handle = device->handle;
+        command.hotspot_x = hotspot_x;
+        command.hotspot_y = hotspot_y;
+        command.width = surface->width;
+        command.height = surface->height;
+        command.data_bytes = byte_count;
+        command.data_offset = (uint32_t)(blob - batch_base());
+        CopyMemory(payload, &command, sizeof(command));
+        /* Repack to a tight width*4 stride; the source pitch is whatever the
+         * surface was allocated with. */
+        for (row = 0; row < surface->height; ++row)
+            CopyMemory(blob + row * surface->width * 4u,
+                    pixels + row * row_pitch, surface->width * 4u);
+    }
+    LeaveCriticalSection(&g_transport_lock);
+    if (!result)
+        return D3DERR_DRIVERINTERNALERROR;
+    device->cursor_ready = TRUE;
+    device->app_cursor = TRUE;
+    TRACE_FIRST({
+        char line[160];
+        wsprintfA(line, "set_cursor_properties %lux%lu hotspot=%lu,%lu",
+                (unsigned long)surface->width, (unsigned long)surface->height,
+                (unsigned long)hotspot_x, (unsigned long)hotspot_y);
+        d9wg_log(line);
+    });
+    return D3D_OK;
+}
+
+/*
+ * Reports the guest window manager's view of the device window, once and then
+ * only when it changes.
+ *
+ * The host draws its overlay on top unconditionally, so a game whose window is
+ * minimised, hidden, or merely not in the foreground still looks perfectly
+ * rendered -- while the guest routes every click to whatever window really
+ * owns those pixels. That failure is invisible in the picture by construction,
+ * so it has to be reported rather than deduced.
+ */
+static void emit_window_state(D9Device *device, HWND window)
+{
+    D9WGWindowState command;
+    HWND foreground = GetForegroundWindow();
+    RECT window_rect;
+    RECT client;
+    uint32_t flags = 0;
+
+    SetRect(&window_rect, 0, 0, 0, 0);
+    SetRect(&client, 0, 0, 0, 0);
+    if (window && IsWindow(window)) {
+        flags |= D9WG_WINDOW_IS_WINDOW;
+        if (IsWindowVisible(window)) flags |= D9WG_WINDOW_VISIBLE;
+        if (IsIconic(window)) flags |= D9WG_WINDOW_ICONIC;
+        if (window == foreground) flags |= D9WG_WINDOW_FOREGROUND;
+        GetWindowRect(window, &window_rect);
+        GetClientRect(window, &client);
+    }
+    if (!device->present.Windowed)
+        flags |= D9WG_WINDOW_FULLSCREEN;
+
+    command.device_handle = device->handle;
+    command.hwnd = (uint32_t)(uintptr_t)window;
+    command.foreground_hwnd = (uint32_t)(uintptr_t)foreground;
+    command.flags = flags;
+    command.window_x = window_rect.left;
+    command.window_y = window_rect.top;
+    command.window_width = (uint32_t)(window_rect.right - window_rect.left);
+    command.window_height = (uint32_t)(window_rect.bottom - window_rect.top);
+    command.client_width = (uint32_t)(client.right - client.left);
+    command.client_height = (uint32_t)(client.bottom - client.top);
+
+    if (device->window_state_sent
+            && device->last_window_flags == flags
+            && device->last_foreground == command.foreground_hwnd)
+        return;
+    device->window_state_sent = TRUE;
+    device->last_window_flags = flags;
+    device->last_foreground = command.foreground_hwnd;
+    emit_command(D9WG_OP_WINDOW_STATE, &command, sizeof(command));
+}
+
+/*
+ * A real fullscreen D3D9 device takes the foreground and the top of the
+ * z-order when it is created -- that is part of what "exclusive fullscreen"
+ * means, and it is done by the driver/runtime, not by the game. Nothing here
+ * is a real driver, so without this the game's window can sit behind whatever
+ * the user last had focused while its frames are still composited on top by
+ * the host: the picture looks right and every click lands in the window
+ * underneath.
+ */
+static void claim_fullscreen_foreground(D9Device *device, HWND window)
+{
+    DEVMODEA mode;
+    LONG result;
+
+    if (device->present.Windowed)
+        return;
+
+    /*
+     * Switch the guest's display mode to the one the device asked for.
+     *
+     * This is the other half of what "exclusive fullscreen" means, and it is
+     * not cosmetic. Warcraft III creates an 800x600 fullscreen device on a
+     * 1024x768 desktop; with no mode change Windows keeps reporting a
+     * 1024x768 screen, so the guest's pointer coordinates, the window
+     * geometry and the game's own 800x600 layout all disagree -- the picture
+     * looks right while a click lands somewhere else entirely. Doing the mode
+     * change makes the guest's idea of the screen match what the game
+     * renders, which is what every other part of this path already assumes.
+     */
+    ZeroMemory(&mode, sizeof(mode));
+    mode.dmSize = sizeof(mode);
+    mode.dmPelsWidth = device->display_mode.Width;
+    mode.dmPelsHeight = device->display_mode.Height;
+    mode.dmBitsPerPel = 32;
+    mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL;
+    result = ChangeDisplaySettingsA(&mode, CDS_FULLSCREEN);
+    if (result != DISP_CHANGE_SUCCESSFUL) {
+        /* 16bpp is the other mode a v86 guest is likely to actually have. */
+        mode.dmBitsPerPel = 16;
+        result = ChangeDisplaySettingsA(&mode, CDS_FULLSCREEN);
+    }
+    device->display_mode_changed = (result == DISP_CHANGE_SUCCESSFUL);
+    TRACE_FIRST({
+        char line[160];
+        wsprintfA(line, "fullscreen mode change to %lux%lu -> %ld%s",
+                (unsigned long)device->display_mode.Width,
+                (unsigned long)device->display_mode.Height, (long)result,
+                result == DISP_CHANGE_SUCCESSFUL ? " (ok)" : " (FAILED)");
+        d9wg_log(line);
+    });
+
+    if (!window || !IsWindow(window))
+        return;
+    if (IsIconic(window))
+        ShowWindow(window, SW_RESTORE);
+    /* Size the device window to the mode as well: the trace showed War3's
+     * window reporting an empty rect to both GetClientRect and GetWindowRect,
+     * so nothing downstream can discover where the game's output belongs. */
+    SetWindowPos(window, HWND_TOP, 0, 0, (int)device->display_mode.Width,
+            (int)device->display_mode.Height, SWP_SHOWWINDOW);
+    BringWindowToTop(window);
+    SetForegroundWindow(window);
+    SetFocus(window);
+    TRACE_ONCE("claim_fullscreen_foreground: raised and sized the device window");
+}
+
+/* Undo the mode change when the device goes away, so a crashed or closed game
+ * does not leave the guest desktop stuck at the game's resolution. */
+static void restore_display_mode(D9Device *device)
+{
+    if (!device->display_mode_changed)
+        return;
+    device->display_mode_changed = FALSE;
+    ChangeDisplaySettingsA(NULL, 0);
+    d9wg_log("restored the guest display mode");
+}
+
+static void emit_cursor_position(D9Device *device, int x, int y, DWORD flags)
+{
+    D9WGSetCursorPosition command;
+    command.device_handle = device->handle;
+    command.x = x;
+    command.y = y;
+    command.flags = flags;
+    emit_command(D9WG_OP_SET_CURSOR_POSITION, &command, sizeof(command));
+}
+
+/*
+ * Capture whatever cursor Windows is currently showing and ship it as if the
+ * application had called SetCursorProperties.
+ *
+ * This exists because most games never call SetCursorProperties at all: on
+ * real hardware Windows composites the GDI cursor onto the primary surface
+ * even for a fullscreen D3D9 device, so the game simply lets it. Here the
+ * "primary surface" is a WebGPU canvas Windows knows nothing about, so that
+ * compositing never happens and the pointer is invisible no matter what the
+ * game does -- Warcraft III's first run showed cursorUploads: 0 for exactly
+ * this reason. Reading the cursor out of GDI covers both mechanisms with one
+ * path.
+ */
+/*
+ * Off by default. Capturing the Windows pointer is the right answer only for a
+ * game that genuinely leaves the cursor to Windows; when the game has its own
+ * cursor it draws the *wrong* pointer (a plain arrow instead of Warcraft III's
+ * hand) and, worse, hides the fact that the real path -- SetCursorProperties,
+ * which WineD3D honours -- is being refused. Set D9WG_GDI_CURSOR=1 to enable
+ * it for a game that needs it.
+ */
+static BOOL gdi_cursor_fallback_enabled(void)
+{
+    static LONG cached = -1;
+    char value[8];
+    DWORD length;
+
+    if (cached >= 0)
+        return cached != 0;
+    length = GetEnvironmentVariableA("D9WG_GDI_CURSOR", value, sizeof(value));
+    cached = (length == 1 && value[0] == '1') ? 1 : 0;
+    if (cached)
+        d9wg_log("D9WG_GDI_CURSOR=1: capturing the Windows pointer as a "
+                "fallback cursor");
+    return cached != 0;
+}
+
+static BOOL emit_system_cursor_bitmap(D9Device *device, HCURSOR cursor)
+{
+    ICONINFO icon;
+    BITMAP bitmap;
+    HDC dc;
+    struct { BITMAPINFOHEADER header; DWORD masks[3]; } info;
+    BYTE *colors = NULL;
+    BYTE *mask = NULL;
+    D9WGSetCursorProperties command;
+    uint8_t *payload;
+    uint8_t *blob;
+    UINT width;
+    UINT height;
+    UINT pixel_bytes;
+    UINT index;
+    BOOL monochrome;
+    BOOL has_alpha = FALSE;
+    BOOL result = FALSE;
+
+    ZeroMemory(&icon, sizeof(icon));
+    if (!GetIconInfo(cursor, &icon))
+        return FALSE;
+    monochrome = icon.hbmColor == NULL;
+    if (!GetObjectA(monochrome ? icon.hbmMask : icon.hbmColor,
+            sizeof(bitmap), &bitmap))
+        goto done;
+    width = (UINT)bitmap.bmWidth;
+    /* A monochrome cursor packs an AND mask above an XOR mask in a single
+     * bitmap of twice the real height. */
+    height = (UINT)(monochrome ? bitmap.bmHeight / 2 : bitmap.bmHeight);
+    if (!width || !height || width > 256u || height > 256u)
+        goto done;
+    if (!multiply_u32(width * 4u, height, &pixel_bytes))
+        goto done;
+
+    dc = CreateCompatibleDC(NULL);
+    if (!dc)
+        goto done;
+    ZeroMemory(&info, sizeof(info));
+    info.header.biSize = sizeof(info.header);
+    info.header.biWidth = (LONG)width;
+    /* Negative height asks for a top-down image, which is the row order the
+     * wire format and every other upload on this path already use. */
+    info.header.biHeight = -(LONG)(monochrome ? height * 2u : height);
+    info.header.biPlanes = 1;
+    info.header.biBitCount = 32;
+    info.header.biCompression = BI_RGB;
+
+    mask = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+            monochrome ? pixel_bytes * 2u : pixel_bytes);
+    if (!mask) {
+        DeleteDC(dc);
+        goto done;
+    }
+    if (!GetDIBits(dc, icon.hbmMask, 0, monochrome ? height * 2u : height,
+            mask, (BITMAPINFO *)&info, DIB_RGB_COLORS)) {
+        DeleteDC(dc);
+        goto done;
+    }
+    if (!monochrome) {
+        colors = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                pixel_bytes);
+        if (!colors) {
+            DeleteDC(dc);
+            goto done;
+        }
+        info.header.biHeight = -(LONG)height;
+        if (!GetDIBits(dc, icon.hbmColor, 0, height, colors,
+                (BITMAPINFO *)&info, DIB_RGB_COLORS)) {
+            DeleteDC(dc);
+            goto done;
+        }
+    }
+    DeleteDC(dc);
+
+    if (monochrome) {
+        /* AND=1,XOR=0 -> transparent; AND=1,XOR=1 -> inverted, approximated
+         * as white; AND=0 -> the opaque XOR colour (black or white). */
+        colors = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                pixel_bytes);
+        if (!colors)
+            goto done;
+        for (index = 0; index < width * height; ++index) {
+            BYTE and_bit = mask[index * 4] ? 1u : 0u;
+            BYTE xor_bit = mask[(width * height + index) * 4] ? 1u : 0u;
+            BYTE value = xor_bit ? 255u : 0u;
+            colors[index * 4 + 0] = value;
+            colors[index * 4 + 1] = value;
+            colors[index * 4 + 2] = value;
+            colors[index * 4 + 3] = and_bit ? 0u : 255u;
+        }
+    } else {
+        for (index = 0; index < width * height; ++index) {
+            if (colors[index * 4 + 3]) {
+                has_alpha = TRUE;
+                break;
+            }
+        }
+        if (!has_alpha) {
+            /* A pre-XP style colour cursor carries no alpha channel; the 1bpp
+             * mask is what says which texels see through (white == cut out). */
+            for (index = 0; index < width * height; ++index)
+                colors[index * 4 + 3] = mask[index * 4] ? 0u : 255u;
+        }
+    }
+
+    ZeroMemory(&command, sizeof(command));
+    EnterCriticalSection(&g_transport_lock);
+    result = reserve_command_locked(D9WG_OP_SET_CURSOR_PROPERTIES,
+            sizeof(command), pixel_bytes, NULL, &payload, &blob);
+    if (result) {
+        command.device_handle = device->handle;
+        command.hotspot_x = icon.xHotspot;
+        command.hotspot_y = icon.yHotspot;
+        command.width = width;
+        command.height = height;
+        command.data_bytes = pixel_bytes;
+        command.data_offset = (uint32_t)(blob - batch_base());
+        CopyMemory(payload, &command, sizeof(command));
+        CopyMemory(blob, colors, pixel_bytes);
+    }
+    LeaveCriticalSection(&g_transport_lock);
+    TRACE_FIRST({
+        char line[160];
+        wsprintfA(line, "system cursor captured %lux%lu mono=%d alpha=%d",
+                (unsigned long)width, (unsigned long)height,
+                (int)monochrome, (int)has_alpha);
+        d9wg_log(line);
+    });
+
+done:
+    if (colors) HeapFree(GetProcessHeap(), 0, colors);
+    if (mask) HeapFree(GetProcessHeap(), 0, mask);
+    if (icon.hbmColor) DeleteObject(icon.hbmColor);
+    if (icon.hbmMask) DeleteObject(icon.hbmMask);
+    return result;
+}
+
+/* Called once per Present. Only re-captures the bitmap when the HCURSOR
+ * actually changes -- a game swaps cursors on hover, not every frame. */
+static void update_system_cursor(D9Device *device, HWND window)
+{
+    CURSORINFO cursor_info;
+    POINT pointer;
+
+    if (!gdi_cursor_fallback_enabled())
+        return;
+    ZeroMemory(&cursor_info, sizeof(cursor_info));
+    cursor_info.cbSize = sizeof(cursor_info);
+    if (!GetCursorInfo(&cursor_info))
+        return;
+
+    if (!(cursor_info.flags & CURSOR_SHOWING) || !cursor_info.hCursor) {
+        if (device->cursor_visible) {
+            D9WGShowCursor hide;
+            device->cursor_visible = FALSE;
+            hide.device_handle = device->handle;
+            hide.show = 0;
+            emit_command(D9WG_OP_SHOW_CURSOR, &hide, sizeof(hide));
+        }
+        return;
+    }
+    if (cursor_info.hCursor != device->system_cursor) {
+        if (!emit_system_cursor_bitmap(device, cursor_info.hCursor))
+            return;
+        device->system_cursor = cursor_info.hCursor;
+        device->cursor_ready = TRUE;
+    }
+    if (!device->cursor_visible) {
+        D9WGShowCursor show;
+        device->cursor_visible = TRUE;
+        show.device_handle = device->handle;
+        show.show = 1;
+        emit_command(D9WG_OP_SHOW_CURSOR, &show, sizeof(show));
+    }
+    pointer = cursor_info.ptScreenPos;
+    if (window)
+        ScreenToClient(window, &pointer);
+    emit_cursor_position(device, pointer.x, pointer.y, 0);
+}
+
 static void WINAPI device_set_cursor_position(IDirect3DDevice9 *iface,
         int x, int y, DWORD flags)
-{ (void)iface; (void)x; (void)y; (void)flags; }
+{
+    D9Device *device = device_from_iface(iface);
+    POINT point;
+
+    /* D3D9 takes screen coordinates here; the host draws into back-buffer
+     * space, so convert through the device window the same way
+     * emit_present_and_flush() does. */
+    point.x = x;
+    point.y = y;
+    if (device->present.hDeviceWindow)
+        ScreenToClient(device->present.hDeviceWindow, &point);
+    emit_cursor_position(device, point.x, point.y, flags);
+}
 
 static WINBOOL WINAPI device_show_cursor(IDirect3DDevice9 *iface,
         WINBOOL show)
-{ (void)iface; (void)show; return FALSE; }
+{
+    D9Device *device = device_from_iface(iface);
+    D9WGShowCursor command;
+    WINBOOL previous = device->cursor_visible;
+
+    /* Worth tracing on its own: ShowCursor(FALSE) from a game that never
+     * called SetCursorProperties means it intends to draw the pointer itself,
+     * as ordinary geometry. A missing cursor would then be a lost draw, not a
+     * missing cursor feature -- a completely different bug. */
+    TRACE_FIRST({
+        char line[96];
+        wsprintfA(line, "device_show_cursor(%d) app_cursor=%d",
+                show ? 1 : 0, device->app_cursor ? 1 : 0);
+        d9wg_log(line);
+    });
+
+    device->cursor_visible = show ? TRUE : FALSE;
+    command.device_handle = device->handle;
+    command.show = device->cursor_visible ? 1u : 0u;
+    emit_command(D9WG_OP_SHOW_CURSOR, &command, sizeof(command));
+    return previous;
+}
 
 static UINT WINAPI device_get_number_of_swap_chains(IDirect3DDevice9 *iface)
 { (void)iface; return 1; }
@@ -2144,8 +3064,70 @@ static BOOL emit_present_and_flush(D9Device *device, HWND override_window)
     present.hwnd = (uint32_t)(uintptr_t)window;
     present.x = origin.x;
     present.y = origin.y;
+    /*
+     * An empty client rect is not a curiosity to work around -- it means the
+     * host has no idea where the game's output actually is, and it positions
+     * the WebGPU overlay from exactly this. Get it wrong and the picture is
+     * drawn somewhere the guest does not think the window is, so a click at
+     * the pixel the user aimed at is delivered to whatever the guest really
+     * has there: another window, the desktop, anything.
+     *
+     * GetWindowRect is the fallback because it works on windows GetClientRect
+     * reports nothing useful for, and it answers both questions at once
+     * (position and size, in screen coordinates).
+     */
+    if (client.right - client.left <= 0 || client.bottom - client.top <= 0) {
+        RECT window_rect;
+        if (window && GetWindowRect(window, &window_rect)
+                && window_rect.right > window_rect.left
+                && window_rect.bottom > window_rect.top) {
+            origin.x = window_rect.left;
+            origin.y = window_rect.top;
+            SetRect(&client, 0, 0, window_rect.right - window_rect.left,
+                    window_rect.bottom - window_rect.top);
+        }
+        TRACE_FIRST({
+            char line[256];
+            RECT probe;
+            HWND foreground = GetForegroundWindow();
+            if (!window || !GetWindowRect(window, &probe))
+                SetRect(&probe, 0, 0, 0, 0);
+            wsprintfA(line, "present: empty client rect hwnd=0x%08lX "
+                    "valid=%d foreground=0x%08lX windowRect=%ld,%ld,%ld,%ld "
+                    "-> using %lux%lu at %ld,%ld",
+                    (unsigned long)(uintptr_t)window,
+                    window ? (int)IsWindow(window) : 0,
+                    (unsigned long)(uintptr_t)foreground,
+                    (long)probe.left, (long)probe.top,
+                    (long)probe.right, (long)probe.bottom,
+                    (unsigned long)(client.right - client.left),
+                    (unsigned long)(client.bottom - client.top),
+                    (long)origin.x, (long)origin.y);
+            d9wg_log(line);
+        });
+    }
     present.width = (uint32_t)(client.right - client.left);
     present.height = (uint32_t)(client.bottom - client.top);
+
+    /* D3D9's hardware cursor follows the OS pointer on its own, so the app is
+     * under no obligation to call SetCursorPosition -- most never do. Sample
+     * it here instead, once per frame, and only while a cursor is actually
+     * armed and visible. */
+    emit_window_state(device, window);
+    if (device->app_cursor) {
+        if (device->cursor_visible) {
+            POINT pointer;
+            if (GetCursorPos(&pointer)) {
+                if (window)
+                    ScreenToClient(window, &pointer);
+                emit_cursor_position(device, pointer.x, pointer.y, 0);
+            }
+        }
+    } else {
+        /* The application is leaving the pointer to Windows; capture it out
+         * of GDI instead (see emit_system_cursor_bitmap). */
+        update_system_cursor(device, window);
+    }
 
     EnterCriticalSection(&g_transport_lock);
     result = reserve_command_locked(D9WG_OP_PRESENT, sizeof(present), 0,
@@ -3081,40 +4063,418 @@ static HRESULT WINAPI device_get_fvf(IDirect3DDevice9 *iface, DWORD *fvf)
     return D3D_OK;
 }
 
-/*
+/* ---- programmable shaders (M2) ----
+ *
  * D3D9 gives SetVertexShader/SetPixelShader a real COM pointer type, unlike
  * D3D8's overloaded DWORD, so there is no FVF-vs-shader-handle ambiguity to
- * resolve here. M1 never creates a shader object (CreateVertexShader/
- * CreatePixelShader always fail below), so the only value that can ever
- * legitimately arrive is NULL -- "go back to fixed function", which is
- * already the only mode this milestone has. Treat that as a real no-op
- * success rather than routing it through the same stub that rejects actual
- * shader creation, since defensive `SetVertexShader(NULL)` at fixed-function
- * init is common even in games that never intend to use shaders.
+ * resolve. Passing NULL means "go back to fixed function", which stays a
+ * fully supported mode.
+ *
+ * The guest does no semantic work on the bytecode: it counts tokens, hashes
+ * them, keeps a shadow copy for GetFunction and Reset replay, and ships the
+ * raw stream. Translation to WGSL is entirely host-side (plan 4.2), so a
+ * shader this build cannot translate still creates successfully here and is
+ * refused where the failure is visible and countable -- in the executor --
+ * rather than being second-guessed from inside the guest.
  */
+static D9Shader *vertex_shader_from_iface(IDirect3DVertexShader9 *iface)
+{
+    return (D9Shader *)iface;
+}
+
+static D9Shader *pixel_shader_from_iface(IDirect3DPixelShader9 *iface)
+{
+    return (D9Shader *)iface;
+}
+
+static HRESULT create_shader(D9Device *device, const DWORD *bytecode,
+        BOOL want_pixel, D9Shader **shader_out)
+{
+    D9Shader *shader;
+    UINT token_count = 0;
+    BOOL is_pixel = FALSE;
+    uint32_t code_bytes;
+
+    *shader_out = NULL;
+    if (!bytecode)
+        return D3DERR_INVALIDCALL;
+    if (!shader_token_count(bytecode, &token_count, &is_pixel)
+            || is_pixel != want_pixel) {
+        TRACE_FIRST({
+            char line[160];
+            wsprintfA(line, "create_shader REJECTED version=0x%08lX "
+                    "want_pixel=%d parsed_pixel=%d tokens=%lu",
+                    (unsigned long)bytecode[0], (int)want_pixel, (int)is_pixel,
+                    (unsigned long)token_count);
+            d9wg_log(line);
+        });
+        return D3DERR_INVALIDCALL;
+    }
+
+    code_bytes = (uint32_t)token_count * 4u;
+    shader = (D9Shader *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+            sizeof(*shader));
+    if (!shader)
+        return E_OUTOFMEMORY;
+    shader->code = (DWORD *)HeapAlloc(GetProcessHeap(), 0, code_bytes);
+    if (!shader->code) {
+        HeapFree(GetProcessHeap(), 0, shader);
+        return E_OUTOFMEMORY;
+    }
+    CopyMemory(shader->code, bytecode, code_bytes);
+    if (want_pixel)
+        shader->iface.pixel.lpVtbl = &g_pixel_shader_vtbl;
+    else
+        shader->iface.vertex.lpVtbl = &g_vertex_shader_vtbl;
+    shader->refcount = 1;
+    shader->device = device;
+    shader->handle = allocate_shader_handle();
+    shader->is_pixel = want_pixel;
+    shader->token_count = token_count;
+    shader_bytecode_hash(shader->code, token_count, &shader->hash_low,
+            &shader->hash_high);
+    device_child_add_ref(device);
+
+    if (!emit_shader_create(device, shader)) {
+        device_child_release(device);
+        HeapFree(GetProcessHeap(), 0, shader->code);
+        HeapFree(GetProcessHeap(), 0, shader);
+        return D3DERR_DRIVERINTERNALERROR;
+    }
+    TRACE_FIRST({
+        char line[160];
+        wsprintfA(line, "create_shader ok %s_%lu_%lu tokens=%lu handle=0x%08lX",
+                want_pixel ? "ps" : "vs",
+                (unsigned long)((bytecode[0] >> 8) & 0xFFu),
+                (unsigned long)(bytecode[0] & 0xFFu),
+                (unsigned long)token_count, (unsigned long)shader->handle);
+        d9wg_log(line);
+    });
+    shader->next_device_resource = device->shaders;
+    device->shaders = shader;
+    *shader_out = shader;
+    return D3D_OK;
+}
+
+static void shader_destroy(D9Shader *shader)
+{
+    D9Shader **link = &shader->device->shaders;
+    D9WGDestroyResource destroy;
+
+    while (*link && *link != shader)
+        link = &(*link)->next_device_resource;
+    if (*link)
+        *link = shader->next_device_resource;
+    destroy.resource_handle = shader->handle;
+    destroy.resource_kind = shader->is_pixel ? D9WG_RESOURCE_PIXEL_SHADER
+            : D9WG_RESOURCE_VERTEX_SHADER;
+    emit_command(D9WG_OP_DESTROY_RESOURCE, &destroy, sizeof(destroy));
+    device_child_release(shader->device);
+    HeapFree(GetProcessHeap(), 0, shader->code);
+    HeapFree(GetProcessHeap(), 0, shader);
+}
+
+static HRESULT emit_set_shader(D9Device *device, D9Shader *shader,
+        BOOL is_pixel)
+{
+    D9WGSetShader command;
+    command.device_handle = device->handle;
+    command.shader_handle = shader ? shader->handle : 0;
+    return emit_command(is_pixel ? D9WG_OP_SET_PIXEL_SHADER
+                    : D9WG_OP_SET_VERTEX_SHADER,
+            &command, sizeof(command)) ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
+}
+
+static HRESULT WINAPI device_create_vertex_shader(IDirect3DDevice9 *iface,
+        const DWORD *bytecode, IDirect3DVertexShader9 **shader_out)
+{
+    D9Shader *shader;
+    HRESULT hr;
+
+    if (!shader_out)
+        return D3DERR_INVALIDCALL;
+    *shader_out = NULL;
+    hr = create_shader(device_from_iface(iface), bytecode, FALSE, &shader);
+    if (FAILED(hr))
+        return hr;
+    *shader_out = &shader->iface.vertex;
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_create_pixel_shader(IDirect3DDevice9 *iface,
+        const DWORD *bytecode, IDirect3DPixelShader9 **shader_out)
+{
+    D9Shader *shader;
+    HRESULT hr;
+
+    if (!shader_out)
+        return D3DERR_INVALIDCALL;
+    *shader_out = NULL;
+    hr = create_shader(device_from_iface(iface), bytecode, TRUE, &shader);
+    if (FAILED(hr))
+        return hr;
+    *shader_out = &shader->iface.pixel;
+    return D3D_OK;
+}
+
 static HRESULT WINAPI device_set_vertex_shader(IDirect3DDevice9 *iface,
-        IDirect3DVertexShader9 *shader)
-{ (void)iface; return shader ? D3DERR_INVALIDCALL : D3D_OK; }
+        IDirect3DVertexShader9 *shader_iface)
+{
+    D9Device *device = device_from_iface(iface);
+    D9Shader *shader = shader_iface ? vertex_shader_from_iface(shader_iface) : NULL;
+
+    if (shader && (shader_iface->lpVtbl != &g_vertex_shader_vtbl
+            || shader->device != device))
+        return D3DERR_INVALIDCALL;
+    if (shader)
+        IDirect3DVertexShader9_AddRef(shader_iface);
+    if (device->vertex_shader)
+        IDirect3DVertexShader9_Release(&device->vertex_shader->iface.vertex);
+    device->vertex_shader = shader;
+    return emit_set_shader(device, shader, FALSE);
+}
 
 static HRESULT WINAPI device_get_vertex_shader(IDirect3DDevice9 *iface,
         IDirect3DVertexShader9 **shader_out)
 {
-    (void)iface;
-    if (!shader_out) return D3DERR_INVALIDCALL;
-    *shader_out = NULL;
+    D9Device *device = device_from_iface(iface);
+    if (!shader_out)
+        return D3DERR_INVALIDCALL;
+    *shader_out = device->vertex_shader ? &device->vertex_shader->iface.vertex
+            : NULL;
+    if (*shader_out)
+        IDirect3DVertexShader9_AddRef(*shader_out);
     return D3D_OK;
 }
 
 static HRESULT WINAPI device_set_pixel_shader(IDirect3DDevice9 *iface,
-        IDirect3DPixelShader9 *shader)
-{ (void)iface; return shader ? D3DERR_INVALIDCALL : D3D_OK; }
+        IDirect3DPixelShader9 *shader_iface)
+{
+    D9Device *device = device_from_iface(iface);
+    D9Shader *shader = shader_iface ? pixel_shader_from_iface(shader_iface) : NULL;
+
+    if (shader && (shader_iface->lpVtbl != &g_pixel_shader_vtbl
+            || shader->device != device))
+        return D3DERR_INVALIDCALL;
+    if (shader)
+        IDirect3DPixelShader9_AddRef(shader_iface);
+    if (device->pixel_shader)
+        IDirect3DPixelShader9_Release(&device->pixel_shader->iface.pixel);
+    device->pixel_shader = shader;
+    return emit_set_shader(device, shader, TRUE);
+}
 
 static HRESULT WINAPI device_get_pixel_shader(IDirect3DDevice9 *iface,
         IDirect3DPixelShader9 **shader_out)
 {
-    (void)iface;
-    if (!shader_out) return D3DERR_INVALIDCALL;
-    *shader_out = NULL;
+    D9Device *device = device_from_iface(iface);
+    if (!shader_out)
+        return D3DERR_INVALIDCALL;
+    *shader_out = device->pixel_shader ? &device->pixel_shader->iface.pixel
+            : NULL;
+    if (*shader_out)
+        IDirect3DPixelShader9_AddRef(*shader_out);
+    return D3D_OK;
+}
+
+/* ---- shader constant registers ----
+ *
+ * Two things happen here beyond storing the value. First, the shadow makes
+ * the redundant-set suppression the plan asks for in 7.5 possible: engines
+ * routinely re-upload an entire constant bank every frame even when nothing
+ * in it changed. Second, when something *has* changed, only the dirty
+ * sub-range is sent -- a 32-register bone palette where one bone moved
+ * becomes one float4 on the wire, not 32.
+ */
+static BOOL constant_range_valid(UINT start, UINT count, UINT capacity)
+{
+    return count != 0 && start < capacity && count <= capacity - start;
+}
+
+static HRESULT set_constant_f(D9Device *device, BOOL is_pixel, UINT start,
+        const float *data, UINT count)
+{
+    float (*shadow)[4] = is_pixel ? device->ps_const_f : device->vs_const_f;
+    UINT capacity = is_pixel ? D9_MAX_PS_CONST_F : D9_MAX_VS_CONST_F;
+    UINT first_dirty = count;
+    UINT last_dirty = 0;
+    UINT index;
+
+    if (!data || !constant_range_valid(start, count, capacity))
+        return D3DERR_INVALIDCALL;
+    for (index = 0; index < count; ++index) {
+        const float *source = data + index * 4;
+        float *target = shadow[start + index];
+        if (target[0] == source[0] && target[1] == source[1]
+                && target[2] == source[2] && target[3] == source[3])
+            continue;
+        target[0] = source[0]; target[1] = source[1];
+        target[2] = source[2]; target[3] = source[3];
+        if (index < first_dirty) first_dirty = index;
+        last_dirty = index;
+    }
+    if (first_dirty > last_dirty)
+        return D3D_OK; /* nothing actually changed */
+    return emit_shader_constants(device,
+            is_pixel ? D9WG_OP_SET_PIXEL_SHADER_CONSTANT_F
+                    : D9WG_OP_SET_VERTEX_SHADER_CONSTANT_F,
+            start + first_dirty, last_dirty - first_dirty + 1,
+            shadow[start + first_dirty],
+            (last_dirty - first_dirty + 1) * 16u)
+            ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
+}
+
+static HRESULT set_constant_i(D9Device *device, BOOL is_pixel, UINT start,
+        const int *data, UINT count)
+{
+    int (*shadow)[4] = is_pixel ? device->ps_const_i : device->vs_const_i;
+    UINT first_dirty = count;
+    UINT last_dirty = 0;
+    UINT index;
+
+    if (!data || !constant_range_valid(start, count, D9_MAX_CONST_I))
+        return D3DERR_INVALIDCALL;
+    for (index = 0; index < count; ++index) {
+        const int *source = data + index * 4;
+        int *target = shadow[start + index];
+        if (target[0] == source[0] && target[1] == source[1]
+                && target[2] == source[2] && target[3] == source[3])
+            continue;
+        target[0] = source[0]; target[1] = source[1];
+        target[2] = source[2]; target[3] = source[3];
+        if (index < first_dirty) first_dirty = index;
+        last_dirty = index;
+    }
+    if (first_dirty > last_dirty)
+        return D3D_OK;
+    return emit_shader_constants(device,
+            is_pixel ? D9WG_OP_SET_PIXEL_SHADER_CONSTANT_I
+                    : D9WG_OP_SET_VERTEX_SHADER_CONSTANT_I,
+            start + first_dirty, last_dirty - first_dirty + 1,
+            shadow[start + first_dirty],
+            (last_dirty - first_dirty + 1) * 16u)
+            ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
+}
+
+static HRESULT set_constant_b(D9Device *device, BOOL is_pixel, UINT start,
+        const WINBOOL *data, UINT count)
+{
+    BOOL *shadow = is_pixel ? device->ps_const_b : device->vs_const_b;
+    uint32_t packed[D9_MAX_CONST_B];
+    UINT first_dirty = count;
+    UINT last_dirty = 0;
+    UINT index;
+
+    if (!data || !constant_range_valid(start, count, D9_MAX_CONST_B))
+        return D3DERR_INVALIDCALL;
+    for (index = 0; index < count; ++index) {
+        BOOL value = data[index] ? TRUE : FALSE;
+        if (shadow[start + index] == value)
+            continue;
+        shadow[start + index] = value;
+        if (index < first_dirty) first_dirty = index;
+        last_dirty = index;
+    }
+    if (first_dirty > last_dirty)
+        return D3D_OK;
+    /* One 32-bit slot per register on the wire: the host's uniform layout
+     * (plan 9.7) has no packed-bit representation, and this is a handful of
+     * bytes either way. */
+    for (index = first_dirty; index <= last_dirty; ++index)
+        packed[index - first_dirty] = shadow[start + index] ? 1u : 0u;
+    return emit_shader_constants(device,
+            is_pixel ? D9WG_OP_SET_PIXEL_SHADER_CONSTANT_B
+                    : D9WG_OP_SET_VERTEX_SHADER_CONSTANT_B,
+            start + first_dirty, last_dirty - first_dirty + 1, packed,
+            (last_dirty - first_dirty + 1) * 4u)
+            ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
+}
+
+static HRESULT WINAPI device_set_vertex_shader_constant_f(
+        IDirect3DDevice9 *iface, UINT start, const float *data, UINT count)
+{ return set_constant_f(device_from_iface(iface), FALSE, start, data, count); }
+
+static HRESULT WINAPI device_set_pixel_shader_constant_f(
+        IDirect3DDevice9 *iface, UINT start, const float *data, UINT count)
+{ return set_constant_f(device_from_iface(iface), TRUE, start, data, count); }
+
+static HRESULT WINAPI device_set_vertex_shader_constant_i(
+        IDirect3DDevice9 *iface, UINT start, const int *data, UINT count)
+{ return set_constant_i(device_from_iface(iface), FALSE, start, data, count); }
+
+static HRESULT WINAPI device_set_pixel_shader_constant_i(
+        IDirect3DDevice9 *iface, UINT start, const int *data, UINT count)
+{ return set_constant_i(device_from_iface(iface), TRUE, start, data, count); }
+
+static HRESULT WINAPI device_set_vertex_shader_constant_b(
+        IDirect3DDevice9 *iface, UINT start, const WINBOOL *data, UINT count)
+{ return set_constant_b(device_from_iface(iface), FALSE, start, data, count); }
+
+static HRESULT WINAPI device_set_pixel_shader_constant_b(
+        IDirect3DDevice9 *iface, UINT start, const WINBOOL *data, UINT count)
+{ return set_constant_b(device_from_iface(iface), TRUE, start, data, count); }
+
+static HRESULT WINAPI device_get_vertex_shader_constant_f(
+        IDirect3DDevice9 *iface, UINT start, float *data, UINT count)
+{
+    D9Device *device = device_from_iface(iface);
+    if (!data || !constant_range_valid(start, count, D9_MAX_VS_CONST_F))
+        return D3DERR_INVALIDCALL;
+    CopyMemory(data, device->vs_const_f[start], count * 16u);
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_get_pixel_shader_constant_f(
+        IDirect3DDevice9 *iface, UINT start, float *data, UINT count)
+{
+    D9Device *device = device_from_iface(iface);
+    if (!data || !constant_range_valid(start, count, D9_MAX_PS_CONST_F))
+        return D3DERR_INVALIDCALL;
+    CopyMemory(data, device->ps_const_f[start], count * 16u);
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_get_vertex_shader_constant_i(
+        IDirect3DDevice9 *iface, UINT start, int *data, UINT count)
+{
+    D9Device *device = device_from_iface(iface);
+    if (!data || !constant_range_valid(start, count, D9_MAX_CONST_I))
+        return D3DERR_INVALIDCALL;
+    CopyMemory(data, device->vs_const_i[start], count * 16u);
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_get_pixel_shader_constant_i(
+        IDirect3DDevice9 *iface, UINT start, int *data, UINT count)
+{
+    D9Device *device = device_from_iface(iface);
+    if (!data || !constant_range_valid(start, count, D9_MAX_CONST_I))
+        return D3DERR_INVALIDCALL;
+    CopyMemory(data, device->ps_const_i[start], count * 16u);
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_get_vertex_shader_constant_b(
+        IDirect3DDevice9 *iface, UINT start, WINBOOL *data, UINT count)
+{
+    D9Device *device = device_from_iface(iface);
+    UINT index;
+    if (!data || !constant_range_valid(start, count, D9_MAX_CONST_B))
+        return D3DERR_INVALIDCALL;
+    for (index = 0; index < count; ++index)
+        data[index] = device->vs_const_b[start + index];
+    return D3D_OK;
+}
+
+static HRESULT WINAPI device_get_pixel_shader_constant_b(
+        IDirect3DDevice9 *iface, UINT start, WINBOOL *data, UINT count)
+{
+    D9Device *device = device_from_iface(iface);
+    UINT index;
+    if (!data || !constant_range_valid(start, count, D9_MAX_CONST_B))
+        return D3DERR_INVALIDCALL;
+    for (index = 0; index < count; ++index)
+        data[index] = device->ps_const_b[start + index];
     return D3D_OK;
 }
 
@@ -3128,8 +4488,6 @@ static HRESULT WINAPI device_get_pixel_shader(IDirect3DDevice9 *iface,
 #define DEV_STUB(name, ...) \
     static HRESULT WINAPI device_##name(IDirect3DDevice9 *iface, __VA_ARGS__)
 
-DEV_STUB(set_cursor_properties, UINT x, UINT y, IDirect3DSurface9 *bitmap)
-{ TRACE_STUB_ONCE(); (void)iface; (void)x; (void)y; (void)bitmap; return D3DERR_INVALIDCALL; }
 DEV_STUB(create_additional_swap_chain, D3DPRESENT_PARAMETERS *params,
         IDirect3DSwapChain9 **out)
 { TRACE_STUB_ONCE(); (void)iface; (void)params; if (out) { *out = NULL; } return D3DERR_INVALIDCALL; }
@@ -3250,10 +4608,69 @@ DEV_STUB(color_fill, IDirect3DSurface9 *surface, const RECT *rect,
         D3DCOLOR color)
 { TRACE_STUB_ONCE(); (void)iface; (void)surface; (void)rect; (void)color;
   return D3DERR_INVALIDCALL; }
-DEV_STUB(create_offscreen_plain_surface, UINT w, UINT h, D3DFORMAT format,
+/* A plain system-memory surface with no GPU resource behind it. Implemented
+ * because it is how an application builds a cursor bitmap for
+ * SetCursorProperties; it is deliberately limited to the 32-bit formats a
+ * cursor may use, so nothing else starts depending on it as a general
+ * offscreen surface. */
+static HRESULT WINAPI device_create_offscreen_plain_surface(
+        IDirect3DDevice9 *iface, UINT width, UINT height, D3DFORMAT format,
         D3DPOOL pool, IDirect3DSurface9 **out, HANDLE *shared)
-{ TRACE_STUB_ONCE(); (void)iface; (void)w; (void)h; (void)format; (void)pool; (void)shared;
-  if (out) { *out = NULL; } return D3DERR_INVALIDCALL; }
+{
+    D9Device *device = device_from_iface(iface);
+    D9Surface *surface;
+    UINT row_pitch;
+    UINT byte_count;
+
+    (void)pool;
+    (void)shared;
+    if (!out)
+        return D3DERR_INVALIDCALL;
+    *out = NULL;
+    if (format != D3DFMT_A8R8G8B8 && format != D3DFMT_X8R8G8B8) {
+        TRACE_FIRST({
+            char line[128];
+            wsprintfA(line, "create_offscreen_plain_surface REJECTED format=%lu",
+                    (unsigned long)format);
+            d9wg_log(line);
+        });
+        return D3DERR_INVALIDCALL;
+    }
+    if (!width || !height)
+        return D3DERR_INVALIDCALL;
+    if (!multiply_u32(width, 4u, &row_pitch)
+            || !multiply_u32(row_pitch, height, &byte_count))
+        return D3DERR_INVALIDCALL;
+
+    surface = (D9Surface *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+            sizeof(*surface));
+    if (!surface)
+        return E_OUTOFMEMORY;
+    surface->shadow = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+            byte_count);
+    if (!surface->shadow) {
+        HeapFree(GetProcessHeap(), 0, surface);
+        return E_OUTOFMEMORY;
+    }
+    surface->iface.lpVtbl = &g_surface_vtbl;
+    surface->refcount = 1;
+    surface->device = device;
+    surface->width = width;
+    surface->height = height;
+    surface->format = format;
+    surface->row_pitch = row_pitch;
+    surface->byte_count = byte_count;
+    device_child_add_ref(device);
+    TRACE_FIRST({
+        char line[128];
+        wsprintfA(line, "create_offscreen_plain_surface ok %lux%lu format=%lu",
+                (unsigned long)width, (unsigned long)height,
+                (unsigned long)format);
+        d9wg_log(line);
+    });
+    *out = &surface->iface;
+    return D3D_OK;
+}
 DEV_STUB(set_render_target, DWORD index, IDirect3DSurface9 *target)
 { TRACE_STUB_ONCE(); (void)iface; (void)index; (void)target; return D3DERR_INVALIDCALL; }
 DEV_STUB(get_render_target, DWORD index, IDirect3DSurface9 **out)
@@ -3428,58 +4845,10 @@ DEV_STUB(process_vertices, UINT src_start, UINT dst_index, UINT count,
         DWORD flags)
 { TRACE_STUB_ONCE(); (void)iface; (void)src_start; (void)dst_index; (void)count; (void)dst;
   (void)decl; (void)flags; return D3DERR_INVALIDCALL; }
-DEV_STUB(create_vertex_shader, const DWORD *bytecode,
-        IDirect3DVertexShader9 **out)
-{ TRACE_STUB_ONCE(); (void)iface; (void)bytecode; if (out) { *out = NULL; } return D3DERR_INVALIDCALL; }
-DEV_STUB(set_vertex_shader_constant_f, UINT start, const float *data,
-        UINT count)
-{ TRACE_STUB_ONCE(); (void)iface; (void)start; (void)data; (void)count;
-  return D3DERR_INVALIDCALL; }
-DEV_STUB(get_vertex_shader_constant_f, UINT start, float *data, UINT count)
-{ TRACE_STUB_ONCE(); (void)iface; (void)start; (void)data; (void)count;
-  return D3DERR_INVALIDCALL; }
-DEV_STUB(set_vertex_shader_constant_i, UINT start, const int *data,
-        UINT count)
-{ TRACE_STUB_ONCE(); (void)iface; (void)start; (void)data; (void)count;
-  return D3DERR_INVALIDCALL; }
-DEV_STUB(get_vertex_shader_constant_i, UINT start, int *data, UINT count)
-{ TRACE_STUB_ONCE(); (void)iface; (void)start; (void)data; (void)count;
-  return D3DERR_INVALIDCALL; }
-DEV_STUB(set_vertex_shader_constant_b, UINT start, const WINBOOL *data,
-        UINT count)
-{ TRACE_STUB_ONCE(); (void)iface; (void)start; (void)data; (void)count;
-  return D3DERR_INVALIDCALL; }
-DEV_STUB(get_vertex_shader_constant_b, UINT start, WINBOOL *data, UINT count)
-{ TRACE_STUB_ONCE(); (void)iface; (void)start; (void)data; (void)count;
-  return D3DERR_INVALIDCALL; }
 DEV_STUB(set_stream_source_freq, UINT stream, UINT divider)
 { TRACE_STUB_ONCE(); (void)iface; (void)stream; (void)divider; return D3DERR_INVALIDCALL; }
 DEV_STUB(get_stream_source_freq, UINT stream, UINT *divider)
 { TRACE_STUB_ONCE(); (void)iface; (void)stream; (void)divider; return D3DERR_INVALIDCALL; }
-DEV_STUB(create_pixel_shader, const DWORD *bytecode,
-        IDirect3DPixelShader9 **out)
-{ TRACE_STUB_ONCE(); (void)iface; (void)bytecode; if (out) { *out = NULL; } return D3DERR_INVALIDCALL; }
-DEV_STUB(set_pixel_shader_constant_f, UINT start, const float *data,
-        UINT count)
-{ TRACE_STUB_ONCE(); (void)iface; (void)start; (void)data; (void)count;
-  return D3DERR_INVALIDCALL; }
-DEV_STUB(get_pixel_shader_constant_f, UINT start, float *data, UINT count)
-{ TRACE_STUB_ONCE(); (void)iface; (void)start; (void)data; (void)count;
-  return D3DERR_INVALIDCALL; }
-DEV_STUB(set_pixel_shader_constant_i, UINT start, const int *data,
-        UINT count)
-{ TRACE_STUB_ONCE(); (void)iface; (void)start; (void)data; (void)count;
-  return D3DERR_INVALIDCALL; }
-DEV_STUB(get_pixel_shader_constant_i, UINT start, int *data, UINT count)
-{ TRACE_STUB_ONCE(); (void)iface; (void)start; (void)data; (void)count;
-  return D3DERR_INVALIDCALL; }
-DEV_STUB(set_pixel_shader_constant_b, UINT start, const WINBOOL *data,
-        UINT count)
-{ TRACE_STUB_ONCE(); (void)iface; (void)start; (void)data; (void)count;
-  return D3DERR_INVALIDCALL; }
-DEV_STUB(get_pixel_shader_constant_b, UINT start, WINBOOL *data, UINT count)
-{ TRACE_STUB_ONCE(); (void)iface; (void)start; (void)data; (void)count;
-  return D3DERR_INVALIDCALL; }
 DEV_STUB(draw_rect_patch, UINT handle, const float *segments,
         const D3DRECTPATCH_INFO *info)
 { TRACE_STUB_ONCE(); (void)iface; (void)handle; (void)segments; (void)info;
@@ -4122,12 +5491,122 @@ static HRESULT WINAPI decl_get_declaration(IDirect3DVertexDeclaration9 *iface,
     return D3D_OK;
 }
 
-/* ---- IDirect3DSurface9 (GetBackBuffer only; see the struct comment) ---- */
+/* ---- IDirect3DVertexShader9 / IDirect3DPixelShader9 ----
+ *
+ * Both interfaces are IUnknown + GetDevice + GetFunction with identical
+ * layouts, so the bodies below are shared through D9Shader and only the
+ * vtable entry points differ. GetFunction hands back the shadow copy taken
+ * at creation, which is what a game's own shader-cache or effect-reload path
+ * reads back. */
 
-static D9Surface *surface_from_iface(IDirect3DSurface9 *iface)
+static HRESULT shader_query_interface(D9Shader *shader, REFIID iid,
+        void **object, const void *interface_guid)
 {
-    return (D9Surface *)iface;
+    if (!object)
+        return E_POINTER;
+    *object = NULL;
+    if (!iid || (!iid_is_unknown(iid) && !guid_equal(iid, interface_guid)))
+        return E_NOINTERFACE;
+    *object = &shader->iface;
+    InterlockedIncrement(&shader->refcount);
+    return S_OK;
 }
+
+static HRESULT shader_get_function(D9Shader *shader, void *data, UINT *size)
+{
+    UINT byte_count = shader->token_count * 4u;
+    if (!size)
+        return D3DERR_INVALIDCALL;
+    if (!data) {
+        *size = byte_count;
+        return D3D_OK;
+    }
+    if (*size < byte_count)
+        return D3DERR_INVALIDCALL;
+    CopyMemory(data, shader->code, byte_count);
+    *size = byte_count;
+    return D3D_OK;
+}
+
+static HRESULT WINAPI vertex_shader_query_interface(
+        IDirect3DVertexShader9 *iface, REFIID iid, void **object)
+{
+    return shader_query_interface(vertex_shader_from_iface(iface), iid, object,
+            &IID_IDirect3DVertexShader9);
+}
+
+static ULONG WINAPI vertex_shader_add_ref(IDirect3DVertexShader9 *iface)
+{
+    return (ULONG)InterlockedIncrement(
+            &vertex_shader_from_iface(iface)->refcount);
+}
+
+static ULONG WINAPI vertex_shader_release(IDirect3DVertexShader9 *iface)
+{
+    D9Shader *shader = vertex_shader_from_iface(iface);
+    ULONG refs = (ULONG)InterlockedDecrement(&shader->refcount);
+    if (!refs)
+        shader_destroy(shader);
+    return refs;
+}
+
+static HRESULT WINAPI vertex_shader_get_device(IDirect3DVertexShader9 *iface,
+        IDirect3DDevice9 **device_out)
+{
+    D9Shader *shader = vertex_shader_from_iface(iface);
+    if (!device_out)
+        return D3DERR_INVALIDCALL;
+    *device_out = &shader->device->iface;
+    IDirect3DDevice9_AddRef(*device_out);
+    return D3D_OK;
+}
+
+static HRESULT WINAPI vertex_shader_get_function(IDirect3DVertexShader9 *iface,
+        void *data, UINT *size)
+{
+    return shader_get_function(vertex_shader_from_iface(iface), data, size);
+}
+
+static HRESULT WINAPI pixel_shader_query_interface(
+        IDirect3DPixelShader9 *iface, REFIID iid, void **object)
+{
+    return shader_query_interface(pixel_shader_from_iface(iface), iid, object,
+            &IID_IDirect3DPixelShader9);
+}
+
+static ULONG WINAPI pixel_shader_add_ref(IDirect3DPixelShader9 *iface)
+{
+    return (ULONG)InterlockedIncrement(
+            &pixel_shader_from_iface(iface)->refcount);
+}
+
+static ULONG WINAPI pixel_shader_release(IDirect3DPixelShader9 *iface)
+{
+    D9Shader *shader = pixel_shader_from_iface(iface);
+    ULONG refs = (ULONG)InterlockedDecrement(&shader->refcount);
+    if (!refs)
+        shader_destroy(shader);
+    return refs;
+}
+
+static HRESULT WINAPI pixel_shader_get_device(IDirect3DPixelShader9 *iface,
+        IDirect3DDevice9 **device_out)
+{
+    D9Shader *shader = pixel_shader_from_iface(iface);
+    if (!device_out)
+        return D3DERR_INVALIDCALL;
+    *device_out = &shader->device->iface;
+    IDirect3DDevice9_AddRef(*device_out);
+    return D3D_OK;
+}
+
+static HRESULT WINAPI pixel_shader_get_function(IDirect3DPixelShader9 *iface,
+        void *data, UINT *size)
+{
+    return shader_get_function(pixel_shader_from_iface(iface), data, size);
+}
+
+/* ---- IDirect3DSurface9 (GetBackBuffer only; see the struct comment) ---- */
 
 static HRESULT WINAPI surface_query_interface(IDirect3DSurface9 *iface,
         REFIID iid, void **object)
@@ -4159,6 +5638,8 @@ static ULONG WINAPI surface_release(IDirect3DSurface9 *iface)
          * no texture and only holds the device. */
         if (surface->texture)
             IDirect3DTexture9_Release(&surface->texture->iface);
+        if (surface->shadow)
+            HeapFree(GetProcessHeap(), 0, surface->shadow);
         device_child_release(surface->device);
         HeapFree(GetProcessHeap(), 0, surface);
     }
@@ -4252,6 +5733,22 @@ static HRESULT WINAPI surface_lock_rect(IDirect3DSurface9 *iface,
 {
     D9Surface *surface = surface_from_iface(iface);
     TRACE_ONCE("surface_lock_rect: first call");
+    if (surface->shadow) {
+        /* A standalone CPU surface. The whole surface is handed over
+         * regardless of `rect`: there is no upload to narrow, so a sub-rect
+         * lock only changes which pointer the app is given. */
+        UINT x = rect ? (UINT)rect->left : 0;
+        UINT y = rect ? (UINT)rect->top : 0;
+        if (!locked_rect || surface->locked)
+            return D3DERR_INVALIDCALL;
+        if (x >= surface->width || y >= surface->height)
+            return D3DERR_INVALIDCALL;
+        locked_rect->Pitch = (INT)surface->row_pitch;
+        locked_rect->pBits = surface->shadow + y * surface->row_pitch + x * 4u;
+        surface->locked = TRUE;
+        (void)flags;
+        return D3D_OK;
+    }
     if (!surface->texture)
         return D3DERR_INVALIDCALL;
     return texture_lock_level(surface->texture, surface->level, locked_rect,
@@ -4261,6 +5758,12 @@ static HRESULT WINAPI surface_lock_rect(IDirect3DSurface9 *iface,
 static HRESULT WINAPI surface_unlock_rect(IDirect3DSurface9 *iface)
 {
     D9Surface *surface = surface_from_iface(iface);
+    if (surface->shadow) {
+        if (!surface->locked)
+            return D3DERR_INVALIDCALL;
+        surface->locked = FALSE;
+        return D3D_OK;
+    }
     if (!surface->texture)
         return D3DERR_INVALIDCALL;
     return texture_unlock_level(surface->texture, surface->level);
@@ -4481,6 +5984,22 @@ static IDirect3DVertexDeclaration9Vtbl g_decl_vtbl = {
     .Release = decl_release,
     .GetDevice = decl_get_device,
     .GetDeclaration = decl_get_declaration
+};
+
+static IDirect3DVertexShader9Vtbl g_vertex_shader_vtbl = {
+    .QueryInterface = vertex_shader_query_interface,
+    .AddRef = vertex_shader_add_ref,
+    .Release = vertex_shader_release,
+    .GetDevice = vertex_shader_get_device,
+    .GetFunction = vertex_shader_get_function
+};
+
+static IDirect3DPixelShader9Vtbl g_pixel_shader_vtbl = {
+    .QueryInterface = pixel_shader_query_interface,
+    .AddRef = pixel_shader_add_ref,
+    .Release = pixel_shader_release,
+    .GetDevice = pixel_shader_get_device,
+    .GetFunction = pixel_shader_get_function
 };
 
 static IDirect3DSurface9Vtbl g_surface_vtbl = {

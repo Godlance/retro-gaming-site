@@ -13,7 +13,8 @@ for test_name in \
     triangle \
     texture \
     world \
-    reset
+    reset \
+    shader
 do
     "$compiler" -mwindows -std=gnu99 -Os -s -nostdlib \
         -Wall -Wextra -Werror \

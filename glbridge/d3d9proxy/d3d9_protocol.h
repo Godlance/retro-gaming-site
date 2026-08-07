@@ -31,6 +31,18 @@
 
 #define D9WG_BATCH_FLAG_PRESENT (1u << 0)
 
+/*
+ * D9WGHello.feature_bits. The host does not gate anything on these -- they
+ * exist so a running session can be asked "which guest DLL is actually
+ * loaded?" without guessing from behaviour. That question is not academic:
+ * the host executor ships with the page and updates on reload, while the
+ * guest DLL lives inside the disk image and only changes when someone copies
+ * it in, so "new host + stale guest" is the normal failure mode after a
+ * milestone lands, and its symptom (no shaders ever created) is
+ * indistinguishable from "this scene genuinely uses no shaders".
+ */
+#define D9WG_FEATURE_SHADER_MODEL_2 (1u << 0)
+
 enum D9WGOpcode {
     D9WG_OP_HELLO = 1,
     D9WG_OP_CREATE_DEVICE = 2,
@@ -82,6 +94,21 @@ enum D9WGOpcode {
     D9WG_OP_SET_PIXEL_SHADER_CONSTANT_I = 0x217,  /* M2 */
     D9WG_OP_SET_PIXEL_SHADER_CONSTANT_B = 0x218,  /* M2 */
     D9WG_OP_SET_CLIP_PLANE = 0x219,          /* not before M3/M5, see 9.11 */
+    /* M2: the D3D9 hardware cursor. A fullscreen game draws its pointer
+     * through these rather than through GDI, so with them unimplemented the
+     * pointer is simply invisible -- the guest's GDI cursor never reaches the
+     * VGA framebuffer the site composites underneath, and the site hides the
+     * browser cursor (`cursor: none`) on the assumption the guest draws it. */
+    D9WG_OP_SET_CURSOR_PROPERTIES = 0x21A,
+    D9WG_OP_SET_CURSOR_POSITION = 0x21B,
+    D9WG_OP_SHOW_CURSOR = 0x21C,
+    /* Diagnostic only: reports what the guest's window manager thinks of the
+     * device window. The host draws its overlay unconditionally on top, so a
+     * game whose window is minimised, hidden or simply not in the foreground
+     * still *looks* perfectly rendered while every click goes somewhere else
+     * entirely. Nothing about that is visible in the picture, which is why it
+     * has to be reported rather than inferred. */
+    D9WG_OP_WINDOW_STATE = 0x21D,
 
     D9WG_OP_DRAW_PRIMITIVE = 0x300,
     D9WG_OP_DRAW_INDEXED_PRIMITIVE = 0x301,
@@ -425,6 +452,55 @@ typedef struct D9WGSetScissorRect {
     int32_t  right;
     int32_t  bottom;
 } D9WGSetScissorRect;
+
+/* The cursor bitmap, always expanded to A8R8G8B8 by the guest (D3D9 requires
+ * that format for a cursor surface anyway), followed by width*height*4 bytes
+ * at data_offset. */
+typedef struct D9WGSetCursorProperties {
+    uint32_t device_handle;
+    uint32_t hotspot_x;
+    uint32_t hotspot_y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t data_bytes;
+    uint32_t data_offset;
+    uint32_t reserved;
+} D9WGSetCursorProperties;
+
+/* Client-relative pixel coordinates, i.e. already in back-buffer space. D3D9's
+ * hardware cursor tracks the OS pointer on its own once ShowCursor(TRUE) is
+ * set -- SetCursorPosition only warps it -- so the guest re-sends the live
+ * position on every Present rather than only when the app calls that method. */
+typedef struct D9WGSetCursorPosition {
+    uint32_t device_handle;
+    int32_t x;
+    int32_t y;
+    uint32_t flags;
+} D9WGSetCursorPosition;
+
+typedef struct D9WGShowCursor {
+    uint32_t device_handle;
+    uint32_t show;
+} D9WGShowCursor;
+
+#define D9WG_WINDOW_IS_WINDOW    (1u << 0)
+#define D9WG_WINDOW_VISIBLE      (1u << 1)
+#define D9WG_WINDOW_ICONIC       (1u << 2)
+#define D9WG_WINDOW_FOREGROUND   (1u << 3)
+#define D9WG_WINDOW_FULLSCREEN   (1u << 4)
+
+typedef struct D9WGWindowState {
+    uint32_t device_handle;
+    uint32_t hwnd;
+    uint32_t foreground_hwnd;
+    uint32_t flags;
+    int32_t  window_x;
+    int32_t  window_y;
+    uint32_t window_width;
+    uint32_t window_height;
+    uint32_t client_width;
+    uint32_t client_height;
+} D9WGWindowState;
 
 typedef struct D9WGCreateQuery {
     uint32_t device_handle;

@@ -8,6 +8,7 @@ canvas { width: 640px; height: 480px; }
 </style>
 <canvas id="screen" width="640" height="480"></canvas>
 <div id="result">RUNNING</div>
+<script src="../d3d9-webgpu/d3d9_shader_pipeline.js"></script>
 <script src="../d3d9-webgpu/d3d9_executor.js"></script>
 <script>
 (async () => {
@@ -69,6 +70,23 @@ canvas { width: 640px; height: 480px; }
     const DECLUSAGE_TEXCOORD = 5;
     const DECLUSAGE_POSITIONT = 9;
     const DECLUSAGE_COLOR = 10;
+
+    // ---- M2 helpers ----
+    // CREATE_{VERTEX,PIXEL}_SHADER: device/handle/token_count/code_offset/
+    // hash_low/hash_high, with the raw token stream as the trailing blob.
+    const createShader = (deviceHandle, handle, tokens) => {
+        const hash = D3D9ShaderPipeline.hashTokens(tokens);
+        const blob = new Uint8Array(tokens.buffer.slice(0));
+        return { payload: u32(deviceHandle, handle, tokens.length, 0,
+                hash.low, hash.high),
+            blobs: [{ offsetField: 12, data: blob }] };
+    };
+    // SET_*_SHADER_CONSTANT_F: device/start_register/vector_count/data_offset.
+    const shaderConstants = (deviceHandle, startRegister, values) => {
+        const data = new Uint8Array(new Float32Array(values).buffer);
+        return { payload: u32(deviceHandle, startRegister, values.length / 4, 0),
+            blobs: [{ offsetField: 12, data }] };
+    };
 
     const command = (opcode, payload, blobs = []) =>
         ({ opcode, payload, blobs });
@@ -167,6 +185,73 @@ canvas { width: 640px; height: 480px; }
             0, 0, 1, 0, 0, 0, 0, 1,
         ];
 
+        // Draw 3 (M2): the same geometry through a real vs_2_0/ps_2_0 pair.
+        // The bytecode is the one glbridge/sample/d3d9_shader_test.c ships to
+        // the XP guest, so this validates against real WebGPU exactly what
+        // that test validates against the real guest DLL. Token encoding is
+        // documented in that file.
+        const vertexShaderTokens = new Uint32Array([
+            0xFFFE0200,
+            0x0200001F, 0x80000000, 0x900F0000,             // dcl_position v0
+            0x0200001F, 0x8000000A, 0x900F0001,             // dcl_color0 v1
+            0x0200001F, 0x80000005, 0x900F0002,             // dcl_texcoord0 v2
+            0x03000014, 0xC00F0000, 0x90E40000, 0xA0E40000, // m4x4 oPos, v0, c0
+            0x03000005, 0xD00F0000, 0x90E40001, 0xA0E40004, // mul oD0, v1, c4
+            0x02000001, 0xE00F0000, 0x90E40002,             // mov oT0, v2
+            0x0000FFFF,
+        ]);
+        const pixelShaderTokens = new Uint32Array([
+            0xFFFF0200,
+            0x0200001F, 0x90000000, 0xA00F0800,             // dcl_2d s0
+            0x0200001F, 0x80000005, 0xB0030000,             // dcl t0.xy
+            0x0200001F, 0x8000000A, 0x900F0000,             // dcl_color0 v0
+            0x05000051, 0xA00F0001,                         // def c1, ...
+                0x3DCCCCCD, 0x3DCCCCCD, 0x3DCCCCCD, 0x00000000,
+            0x03000042, 0x800F0000, 0xB0E40000, 0xA0E40800, // texld r0, t0, s0
+            0x03000005, 0x800F0000, 0x80E40000, 0x90E40000, // mul r0, r0, v0
+            0x04000004, 0x800F0800, 0x80E40000, 0xA0E40000, 0xA0E40001,
+            0x0000FFFF,
+        ]);
+        const vertexShaderHandle = 0x40000001;
+        const pixelShaderHandle = 0x40000003;
+        // POSITION(float3) + COLOR(D3DCOLOR) + TEXCOORD0(float2), stride 24 --
+        // the three semantics the vertex shader dcl's, in a different element
+        // order than the fixed-function stage would assume.
+        const shaderElements = [
+            element(0, DECLTYPE_FLOAT3, DECLUSAGE_POSITION),
+            element(12, DECLTYPE_D3DCOLOR, DECLUSAGE_COLOR),
+            element(16, DECLTYPE_FLOAT2, DECLUSAGE_TEXCOORD),
+        ];
+        const shaderVertices = new Uint8Array(3 * 24);
+        const shaderVertexView = new DataView(shaderVertices.buffer);
+        [[-0.6, -0.2, 0, 1], [-0.1, -0.2, 1, 1], [-0.35, -0.9, 0.5, 0]]
+            .forEach((vertex, index) => {
+                const offset = index * 24;
+                shaderVertexView.setFloat32(offset, vertex[0], true);
+                shaderVertexView.setFloat32(offset + 4, vertex[1], true);
+                shaderVertexView.setFloat32(offset + 8, 0.4, true);
+                shaderVertexView.setUint32(offset + 12, 0xFFFFFFFF, true);
+                shaderVertexView.setFloat32(offset + 16, vertex[2], true);
+                shaderVertexView.setFloat32(offset + 20, vertex[3], true);
+            });
+        // c0-c3 transposed for m4x4's four dot products (scale 0.8, shift x).
+        const shaderTransform = [
+            0.8, 0, 0, 0.1,
+            0, 0.8, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1,
+        ];
+        const vertexShaderCreate = createShader(deviceHandle,
+            vertexShaderHandle, vertexShaderTokens);
+        const pixelShaderCreate = createShader(deviceHandle,
+            pixelShaderHandle, pixelShaderTokens);
+        const vertexTransformConstants = shaderConstants(deviceHandle, 0,
+            shaderTransform);
+        const vertexTintConstants = shaderConstants(deviceHandle, 4,
+            [1, 0.9, 0.8, 1]);
+        const pixelScaleConstants = shaderConstants(deviceHandle, 0,
+            [0.9, 0.9, 0.9, 1]);
+
         const executor = new D3D9WebGPUExecutor(
             document.getElementById("screen"));
         await Promise.race([
@@ -197,6 +282,35 @@ canvas { width: 640px; height: 480px; }
             command(0x302, u32(deviceHandle, 4, 1, 16, 3,
                 worldVertices.byteLength, 0, 0),
                 [{ offsetField: 24, data: worldVertices }]),
+
+            // Draw 3: programmable vs_2_0 + ps_2_0, sampling the same texture
+            // through independent sampler state (CLAMP + LINEAR rather than
+            // D3D9's WRAP/POINT defaults, so a dropped SetSamplerState is
+            // visible in the sampler descriptor the cache builds).
+            command(0x121, vertexShaderCreate.payload, vertexShaderCreate.blobs),
+            command(0x122, pixelShaderCreate.payload, pixelShaderCreate.blobs),
+            command(0x211, u32(deviceHandle, vertexShaderHandle)),
+            command(0x212, u32(deviceHandle, pixelShaderHandle)),
+            command(0x213, vertexTransformConstants.payload,
+                vertexTransformConstants.blobs),
+            command(0x213, vertexTintConstants.payload,
+                vertexTintConstants.blobs),
+            command(0x216, pixelScaleConstants.payload,
+                pixelScaleConstants.blobs),
+            command(0x201, u32(deviceHandle, 0, 5, 2)),  // MAGFILTER=LINEAR
+            command(0x201, u32(deviceHandle, 0, 6, 2)),  // MINFILTER=LINEAR
+            command(0x201, u32(deviceHandle, 0, 1, 3)),  // ADDRESSU=CLAMP
+            command(0x201, u32(deviceHandle, 0, 2, 3)),  // ADDRESSV=CLAMP
+            command(0x203, u32(deviceHandle, 0, textureHandle, 0)),
+            command(0x20E, setFVF(deviceHandle, 0x142, shaderElements)),
+            command(0x302, u32(deviceHandle, 4, 1, 24, 3,
+                shaderVertices.byteLength, 0, 0),
+                [{ offsetField: 24, data: shaderVertices }]),
+            // Unbinding both shaders must return to the fixed-function path
+            // inside the same frame.
+            command(0x211, u32(deviceHandle, 0)),
+            command(0x212, u32(deviceHandle, 0)),
+
             command(7, u32(deviceHandle, 0)),
             command(0x103, u32(textureHandle, 3)),
             command(4, surface(deviceHandle, 640, 480)),
@@ -205,14 +319,34 @@ canvas { width: 640px; height: 480px; }
         if (executor.failed) throw executor.failed;
         if (validation) throw validation;
         const stats = executor.getStats();
-        if (stats.drawCalls !== 2 || stats.upDrawCalls !== 2 ||
-                stats.presents !== 1 || stats.pipelineCreations !== 2 ||
-                stats.malformedBatches !== 0 || stats.unsupportedCommands !== 0)
-            throw new Error("unexpected stats " + JSON.stringify(stats));
+        const expected = {
+            drawCalls: 3, upDrawCalls: 3, presents: 1, pipelineCreations: 3,
+            malformedBatches: 0, unsupportedCommands: 0, droppedDraws: 0,
+            // Two shaders translated, plus one extra variant because the
+            // declaration types COLOR0 as D3DCOLOR and the vertex module has
+            // to swizzle it.
+            shadersTranslated: 2, shaderTranslationFailures: 0,
+            shaderVariantsTranslated: 1, shaderCompileErrors: 0,
+            programmableDraws: 1,
+            // Draws 1 and 2 sample with D3D9's default sampler state; draw 3
+            // with the CLAMP/LINEAR one set above.
+            samplersCreated: 2,
+        };
+        const mismatches = Object.keys(expected)
+            .filter(key => stats[key] !== expected[key])
+            .map(key => key + "=" + stats[key] + " (expected " + expected[key] + ")");
+        if (mismatches.length)
+            throw new Error("unexpected stats: " + mismatches.join(", ") +
+                "\n" + JSON.stringify(stats, null, 2));
         result.textContent = "PASS\n" + JSON.stringify(stats, null, 2);
         result.dataset.status = "pass";
     } catch (error) {
-        result.textContent = "FAIL\n" + (error && error.stack || error);
+        // A GPUValidationError has no stack and stringifies to
+        // "[object GPUValidationError]", which hides the only useful part of
+        // it; always surface .message first.
+        result.textContent = "FAIL\n" +
+            ((error && error.message) || "") + "\n" +
+            ((error && error.stack) || String(error));
         result.dataset.status = "fail";
     }
 })();

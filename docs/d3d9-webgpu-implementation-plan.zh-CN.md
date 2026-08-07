@@ -635,6 +635,12 @@ glbridge/webgpu-runtime/   # 新增，D3D8/D3D9 共享基础设施（见 3.1）
   lru_cache.js
 ```
 
+M2 落地时前两个文件都已建立（`webgpu-runtime/` 仍未建）。注意加载顺序：
+`d3d9_executor.js` 在**加载时**就解析 `D3D9ShaderPipeline`，不是惰性的，
+所以 `d3d9_shader_pipeline.js` 的 `<script>` 必须排在它前面
+（见 `game.html`）。这样写是为了让缺失依赖在页面加载时就报错，而不是
+拖到第一次 `CreateVertexShader` 才炸。
+
 ### 8.2 初始化生命周期
 
 与 D3D8 executor 相同的形状：独立 overlay canvas、独立 WebGPU
@@ -707,6 +713,13 @@ D3D8 路径的 SM1.x 翻译器能手写，是因为 SM1.x 字节码是**无分�
 实现一个简化版的着色器编译器前端，工程量和正确性风险都远超"扩展一张
 opcode 表"，且极易在边角指令组合上产生隐蔽的渲染错误（不崩溃，但颜色/
 光照错误，比崩溃更难排查）。
+
+> **2026-08-07 落地修正**：M2 实际走的**不是**本节推荐的 WASM 工具链，
+> 而是一个手写的 JS 直译器（`glbridge/d3d9-webgpu/d3d9_shader_pipeline.js`）。
+> 理由、代价与保留的替换接缝见第 15 章 M2 的状态记录与该文件顶部注释；
+> 一句话概括：9.2 节的论证针对 SSA 目标（SPIR-V）成立，对 WGSL 这种
+> 带可变变量、控制流结构与 D3D9 汇编一一对应的命令式语言不成立。
+> 本节以下内容作为**日后若要替换后端**的设计依据保留。
 
 ### 9.3 推荐路线：借用成熟开源前端，只编译需要的部分到 WASM
 
@@ -1078,6 +1091,247 @@ War3 确实不需要等 M2 的 shader 编译管线就能跑到主菜单**（caps
 - 验收：KartRider 的水面/反光等 SM2.0 特效正确渲染，赛道可以从起点
   跑到终点，帧率达标（见 2.3 成功标准表）。
 
+**2026-08-07 状态记录：代码与自动化验证已完成，真实游戏验收待人工执行。**
+
+**翻译后端改为手写 JS 直译器，不走 vkd3d-shader/Tint 的 WASM 工具链。**
+这是对 9.3 节推荐路线的有意偏离，理由见
+`glbridge/d3d9-webgpu/d3d9_shader_pipeline.js` 顶部注释，核心是：9.2 节
+"需要 CFG 构建器和 SSA 寄存器版本管理"的论证针对的是 **SPIR-V 这类 SSA
+目标**，对 WGSL 不成立。D3D9 汇编和 WGSL 都是带可变变量的命令式语言，
+且 D3D9 的控制流按规范就是结构化嵌套的（`if/endif`、`rep/endrep`、
+`loop/endloop`、`call/ret`，没有任意跳转），恰好对应 WGSL 的
+`if`/`loop`/函数——所以翻译是针对 `var<private>` 寄存器的逐语句转写，
+不需要基本块、CFG、SSA 或 phi 节点。代价是正确性依靠本仓库自己的测试
+而非 Wine 多年的游戏覆盖；收益是没有 Emscripten/Dawn 构建链要维护、
+没有第 25 章标记为未解决的 LGPL 分发义务、且翻译器可以直接在 Node 里
+单测。`compileShader(tokens)` 是接缝：日后换成 WASM 后端只动这一个文件。
+
+已落地范围：
+
+- **翻译器**（`d3d9_shader_pipeline.js`，约 1400 行）：vs/ps 1.1–3.0
+  的指令集、写掩码、源/目的修饰符、swizzle、相对寻址（`c[a0.x+n]` /
+  `c[aL+n]`，带越界 clamp）、谓词指令、`rep`/`loop`/`if`/`ifc`/`break`、
+  `label`/`call`/`callnz`（按调用图拓扑排序成 WGSL 函数，检测递归并拒绝）、
+  `def`/`defi`/`defb`、`dcl` 语义、vs_3_0 的任意输出语义、ps_3_0 的
+  `vPos`/`vFace`/`oDepth`。ps_1_x 的 bump-environment 与 `texm3x*` 家族
+  **明确拒绝**（`UNSUPPORTED_OPS`），不做近似。
+- **VS/PS 接口契约**：固定管线与可编程着色器是**同一条路径**。两个阶段
+  永远是两个独立的 `GPUShaderModule`，通过固定的 varying 约定相遇
+  （COLOR0/1 = location 0/1，TEXCOORD0..7 = 2..9，FOG = 10），固定管线
+  阶段被合成成遵守同一约定的模块。这是 D3D9 允许的四种 VS/PS 组合
+  （含"固定管线 T&L + 真实 pixel shader"）能工作的前提。
+- **常量寄存器**：guest 侧持有完整寄存器文件影子，抑制重复设置并把变化
+  收窄到脏区间；host 侧按 9.7 打包（float4 区 → int4 区 → 每 bool 一个
+  32 位槽），vs/ps 各占一段、pixel 段按 256 字节对齐以便独立绑定。
+  shader 自带的 `def` 常量覆盖 app 设置的同号寄存器（D3D9 语义）。
+- **独立 sampler state**：`SetSamplerState` 驱动一个按参数元组去重的
+  `GPUSampler` 缓存，取代 M1 那个"随纹理创建、永远 linear/repeat"的
+  采样器。`D3DTADDRESS_BORDER`/`MIRRORONCE` 无 WebGPU 对应物，退化为
+  clamp 并各记一条 warning。
+- **多 stream 顶点声明**：每个 stream 一个 `GPUVertexBufferLayout`，
+  按 stream 号稳定排序。
+- caps 诚实上报 `vs_2_0`/`ps_2_0`；`PS20Caps.DynamicFlowControlDepth`
+  故意报 0（见下方"已知折衷"）。适配器身份同步改为 GeForce FX 5200
+  （NV34，第一代支持 SM2.0 的 NVIDIA 入门卡），因为 M1 报的 GeForce4 MX
+  没有可编程着色器，与 `(2,0)` 的 caps 自相矛盾。
+
+**M2 过程中发现并修复的 M1 缺陷**（都不是新代码引入的）：
+
+1. **`DrawIndexedPrimitiveUP` 每次调用必抛异常**——payload 里的 `stride`
+   字段从未被读出，但记录绘制时引用了同名变量，严格模式下是
+   `ReferenceError`，会被 batch 的 catch 吞掉并丢弃整帧。War3 主菜单
+   恰好不走这个入口，所以 M1 没暴露。
+2. **固定管线顶点属性 location 按元素顺序分配，而 WGSL 里写死为
+   位置/颜色/纹理坐标 = 0/1/2**——只有当声明恰好按这个顺序排列时才一致。
+   一个把 TEXCOORD 排在 COLOR 前面的声明会把纹理坐标的字节喂进颜色属性。
+   改为按语义分配。
+3. **图元拓扑一律按 `triangle-list` 建管线**，同时又按 strip/fan 的规则
+   计算元素数量——N 个三角形的 strip 被当成 floor((N+2)/3) 个互不相干的
+   三角形光栅化。这类错误画出来的是**错误的几何**而不是空白，很容易被
+   误判成变换矩阵的问题。现按 D3DPRIMITIVETYPE 映射拓扑；WebGPU 没有
+   fan 拓扑，转成生成的索引三角形列表（索引 fan 通过索引缓冲的 CPU
+   镜像重新索引）；索引 strip 补上 `stripIndexFormat`。
+4. **`DESTROY_RESOURCE` 立即 `destroy()` GPU 对象**——正在录制的帧可能
+   已经持有引用该纹理视图的 bind group，而帧要到 Present 才提交，于是
+   WebGPU 拒绝整个 command buffer（"Destroyed texture ... used in a
+   submit"）。在同一帧里释放刚画过的纹理是普通应用行为，不是边角情况。
+   改为走已有的 `retireGPUObject()` 延迟销毁路径。
+5. **同一帧内改写动态缓冲会破坏该帧里更早的绘制（写后录制冒险）**——这条
+   是 War3 真实运行中暴露的，也是本次最严重的一个。绘制被推迟到 Present
+   才编码（因为 swapchain 贴图只在获取它的那个任务内有效），而
+   `UPDATE_BUFFER` 是**立刻** `queue.writeBuffer` 的；`writeBuffer` 与
+   `submit` 在队列上按调用顺序执行，于是一帧里所有的写都排在那唯一一次
+   submit 之前，也就排在该帧**每一次**绘制之前。最常见的动态几何写法
+   （`Lock(DISCARD)` → 填批次 A → 绘制 → `Lock(DISCARD)` → 填批次 B →
+   绘制 → Present）因此让第一次绘制拿着正确的索引去读批次 B 的顶点。
+   屏幕上的表现是：UI、文字、managed 资源渲染完全正常，而共享动态缓冲的
+   场景几何飞出大片错位三角形，且每帧都不同——很容易被误读成"闪烁"。
+   修复采用真实 D3D9 驱动对 `D3DLOCK_DISCARD` 的标准做法——**重命名
+   （renaming）**：当被写的缓冲已经被本帧**已录制**的绘制读过时，分配一
+   块新的 GPU 缓冲承载新内容，旧的留给先前的绘制并在提交后回收。判据是
+   "本帧是否已被绘制引用"，所以"上传一次、绘制多次"这条常规路径一次都不
+   会触发重命名。`bufferRenames` 计数暴露实际发生频率；纹理有同类暴露面
+   但重命名代价高得多，目前只用 `textureUpdateHazards` 计数、暂不修复。
+
+   遗留的性能风险：重命名会整份重传该缓冲的影子。对整块改写（DISCARD 的
+   典型用法）不比 guest 本来发的数据更多，但"对一个大缓冲做小范围局部
+   更新、且刚画过"会放大上传量。要先用 `bufferRenames` 量出真实频率再
+   决定是否需要更精细的方案（例如在 Present 的 encoder 里用
+   `copyBufferToBuffer` 只补未改动的部分）。
+
+**验证情况**：
+
+- `glbridge/tests/d3d9_shader_pipeline_test.js`：29 项，用手工汇编的真实
+  D3D9 token 覆盖翻译结构（哪些寄存器、uniform、varying、reflection）。
+- `glbridge/tests/d3d9_shader_wgsl_validation_test.js`：把 20 个语料
+  shader 加 18 个合成的固定管线 shader 全部喂给 `naga` 做真实 WGSL 校验。
+- `glbridge/tests/d3d9_webgpu_executor_test.js`：16 项，真实 D9WG 批次
+  打进一个会强制执行 bind-group 与 `writeBuffer` 校验规则的假 WebGPU 设备。
+- `glbridge/tests/d3d9_webgpu_browser_test.html`：**真实 WebGPU**（headless
+  Chrome + CDP）下三次绘制通过，`pushErrorScope("validation")` 全程无错，
+  其中第三次是翻译后的 `vs_2_0`+`ps_2_0`、走独立 sampler state 采样纹理。
+  截图确认三个三角形都正确渲染。
+- `glbridge/sample/d3d9_shader_test.c`：新增的 XP 客户机 smoke test，
+  自带手工汇编的 vs_2_0/ps_2_0，覆盖 `CreateVertexShader`/`GetFunction`
+  往返校验/常量设置与回读/`SetSamplerState`/真实顶点声明/同一帧内
+  shader 与固定管线混用。已能编译，**尚未在 v86 里跑过**。
+
+一条方法论上的收获：**naga 和 Tint 的严格程度不同，不能只用一个**。
+翻译器最初把 f32 最大值写成 `3.4028235e38`——这是能往返 double 的最短
+十进制，但解析后**大于** f32 上界。naga 接受，Tint 直接拒绝
+（"cannot be represented as 'f32'"）。是那个跑真实 WebGPU 的浏览器测试
+抓到的，改成十六进制浮点字面量 `0x1.fffffep+127` 才两边都过。
+
+**2026-08-07 War3 首次真机运行的结论**（`guestShaderModel2: true`，2884 帧）：
+
+- **War3 1.27 即使看到 `vs_2_0`/`ps_2_0` 的 caps 也一个 shader 都不创建**
+  （`shadersTranslated: 0`、`programmableDraws: 0`，
+  `constantUploadBytes ÷ indexedDrawCalls` 恰好等于固定管线 uniform 块的
+  80 字节）。这不是缺陷，是这款 2002 年游戏的真实行为，也再次印证 4.7 节
+  的判断。**推论：War3 无法作为 M2 shader 路径的验收目标**——它验证的是
+  M2 顺带修好的固定管线正确性。SM2.0 路径的真实游戏验收仍然悬空，需要
+  KartRider 或别的确实使用 SM2.0 的 D3D9 客户端。
+- 全屏下 `GetClientRect` 返回空矩形是**每帧**发生的
+  （`emptySurfaceReports` 等于 present 数），不是间歇性的，因此它不会
+  造成画面抖动；M1 记录里"不影响显示"的判断成立。
+- 真正的画面缺陷是上面第 5 条的写后录制冒险。
+
+**尚未完成的**：本节的验收目标（原定 KartRider，因其私服联网问题改为
+War3 进入实战场景）需要在真实 v86 XP 客户机里人工执行——War3 的镜像是
+本地开发用的 `game/warcraft3.img`，按 `tests/site-configuration.test.js`
+的断言刻意没有接进站点，`d3d9.dll` 也需要人工放进镜像里的游戏目录。
+执行步骤：用 `glbridge/d3d9proxy/build.sh` 出的 DLL 覆盖游戏目录里的旧
+版本，进战役，观察 host 端 `v86gl.d3d9Executor.getStats()` 的
+`shadersTranslated`/`shaderTranslationFailures`/`drawsSkippedForBadShader`/
+`shaderCompileErrors`/`droppedDraws` 五项。若画面出现回归，先用
+`D9WG_SHADER_MODEL=0` 把 caps 退回 M1 的固定管线档，确认问题是否出在
+shader 路径上——这个开关就是为这次二分而加的。
+
+**2026-08-07 第二次真机运行后补的三项**（几何修好之后暴露出来的）：
+
+- **D3D9 硬件光标**（`SetCursorProperties`/`SetCursorPosition`/`ShowCursor`，
+  新 opcode `0x21A`-`0x21C`）。全屏 D3D9 游戏的指针走的是硬件光标而不是
+  GDI，因此完全不会进入本站在 WebGPU 画布下面合成的 VGA framebuffer，而
+  站点的 CSS 又用 `cursor: none` 藏掉了浏览器光标——三个入口都是 stub 时
+  的结果就是指针彻底不可见（输入其实是好的，但看不见等于不能玩）。为此
+  顺带实现了 `CreateOffscreenPlainSurface`（纯 CPU surface，带
+  `LockRect`/`UnlockRect`），因为那是应用构造光标位图的常规途径；它被
+  刻意限制在 32 位格式上，免得被当成通用离屏 surface 依赖。host 端把光标
+  作为帧末一个独立的、无深度附件的 pass 画上去。D3D9 的硬件光标在
+  `ShowCursor(TRUE)` 之后是**自动跟随系统指针**的（`SetCursorPosition`
+  只用于强制移动），所以 guest 在每次 Present 时重新采样一次真实指针位置。
+- **Alpha test**（`D3DRS_ALPHATESTENABLE`/`ALPHAFUNC`/`ALPHAREF`）。WebGPU
+  没有对应的固定功能级，只能在 fragment shader 里 `discard`，因此比较函数
+  与参考值进入 shader 变体和 pipeline key。固定管线与翻译后的 pixel shader
+  都覆盖（后者按 alpha test 生成额外变体）。UI 图集和树叶广告牌普遍依赖
+  它裁掉全透明像素；不实现的话那些像素会被画成不透明，表现正是"面板边缘
+  /背景纹理不对"。
+- **测试程序在 WM_PAINT 时重新 Present**。host 只从 Present 携带的
+  client rect 学习 overlay 画布的位置，所以"渲染一帧就进消息循环"的程序
+  在窗口被拖动后画面会留在原地。真实游戏每帧 Present 因而天然跟随；这是
+  设计使然而非桥的缺陷，修的是我们自己的 smoke test，让它像正常 Windows
+  程序一样重绘。
+
+**2026-08-07 第三次真机运行后的修正**：
+
+- **光标改为从 GDI 抓取，而不是只等 `SetCursorProperties`**。实测
+  `cursorUploads: 0`——War3 从不调用 D3D9 硬件光标。原因是真实硬件上
+  Windows 会把 GDI 光标合成到 primary surface 上（全屏 D3D9 也一样），
+  游戏因此直接把指针交给系统；而这里的"primary surface"是 Windows 毫不
+  知情的 WebGPU 画布，那次合成永远不会发生。改为 guest 每次 Present 用
+  `GetCursorInfo` 检查当前 `HCURSOR`，变化时用 `GetIconInfo`+`GetDIBits`
+  抓成 32bpp 送出（单色光标按 AND/XOR 掩码合成，无 alpha 的彩色光标用
+  1bpp 掩码补 alpha）。应用如果自己调了 `SetCursorProperties`，它优先。
+- **`bufferRenames` 的开销按 lock flag 分类解决**。上一轮量到每帧约 277
+  次重命名。协议里 `D9WGUpdateBuffer.lock_flags` 一直带着这个信息，只是
+  host 没读：`D3DLOCK_NOOVERWRITE` 本身就是"我写的字节没有任何已发出的
+  绘制在读"的承诺——正好是这个冒险需要的保证，原地写即可，重命名纯属浪费
+  （游戏正是用它往一个缓冲里连续追加批次的）；`D3DLOCK_DISCARD` 需要
+  重命名，但新缓冲只需承载**本次写入的范围**，其余是应用已声明不再读的
+  内容；两者都没有的普通 lock 才需要整份拷贝，很罕见。
+  `bufferNoOverwriteWrites`/`bufferFullCopyRenames` 分别计数这两条。
+- **修正上一轮 texture-stage 诊断的误报**。`drawsWithUnsupportedTextureOp`
+  报了 108830（等于全部带纹理的绘制），实际是判据写错：War3 用的是
+  `MODULATE(TEXTURE, D3DTA_CURRENT)`，而在 **stage 0，`D3DTA_CURRENT`
+  按定义就是 diffuse**（没有前序阶段的结果可继承），与我们实现的
+  `MODULATE(TEXTURE, DIFFUSE)` 完全等价。把两者视为不同参数导致了 100%
+  的误报。结论随之改变：**texture stage 运算不是 UI 纹理问题的成因**。
+
+**2026-08-08 War3 真机调试记录（M2 之外、但直接影响观感的一串修复）**：
+
+按发现顺序，每一条都是先补诊断、再看数据、最后才改代码：
+
+1. **全屏设备不切换显示模式**。真实 D3D9 独占全屏由 runtime 负责
+   `ChangeDisplaySettings`；我们没做，于是 guest 桌面停在 1024x768 而游戏
+   按 800x600 排版，窗口矩形取不到、点击落到别的窗口上。补上模式切换与
+   `SetWindowPos`/前台抢占后，`emptySurfaceReports` 从 100% 归零。
+2. **固定管线不应用纹理坐标变换**（`D3DTSS_TEXTURETRANSFORMFLAGS` +
+   `D3DTS_TEXTURE0`）。War3 用 `D3DTTFF_COUNT2` 做云雾/冰棱的坐标动画，
+   忽略它的结果是这些面渲染成平色块。注意坐标以**行向量 `(u, v, 1, 1)`**
+   进矩阵——这正是游戏把滚动偏移放在第 3 行（`_31`/`_32`）的原因。
+   目前只实现 stage 0 的 COUNT1/COUNT2，COUNT3/COUNT4/`PROJECTED` 仍计数
+   告警。
+3. **D3D9 硬件光标 + `CreateOffscreenPlainSurface`**（新 opcode
+   `0x21A`-`0x21C`）。实测 War3 两个光标 API 都不调、而是把指针当几何体
+   画，所以这条对它是死代码；但对确实使用硬件光标的游戏是必需的，保留。
+   GDI 光标抓取作为回退，默认关闭（`D9WG_GDI_CURSOR=1` 启用）。
+4. **压缩纹理 `rowsPerImage` 传的是像素行数**而非块行数（BCn 块是 4x4），
+   规范错误，已修。
+
+这一串里真正的教训不是任何一条具体的 bug，而是**它们全都被"看起来没问题"
+掩盖过**：静默的 `return D3DERR_INVALIDCALL`、只检查 `COLOROP` 却不检查
+`TEXCOORDINDEX`/`TEXTURETRANSFORMFLAGS` 的"未支持操作"计数、64x64 的贴图
+预览上限（要找的光标图集比它大）、`BLEND_FACTORS[x] || "src-alpha"` 这种
+静默回退、以及把"UV 图是平滑渐变"当成"UV 是正确的"（那是**未变换**的原始
+坐标，平滑本来就是它应有的样子）。共同点是：**声称"没问题"的那句话，其
+检查范围比实际被忽略的范围窄。** 因此现在的纪律是：任何 `|| 默认值` 或
+静默降级都必须同时带计数器和一次性日志；任何"未支持"计数在被引用为证据
+之前，要先确认它覆盖的状态集合。相应地，`getStats()` 现在带有
+`drawsWithUnmappedBlend`/`drawsWithTexCoordIndex`/`drawsWithTextureTransform`/
+`drawsWithIncompleteMipChain`/`bufferRenames` 等一批"我们悄悄做了替代"的
+计数，以及 `debug.dumpSmallTextures()`/`dumpPipelineStates()`/
+`forceMipLevel0`/`shaderMode` 这些不用重新构建就能二分的开关。
+
+**已知折衷（不是缺陷，但要记下来）**：
+
+- **像素着色器里的数据相关分支会退化为 mip level 0 采样**。WGSL 禁止在
+  非一致控制流里做隐式求导采样，而分支内部没有可以把 `dpdx`/`dpdy`
+  外提到的坐标。退化路径是合法且确定性的（画面偏锐利/有走样，而不是
+  颜色错误），并且被计数。ps_2_0 根本没有流控制、`if b#`/`rep`/`loop`
+  这类由 uniform buffer 驱动的分支仍算一致控制流，所以这条路径对
+  M2 的目标游戏实际上不可达——`PS20Caps.DynamicFlowControlDepth` 报 0
+  正是为了不去招惹会命中它的 shader。
+- **MRT 的 `oC1`-`oC3` 被丢弃**，只写 `oC0`（MRT 本体在 M4）。
+- **`UBYTE4`/`SHORT2`/`SHORT4`/`UDEC3`/`DEC3N` 顶点格式仍被拒绝**。前三种
+  在 D3D9 里以未归一化的浮点送进 shader，而 WebGPU 的 `uint8x4`/`sint16x2`
+  给的是整型向量，要修就得让 shader 模块知道顶点声明，从而破坏
+  "一个 shader 一个模块"的缓存前提；后两种是 10:10:10 打包，WebGPU 没有
+  对应格式。它们主要出现在蒙皮网格里，归入 M5。
+- **vs_3_0 顶点纹理采样**按 9.9 节明确拒绝（`dcl sampler` 出现在 vertex
+  shader 里直接翻译失败），caps 里 `VertexTextureFilterCaps` 报 0。
+- M1 遗留的三项基础设施（`glbridge/webgpu-runtime/` 共享模块、
+  per-process session 隔离、设备丢失恢复）本阶段仍未做。
+
 ### M3：Warcraft III 固定管线与地形
 
 - 多层贴图混合（terrain splatting，通常是多纹理阶段固定管线运算或
@@ -1356,28 +1610,31 @@ vkd3d-shader(wasm)、Tint(wasm) 的构建脚本
 
 ## 24. 当前仓库状态与下一步建议
 
-截至本文档撰写时：
+截至 2026-08-07：
 
 - D3D8 路径（D8WG v1.7）已实现到 M4+/shader-model-1.x 里程碑，是本
   方案在传输层、批处理、缓存设计上的直接参照物。
-- `glbridge/d3d9proxy/`、`glbridge/d3d9-webgpu/`、
-  `glbridge/webgpu-runtime/` 均**尚未创建**，本文档是这些目录出现前
-  的设计依据。
-- `game/warcraft3.img` 已存在于站点资源里；KartRider、WoW 尚未出现在
-  `game/` 目录或 `README.md` 的游戏列表中，说明这两款游戏的镜像/部署
-  流程本身也需要作为阶段 0 之外的独立准备工作（与本方案的渲染兼容层
-  工作正交，不应混在一起排期）。
+- `glbridge/d3d9proxy/`（guest DLL，M1 验收达成）与
+  `glbridge/d3d9-webgpu/`（`d3d9_executor.js` + M2 新增的
+  `d3d9_shader_pipeline.js`）已建立。`glbridge/webgpu-runtime/`
+  仍未创建——见 M1 状态记录里"等出现第二个消费者再抽取"的判断，M2 没有
+  改变这个结论。
+- `game/warcraft3.img` 是本地开发用镜像，按
+  `tests/site-configuration.test.js` 的断言刻意**没有**接进站点的游戏
+  目录；KartRider、WoW 的镜像/部署流程仍未准备。这意味着 M1/M2 的真实
+  游戏验收都只能人工执行，无法进 CI。
 
-**建议的下一步（不等待本文档之外的批准，可以直接开始）：**
+**建议的下一步：**
 
-1. 先做 21 章的 shader 工具链尖刀验证（vkd3d-shader/Tint 编译到
-   WASM，打通一个真实 SM2.0 着色器）。这是全案风险最高的单点，越早
-   验证，后续里程碑的时间估算才越可信。
-2. 与尖刀验证并行，开始阶段 0（第 5 章）的三款游戏 API trace 采集，
-   为 D9WG v0.1 的 opcode 集合和第 11 章格式矩阵提供真实数据而不是
-   规格书全集。
-3. 确认 KartRider、WoW 的镜像/资源获取与部署方式（与本文档正交，但
-   是能够开始 M1 端到端验收的前提）。
+1. 人工跑 M2 的验收：War3 进入实战场景，按 M2 状态记录里列的五项统计
+   判读结果（必要时用 `D9WG_SHADER_MODEL=0` 二分）。这是目前唯一
+   卡在自动化之外的验证。
+2. 顺带在同一次运行里跑 `glbridge/sample/d3d9_shader_test.exe`（已随
+   `build_smoke_test.sh` 构建），它比整局游戏更容易定位失败点。
+3. 阶段 0（第 5 章）的 API trace 采集仍未做。M2 的翻译器目前是按 D3D9
+   规格书实现的，没有真实游戏的 shader 语料做覆盖率参考——这在进入 M5
+   （WoW，shader 种类事实上无上限）之前必须补上。
+4. 确认 KartRider、WoW 的镜像/资源获取与部署方式。
 
 ## 25. 参考资料与许可边界
 
@@ -1388,10 +1645,17 @@ vkd3d-shader(wasm)、Tint(wasm) 的构建脚本
   产物，必须在产物旁附带 LGPL 许可证文本与源码获取方式说明（LGPL 对
   静态链接到 WASM 模块的分发有明确的源码提供义务，需要在正式引入前
   确认满足方式：动态可替换的 WASM 模块，或提供构建脚本与对应源码
-  快照）。
+  快照）。**M2 落地时没有引入 vkd3d-shader**（见 9.3 的落地修正），
+  所以这项义务目前不适用；如果日后替换后端，需要先解决它。
 - Tint（Chromium/Dawn 项目，BSD-3-Clause）：SPIR-V 到 WGSL 转换的
   来源，BSD-3-Clause 要求保留版权声明，义务比 LGPL 轻，但仍需在
-  `THIRD_PARTY_NOTICES` 类文件中列出。
+  `THIRD_PARTY_NOTICES` 类文件中列出。**同样未引入**——Tint 只在浏览器
+  自己的 WebGPU 实现里被用到（`createShaderModule` 背后），那是运行环境
+  提供的，不构成分发。
+- naga（`wgpu` 项目，MIT/Apache-2.0）：**仅作为开发期校验工具**，通过
+  `cargo install naga-cli` 由开发者自行安装，
+  `glbridge/tests/d3d9_shader_wgsl_validation_test.js` 在检测不到它时
+  跳过。不随本仓库分发，不进入运行时。
 - 本文档第 3.1、17 章提到的与 D3D8 路径共享设计范式，参照
   `d3d8-webgpu-architecture.md` 中已经记录的 BottleShip 参考边界
   （BottleShip 是 Apache-2.0，D3D8 路径是基于可观察架构的原创实现；
