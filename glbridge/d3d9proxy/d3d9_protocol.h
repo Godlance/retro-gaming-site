@@ -11,17 +11,17 @@
  * transport (v86gl.sys, 16 MiB ring, PCI BAR) via a different outer record
  * type. A guest process loads either d3d8.dll or d3d9.dll, never both.
  *
- * M1 implements only: HELLO, CREATE_DEVICE, RESET, PRESENT, CLEAR,
- * BEGIN_SCENE, END_SCENE, CREATE_BUFFER, UPDATE_BUFFER, DESTROY_RESOURCE,
- * CREATE_TEXTURE_2D, CREATE_VERTEX_DECLARATION, SET_RENDER_STATE,
- * SET_TEXTURE_STAGE_STATE, SET_TEXTURE, SET_VIEWPORT, SET_TRANSFORM,
- * SET_STREAM_SOURCE, SET_INDICES, SET_VERTEX_DECLARATION, SET_FVF, the four
- * DRAW_* opcodes. Every other opcode below is part of the frozen v0.1 wire
- * shape but has no guest emitter yet -- d3d9_proxy.c returns
- * D3DERR_INVALIDCALL/D3DERR_NOTAVAILABLE for the D3D9 API calls that would
- * produce them, rather than emitting a command the M1 executor cannot act
- * on. Do not repurpose an opcode number when its real implementation lands;
- * add a new one instead so archived traces stay decodable.
+ * As of M3, everything below has a guest emitter and a host handler except
+ * CREATE_TEXTURE_VOLUME, UPDATE_SURFACE, SET_STREAM_SOURCE_FREQ,
+ * SET_CLIP_PLANE, CREATE_STATE_BLOCK and the three query opcodes. Those six
+ * remain part of the frozen v0.1 wire shape with no emitter: d3d9_proxy.c
+ * returns D3DERR_INVALIDCALL/D3DERR_NOTAVAILABLE for the D3D9 calls that would
+ * produce them (state blocks and queries are answered entirely inside the
+ * guest and need no wire traffic at all -- see IDirect3DStateBlock9 and
+ * IDirect3DQuery9 in d3d9_proxy.c), rather than emitting a command the host
+ * cannot act on. Do not repurpose an opcode number when its real
+ * implementation lands; add a new one instead so archived traces stay
+ * decodable.
  */
 #define V86GL_CTRL_D3D9_BATCH 0xFFE1u
 
@@ -51,40 +51,40 @@ enum D9WGOpcode {
     D9WG_OP_CLEAR = 5,
     D9WG_OP_BEGIN_SCENE = 6,
     D9WG_OP_END_SCENE = 7,
-    D9WG_OP_STRETCH_RECT = 8,        /* M4 */
-    D9WG_OP_COLOR_FILL = 9,          /* M4 */
+    D9WG_OP_STRETCH_RECT = 8,        /* M3 */
+    D9WG_OP_COLOR_FILL = 9,          /* M3 */
     D9WG_OP_UPDATE_SURFACE = 10,     /* not before M2 */
 
     D9WG_OP_CREATE_BUFFER = 0x100,
     D9WG_OP_UPDATE_BUFFER = 0x101,
     D9WG_OP_DESTROY_RESOURCE = 0x103,
     D9WG_OP_CREATE_TEXTURE_2D = 0x110,
-    D9WG_OP_CREATE_TEXTURE_CUBE = 0x111,     /* not before M3 */
-    D9WG_OP_CREATE_TEXTURE_VOLUME = 0x112,   /* not before M3 */
-    D9WG_OP_UPDATE_TEXTURE = 0x113,          /* not before M2 */
+    D9WG_OP_CREATE_TEXTURE_CUBE = 0x111,     /* M3 */
+    D9WG_OP_CREATE_TEXTURE_VOLUME = 0x112,   /* still unimplemented */
+    D9WG_OP_UPDATE_TEXTURE = 0x113,          /* M1; z = cube face / volume slice */
     D9WG_OP_CREATE_VERTEX_DECLARATION = 0x120,
     D9WG_OP_CREATE_VERTEX_SHADER = 0x121,     /* M2 */
     D9WG_OP_CREATE_PIXEL_SHADER = 0x122,      /* M2 */
-    D9WG_OP_CREATE_QUERY = 0x123,             /* M4 */
-    D9WG_OP_CREATE_STATE_BLOCK = 0x124,       /* not before M3 */
+    D9WG_OP_CREATE_QUERY = 0x123,             /* unused: queries are guest-side */
+    D9WG_OP_CREATE_STATE_BLOCK = 0x124,       /* unused: state blocks are guest-side */
 
     D9WG_OP_SET_RENDER_STATE = 0x200,
     D9WG_OP_SET_SAMPLER_STATE = 0x201,       /* M2 */
     D9WG_OP_SET_TEXTURE_STAGE_STATE = 0x202,
     D9WG_OP_SET_TEXTURE = 0x203,
     D9WG_OP_SET_VIEWPORT = 0x204,
-    D9WG_OP_SET_SCISSOR_RECT = 0x205,        /* not before M3 */
+    D9WG_OP_SET_SCISSOR_RECT = 0x205,        /* M3 */
     D9WG_OP_SET_TRANSFORM = 0x206,
-    D9WG_OP_SET_MATERIAL = 0x207,            /* not before M3 */
-    D9WG_OP_SET_LIGHT = 0x208,               /* not before M3 */
-    D9WG_OP_LIGHT_ENABLE = 0x209,            /* not before M3 */
+    D9WG_OP_SET_MATERIAL = 0x207,            /* M1 wire, consumed since M3 */
+    D9WG_OP_SET_LIGHT = 0x208,               /* M1 wire, consumed since M3 */
+    D9WG_OP_LIGHT_ENABLE = 0x209,            /* M1 wire, consumed since M3 */
     D9WG_OP_SET_STREAM_SOURCE = 0x20A,
     D9WG_OP_SET_STREAM_SOURCE_FREQ = 0x20B,  /* instancing, M6 前不实现 */
     D9WG_OP_SET_INDICES = 0x20C,
     D9WG_OP_SET_VERTEX_DECLARATION = 0x20D,
     D9WG_OP_SET_FVF = 0x20E,                 /* 兼容路径 */
-    D9WG_OP_SET_RENDER_TARGET = 0x20F,       /* MRT 本体在 M4 */
-    D9WG_OP_SET_DEPTH_STENCIL_SURFACE = 0x210, /* not before M4 */
+    D9WG_OP_SET_RENDER_TARGET = 0x20F,       /* M3, up to four MRT slots */
+    D9WG_OP_SET_DEPTH_STENCIL_SURFACE = 0x210, /* M3 */
     D9WG_OP_SET_VERTEX_SHADER = 0x211,       /* M2 */
     D9WG_OP_SET_PIXEL_SHADER = 0x212,        /* M2 */
     D9WG_OP_SET_VERTEX_SHADER_CONSTANT_F = 0x213, /* M2 */
@@ -93,7 +93,7 @@ enum D9WGOpcode {
     D9WG_OP_SET_PIXEL_SHADER_CONSTANT_F = 0x216,  /* M2 */
     D9WG_OP_SET_PIXEL_SHADER_CONSTANT_I = 0x217,  /* M2 */
     D9WG_OP_SET_PIXEL_SHADER_CONSTANT_B = 0x218,  /* M2 */
-    D9WG_OP_SET_CLIP_PLANE = 0x219,          /* not before M3/M5, see 9.11 */
+    D9WG_OP_SET_CLIP_PLANE = 0x219,          /* still unimplemented, see 9.11 */
     /* M2: the D3D9 hardware cursor. A fullscreen game draws its pointer
      * through these rather than through GDI, so with them unimplemented the
      * pointer is simply invisible -- the guest's GDI cursor never reaches the
@@ -115,9 +115,9 @@ enum D9WGOpcode {
     D9WG_OP_DRAW_PRIMITIVE_UP = 0x302,
     D9WG_OP_DRAW_INDEXED_PRIMITIVE_UP = 0x303,
 
-    D9WG_OP_BEGIN_QUERY = 0x400,             /* M4 */
-    D9WG_OP_END_QUERY = 0x401,               /* M4 */
-    D9WG_OP_GET_QUERY_DATA = 0x402           /* M4 */
+    D9WG_OP_BEGIN_QUERY = 0x400,             /* unused: queries are guest-side */
+    D9WG_OP_END_QUERY = 0x401,               /* unused: queries are guest-side */
+    D9WG_OP_GET_QUERY_DATA = 0x402           /* unused: queries are guest-side */
 };
 
 #define D9WG_RESOURCE_BUFFER_VERTEX      1u
@@ -509,6 +509,102 @@ typedef struct D9WGCreateQuery {
     uint32_t reserved;
 } D9WGCreateQuery;
 
+/* M3. A cube texture is six square faces at each mip level; the host maps it
+ * onto a WebGPU 2D texture with six array layers, which is what a
+ * texture_cube<f32> view is built over. UpdateTexture reaches a face through
+ * D9WGUpdateTexture.z (0..5, D3DCUBEMAP_FACE_*) -- the same field a volume
+ * texture uses for its slice, because in both cases it selects the layer/depth
+ * the upload lands in and neither needs a second opcode. */
+typedef struct D9WGCreateTextureCube {
+    uint32_t device_handle;
+    uint32_t resource_handle;
+    uint32_t edge_length;
+    uint32_t level_count;
+    uint32_t format;
+    uint32_t usage;
+    uint32_t pool;
+    uint32_t reserved;
+} D9WGCreateTextureCube;
+
+typedef struct D9WGCreateTextureVolume {
+    uint32_t device_handle;
+    uint32_t resource_handle;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    uint32_t level_count;
+    uint32_t format;
+    uint32_t usage;
+    uint32_t pool;
+    uint32_t reserved;
+} D9WGCreateTextureVolume;
+
+/* M3. WebGPU/WGSL has no clip-distance facility, so a user clip plane becomes a
+ * per-plane distance the vertex stage writes and the fragment stage discards
+ * on (plan 9.11). D3D9 defines the plane in world space for fixed-function
+ * vertex processing and in clip space when a vertex shader is bound; the guest
+ * sends the app's coefficients unchanged and the host applies the space rule,
+ * because only the host knows which vertex stage a given draw resolved to. */
+typedef struct D9WGSetClipPlane {
+    uint32_t device_handle;
+    uint32_t index; /* 0..5 */
+    float plane[4];
+} D9WGSetClipPlane;
+
+/* M4 (implemented ahead of schedule -- a 2005-era D3D9 game renders most of its
+ * frame into textures). The bound surface is always identified by the host
+ * texture it is a level of, so a standalone CreateRenderTarget surface is sent
+ * as a CREATE_TEXTURE_2D with D3DUSAGE_RENDERTARGET rather than needing its own
+ * resource kind.
+ *
+ * depth_texture_handle needs three distinguishable values, not two: a real
+ * surface, "no depth at all" (SetDepthStencilSurface(NULL), which D3D9 permits
+ * and which disables depth testing for the following draws), and "the device's
+ * own implicit auto depth-stencil". The third exists because the standard
+ * render-to-texture sequence is Get the current depth surface, bind a different
+ * one, then put the original back -- and the original has no texture handle of
+ * its own, so without a sentinel it would be indistinguishable from unbinding. */
+#define D9WG_AUTO_DEPTH_STENCIL_HANDLE 0xFFFFFFFFu
+typedef struct D9WGSetDepthStencilSurface {
+    uint32_t device_handle;
+    uint32_t depth_texture_handle;
+    uint32_t width;
+    uint32_t height;
+} D9WGSetDepthStencilSurface;
+
+/* StretchRect between two surfaces the host owns. A zero *_texture_handle names
+ * the current render target (D3D9 apps routinely stretch the back buffer into a
+ * texture and back), and level selects the mip. filter_point is
+ * D3DTEXF_POINT vs anything else, which is the only distinction WebGPU's blit
+ * path can honour. */
+typedef struct D9WGStretchRect {
+    uint32_t device_handle;
+    uint32_t source_texture_handle;
+    uint32_t source_level;
+    int32_t  source_left;
+    int32_t  source_top;
+    int32_t  source_right;
+    int32_t  source_bottom;
+    uint32_t destination_texture_handle;
+    uint32_t destination_level;
+    int32_t  destination_left;
+    int32_t  destination_top;
+    int32_t  destination_right;
+    int32_t  destination_bottom;
+    uint32_t filter_point;
+} D9WGStretchRect;
+
+typedef struct D9WGColorFill {
+    uint32_t device_handle;
+    uint32_t texture_handle;
+    uint32_t level;
+    uint32_t color;
+    int32_t  left;
+    int32_t  top;
+    int32_t  right;
+    int32_t  bottom;
+} D9WGColorFill;
+
 typedef struct D9WGDrawPrimitive {
     uint32_t device_handle;
     uint32_t primitive_type;
@@ -608,5 +704,23 @@ typedef char D9WGAssertDrawPrimitiveUPSize[
         sizeof(D9WGDrawPrimitiveUP) == 32 ? 1 : -1];
 typedef char D9WGAssertDrawIndexedPrimitiveUPSize[
         sizeof(D9WGDrawIndexedPrimitiveUP) == 48 ? 1 : -1];
+typedef char D9WGAssertCreateTextureCubeSize[
+        sizeof(D9WGCreateTextureCube) == 32 ? 1 : -1];
+typedef char D9WGAssertCreateTextureVolumeSize[
+        sizeof(D9WGCreateTextureVolume) == 40 ? 1 : -1];
+typedef char D9WGAssertSetClipPlaneSize[
+        sizeof(D9WGSetClipPlane) == 24 ? 1 : -1];
+typedef char D9WGAssertSetRenderTargetSize[
+        sizeof(D9WGSetRenderTarget) == 16 ? 1 : -1];
+typedef char D9WGAssertSetDepthStencilSurfaceSize[
+        sizeof(D9WGSetDepthStencilSurface) == 16 ? 1 : -1];
+typedef char D9WGAssertSetScissorRectSize[
+        sizeof(D9WGSetScissorRect) == 20 ? 1 : -1];
+typedef char D9WGAssertStretchRectSize[
+        sizeof(D9WGStretchRect) == 56 ? 1 : -1];
+typedef char D9WGAssertColorFillSize[
+        sizeof(D9WGColorFill) == 32 ? 1 : -1];
+typedef char D9WGAssertCreateQuerySize[
+        sizeof(D9WGCreateQuery) == 16 ? 1 : -1];
 
 #endif

@@ -247,7 +247,7 @@ test("ps_1_1: t# is both coordinate and sample destination, r0 is the output", (
     ]);
     assert.ok(wgsl.includes("textureSample(d9_tex0, d9_smp0"), "no sample of texture 0");
     // ps_1_x has no oC0: the result is r0.
-    assert.ok(wgsl.includes("result.color = r0;"),
+    assert.ok(wgsl.includes("result.color0 = r0;"),
         "ps_1_x output should come from r0, got:\n" + wgsl);
     // v0 is COLOR0 (varying 0), t0 is TEXCOORD0 (varying 2).
     assert.ok(wgsl.includes("v0 = stage_in.varying0;"), "v0 not wired to COLOR0");
@@ -267,7 +267,7 @@ test("ps_2_0: dcl_2d, def and texld produce a sampler pair and a constant defaul
     assert.strictEqual(reflection.floatDefaults[0].register, 0);
     assert.deepStrictEqual(reflection.floatDefaults[0].values.map(v => Math.round(v * 100) / 100),
         [0.5, 0.25, 0, 1]);
-    assert.ok(wgsl.includes("result.color = oC0;"), "ps_2_0 output should come from oC0");
+    assert.ok(wgsl.includes("result.color0 = oC0;"), "ps_2_0 output should come from oC0");
     // The coordinate is a 2D sampler's, so only .xy is taken.
     assert.ok(/textureSample\(d9_tex0, d9_smp0, _uv\d+\.xy\)/.test(wgsl),
         "2D sample did not use a two-component coordinate:\n" + wgsl);

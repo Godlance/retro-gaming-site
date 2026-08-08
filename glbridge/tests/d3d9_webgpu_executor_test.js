@@ -26,6 +26,7 @@ const OP = {
     CREATE_VERTEX_SHADER: 0x121, CREATE_PIXEL_SHADER: 0x122,
     SET_RENDER_STATE: 0x200, SET_SAMPLER_STATE: 0x201,
     SET_TEXTURE: 0x203, SET_VIEWPORT: 0x204, SET_TRANSFORM: 0x206,
+    SET_MATERIAL: 0x207, SET_LIGHT: 0x208, LIGHT_ENABLE: 0x209,
     SET_STREAM_SOURCE: 0x20A, SET_INDICES: 0x20C,
     SET_VERTEX_DECLARATION: 0x20D, SET_FVF: 0x20E,
     SET_VERTEX_SHADER: 0x211, SET_PIXEL_SHADER: 0x212,
@@ -232,7 +233,11 @@ function makeFakeWebGPU() {
     }
     class FakeTexture {
         constructor(descriptor) { this.descriptor = descriptor; }
-        createView() { return { texture: this }; }
+        createView(descriptor) {
+            const view = { texture: this, descriptor: descriptor || null };
+            calls.push(["createView", this, descriptor || null, view]);
+            return view;
+        }
         destroy() { this.destroyed = true; }
     }
     class FakePass {
@@ -240,6 +245,10 @@ function makeFakeWebGPU() {
         setPipeline(p) { this.ops.push(["pipeline", p]); }
         setBindGroup(i, g) { this.ops.push(["bindGroup", i, g]); }
         setViewport(...a) { this.ops.push(["viewport", ...a]); }
+        setScissorRect(...a) {
+            this.ops.push(["scissor", ...a]);
+            calls.push(["setScissorRect", ...a]);
+        }
         setVertexBuffer(slot, buffer, offset) {
             this.ops.push(["vertexBuffer", slot, buffer, offset]);
         }
@@ -350,7 +359,17 @@ function makeFakeWebGPU() {
         },
     };
     const gpu = {
-        async requestAdapter() { return { async requestDevice() { return device; } }; },
+        async requestAdapter() {
+            return {
+                // A real adapter advertises optional features here, and a device
+                // gets none of them unless it names them in requiredFeatures.
+                features: new Set(["texture-compression-bc"]),
+                async requestDevice(descriptor) {
+                    calls.push(["requestDevice", descriptor || null]);
+                    return device;
+                },
+            };
+        },
         getPreferredCanvasFormat() { return "bgra8unorm"; },
     };
     return { calls, device, context, gpu,
@@ -449,8 +468,12 @@ await test("fixed-function attribute locations follow semantics, not element ord
         .map(a => [a.shaderLocation, a]));
     assert.equal(byLocation.get(1).offset, 20, "COLOR0 must stay at location 1");
     assert.equal(byLocation.get(1).format, "unorm8x4");
-    assert.equal(byLocation.get(2).offset, 12, "TEXCOORD0 must stay at location 2");
-    assert.equal(byLocation.get(2).format, "float32x2");
+    // M3 widened the fixed-function location table to make room for NORMAL and
+    // COLOR1 (lighting) plus all eight coordinate sets, so TEXCOORD0 moved from
+    // 2 to 4. The property under test is unchanged: the location follows the
+    // semantic, not the element's position in the declaration.
+    assert.equal(byLocation.get(4).offset, 12, "TEXCOORD0 must stay at location 4");
+    assert.equal(byLocation.get(4).format, "float32x2");
 });
 
 await test("programmable vs+ps: modules, bindings and constants all line up", async () => {
@@ -1258,9 +1281,9 @@ await test("the stage-0 texture matrix transforms fixed-function texcoords", asy
     const pipelines = find("createRenderPipeline").map(call => call[1]);
     assert.equal(pipelines.length, 2,
         "enabling the transform must not reuse the untransformed pipeline");
-    assert.ok(!pipelines[0].vertex.module.code.includes("texture_transform *"),
+    assert.ok(!pipelines[0].vertex.module.code.includes("texture_transform0 *"),
         "the first draw has D3DTTFF_DISABLE and must pass texcoords through");
-    assert.ok(pipelines[1].vertex.module.code.includes("texture_transform *"),
+    assert.ok(pipelines[1].vertex.module.code.includes("texture_transform0 *"),
         "the second draw must apply the matrix:\n" + pipelines[1].vertex.module.code);
     // Entering as (u, v, 1, 1) is what puts the game's offset in row 3.
     assert.ok(pipelines[1].vertex.module.code.includes(".xy, 1.0, 1.0)"),
@@ -1305,12 +1328,12 @@ await test("fixed-function fog tints the fragment towards D3DRS_FOGCOLOR", async
 
     const pipelines = find("createRenderPipeline").map(call => call[1]);
     assert.equal(pipelines.length, 2, "fog must not reuse the unfogged pipeline");
-    assert.ok(!pipelines[0].fragment.module.code.includes("mix(fog.color"),
+    assert.ok(!pipelines[0].fragment.module.code.includes("mix(uniforms.fog_color"),
         "the pre-fog draw must not blend");
     assert.ok(pipelines[1].vertex.module.code.includes("fog_distance"),
         "the fog factor is computed in the vertex stage:\n" +
         pipelines[1].vertex.module.code);
-    assert.ok(pipelines[1].fragment.module.code.includes("mix(fog.color"),
+    assert.ok(pipelines[1].fragment.module.code.includes("mix(uniforms.fog_color"),
         "the pixel stage must blend towards the fog colour");
 
     // The fixed-function pixel stage has no register file, so binding 1 exists
@@ -1333,8 +1356,10 @@ await test("fixed-function fog tints the fragment towards D3DRS_FOGCOLOR", async
     const vertexData = new Float32Array(
         find("writeBuffer").filter(c => c[1] === bindGroup.entries[0].resource.buffer)
             .pop()[6].buffer);
-    assert.equal(vertexData[40], 10, "FOGSTART decoded as float bits");
-    assert.equal(vertexData[41], 200, "FOGEND decoded as float bits");
+    // The vertex block's shape follows the signature (M3), so with no lighting
+    // and no texture transform fog_params sits right after the WVP and viewport.
+    assert.equal(vertexData[20], 10, "FOGSTART decoded as float bits");
+    assert.equal(vertexData[21], 200, "FOGEND decoded as float bits");
 });
 
 await test("a malformed batch is rejected rather than half-executed", async () => {
@@ -1362,6 +1387,636 @@ await test("shader bytecode that overruns the batch is rejected", async () => {
     await executor.submit(batch);
     await executor.idle();
     assert.ok(executor.failed, "an overrunning token count must fail the batch");
+});
+
+// ---- M3: fixed-function lighting and the texture-blending cascade ----
+
+const D3DRS = {
+    LIGHTING: 137, AMBIENT: 139, SPECULARENABLE: 29, COLORVERTEX: 141,
+    NORMALIZENORMALS: 143, TEXTUREFACTOR: 60, SCISSORTESTENABLE: 174,
+    DIFFUSEMATERIALSOURCE: 145,
+};
+const D3DTSS = {
+    COLOROP: 1, COLORARG1: 2, COLORARG2: 3, ALPHAOP: 4, ALPHAARG1: 5,
+    ALPHAARG2: 6, TEXCOORDINDEX: 11, TEXTURETRANSFORMFLAGS: 24,
+    COLORARG0: 26, RESULTARG: 28, CONSTANT: 32,
+};
+const D3DTOP = {
+    DISABLE: 1, SELECTARG1: 2, SELECTARG2: 3, MODULATE: 4, ADD: 7,
+    ADDSIGNED: 8, BLENDTEXTUREALPHA: 13, DOTPRODUCT3: 24, MULTIPLYADD: 25,
+    LERP: 26,
+};
+const D3DTA = { DIFFUSE: 0, CURRENT: 1, TEXTURE: 2, TFACTOR: 3, SPECULAR: 4,
+    TEMP: 5, CONSTANT: 6, COMPLEMENT: 0x10, ALPHAREPLICATE: 0x20 };
+
+function materialPayload(diffuse, ambient, specular, emissive, power) {
+    const payload = Buffer.alloc(72);
+    payload.writeUInt32LE(DEVICE, 0);
+    [...diffuse, ...ambient, ...specular, ...emissive].forEach((value, index) =>
+        payload.writeFloatLE(value, 4 + index * 4));
+    payload.writeFloatLE(power, 68);
+    return payload;
+}
+
+function lightPayload(index, type, options = {}) {
+    const payload = Buffer.alloc(112);
+    payload.writeUInt32LE(DEVICE, 0);
+    payload.writeUInt32LE(index, 4);
+    payload.writeUInt32LE(type, 8);
+    const diffuse = options.diffuse || [1, 1, 1, 1];
+    const specular = options.specular || [1, 1, 1, 1];
+    const ambient = options.ambient || [0, 0, 0, 0];
+    [...diffuse, ...specular, ...ambient].forEach((value, i) =>
+        payload.writeFloatLE(value, 12 + i * 4));
+    (options.position || [0, 0, 0]).forEach((value, i) =>
+        payload.writeFloatLE(value, 60 + i * 4));
+    (options.direction || [0, 0, 1]).forEach((value, i) =>
+        payload.writeFloatLE(value, 72 + i * 4));
+    payload.writeFloatLE(options.range === undefined ? 1000 : options.range, 84);
+    payload.writeFloatLE(options.falloff === undefined ? 1 : options.falloff, 88);
+    (options.attenuation || [1, 0, 0]).forEach((value, i) =>
+        payload.writeFloatLE(value, 92 + i * 4));
+    payload.writeFloatLE(options.theta === undefined ? 0.5 : options.theta, 104);
+    payload.writeFloatLE(options.phi === undefined ? 1.0 : options.phi, 108);
+    return payload;
+}
+
+function transformPayload(state, matrix) {
+    const payload = Buffer.alloc(72);
+    payload.writeUInt32LE(DEVICE, 0);
+    payload.writeUInt32LE(state, 4);
+    matrix.forEach((value, index) => payload.writeFloatLE(value, 8 + index * 4));
+    return payload;
+}
+
+await test("fixed-function lighting reaches the shader and the uniform block",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT3, DECLUSAGE.NORMAL),
+    ];
+    // A view matrix with a translation, so "the light was transformed into view
+    // space" is distinguishable from "the light was passed through untouched" --
+    // an identity view would make the two indistinguishable, which is exactly
+    // the mistake the M1 WVP-order bug was.
+    const view = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 10, 20, 30, 1];
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
+        command(OP.SET_FVF, fvfPayload(0x102, elements)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 24)),
+        command(OP.SET_TRANSFORM, transformPayload(2, view)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.LIGHTING, 1, 0)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.AMBIENT, 0x00204060, 0)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.NORMALIZENORMALS, 1, 0)),
+        command(OP.SET_MATERIAL, materialPayload(
+            [0.5, 0.25, 0.125, 0.75], [1, 1, 1, 1], [0, 0, 0, 0], [0, 0, 0, 0], 16)),
+        command(OP.SET_LIGHT, lightPayload(0, 1 /* POINT */,
+            { position: [1, 2, 3], attenuation: [1, 0, 0] })),
+        command(OP.LIGHT_ENABLE, u32(DEVICE, 0, 1, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.drawsWithUnappliedLighting, 0,
+        "a declaration with a NORMAL must actually be lit");
+
+    const pipeline = find("createRenderPipeline").pop()[1];
+    const wgsl = pipeline.vertex.module.code;
+    assert.ok(wgsl.includes("struct D9Light"),
+        "the light array has to be declared:\n" + wgsl);
+    assert.ok(wgsl.includes("normal_matrix"),
+        "normals need the inverse-transpose matrix");
+    assert.ok(wgsl.includes("uniforms.lights[0]"), "light 0 must be read");
+    assert.ok(wgsl.includes("light.range_falloff.x"),
+        "a point light must honour its range");
+    // The normal has to reach the pipeline as its own attribute.
+    const byLocation = new Map(pipeline.vertex.buffers[0].attributes
+        .map(a => [a.shaderLocation, a]));
+    assert.equal(byLocation.get(3).offset, 12, "NORMAL belongs at location 3");
+
+    // And the light's position must arrive already multiplied by the view
+    // matrix. (1,2,3) * view = (11,22,33).
+    const bindGroup = find("createBindGroup").pop()[1];
+    const write = find("writeBuffer")
+        .filter(call => call[1] === bindGroup.entries[0].resource.buffer).pop();
+    const data = new Float32Array(write[6].buffer, write[6].byteOffset);
+    // world_view_projection(16) viewport(4) world_view(16) normal_matrix(16)
+    // material diffuse/ambient/specular/emissive(16) ambient_power(4) lights...
+    const materialDiffuse = 16 + 4 + 16 + 16;
+    assert.deepEqual([...data.slice(materialDiffuse, materialDiffuse + 4)],
+        [0.5, 0.25, 0.125, 0.75], "material diffuse must reach the block");
+    const ambientPower = materialDiffuse + 16;
+    assert.deepEqual([...data.slice(ambientPower, ambientPower + 4)]
+        .map(v => Math.round(v * 255) / 255),
+        [0x20 / 255, 0x40 / 255, 0x60 / 255, 16 / 255].map(v =>
+            Math.round(v * 255) / 255).slice(0, 3).concat([
+                Math.round(16 * 255) / 255]),
+        "D3DRS_AMBIENT is 0x00RRGGBB and the material power shares the vec4");
+    const lightBase = ambientPower + 4;
+    const position = [...data.slice(lightBase + 12, lightBase + 15)];
+    assert.deepEqual(position, [11, 22, 33],
+        "the light position must be transformed into view space");
+});
+
+await test("D3DRS_LIGHTING with no NORMAL passes the vertex colour through",
+        async () => {
+    // D3DRS_LIGHTING defaults to TRUE, so most draws with a plain pre-coloured
+    // vertex format arrive with lighting nominally on. Running the maths on a
+    // zero normal would leave only ambient+emissive, and with D3DRS_AMBIENT
+    // defaulting to 0 that renders every such draw black.
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x42, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+            element(0, 12, DECLTYPE.D3DCOLOR, DECLUSAGE.COLOR)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 16)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.LIGHTING, 1, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.drawsWithUnappliedLighting, 1,
+        "skipping lighting for a normal-less draw has to be counted");
+    const wgsl = find("createRenderPipeline").pop()[1].vertex.module.code;
+    assert.ok(!wgsl.includes("struct D9Light"),
+        "no lighting maths should be generated:\n" + wgsl);
+    assert.ok(wgsl.includes("let out_diffuse = vertex_diffuse;"),
+        "the vertex colour must reach the rasteriser unchanged");
+});
+
+await test("a multi-stage texture cascade generates one blend per stage",
+        async () => {
+    // Terrain splatting in miniature: stage 0 selects its texture, stage 1
+    // blends a second texture over it by the first's alpha, stage 2 modulates
+    // the result with the diffuse colour.
+    const { executor, find } = makeExecutor();
+    const tss = (stage, state, value) =>
+        command(0x202, u32(DEVICE, stage, state, value));
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 4, 4, 1, 21, 0, 1)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x402, 4, 4, 1, 21, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x144, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+            element(0, 12, DECLTYPE.D3DCOLOR, DECLUSAGE.COLOR),
+            element(0, 16, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD, 0),
+            element(0, 24, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD, 1)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 32)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 1, 0x402, 0)),
+        tss(0, D3DTSS.COLOROP, D3DTOP.SELECTARG1),
+        tss(0, D3DTSS.COLORARG1, D3DTA.TEXTURE),
+        tss(1, D3DTSS.COLOROP, D3DTOP.BLENDTEXTUREALPHA),
+        tss(1, D3DTSS.COLORARG1, D3DTA.TEXTURE),
+        tss(1, D3DTSS.COLORARG2, D3DTA.CURRENT),
+        tss(1, D3DTSS.TEXCOORDINDEX, 1),
+        tss(2, D3DTSS.COLOROP, D3DTOP.MODULATE),
+        tss(2, D3DTSS.COLORARG1, D3DTA.CURRENT),
+        tss(2, D3DTSS.COLORARG2, D3DTA.DIFFUSE),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.drawsWithUnsupportedTextureOp, 0,
+        "every operation used here is inside TextureOpCaps");
+
+    const pipeline = find("createRenderPipeline").pop()[1];
+    const wgsl = pipeline.fragment.module.code;
+    assert.ok(wgsl.includes("d9_tex0") && wgsl.includes("d9_tex1"),
+        "both sampled stages need their own texture binding:\n" + wgsl);
+    assert.ok(!wgsl.includes("d9_tex2"),
+        "stage 2 samples nothing and must not declare a texture");
+    assert.ok(wgsl.includes("mix("),
+        "BLENDTEXTUREALPHA is a mix by the stage's texture alpha");
+    // Stage 2 reads the running result, so `current` has to thread through.
+    assert.ok(/current = vec4<f32>\(stage_rgb, stage_a\);/.test(wgsl),
+        "each stage must write the cascade register");
+
+    // Two textures bound means two texture/sampler binding pairs.
+    const layout = find("createBindGroupLayout").pop()[1];
+    for (const binding of [2, 3, 4, 5])
+        assert.ok(layout.entries.some(entry => entry.binding === binding),
+            "binding " + binding + " must be declared for two sampled stages");
+    assert.ok(!layout.entries.some(entry => entry.binding === 6),
+        "stage 2 samples nothing, so no third pair");
+});
+
+await test("D3DTSS_RESULTARG threads a stage result through the temp register",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const tss = (stage, state, value) =>
+        command(0x202, u32(DEVICE, stage, state, value));
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 4, 4, 1, 21, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x104, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+            element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD, 0)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        tss(0, D3DTSS.COLOROP, D3DTOP.SELECTARG1),
+        tss(0, D3DTSS.COLORARG1, D3DTA.TEXTURE),
+        tss(0, D3DTSS.RESULTARG, D3DTA.TEMP),
+        tss(1, D3DTSS.COLOROP, D3DTOP.MULTIPLYADD),
+        tss(1, D3DTSS.COLORARG0, D3DTA.TEMP),
+        tss(1, D3DTSS.COLORARG1, D3DTA.DIFFUSE),
+        tss(1, D3DTSS.COLORARG2, D3DTA.TFACTOR),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.TEXTUREFACTOR, 0x80402010, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    const wgsl = find("createRenderPipeline").pop()[1].fragment.module.code;
+    assert.ok(/temp = vec4<f32>\(stage_rgb, stage_a\);/.test(wgsl),
+        "stage 0 must write the temp register:\n" + wgsl);
+    assert.ok(wgsl.includes("temp.rgb"), "stage 1 must read it back");
+    assert.ok(wgsl.includes("uniforms.texture_factor"),
+        "D3DTA_TFACTOR needs the texture factor uniform");
+
+    // The texture factor has to actually be uploaded, as 0xAARRGGBB.
+    const bindGroup = find("createBindGroup").pop()[1];
+    const pixelEntry = bindGroup.entries.find(entry => entry.binding === 1);
+    const write = find("writeBuffer")
+        .filter(call => call[1] === pixelEntry.resource.buffer).pop();
+    const data = new Float32Array(write[6].buffer, write[6].byteOffset);
+    const factor = [...data.slice(pixelEntry.resource.offset / 4,
+        pixelEntry.resource.offset / 4 + 4)].map(v => Math.round(v * 255));
+    assert.deepEqual(factor, [0x40, 0x20, 0x10, 0x80],
+        "D3DRS_TEXTUREFACTOR is 0xAARRGGBB");
+});
+
+await test("a texture stage op outside TextureOpCaps is counted, not invented",
+        async () => {
+    const { executor } = makeExecutor();
+    const D3DTOP_BUMPENVMAP = 22;
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 4, 4, 1, 21, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x104, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+            element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD, 0)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        command(0x202, u32(DEVICE, 0, D3DTSS.COLOROP, D3DTOP_BUMPENVMAP)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.drawsWithUnsupportedTextureOp, 1,
+        "D3DTOP_BUMPENVMAP is not in TextureOpCaps and must be reported");
+    assert.equal(executor.stats.droppedDraws, 0,
+        "the draw still renders, with the stage falling back to its arg1");
+});
+
+await test("a render target redirects the pass and keys its own pipeline",
+        async () => {
+    const D3DUSAGE_RENDERTARGET = 1;
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        // A render target arrives as a CREATE_TEXTURE_2D carrying the usage.
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x501, 256, 256, 1, 21, D3DUSAGE_RENDERTARGET, 0)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        // Into the texture...
+        command(0x20F, u32(DEVICE, 0, 0x501, 0)),
+        command(0x210, u32(DEVICE, 0, 0, 0)), // no depth surface with it
+        command(OP.SET_VIEWPORT, u32(DEVICE, 0, 0, 256, 256, 0, 0x3f800000, 0)),
+        command(OP.CLEAR, u32(DEVICE, 1, 0xff112233, 0, 0, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        // ...and back to the back buffer, restoring the implicit depth surface
+        // (D9WG_AUTO_DEPTH_STENCIL_HANDLE) the way an app that saved it does.
+        command(0x20F, u32(DEVICE, 0, 0, 0)),
+        command(0x210, u32(DEVICE, 0xffffffff, 640, 480)),
+        command(OP.SET_VIEWPORT, u32(DEVICE, 0, 0, 640, 480, 0, 0x3f800000, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.renderTargetsCreated, 1);
+    assert.equal(executor.stats.renderTargetBinds, 2);
+    // The texture pass has no depth attachment and the back-buffer pass does,
+    // so they cannot share a pipeline -- that is the whole point of baking
+    // hasDepth into the key.
+    const pipelines = find("createRenderPipeline").map(call => call[1]);
+    assert.equal(pipelines.length, 2,
+        "a target with a different depth configuration needs its own pipeline");
+    assert.ok(!pipelines[0].depthStencil,
+        "the render-to-texture pass was given no depth surface");
+    assert.ok(pipelines[1].depthStencil,
+        "the back-buffer pass still has the auto depth-stencil");
+    // Two distinct targets means at least two passes, and the first must not be
+    // pointed at the swap chain.
+    const passes = find("beginRenderPass").map(call => call[1]);
+    assert.ok(passes.length >= 2, "each target needs its own pass");
+    assert.notEqual(passes[0].colorAttachments[0].view,
+        passes[passes.length - 1].colorAttachments[0].view,
+        "the texture pass must not render into the back buffer");
+    assert.equal(executor.stats.renderPasses, passes.length);
+});
+
+await test("a cube texture binds as a cube view and uploads per face",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const face = (index, level) => {
+        const payload = Buffer.alloc(48);
+        payload.writeUInt32LE(0x601, 0);
+        payload.writeUInt32LE(level, 4);
+        payload.writeUInt32LE(0, 8);   // x
+        payload.writeUInt32LE(0, 12);  // y
+        payload.writeUInt32LE(index, 16); // z == cube face
+        payload.writeUInt32LE(4, 20);  // width
+        payload.writeUInt32LE(4, 24);  // height
+        payload.writeUInt32LE(1, 28);  // depth
+        payload.writeUInt32LE(16, 32); // row pitch
+        payload.writeUInt32LE(0, 36);
+        payload.writeUInt32LE(64, 40); // data bytes
+        return { payload, blob: Buffer.alloc(64, index + 1), field: 44 };
+    };
+    const uploads = [0, 1, 2, 3, 4, 5].map(index => face(index, 0));
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
+        command(0x111, u32(DEVICE, 0x601, 4, 1, 21, 0, 1, 0)),
+        ...uploads.map(upload =>
+            command(OP.UPDATE_TEXTURE, upload.payload, upload.blob, upload.field)),
+        command(OP.SET_FVF, fvfPayload(0x104, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+            element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD, 0)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x601, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.cubeTexturesCreated, 1);
+    assert.equal(executor.stats.textureUploads, 6, "one upload per face");
+    assert.equal(executor.stats.drawsWithIncompleteMipChain, 0,
+        "all six faces of the single level were uploaded");
+
+    const created = find("createTexture").pop()[1];
+    assert.equal(created.size.depthOrArrayLayers, 6,
+        "a cube is six array layers");
+    assert.ok(find("createView").some(call =>
+        call[2] && call[2].dimension === "cube"),
+        "the sampled view has to be a cube view");
+    // Each face has to land on its own layer, or five of them overwrite one.
+    const layers = find("writeTexture")
+        .filter(call => call[1] && call[1].origin)
+        .map(call => call[1].origin.z);
+    assert.deepEqual(layers, [0, 1, 2, 3, 4, 5]);
+    // And the fixed-function cascade has to sample it as a cube.
+    const wgsl = find("createRenderPipeline").pop()[1].fragment.module.code;
+    assert.ok(wgsl.includes("texture_cube<f32>"),
+        "the cascade must declare a cube sampler:\n" + wgsl);
+});
+
+await test("D3DRS_SCISSORTESTENABLE gates the scissor rect", async () => {
+    const { executor, find } = makeExecutor();
+    const scissor = Buffer.alloc(20);
+    scissor.writeUInt32LE(DEVICE, 0);
+    scissor.writeInt32LE(10, 4);
+    scissor.writeInt32LE(20, 8);
+    scissor.writeInt32LE(110, 12);
+    scissor.writeInt32LE(220, 16);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(0x205, scissor),
+        // Rect set but the test disabled: D3D9 ignores it.
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.SCISSORTESTENABLE, 1, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.drawsWithScissor, 1,
+        "only the draw with the test enabled is scissored");
+    const calls = find("setScissorRect");
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].slice(1), [10, 20, 100, 200]);
+});
+
+await test("a new guest session releases the previous process's resources",
+        async () => {
+    const { executor } = makeExecutor();
+    const hello = session => {
+        const payload = Buffer.alloc(16);
+        payload.writeUInt32LE(32, 0);
+        payload.writeUInt32LE(1, 4); // D9WG_FEATURE_SHADER_MODEL_2
+        payload.writeUInt32LE(session, 8);
+        payload.writeUInt32LE(0, 12);
+        return command(OP.HELLO, payload);
+    };
+    await executor.submit(buildBatch([
+        hello(0xabcd),
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+    ]));
+    await executor.idle();
+    assert.equal(executor.resources.size, 1);
+    assert.equal(executor.stats.sessionChanges, 0);
+
+    // A different process reuses the same numeric handles for different
+    // objects; keeping the old entries would let one process draw with the
+    // other's geometry.
+    await executor.submit(buildBatch([hello(0x1234)]));
+    await executor.idle();
+    assert.equal(executor.stats.sessionChanges, 1);
+    assert.equal(executor.resources.size, 0,
+        "the departing process's resources must be released");
+    assert.equal(executor.devices.size, 0);
+});
+
+await test("the device requests texture-compression-bc so DXT textures work",
+        async () => {
+    // Without this, every createTexture for a DXT format throws
+    // ("requires the 'texture-compression-bc' feature") and takes the whole
+    // batch -- and therefore the whole frame -- down with it. DXT1/3/5 is where
+    // a D3D9 game of this era keeps nearly all of its art, so the symptom is a
+    // blank screen, not a missing texture.
+    const { executor, find, fake } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x401, 16, 16, 1, 0x33545844 /* DXT3 */, 0, 1)),
+    ]));
+    await executor.idle();
+    const request = find("requestDevice").pop();
+    assert.ok(request, "requestDevice must be observed");
+    assert.deepEqual(request[1] && request[1].requiredFeatures,
+        ["texture-compression-bc"],
+        "the adapter advertises BC, so the device has to ask for it");
+    const created = find("createTexture").map(call => call[1]);
+    assert.ok(created.some(descriptor => descriptor.format === "bc2-rgba-unorm"),
+        "DXT3 must reach WebGPU as bc2-rgba-unorm");
+    assert.equal(executor.stats.texturesRejected, 0);
+    assert.equal(executor.stats.malformedBatches, 0);
+    assert.ok(!executor.failed, "a DXT texture must not fail the batch");
+});
+
+await test("a texture format the device refuses costs one texture, not the frame",
+        async () => {
+    const { executor, fake } = makeExecutor();
+    const realCreateTexture = fake.device.createTexture.bind(fake.device);
+    fake.device.createTexture = descriptor => {
+        if (descriptor.format === "bc1-rgba-unorm")
+            throw new Error("simulated: unsupported format");
+        return realCreateTexture(descriptor);
+    };
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x401, 16, 16, 1, 0x31545844 /* DXT1 */, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x104, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+            element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD, 0)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.ok(!executor.failed, "the batch must survive one refused texture");
+    assert.equal(executor.stats.texturesRejected, 1);
+    assert.equal(executor.stats.droppedDraws, 0,
+        "the draw still renders, with the white fallback bound");
+    assert.equal(executor.stats.drawsWithFallbackTexture, 1);
+    assert.equal(executor.stats.presents, 1);
+});
+
+await test("StretchRect from the back buffer becomes a deferred blit", async () => {
+    // The back buffer has no view until Present (the swap chain texture is only
+    // valid inside the task that acquired it), so this cannot be submitted where
+    // the command arrives. Doing it eagerly is what produced "the host cannot
+    // address this surface" -- and grabbing the frame into a texture is how a
+    // D3D9 game does full-screen post-processing, so it is not a rare path.
+    const D3DUSAGE_RENDERTARGET = 1;
+    const stretch = (sourceHandle, destinationHandle) => {
+        const payload = Buffer.alloc(56);
+        payload.writeUInt32LE(DEVICE, 0);
+        payload.writeUInt32LE(sourceHandle, 4);
+        payload.writeUInt32LE(0, 8);
+        [0, 0, 640, 480].forEach((v, i) => payload.writeInt32LE(v, 12 + i * 4));
+        payload.writeUInt32LE(destinationHandle, 28);
+        payload.writeUInt32LE(0, 32);
+        [0, 0, 256, 256].forEach((v, i) => payload.writeInt32LE(v, 36 + i * 4));
+        payload.writeUInt32LE(0, 52); // linear filter
+        return payload;
+    };
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x501, 256, 256, 1, 21, D3DUSAGE_RENDERTARGET, 0)),
+        command(OP.CLEAR, u32(DEVICE, 1, 0xff000000, 0, 0, 0)),
+        // Source handle 0 == the back buffer.
+        command(0x8, stretch(0, 0x501)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.ok(!executor.failed, executor.failed && executor.failed.message);
+    assert.equal(executor.stats.blitsSkipped, 0,
+        "a back-buffer StretchRect must no longer be skipped");
+    assert.equal(executor.stats.blits, 1);
+    assert.equal(executor.stats.blitsThroughBackBuffer, 1);
+
+    // It has to run as its own pass, drawing the six-vertex quad, into the
+    // texture -- not into the back buffer.
+    const passes = find("beginRenderPass").map(call => call[2]);
+    const blitPass = passes.find(pass =>
+        pass.ops.some(op => op[0] === "draw" && op[1] === 6));
+    assert.ok(blitPass, "the blit must draw its quad in a pass of its own");
+    const viewport = blitPass.ops.find(op => op[0] === "viewport");
+    assert.deepEqual(viewport.slice(1, 5), [0, 0, 256, 256],
+        "the destination rect becomes the viewport");
+    // The source rect reaches the shader normalised against the source size.
+    const uniformWrite = find("writeBuffer").pop();
+    assert.deepEqual([...new Float32Array(uniformWrite[6].buffer,
+        uniformWrite[6].byteOffset, 4)], [0, 0, 1, 1]);
+});
+
+await test("D3DSAMP_SRGBTEXTURE samples through an -srgb view", async () => {
+    // Ignoring it hands the shader values substantially brighter than the app
+    // intends (sRGB 0.5 is linear 0.21), which on an additive environment
+    // reflection reads as blown-out white rather than as a gamma difference.
+    const D3DSAMP_SRGBTEXTURE = 11;
+    const { executor, find } = makeExecutor();
+    const draw = extra => [
+        command(OP.SET_FVF, fvfPayload(0x104, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+            element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD, 0)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        ...extra,
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+    ];
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 4, 4, 1, 21, 0, 1)),
+        ...draw([]),
+        ...draw([command(OP.SET_SAMPLER_STATE,
+            u32(DEVICE, 0, D3DSAMP_SRGBTEXTURE, 1))]),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.srgbTextureSamples, 1,
+        "only the second draw asked for sRGB decoding");
+    assert.equal(executor.stats.srgbViewsCreated, 1);
+    assert.equal(executor.stats.srgbTextureUnavailable, 0);
+
+    // The texture has to declare the view format up front, or the view is
+    // invalid however it is requested later.
+    const created = find("createTexture")
+        .map(call => call[1]).find(d => d.size.width === 4);
+    assert.deepEqual(created.viewFormats, ["rgba8unorm-srgb"]);
+    assert.ok(find("createView").some(call =>
+        call[2] && call[2].format === "rgba8unorm-srgb"),
+        "the second draw must sample through the -srgb view");
+});
+
+await test("a state nothing reads is listed rather than silently dropped",
+        async () => {
+    // The expensive failures on this path have all been silent: a state the app
+    // clearly cares about that the renderer never looks at, producing a picture
+    // that is wrong in a plausible way with nothing saying so.
+    const D3DRS_WRAP0 = 128, D3DSAMP_MIPMAPLODBIAS = 8;
+    const { executor } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_WRAP0, 3, 0)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, 22 /* CULLMODE, read */, 1, 0)),
+        command(OP.SET_SAMPLER_STATE, u32(DEVICE, 0, D3DSAMP_MIPMAPLODBIAS, 1)),
+        command(OP.SET_SAMPLER_STATE, u32(DEVICE, 0, 5 /* MAGFILTER, read */, 2)),
+    ]));
+    await executor.idle();
+    assert.deepEqual(executor.stats.unreadStateIds, {
+        renderStates: [D3DRS_WRAP0],
+        samplerStates: [D3DSAMP_MIPMAPLODBIAS],
+    }, "only the unread ones, and each listed once");
 });
 
 // ---- report ----

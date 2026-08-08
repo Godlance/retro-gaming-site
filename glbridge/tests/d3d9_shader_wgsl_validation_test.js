@@ -364,22 +364,151 @@ for (const [name, list] of CORPUS) {
 {
     const executor = require("../d3d9-webgpu/d3d9_executor.js");
     const fixedFunction = [];
+    // A vertex signature with every optional field defaulted off. The builder
+    // reads these unconditionally, so a partial object would fail for reasons
+    // that have nothing to do with what a case is testing.
+    const vsBase = overrides => Object.assign({
+        positionType: "world", hasColor: false, colorIsBGRA: false,
+        hasColor1: false, color1IsBGRA: false, hasNormal: false,
+        texCoordSets: [], hasTexCoord: false, coordStages: [],
+        fogMode: 0, fogRange: false, normalizeNormals: false,
+        needsViewSpace: false, lighting: null, clipPlaneCount: 0,
+    }, overrides);
     for (const positionType of ["world", "screen"]) {
         for (const hasColor of [false, true]) {
             for (const hasTexCoord of [false, true]) {
                 fixedFunction.push(["ff vs " + positionType +
                     (hasColor ? " colour" : "") + (hasTexCoord ? " texcoord" : ""),
-                    executor.buildFixedFunctionVertexShader(
-                        { positionType, hasColor, hasTexCoord })]);
+                    executor.buildFixedFunctionVertexShader(vsBase({
+                        positionType, hasColor, hasTexCoord,
+                        texCoordSets: hasTexCoord ? [0] : [],
+                        coordStages: hasTexCoord
+                            ? [{ index: 0, texCoordIndex: 0, tciMode: 0,
+                                transformCount: 0, projected: false }] : [],
+                    }))]);
             }
         }
     }
+    // M3's fixed-function lighting: every light type, every material source,
+    // and the two branches (local viewer, specular) that change the maths.
+    for (const type of [1, 2, 3]) { // D3DLIGHT_POINT / SPOT / DIRECTIONAL
+        for (const specularEnable of [false, true]) {
+            for (const localViewer of [false, true]) {
+                fixedFunction.push(["ff vs light type" + type +
+                    (specularEnable ? " specular" : "") +
+                    (localViewer ? " localviewer" : ""),
+                    executor.buildFixedFunctionVertexShader(vsBase({
+                        hasColor: true, hasColor1: true, hasNormal: true,
+                        needsViewSpace: true, normalizeNormals: true,
+                        lighting: { lights: [{ index: 0, type }, { index: 3, type }],
+                            colorVertex: true, specularEnable, localViewer,
+                            diffuseSource: 1, ambientSource: 0,
+                            specularSource: 2, emissiveSource: 0 },
+                    }))]);
+            }
+        }
+    }
+    for (const source of [0, 1, 2]) { // D3DMCS_MATERIAL / COLOR1 / COLOR2
+        fixedFunction.push(["ff vs material source " + source,
+            executor.buildFixedFunctionVertexShader(vsBase({
+                hasColor: true, hasColor1: true, hasNormal: true,
+                needsViewSpace: true,
+                lighting: { lights: [{ index: 0, type: 3 }], colorVertex: true,
+                    specularEnable: true, localViewer: false,
+                    diffuseSource: source, ambientSource: source,
+                    specularSource: source, emissiveSource: source },
+            }))]);
+    }
+    // Coordinate generation and the transform component counts, including the
+    // camera-space modes that make the shader read view-space position/normal.
+    for (const tciMode of [0, 0x10000, 0x20000, 0x30000]) {
+        for (const transformCount of [0, 1, 2, 3, 4]) {
+            fixedFunction.push(["ff vs tci " + tciMode.toString(16) +
+                " count" + transformCount,
+                executor.buildFixedFunctionVertexShader(vsBase({
+                    hasNormal: true, texCoordSets: [0, 1], hasTexCoord: true,
+                    needsViewSpace: tciMode !== 0,
+                    coordStages: [
+                        { index: 0, texCoordIndex: 1, tciMode, transformCount,
+                          projected: false },
+                        { index: 1, texCoordIndex: 0, tciMode: 0,
+                          transformCount: 0, projected: false },
+                    ],
+                }))]);
+        }
+    }
+    for (const fogMode of [1, 2, 3]) {
+        for (const fogRange of [false, true]) {
+            fixedFunction.push(["ff vs fog " + fogMode + (fogRange ? " range" : ""),
+                executor.buildFixedFunctionVertexShader(vsBase({
+                    fogMode, fogRange, needsViewSpace: fogRange,
+                }))]);
+        }
+    }
+
+    // A pixel signature with a single default stage.
+    const stage = overrides => Object.assign({
+        index: 0, colorOp: 4, colorArg0: 1, colorArg1: 2, colorArg2: 1,
+        alphaOp: 2, alphaArg0: 1, alphaArg1: 2, alphaArg2: 1, resultArg: 1,
+        usesConstant: false, samplesTexture: true, textureType: "2d",
+        transformCount: 0, projected: false, coordVarying: 0,
+    }, overrides);
+    const psBase = overrides => Object.assign({
+        stages: [stage()], usesTextureFactor: false, fogMode: 0,
+        alphaTest: { enabled: false, func: 8, reference: 0 },
+        specularEnable: false,
+    }, overrides);
     for (const hasTexture of [false, true]) {
         for (const debugMode of [null, "solid", "color", "uv", "texture"]) {
             fixedFunction.push(["ff ps" + (hasTexture ? " textured" : "") +
                 (debugMode ? " " + debugMode : ""),
-                executor.buildFixedFunctionPixelShader({ hasTexture }, debugMode)]);
+                executor.buildFixedFunctionPixelShader(psBase({
+                    stages: hasTexture ? [stage()] : [],
+                }), debugMode)]);
         }
+    }
+    // Every D3DTEXTUREOP fill_caps() advertises, on both channels, since the
+    // colour and alpha forms are emitted from separate code paths.
+    for (const op of [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 25, 26]) {
+        fixedFunction.push(["ff ps op " + op,
+            executor.buildFixedFunctionPixelShader(psBase({
+                usesTextureFactor: true,
+                stages: [stage({ colorOp: op, alphaOp: op, colorArg0: 3,
+                    alphaArg0: 3 })],
+            }), null)]);
+    }
+    // The argument pool, its two modifier bits, the scratch register and a
+    // multi-stage cascade that threads a result through it.
+    fixedFunction.push(["ff ps argument pool",
+        executor.buildFixedFunctionPixelShader(psBase({
+            usesTextureFactor: true, specularEnable: true,
+            stages: [
+                stage({ index: 0, colorOp: 26, colorArg0: 0x10 | 0,
+                    colorArg1: 0x20 | 2, colorArg2: 3, alphaOp: 4,
+                    alphaArg1: 4, alphaArg2: 6, usesConstant: true,
+                    resultArg: 5 }),
+                stage({ index: 1, colorOp: 25, colorArg0: 5, colorArg1: 1,
+                    colorArg2: 2, alphaOp: 1, coordVarying: 1 }),
+            ],
+        }), null)]);
+    // Cube and volume textures reach the cascade too, and PROJECTED changes the
+    // coordinate expression rather than the sample.
+    for (const textureType of ["2d", "cube", "3d"]) {
+        for (const projected of [false, true]) {
+            fixedFunction.push(["ff ps " + textureType +
+                (projected ? " projected" : ""),
+                executor.buildFixedFunctionPixelShader(psBase({
+                    stages: [stage({ textureType, projected,
+                        transformCount: projected ? 3 : 0 })],
+                }), null)]);
+        }
+    }
+    for (const fogMode of [1, 2, 3]) {
+        fixedFunction.push(["ff ps fog " + fogMode,
+            executor.buildFixedFunctionPixelShader(psBase({
+                fogMode, specularEnable: true,
+                alphaTest: { enabled: true, func: 5, reference: 128 },
+            }), null)]);
     }
     for (const [name, wgsl] of fixedFunction) {
         const file = path.join(directory,

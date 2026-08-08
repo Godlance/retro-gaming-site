@@ -252,6 +252,125 @@ canvas { width: 640px; height: 480px; }
         const pixelScaleConstants = shaderConstants(deviceHandle, 0,
             [0.9, 0.9, 0.9, 1]);
 
+        // --- M3 fixtures ---
+        const renderTargetHandle = 0x00200011;
+        const cubeHandle = 0x00200012;
+        const cubeFace = new Uint8Array(8 * 8 * 4);
+        for (let index = 0; index < 8 * 8; ++index) {
+            cubeFace[index * 4] = 40;
+            cubeFace[index * 4 + 1] = 90;
+            cubeFace[index * 4 + 2] = 140;
+            cubeFace[index * 4 + 3] = 255;
+        }
+        const material = handle => {
+            const payload = new Uint8Array(72);
+            const view = new DataView(payload.buffer);
+            view.setUint32(0, handle, true);
+            [0.9, 0.8, 0.7, 1,   // diffuse
+             1, 1, 1, 1,         // ambient
+             0.5, 0.5, 0.5, 1,   // specular
+             0, 0, 0, 0,         // emissive
+            ].forEach((value, index) =>
+                view.setFloat32(4 + index * 4, value, true));
+            view.setFloat32(68, 24, true); // power
+            return payload;
+        };
+        const light = (handle, index, type) => {
+            const payload = new Uint8Array(112);
+            const view = new DataView(payload.buffer);
+            view.setUint32(0, handle, true);
+            view.setUint32(4, index, true);
+            view.setUint32(8, type, true);
+            [1, 1, 0.95, 1,  // diffuse
+             1, 1, 1, 1,     // specular
+             0.1, 0.1, 0.1, 1, // ambient
+            ].forEach((value, i) => view.setFloat32(12 + i * 4, value, true));
+            [0, 0, 0].forEach((value, i) =>
+                view.setFloat32(60 + i * 4, value, true));   // position
+            [0.3, -0.6, 0.7].forEach((value, i) =>
+                view.setFloat32(72 + i * 4, value, true));   // direction
+            view.setFloat32(84, 1000, true);  // range
+            view.setFloat32(88, 1, true);     // falloff
+            [1, 0, 0].forEach((value, i) =>
+                view.setFloat32(92 + i * 4, value, true));   // attenuation
+            view.setFloat32(104, 0.5, true);  // theta
+            view.setFloat32(108, 1.0, true);  // phi
+            return payload;
+        };
+        // POSITION(float3) NORMAL(float3) TEXCOORD0(float2), stride 32.
+        const litElements = [
+            element(0, DECLTYPE_FLOAT3, DECLUSAGE_POSITION),
+            element(12, DECLTYPE_FLOAT3, 3 /* DECLUSAGE_NORMAL */),
+            element(24, DECLTYPE_FLOAT2, DECLUSAGE_TEXCOORD),
+        ];
+        const litVertices = new Uint8Array(3 * 32);
+        {
+            const view = new DataView(litVertices.buffer);
+            [[-0.8, -0.8, 0, 0], [0.8, -0.8, 1, 0], [0, 0.8, 0.5, 1]]
+                .forEach((vertex, index) => {
+                    const offset = index * 32;
+                    view.setFloat32(offset, vertex[0], true);
+                    view.setFloat32(offset + 4, vertex[1], true);
+                    view.setFloat32(offset + 8, 0.5, true);
+                    view.setFloat32(offset + 12, 0, true);
+                    view.setFloat32(offset + 16, 0, true);
+                    view.setFloat32(offset + 20, -1, true);
+                    view.setFloat32(offset + 24, vertex[2], true);
+                    view.setFloat32(offset + 28, vertex[3], true);
+                });
+        }
+        // A screen-space quad (XYZRHW + colour + uv, stride 28) in the
+        // bottom-right corner, textured with the render target.
+        const rtQuadVertices = new Uint8Array(3 * 28);
+        {
+            const view = new DataView(rtQuadVertices.buffer);
+            [[400, 300, 0, 0], [620, 300, 1, 0], [510, 460, 0.5, 1]]
+                .forEach((vertex, index) => {
+                    const offset = index * 28;
+                    view.setFloat32(offset, vertex[0], true);
+                    view.setFloat32(offset + 4, vertex[1], true);
+                    view.setFloat32(offset + 8, 0.2, true);
+                    view.setFloat32(offset + 12, 1, true);
+                    view.setUint32(offset + 16, 0xFFFFFFFF, true);
+                    view.setFloat32(offset + 20, vertex[2], true);
+                    view.setFloat32(offset + 24, vertex[3], true);
+                });
+        }
+
+        // One 4x4 DXT1 block (8 bytes): two RGB565 endpoints plus a 2-bit
+        // index per texel. This is the format a D3D9 game of this era keeps
+        // nearly all of its art in, and it only works if the device asked for
+        // `texture-compression-bc` at creation -- a fake device cannot prove
+        // that, only a real one can.
+        const dxtHandle = 0x00200013;
+        const dxtBlock = new Uint8Array([
+            0x1F, 0x00,   // colour0 = RGB565 pure blue
+            0xE0, 0x07,   // colour1 = RGB565 pure green
+            0x55, 0x55, 0x55, 0x55, // every texel picks index 1
+        ]);
+
+        const stretchRect = (handle, sourceHandle, sourceLevel,
+                sourceLeft, sourceTop, sourceRight, sourceBottom,
+                destinationHandle, destinationLevel,
+                destinationLeft, destinationTop, destinationRight,
+                destinationBottom) => {
+            const payload = new Uint8Array(56);
+            const view = new DataView(payload.buffer);
+            view.setUint32(0, handle, true);
+            view.setUint32(4, sourceHandle, true);
+            view.setUint32(8, sourceLevel, true);
+            [sourceLeft, sourceTop, sourceRight, sourceBottom]
+                .forEach((value, index) =>
+                    view.setInt32(12 + index * 4, value, true));
+            view.setUint32(28, destinationHandle, true);
+            view.setUint32(32, destinationLevel, true);
+            [destinationLeft, destinationTop, destinationRight,
+             destinationBottom].forEach((value, index) =>
+                view.setInt32(36 + index * 4, value, true));
+            view.setUint32(52, 0, true); // linear
+            return payload;
+        };
+
         const executor = new D3D9WebGPUExecutor(
             document.getElementById("screen"));
         await Promise.race([
@@ -264,6 +383,10 @@ canvas { width: 640px; height: 480px; }
             command(1, u32(32, 0, sessionLow, sessionHigh)),
             command(2, createDevice(deviceHandle, 640, 480)),
             command(0x110, u32(deviceHandle, textureHandle, 16, 16, 1, 21, 0, 1)),
+            command(0x110, u32(deviceHandle, dxtHandle, 4, 4, 1,
+                0x31545844 /* D3DFMT_DXT1 */, 0, 1)),
+            command(0x113, u32(dxtHandle, 0, 0, 0, 0, 4, 4, 1, 8, 0,
+                dxtBlock.byteLength, 0), [{ offsetField: 44, data: dxtBlock }]),
             command(0x113, u32(textureHandle, 0, 0, 0, 0, 16, 16, 1,
                 64, 0, texture.byteLength, 0),
                 [{ offsetField: 44, data: texture }]),
@@ -279,6 +402,7 @@ canvas { width: 640px; height: 480px; }
             command(0x206, transform(deviceHandle, 3, identity)),
             command(0x206, transform(deviceHandle, 256, identity)),
             command(0x20E, setFVF(deviceHandle, 0x42, worldElements)),
+            command(0x203, u32(deviceHandle, 0, dxtHandle, 0)),
             command(0x302, u32(deviceHandle, 4, 1, 16, 3,
                 worldVertices.byteLength, 0, 0),
                 [{ offsetField: 24, data: worldVertices }]),
@@ -311,8 +435,78 @@ canvas { width: 640px; height: 480px; }
             command(0x211, u32(deviceHandle, 0)),
             command(0x212, u32(deviceHandle, 0)),
 
+            // Draw 4 (M3): fixed-function lighting plus a two-stage texture
+            // cascade, rendered into a texture rather than the back buffer, then
+            // sampled back. This is the combination the M3 work added, and Tint
+            // is the compiler that matters for it: naga accepts things Tint
+            // rejects (the f32-max literal in M2 was exactly that), so the
+            // generated lighting and cascade WGSL has to be seen by a real
+            // browser and not only by naga.
+            command(0x110, u32(deviceHandle, renderTargetHandle, 128, 128, 1, 21,
+                1 /* D3DUSAGE_RENDERTARGET */, 0)),
+            command(0x111, u32(deviceHandle, cubeHandle, 8, 1, 21, 0, 1, 0)),
+            // All six faces: an unwritten face has undefined contents, and the
+            // executor counts that (drawsWithIncompleteMipChain) rather than
+            // letting a reflection sample garbage unremarked.
+            ...[0, 1, 2, 3, 4, 5].map(face =>
+                command(0x113, u32(cubeHandle, 0, 0, 0, face, 8, 8, 1, 32, 0,
+                    cubeFace.byteLength, 0),
+                    [{ offsetField: 44, data: cubeFace }])),
+            command(0x20F, u32(deviceHandle, 0, renderTargetHandle, 0)),
+            command(0x210, u32(deviceHandle, 0, 0, 0)), // no depth with it
+            command(0x204, u32(deviceHandle, 0, 0, 128, 128, 0, 0x3F800000, 0)),
+            command(5, u32(deviceHandle, 1, 0xFF203040, 0x3F800000, 0, 0)),
+            command(0x200, u32(deviceHandle, 137, 1, 0)),   // LIGHTING
+            command(0x200, u32(deviceHandle, 139, 0x00303030, 0)), // AMBIENT
+            command(0x200, u32(deviceHandle, 143, 1, 0)),   // NORMALIZENORMALS
+            command(0x200, u32(deviceHandle, 29, 1, 0)),    // SPECULARENABLE
+            command(0x207, material(deviceHandle)),
+            command(0x208, light(deviceHandle, 0, 3 /* DIRECTIONAL */)),
+            command(0x209, u32(deviceHandle, 0, 1, 0)),
+            command(0x203, u32(deviceHandle, 0, textureHandle, 0)),
+            command(0x203, u32(deviceHandle, 1, cubeHandle, 0)),
+            command(0x202, u32(deviceHandle, 0, 1, 4)),     // stage0 COLOROP=MODULATE
+            command(0x202, u32(deviceHandle, 0, 2, 2)),     // COLORARG1=TEXTURE
+            command(0x202, u32(deviceHandle, 0, 3, 0)),     // COLORARG2=DIFFUSE
+            command(0x202, u32(deviceHandle, 1, 1, 7)),     // stage1 COLOROP=ADD
+            command(0x202, u32(deviceHandle, 1, 2, 2)),     // COLORARG1=TEXTURE
+            command(0x202, u32(deviceHandle, 1, 3, 1)),     // COLORARG2=CURRENT
+            command(0x202, u32(deviceHandle, 1, 11, 0x00030000)), // TCI reflection
+            command(0x20E, setFVF(deviceHandle, 0x112, litElements)),
+            command(0x302, u32(deviceHandle, 4, 1, 32, 3,
+                litVertices.byteLength, 0, 0),
+                [{ offsetField: 24, data: litVertices }]),
+            // Back to the back buffer, restoring the implicit depth surface, and
+            // sample the render target through the fixed-function path.
+            command(0x202, u32(deviceHandle, 1, 1, 1)),     // stage1 COLOROP=DISABLE
+            command(0x202, u32(deviceHandle, 0, 3, 0)),
+            command(0x200, u32(deviceHandle, 137, 0, 0)),   // LIGHTING off
+            command(0x200, u32(deviceHandle, 29, 0, 0)),    // SPECULARENABLE off
+            command(0x20F, u32(deviceHandle, 0, 0, 0)),
+            command(0x210, u32(deviceHandle, 0xFFFFFFFF, 640, 480)),
+            command(0x204, u32(deviceHandle, 0, 0, 640, 480, 0, 0x3F800000, 0)),
+            command(0x203, u32(deviceHandle, 0, renderTargetHandle, 0)),
+            command(0x203, u32(deviceHandle, 1, 0, 0)),
+            command(0x20E, setFVF(deviceHandle, 0x144, screenElements)),
+            command(0x302, u32(deviceHandle, 4, 1, 28, 3,
+                rtQuadVertices.byteLength, 0, 0),
+                [{ offsetField: 24, data: rtQuadVertices }]),
+
+            // StretchRect the back buffer into the render target and back out
+            // again. Only a real browser exercises the interesting part: the
+            // swap chain's format (getPreferredCanvasFormat, normally
+            // bgra8unorm) differs from the rgba8unorm every D3D9 texture becomes,
+            // so even a same-size back-buffer copy has to go through the blit
+            // pipeline rather than copyTextureToTexture.
+            command(0x8, stretchRect(deviceHandle, 0, 0, 0, 0, 640, 480,
+                renderTargetHandle, 0, 0, 0, 128, 128)),
+            command(0x8, stretchRect(deviceHandle, renderTargetHandle, 0,
+                0, 0, 128, 128, 0, 0, 20, 20, 148, 148)),
+
             command(7, u32(deviceHandle, 0)),
             command(0x103, u32(textureHandle, 3)),
+            command(0x103, u32(cubeHandle, 4)),
+            command(0x103, u32(dxtHandle, 3)),
             command(4, surface(deviceHandle, 640, 480)),
         ]));
         const validation = await executor.device.popErrorScope();
@@ -320,7 +514,7 @@ canvas { width: 640px; height: 480px; }
         if (validation) throw validation;
         const stats = executor.getStats();
         const expected = {
-            drawCalls: 3, upDrawCalls: 3, presents: 1, pipelineCreations: 3,
+            drawCalls: 5, upDrawCalls: 5, presents: 1, pipelineCreations: 5,
             malformedBatches: 0, unsupportedCommands: 0, droppedDraws: 0,
             // Two shaders translated, plus one extra variant because the
             // declaration types COLOR0 as D3DCOLOR and the vertex module has
@@ -328,6 +522,26 @@ canvas { width: 640px; height: 480px; }
             shadersTranslated: 2, shaderTranslationFailures: 0,
             shaderVariantsTranslated: 1, shaderCompileErrors: 0,
             programmableDraws: 1,
+            // M3: the lit draw goes into a render target, then the target is
+            // sampled back on the back buffer -- two targets, so at least two
+            // passes, and the cube texture is sampled by the cascade.
+            renderTargetsCreated: 1, renderTargetBinds: 2,
+            cubeTexturesCreated: 1,
+            // A refused texture would mean the device did not get the BC
+            // feature; the DXT1 upload above is the only way to notice.
+            texturesRejected: 0,
+            // Both StretchRects touch the back buffer, so both must go through
+            // the deferred blit rather than being skipped.
+            blits: 2, blitsSkipped: 0, blitsThroughBackBuffer: 2,
+            drawsWithUnsupportedTextureOp: 0,
+            depthTargetSizeMismatches: 0,
+            drawsWithIncompleteMipChain: 0,
+            // Exactly one: D3DRS_LIGHTING defaults to TRUE, so draw 2 (XYZ plus
+            // a diffuse colour, no NORMAL) is the one draw here that asks to be
+            // lit without the data to light it. Draw 1 and draw 5 are XYZRHW and
+            // so pre-lit by definition, draw 3 is programmable, and draw 4 has a
+            // real normal. A zero here would mean the counter stopped working.
+            drawsWithUnappliedLighting: 1,
             // Draws 1 and 2 sample with D3D9's default sampler state; draw 3
             // with the CLAMP/LINEAR one set above.
             samplersCreated: 2,

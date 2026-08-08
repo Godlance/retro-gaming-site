@@ -902,12 +902,30 @@ D3D8 路径的 README 把裁剪平面列为"未实现，caps 不声明支持"；
 `dimension: "2d", baseArrayLayer: face` 视图用于渲染目标写入（如果游戏
 把 cube map 的某一面设为渲染目标，例如动态环境反射）。
 
+**2026-08-08（M3）落地**：采样路径已按上面的形状实现，`UPDATE_TEXTURE`
+的 `z` 字段作为面索引。**把 cube 的某一面设为渲染目标尚未实现**——
+`renderTargetsFor()` 建的目标视图固定 `baseArrayLayer: 0`，因为
+`SetRenderTarget` 现在只按"纹理 + mip 级别"寻址，还没有面/层这一维。
+需要它的时候要一起改协议里的 `D9WGSetRenderTarget`。
+另外必须记下一条真实 WebGPU 才能抓到的约束：bind group layout 的 texture
+条目要显式写 `viewDimension: "cube"`，默认的 `"2d"` 与 shader 里的
+`texture_cube<f32>` 不匹配会让整条 pipeline 创建失败，而 `naga` 单独校验
+一个 module 时看不到这件事。
+
 ### 11.3 Volume Texture
 
 `LockBox`/`UnlockBox` 的三维脏区跟踪需要新的影子存储数据结构（不是
 2D 脏矩形的简单扩展），映射为 `GPUTexture`（`dimension: "3d"`）。体积
 贴图在三款目标游戏里预期使用面很窄（体积雾、少量特效），不作为早期
 里程碑的阻塞项。
+
+**2026-08-08（M3）：仍未实现。** `CreateVolumeTexture` 返回
+`D3DERR_INVALIDCALL`，`D3DPTEXTURECAPS_VOLUMEMAP` 不上报，所以按 caps
+行事的应用不会走到这里。协议侧已经预留：`CREATE_TEXTURE_VOLUME` 与
+`D9WGUpdateTexture` 的 `z`/`depth`/`slice_pitch` 字段就是为它留的（cube
+的面索引复用同一个 `z`，因为两者都只是选择上传落到哪一层）。翻译器与
+固定管线级联对 `texture_3d<f32>` 采样的那一侧已经写好并过了 WGSL 校验，
+缺的只是 guest 侧的 COM 对象与影子存储。
 
 ### 11.4 Multiple Render Targets 与格式独立性
 
@@ -937,6 +955,16 @@ render target + 独立 sampler state（M4 前半），再做 MRT（M4 后半）*
 解锁一大批调用面；MRT 只在少数动态特效里出现，晚一点上线不阻塞主线。
 
 ## 13. Occlusion Query 与其他查询
+
+**2026-08-08（M3）落地方式与本节原设计不同**：查询完全在 guest 侧回答，
+给的是保守结果（EVENT 报已完成，OCCLUSION 报"全部样本可见"），没有任何
+D9WG 流量，也没有用到 `GPUQuerySet`。理由写在 `d3d9_proxy.c` 的
+`IDirect3DQuery9` 注释里：真正的 GPU 侧计数需要第 6.7 节的 host→guest
+回传通道；在它存在之前，剩下的两个选择都比保守结果更糟——让
+`CreateQuery` 失败会让引擎关掉一整条以查询为前提的分支，而一直返回
+`S_FALSE` 会让极常见的 `while (GetData(...) == S_FALSE);` 轮询死循环。
+高报可见性只会多画一些本可跳过的东西（损失帧率），低报会删掉该出现的
+几何。本节以下内容作为**日后接上回传通道时**的设计依据保留。
 
 - 第一版只实现 `D3DQUERYTYPE_OCCLUSION` 和 `D3DQUERYTYPE_EVENT`。
 - Occlusion query 映射到 WebGPU `GPUQuerySet`（`type: "occlusion"`）；
@@ -1285,6 +1313,16 @@ shader 路径上——这个开关就是为这次二分而加的。
    `ChangeDisplaySettings`；我们没做，于是 guest 桌面停在 1024x768 而游戏
    按 800x600 排版，窗口矩形取不到、点击落到别的窗口上。补上模式切换与
    `SetWindowPos`/前台抢占后，`emptySurfaceReports` 从 100% 归零。
+   **2026-08-08 补充**：`CreateDevice` 时抢一次前台是不够的。极品飞车 9 跑到
+   主菜单时每一次窗口状态上报都是 `foreground: false`——画面完美，每一次点击
+   都落到别的窗口上。两个成因都不体现在画面里：游戏在设备之后又创建/激活了
+   另一个窗口（启动画面、launcher、message-only 窗口），以及 **Windows 直接
+   拒绝 `SetForegroundWindow`**（对非前台进程它返回 FALSE 且什么都不做）。
+   因此改为在 Present 路径上按 500ms 间隔重新抢占（只对全屏设备——窗口化游戏
+   每帧抢焦点是不可接受的），并用 `AttachThreadInput` 短暂挂到当前前台线程的
+   输入队列上，这是绕过那条限制的既定做法（用完必须立刻脱开，否则两个消息
+   队列耦合会一起死锁）。真实独占全屏 D3D9 设备本来就会在整个生命周期里
+   持有前台并在激活时重新获取，所以这是在对齐 runtime 而不是跟用户抢。
 2. **固定管线不应用纹理坐标变换**（`D3DTSS_TEXTURETRANSFORMFLAGS` +
    `D3DTS_TEXTURE0`）。War3 用 `D3DTTFF_COUNT2` 做云雾/冰棱的坐标动画，
    忽略它的结果是这些面渲染成平色块。注意坐标以**行向量 `(u, v, 1, 1)`**
@@ -1312,7 +1350,8 @@ shader 路径上——这个开关就是为这次二分而加的。
 计数，以及 `debug.dumpSmallTextures()`/`dumpPipelineStates()`/
 `forceMipLevel0`/`shaderMode` 这些不用重新构建就能二分的开关。
 
-**已知折衷（不是缺陷，但要记下来）**：
+**已知折衷（不是缺陷，但要记下来）**。下面几条按 M3（2026-08-08）之后的
+实际状态更新过，M2 当时写的几条已经不再成立：
 
 - **像素着色器里的数据相关分支会退化为 mip level 0 采样**。WGSL 禁止在
   非一致控制流里做隐式求导采样，而分支内部没有可以把 `dpdx`/`dpdy`
@@ -1321,16 +1360,20 @@ shader 路径上——这个开关就是为这次二分而加的。
   这类由 uniform buffer 驱动的分支仍算一致控制流，所以这条路径对
   M2 的目标游戏实际上不可达——`PS20Caps.DynamicFlowControlDepth` 报 0
   正是为了不去招惹会命中它的 shader。
-- **MRT 的 `oC1`-`oC3` 被丢弃**，只写 `oC0`（MRT 本体在 M4）。
+- ~~**MRT 的 `oC1`-`oC3` 被丢弃**，只写 `oC0`（MRT 本体在 M4）。~~
+  **M3 已解决**：翻译器按 shader 实际写入的最高 `oC#` 生成连续的
+  `@location` 输出，host 端绑定至多四个颜色附件。
 - **`UBYTE4`/`SHORT2`/`SHORT4`/`UDEC3`/`DEC3N` 顶点格式仍被拒绝**。前三种
   在 D3D9 里以未归一化的浮点送进 shader，而 WebGPU 的 `uint8x4`/`sint16x2`
   给的是整型向量，要修就得让 shader 模块知道顶点声明，从而破坏
   "一个 shader 一个模块"的缓存前提；后两种是 10:10:10 打包，WebGPU 没有
   对应格式。它们主要出现在蒙皮网格里，归入 M5。
 - **vs_3_0 顶点纹理采样**按 9.9 节明确拒绝（`dcl sampler` 出现在 vertex
-  shader 里直接翻译失败），caps 里 `VertexTextureFilterCaps` 报 0。
-- M1 遗留的三项基础设施（`glbridge/webgpu-runtime/` 共享模块、
-  per-process session 隔离、设备丢失恢复）本阶段仍未做。
+  shader 里直接翻译失败），caps 里 `VertexTextureFilterCaps` 报 0。这是
+  WoW（M5）的需求，M3 的两个目标游戏都用不到，仍未做。
+- M1 遗留的三项基础设施中，per-process session 隔离与设备丢失恢复已在 M3
+  补上（见 M3 状态记录里对后者范围的说明——它不等于完整恢复）；
+  `glbridge/webgpu-runtime/` 共享模块仍未抽取。
 
 ### M3：Warcraft III 固定管线与地形
 
@@ -1340,11 +1383,265 @@ shader 路径上——这个开关就是为这次二分而加的。
 - 状态块（`IDirect3DStateBlock9`）完整覆盖 D3D9 新增状态。
 - 验收：单机战役任意一关可从过场到目标达成，地形/单位/UI 渲染正确。
 
+**2026-08-08 状态记录：代码与自动化验证已完成，真实游戏验收待人工执行。**
+
+本轮的核心认识是：M1/M2 结束时 host 端**存了**固定管线光照与全部
+texture stage state，但一条都没有**用**。`SetLight`/`SetMaterial`/
+`LightEnable` 自 M1 起就在线上传输，host 只记进 map；像素阶段则硬编码为
+"stage 0 的 `MODULATE(texture, diffuse)`"。同时 `fill_caps()` 一直在上报
+`MaxTextureBlendStages = 8`、`D3DVTXPCAPS_DIRECTIONALLIGHTS/
+POSITIONALLIGHTS`、`MaxActiveLights = 8` 以及一大串 `TextureOpCaps`——
+**这些是没有兑现的 caps 承诺**，正是本仓库反复强调要避免的那类问题。
+M3 的主体工作就是把它们变成真的。
+
+已落地范围：
+
+- **固定管线光照**（`d3d9_executor.js` 的 `lightingSignature` /
+  `buildFixedFunctionVertexShader` / `writeFixedVertexUniforms`）：在**视图
+  空间**计算（D3D9 固定管线本来就在那里做），点光源/聚光灯/平行光三种类型
+  全部支持，含距离衰减与 range 截断、聚光锥（`cos(theta/2)`/`cos(phi/2)`
+  与 falloff 幂）、`D3DRS_SPECULARENABLE` 的高光项与 `D3DRS_LOCALVIEWER`
+  两种视线近似、`D3DRS_AMBIENT` 全局环境光、`D3DRS_COLORVERTEX` 与四个
+  `D3DRS_*MATERIALSOURCE` 的材质来源选择、`D3DRS_NORMALIZENORMALS`。
+  **每个启用光源的类型烘进 shader 变体**，所以生成的 WGSL 是直线展开的，
+  没有分支也没有动态光源数量。灯光位置/方向由 JS 侧在打包 uniform 时乘上
+  view 矩阵，而不是把第二个矩阵搬进 shader 逐顶点重算。
+- **一个关键判断：声明里没有 NORMAL 时不做光照**。`D3DRS_LIGHTING` 的默认
+  值是 TRUE，所以大量"顶点自带颜色、不打算被照亮"的绘制其实都是带着
+  lighting=on 到达的；对零法线跑一遍光照公式的结果是只剩 ambient+emissive，
+  而 `D3DRS_AMBIENT` 默认为 0——**画面会全黑**。改为跳过光照、让顶点色原样
+  通过，这也是 WineD3D 固定管线的做法（它的 `ffp_vs_settings` 在声明无法线
+  时清掉 `lighting` 位）。计数器 `drawsWithUnappliedLighting` 暴露频率。
+- **完整的 texture stage 级联**（`textureCascadeSignature` /
+  `buildFixedFunctionPixelShader`）：stage 0..N-1（N 止于第一个
+  `D3DTOP_DISABLE`），每级独立的颜色/alpha 运算，参数取自 diffuse、级联
+  中间结果（`CURRENT`）、本级贴图、`D3DRS_TEXTUREFACTOR`、specular、暂存
+  寄存器（`D3DTA_TEMP` + `D3DTSS_RESULTARG`）与本级 `D3DTSS_CONSTANT`，
+  含 `D3DTA_COMPLEMENT`/`D3DTA_ALPHAREPLICATE` 两个修饰位，每级结果按 D3D9
+  语义饱和。实现的运算**恰好等于** `TextureOpCaps` 上报的那一套；
+  `PREMODULATE` 与 `BUMPENVMAP` 家族既不上报也不实现，遇到时计数告警而
+  不做近似。地形多层混合、细节贴图、光照贴图就是由这些拼出来的。
+- **纹理坐标的来路终于对齐 D3D9**：每个 stage 一条 varying，`TEXCOORDINDEX`
+  选择输入坐标集、`D3DTSS_TCI_*` 的三种相机空间生成模式（法线/位置/反射
+  向量）、`D3DTS_TEXTURE0+n` 的 COUNT1..COUNT4 变换、`D3DTTFF_PROJECTED`
+  的除法，全部实现（`SPHEREMAP` 仍计数告警）。M2 只做了 stage 0 的
+  COUNT1/COUNT2。绑定了可编程 vertex shader 时不做生成/变换——D3D9 也不做。
+- **立方体贴图**：真正的 `IDirect3DCubeTexture9`（六面 × 每级），host 侧是
+  一张六层 2D 纹理加一个 `cube` 视图；`UPDATE_TEXTURE` 的 `z` 字段作为面
+  索引（体积贴图将来用同一字段作切片，因为两者都只是选择上传落到哪一层）。
+  固定管线级联与翻译后的 `dcl_cube` 都能采样它。
+- **`SetScissorRect`** + `D3DRS_SCISSORTESTENABLE` 门控（`RasterCaps` 补上
+  `D3DPRASTERCAPS_SCISSORTEST`）。
+- **状态块**：`CreateStateBlock(ALL/PIXELSTATE/VERTEXSTATE)` 按 D3D9 文档
+  的状态分组捕获（两张 render state 表照抄规范，捕获得比 D3D9 多不是安全的
+  简化——`Apply` 会把 app 故意保留的状态一起还原回去），`Apply`/`Capture`
+  完整，`BeginStateBlock`/`EndStateBlock` 用"Begin 处全量快照 → 正常执行 →
+  End 处 diff 并还原"实现。与 D3D9 的差异（写入同值或写后改回的状态不会被
+  记录）写在 `d3d9_proxy.c` 里 `IDirect3DStateBlock9` 的注释上，不留给后人
+  自己发现。这样做的理由是：真 D3D9 在录制期拦截每一个 setter，而那需要在
+  二十多个 setter 里各加一个绝不能忘的分支——忘掉任何一个都会静默丢状态。
+
+**本轮把 M4 的一部分提前做了**，因为极品飞车 9（2005）这类游戏一帧里的
+绝大部分内容是画进纹理再合成的，没有渲染目标它根本出不了画面：
+
+- **渲染目标 / 深度表面 / MRT**：`CreateRenderTarget`、
+  `CreateDepthStencilSurface`、`D3DUSAGE_RENDERTARGET` 纹理 +
+  `GetSurfaceLevel`、`SetRenderTarget`（4 个槽位）、
+  `SetDepthStencilSurface`、以及对应的 Get。翻译器现在按 shader 实际写入的
+  `oC0..oC3` 生成多个 `@location` 输出（原先只写 oC0 并记一条 note），
+  `D3DRS_COLORWRITEENABLE1/2/3` 映射到各附件的 writeMask。host 端的帧模型
+  改为**按目标分组成多个 render pass**：每个记录下来的 op 携带它当时解析出
+  的目标集合，`finishFrame` 把连续同目标的 op 合成一个 pass，Clear 总是开
+  新 pass。`SetRenderTarget(0, ...)` 按 D3D9 语义顺带重置 viewport——不做这
+  一步的典型症状是"渲染到纹理的那一遍只填了一个角"。
+- **一个必须补的接口**：`GetDepthStencilSurface` 原本对隐式 auto
+  depth-stencil 返回失败。看起来无害（没人读深度像素），实际会打断标准的
+  RTT 序列——取不到当前深度表面的 app 就还不回去，于是第一遍 RTT 之后每一次
+  绘制都在没有深度缓冲的情况下跑。现在返回一个标记为"隐式深度表面"的
+  surface，协议上用 `D9WG_AUTO_DEPTH_STENCIL_HANDLE` 哨兵与
+  `SetDepthStencilSurface(NULL)`（真的要关深度测试）区分开。
+- **`StretchRect` / `ColorFill`**。`StretchRect` 分三档：等尺寸同格式且两侧
+  都不是后台缓冲 → 真正的 `copyTextureToTexture`（无 pass 无 shader）；其余
+  → 一次 blit pass（全视口四边形采样源，`setViewport` 限定目标矩形），覆盖
+  缩放、格式转换和后台缓冲；压缩格式作为目标仍不实现并计数（BCn 不能当
+  render attachment，没有东西可画进去）。部分矩形的 `ColorFill` 同样明确
+  不实现并计数——WebGPU 的 `loadOp: "clear"` 覆盖整个附件，`setScissorRect`
+  并不收窄它，扩大范围会擦掉 app 保留的像素。
+- **涉及后台缓冲的 blit 必须延迟到 Present**，与绘制同理：swapchain 贴图只在
+  获取它的那个任务内有效，而一帧会跨多次 PCI 提交到达。第一版在命令到达处
+  立刻执行，结果是 NFS9 每帧报一条"host 无法寻址这个 surface"——**后台缓冲
+  在那个时刻确实还没有 view**。这不是边角情况：把整帧抓进纹理再处理回去，
+  正是 D3D9 游戏做全屏后处理的标准手法。顺带需要两处配套改动：
+  `context.configure()` 必须显式申请 `COPY_SRC`/`COPY_DST`/
+  `TEXTURE_BINDING`（画布上下文默认只有 `RENDER_ATTACHMENT`），以及非压缩
+  纹理要带上 `RENDER_ATTACHMENT` 才能当 blit 目标。另外后台缓冲的格式
+  （`getPreferredCanvasFormat`，通常 `bgra8unorm`）与 D3D9 纹理统一成的
+  `rgba8unorm` 不同，所以**即使等尺寸的后台缓冲拷贝也走不了
+  `copyTextureToTexture`** —— 这一条只有真实浏览器能验证。
+- **遮挡/事件查询**：完全在 guest 侧回答，给的是**保守结果**（EVENT 报已
+  完成，OCCLUSION 报"全部样本可见"）。理由写在 `d3d9_proxy.c` 里：让
+  `CreateQuery` 失败会让引擎关掉一整条以查询为前提的分支；一直返回
+  `S_FALSE` 会让极常见的 `while (GetData(...) == S_FALSE);` 轮询死循环。
+  高报可见性只会多画一些本可跳过的东西，低报会删掉该出现的几何。真正的
+  GPU 侧计数需要第 6.7 节的 host→guest 回传通道，仍未做。
+
+**M1 遗留的基础设施，本轮补上两项：**
+
+- **per-process session 隔离**：`D9WGHello` 的 64 位会话号现在真的被检查。
+  不同 XP 进程的数字 handle 只在各自进程内唯一，此前第二个进程的
+  `CREATE_BUFFER` 会静默覆盖第一个进程的表项，然后第一个进程拿着自己的
+  索引去读别人上传的顶点。会话号变化时释放上一个进程的全部设备与资源
+  （`sessionChanges` 计数）。
+- **设备丢失恢复**：此前 `device.lost` 只打一条日志，之后每个 batch 永久
+  失败——屏幕上就是一块冻住的画布，没有任何解释。现在会重新拿一个
+  `GPUDevice`、重建 context 与缓存。**范围要说清楚**：翻译产物不受影响
+  （WGSL 文本与 `GPUDevice` 无关，第 8.5 节），但 guest 的资源内容在 guest
+  的 CPU 影子里，只有 guest 自己 Reset 时才会重放，而没有任何东西告诉它
+  设备丢过——所以丢失之后的绘制会引用新设备没见过的 handle 并计入
+  `droppedDraws`。这条把"页面死了"变成"页面活着且统计说清了发生什么"，
+  仅此而已；真正的完整恢复要等第 6.7 节的回传通道。
+
+**验证情况**：
+
+- `glbridge/tests/d3d9_shader_wgsl_validation_test.js`：107 个 shader 过
+  `naga`，其中新增的固定管线用例覆盖三种光源类型 × specular/localviewer
+  组合、三种材质来源、四种 TCI 模式 × 五种变换分量数、三种雾模式 ×
+  range、`TextureOpCaps` 里每一个运算的颜色与 alpha 两条路径、参数池与两个
+  修饰位、暂存寄存器、2d/cube/3d × PROJECTED。
+- `glbridge/tests/d3d9_webgpu_executor_test.js`：39 项（新增 9 项），含
+  光照 uniform 的逐字段校验（灯光位置必须已经乘过 view 矩阵——这里刻意用了
+  带平移的 view，因为单位矩阵会让"变换过"和"原样透传"无法区分，那正是 M1
+  WVP 顺序 bug 的成因）、无法线时的顶点色透传、三级级联的绑定与
+  `current`/`temp` 串联、`RESULTARG`、超出 caps 的运算被计数而非臆造、
+  渲染目标切换导致的独立 pipeline 与 pass、立方体六面各自落到自己的层、
+  scissor 的门控、以及会话切换释放旧进程资源。
+- `glbridge/tests/d3d9_webgpu_browser_test.html`：**真实 WebGPU**（headless
+  Chrome）下五次绘制通过，`pushErrorScope("validation")` 全程无错。第四次
+  绘制是"固定管线光照 + 两级级联（其中一级采样立方体贴图、坐标由相机空间
+  反射向量生成）+ 画进渲染目标"，第五次把该渲染目标当纹理采样回来。
+- `glbridge/tests/d3d9_shader_corpus_test.js`（新增）：`D9WG_DUMP_SHADERS=1`
+  的离线消费端，见下。
+
+**一条又一次被印证的方法论**：`naga` 和 Tint 的严格程度不同，只用一个不
+够。这次是 Tint 抓到的：bind group layout 的 texture 条目必须显式声明
+`viewDimension`，默认的 `"2d"` 与 shader 里的 `texture_cube<f32>` 不匹配，
+整条 pipeline 创建失败。`naga` 单独校验一个 module，看不到"module 与
+layout 配对"这件事，所以它一路放行。修法是把每个采样槽位的维度带进
+pipeline key 与 layout，并为每种维度准备一张 1x1 白色兜底纹理（原先只有
+2D 那一张，绑定到 cube 槽位同样会失败）。
+
+**仍未做的（本轮明确不做，不是忘了）**：
+
+- **体积贴图**（`IDirect3DVolumeTexture9`/`LockBox`）。协议里的
+  `CREATE_TEXTURE_VOLUME` 与 `UpdateTexture.z` 已经为它留好，
+  `D3DPTEXTURECAPS_VOLUMEMAP` 保持不上报。两个目标游戏都不以它为主，
+  优先级低于渲染目标。
+- **用户裁剪面**。`MaxUserClipPlanes` 仍报 0（因此不会有 app 去用它）。
+  WGSL 没有 clip distance，按 9.11 节必须变成"顶点算距离 + 片元
+  discard"，而这会改动两个阶段共同遵守的 varying 契约，需要同时改翻译器
+  与固定管线两侧。
+- **`UBYTE4`/`SHORT2`/`SHORT4`/`UDEC3`/`DEC3N` 顶点格式**仍被拒绝（M5，
+  见下方 M2 的已知折衷）。
+- **vs_3_0 顶点纹理采样**（9.9）仍拒绝，`VertexTextureFilterCaps` 报 0。
+  这是 WoW（M5）的需求，两个目标游戏都用不到。
+- **纹理的写后录制冒险**（`textureUpdateHazards`）仍只计数不修复：重命名
+  一张纹理要整份重新分配并重传所有层级，代价远高于缓冲区，先量频率。
+- **`glbridge/webgpu-runtime/` 共享模块**仍未抽取（第 17 章本就排在里程碑
+  之后）。
+
+**验收待办**：与 M2 一样需要在真实 v86 XP 客户机里人工执行。War3 进战役
+观察 `getStats()` 的 `drawsWithUnappliedLighting`/
+`drawsWithUnsupportedTextureOp`/`drawsWithTexCoordIndex`/
+`drawsWithTextureTransform`/`droppedDraws`；极品飞车 9 额外观察
+`renderTargetsCreated`/`renderTargetBinds`/`renderPasses`/
+`blitsSkipped`/`shadersTranslated`/`shaderTranslationFailures`。
+`blitsSkipped` 非零说明它依赖了压缩格式目标的 `StretchRect` 或部分矩形
+`ColorFill`，那是下一步该做的事；`blitsThroughBackBuffer` 则量出这个游戏
+到底有多依赖抓帧后处理。
+
+**2026-08-08：M2 的验收终于兑现，验收目标是极品飞车 9（Most Wanted, 2005）。**
+
+M2 的状态记录里写着"SM2.0 路径的真实游戏验收仍然悬空"——War3 一个 shader
+都不创建。NFS9 在真实 v86 XP 客户机里**跑完了一整场比赛**（结算画面
+"WINNER 3:10.54 @ 109 MPH"），1333 帧的统计把这条补上了：
+
+| 项 | 值 | 说明 |
+| --- | --- | --- |
+| `shadersTranslated` | 284 | 真实游戏的 SM2.0 字节码 |
+| `shaderTranslationFailures` / `shaderCompileErrors` | 0 / 0 | 手写翻译器一条都没崩 |
+| `programmableDraws` | 157242 | 几乎全部绘制走可编程路径 |
+| `pipelineCreations` / `pipelineHits` | 19 / 157223 | pipeline key 收敛得很好 |
+| `renderTargetsCreated` / `renderTargetBinds` / `renderPasses` | 7 / 18148 / 10776 | 每帧约 8 个 pass，13 次 RT 切换 |
+| `blits` / `blitsThroughBackBuffer` / `blitsSkipped` | 1048 / 1048 / 0 | 抓帧后处理，全部经过后台缓冲 |
+| `droppedDraws` / `malformedBatches` / `texturesRejected` | 0 / 0 / 0 | |
+| `bufferRenames` | 2363 / 1333 帧 ≈ 1.8 | 写后录制冒险的实际频率，很低 |
+| `constantUploadBytes` | 62.6 MB / 1333 帧 ≈ 47 KB/帧 | |
+
+**统计口径的一个坑要记下来**：`drawsWithTexture: 0` 不是"没有贴图"，而是那个
+计数器只在固定管线级联路径上自增，而 NFS9 基本不走固定管线。同理
+`drawsWithUnsupportedTextureOp: 0`/`drawsWithUnappliedLighting: 0` 对这款游戏
+是**空集上的真**，不构成 M3 固定管线工作的验证——那仍然要靠 War3。
+
+**首次真机运行暴露的问题，按发现顺序**（每一条都是"画面看起来没问题"掩盖过的）：
+
+1. **`texture-compression-bc` 从未申请**。`initialize()` 里是裸的
+   `requestDevice()`，而 WebGPU 的可选 feature 不申请就一个都没有。DXT 格式
+   自 M1 起就在格式表里，于是 `createTexture` 抛异常、穿过 batch、整帧被丢弃
+   ——而这个年代的游戏几乎所有美术资源都在 DXT 里，症状是黑屏而不是缺贴图。
+   顺带把纹理创建包进 `createTextureOrNull()`：一张纹理被拒绝只该损失一张
+   纹理（退回白色兜底并计入 `texturesRejected`），不该抹掉整帧。
+2. **涉及后台缓冲的 `StretchRect` 在命令到达处立刻执行**。那个时刻后台缓冲
+   还没有 view（swapchain 贴图只在获取它的那个任务内有效），所以每帧报一条
+   "host 无法寻址这个 surface"。改为推迟到 Present 的 blit op。详见上面
+   M3 状态记录里的三档表。
+3. **前台只在 `CreateDevice` 抢一次**。见上面第 1 条的 2026-08-08 补充。
+4. **`D3DSAMP_SRGBTEXTURE` 被无人读取、也无人计数**。D3D9 会把 sRGB 标记的
+   纹理在**读取时**解码到线性；忽略它等于把明显偏亮的值喂给 shader
+   （sRGB 0.5 的线性值是 0.21，中间调差了两倍多），叠在环境反射这种加性项
+   上的观感就是**过曝成白色**，而不是"gamma 有点不对"。WebGPU 没有
+   sampler 级的 sRGB——它是纹理**格式**的属性——所以实现方式是建纹理时声明
+   `viewFormats: ["...-srgb"]`，绑定时按该 stage 的 sampler state 选择用哪个
+   view。`D3DRS_SRGBWRITEENABLE`（写回时编码）仍未实现：它需要渲染目标的
+   `-srgb` view，因而要进 pipeline key，现在只计数告警。
+
+**并且新增了一条纪律性设施：未被读取的状态审计。** 这条路径上代价最高的
+失败全都是静默的——app 明显在意的某个状态（否则它不会去 Set）渲染器从来
+不看，画出来的东西以一种讲得通的方式是错的，而没有任何地方说这件事。
+`onSetRenderState`/`onSetSamplerState` 现在把每个不在消费白名单里的 state id
+记进 `getStats().unreadStateIds`（只记 id 不记次数，天然有界）。这把"这里
+为什么看起来不对"从猜测变成一张有限的清单。上面第 4 条正是用这个思路找到的。
+
+### M3.5：真实游戏 shader 语料（新增，前置于任何翻译器改动）
+
+`D9WG_DUMP_SHADERS=1` 让 guest DLL 把每个 shader 的原始 token 流按内容
+hash 写到 DLL 旁边的 `d3d9_dump\` 目录（`{vs,ps}_<主><次>_<hash>.d9sh`，
+纯 DWORD 流无头部）。`glbridge/tests/d3d9_shader_corpus_test.js` 是它的
+离线消费端：喂给 `compileShader` 并（可选地）过一遍 `naga`，按错误信息
+分组报告，而不是逐个 shader 列——一个游戏公共 shader 前缀里的一条未实现
+指令会命中几十个 shader，平铺列表会把第二个真正不同的问题埋掉。
+
+这件事的价值是复利的，也是这条路径目前最大的缺口：翻译器是手写的，它的
+正确性证据只有本仓库自己的测试，而那些测试用的是**我们手工汇编的**
+字节码——恰恰是错误的采样，因为手写测试里只有我们已经想到的编码。任何一款
+D3D9 游戏都是语料贡献者，哪怕它在 v86 里只能跑到主菜单就卡住：客户端在
+启动阶段就会创建完整的 shader 集合，几分钟就能换来一份永久可离线重放的
+回归语料。
+
+语料默认**不作为构建门槛**（新导入一款游戏本来就应该暴露未实现指令，为此
+让构建失败会让人干脆不再导出语料）。等某份语料被作为基线签入之后，用
+`D9_CORPUS_STRICT=1` 打开门槛。
+
 ### M4：独立 sampler state 收尾 + MRT + WoW 登录/选角
 
-- MRT（12 章后半部分）。
-- `StretchRect`/`ColorFill`/`GetRenderTargetData`（对已知来源内容）。
-- Occlusion/Event Query（第 13 章）。
+**2026-08-08：本节的渲染能力清单已在 M3 提前完成**（理由与范围见 M3 状态
+记录），剩下的只有 WoW 客户端本身的验收，以及三项 M3 明确未做的：
+
+- ~~MRT（12 章后半部分）。~~ M3 完成。
+- ~~`StretchRect`/`ColorFill`。~~ M3 完成（缩放 `StretchRect` 与部分矩形
+  `ColorFill` 明确不实现并计数）。`GetRenderTargetData`（对已知来源内容）
+  仍未做。
+- ~~Occlusion/Event Query（第 13 章）。~~ M3 以 guest 侧保守结果完成；
+  真正的 GPU 侧计数需要第 6.7 节的 host→guest 回传通道，仍未做。
 - 验收：WoW 登录界面、服务器列表、角色选择（含单个 3D 角色模型预览与
   基础光照）稳定运行。
 

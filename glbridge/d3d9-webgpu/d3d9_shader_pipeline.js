@@ -1384,8 +1384,19 @@
                 out.push("    @location(" + slot + ") varying" + slot + ": vec4<f32>,");
             out.push("};");
             out.push("");
+            // One @location per oC# the shader writes. D3D9 requires oC0 and
+            // allows oC1..oC3 for multiple render targets; a shader that skips
+            // a middle target would leave a hole WebGPU has no way to express,
+            // so the declared set is filled contiguously up to the highest one
+            // written and the unwritten slots get whatever oC# defaulted to
+            // (zero) -- which is what a real driver leaves in an untouched
+            // target within a pass, and is visible in reflection.colorOutputs.
+            const targetCount = this.colorOutputs.size
+                ? Math.max(...this.colorOutputs) + 1 : 1;
             out.push("struct D9PixelOutput {");
-            out.push("    @location(0) color: vec4<f32>,");
+            for (let target = 0; target < targetCount; ++target)
+                out.push("    @location(" + target + ") color" + target +
+                    ": vec4<f32>,");
             if (this.usesDepthOutput)
                 out.push("    @builtin(frag_depth) depth: f32,");
             out.push("};");
@@ -1404,7 +1415,9 @@
             out.push("    d9_body();");
             out.push("    var result: D9PixelOutput;");
             // ps_1_x leaves its result in r0; ps_2_0+ writes oC0 explicitly.
-            out.push("    result.color = " + (this.major === 1 ? "r0" : "oC0") + ";");
+            out.push("    result.color0 = " + (this.major === 1 ? "r0" : "oC0") + ";");
+            for (let target = 1; target < targetCount; ++target)
+                out.push("    result.color" + target + " = oC" + target + ";");
             // D3D9's alpha test runs after the shader, on the colour it
             // produced. WebGPU has no such stage, so the caller passes the
             // comparison in and it becomes a discard here -- which is why an
@@ -1416,10 +1429,7 @@
                 out.push("    result.depth = o_depthv.x;");
             out.push("    return result;");
             out.push("}");
-            const extraTargets = Array.from(this.colorOutputs).filter(i => i > 0);
-            if (extraTargets.length)
-                this.note("multiple render targets (oC" + extraTargets.join("/oC") +
-                    ") are not bound until M4; only oC0 is written");
+
         }
 
         reflect(floatCount, intCount, boolVectors) {
