@@ -1,4 +1,4 @@
-# Direct D3D9 to WebGPU guest frontend (M3: fixed-function pipeline complete)
+# Direct D3D9 to WebGPU guest frontend (M5 rendering path)
 
 This app-local `d3d9.dll` bypasses WineD3D, `opengl32.dll`, gl4es, and
 WebGL, the same way `../d3d8proxy/d3d8.dll` does for D3D8. It emits D9WG
@@ -9,9 +9,10 @@ protocol from D8WG (own opcode numbering, own resource handle namespace,
 own payload shapes) — see `d3d9_protocol.h` and
 `docs/d3d9-webgpu-implementation-plan.zh-CN.md` section 6.
 
-This is milestone M3 (the complete fixed-function pipeline, on top of M2's
-shader model 2.0 and M1's protocol skeleton and transport layer), not a
-general-purpose D3D9 implementation. Implemented:
+This implements the M1-M5 rendering path (protocol, SM2 translation,
+fixed-function rendering, M4 resource operations, the M4.5 caps profile, and
+M5 main-world primitives). It is still not a general-purpose D3D9
+implementation. Implemented:
 
 - `IDirect3D9`/`IDirect3DDevice9` COM lifecycle, adapter enumeration, caps
   (`VertexShaderVersion`/`PixelShaderVersion` now report `(2,0)`, with
@@ -26,8 +27,9 @@ general-purpose D3D9 implementation. Implemented:
 - vertex declarations (`CreateVertexDeclaration`/`SetVertexDeclaration`):
   `POSITION`/`POSITIONT`/`NORMAL`/`COLOR`/`TEXCOORD`/`PSIZE`/`BLENDWEIGHT`/
   `BLENDINDICES`/`TANGENT`/`BINORMAL`/`FOG` usages, default method,
-  `FLOAT1`-`FLOAT4`/`D3DCOLOR`/`UBYTE4N`/`SHORT2N`/`SHORT4N`/`USHORT2N`/
-  `USHORT4N`/`FLOAT16_2`/`FLOAT16_4` types, up to 4 streams;
+  `FLOAT1`-`FLOAT4`/`D3DCOLOR`/`UBYTE4`/`SHORT2`/`SHORT4`/`UBYTE4N`/
+  `SHORT2N`/`SHORT4N`/`USHORT2N`/`USHORT4N`/`UDEC3`/`DEC3N`/`FLOAT16_2`/
+  `FLOAT16_4` types, up to 4 streams;
   `SetFVF`/`GetFVF` as a compatibility path that expands the FVF bits into
   the same element shape (`XYZ`/`XYZRHW`, `NORMAL`, `DIFFUSE`, `SPECULAR`,
   up to 8 default-size 2D `TEXn`) and sends it to the host the same way
@@ -74,8 +76,9 @@ general-purpose D3D9 implementation. Implemented:
   handing back a surface whose `LockRect` wrote to face 0 would be worse;
 - **M3:** `IDirect3DStateBlock9` — `CreateStateBlock(ALL/PIXELSTATE/
   VERTEXSTATE)`, `Apply`, `Capture`, and `BeginStateBlock`/`EndStateBlock`.
-  Read the comment above `IDirect3DStateBlock9` in `d3d9_proxy.c` for how
-  recording is implemented and the one narrow way it differs from D3D9;
+  Recording keeps an explicit Set-call mask (including same-value and
+  write-then-revert calls), and captured textures, shaders, declarations and
+  buffers retain their COM references until the block is released;
 - **M3:** `SetScissorRect`/`GetScissorRect`, gated by
   `D3DRS_SCISSORTESTENABLE`;
 - **M3 (brought forward from M4):** render targets and depth surfaces —
@@ -99,32 +102,52 @@ general-purpose D3D9 implementation. Implemented:
   `d3d9_dump\` beside this DLL, named by content hash, for offline replay
   through `../tests/d3d9_shader_corpus_test.js`. See the comment above
   `dump_shader_bytecode` for why a hand-written translator needs real-game
-  bytecode more than it needs more hand-written tests.
+  bytecode more than it needs more hand-written tests;
+- **M4:** rectangle-list `Clear`, partial `ColorFill`, scaled/converted
+  `StretchRect`, and exact `GetRenderTargetData` for render-target contents
+  whose complete value is known from `Clear`/`ColorFill`/known-source copy.
+  Any GPU draw invalidates that CPU mirror, so arbitrary GPU-produced pixels
+  still fail honestly instead of returning stale data;
+- **M4.5:** `D9WG_CAPS_PROFILE=ffp` (aliases `m4.5` and `low`) exposes the
+  supported fixed-function-only caps profile. `sm2`/`m5` selects the default
+  shader-model-2 profile;
+- **M5:** declaration-specific shader variants convert compact skinning inputs
+  `UBYTE4`/`SHORT2`/`SHORT4`/`UDEC3`/`DEC3N`; sRGB reads and writes use
+  compatible texture/target views; blend constants, separate-alpha blending,
+  front/back stencil state, stencil reference, constant/slope depth bias, and
+  per-draw scissor reset are all carried into WebGPU;
+- **Warcraft III shadow fix:** projected texture division now preserves the
+  sign of `q` in both fixed-function and shader-modifier paths. Clamping a
+  negative `q` to positive epsilon made behind-projector UVs sample an opaque
+  shadow-edge texel across whole terrain triangles, producing large black
+  wedges. The shadow pass also receives its complete blend/stencil/depth state.
+- **Warcraft III campaign state/cursor fix:** the guest state cache now starts
+  from the real D3D9 render, texture-stage, and sampler defaults. This is
+  correctness-critical because equal-value Set calls are suppressed: an
+  all-zero cache discarded the first `ZENABLE=FALSE`/`ZWRITEENABLE=FALSE`
+  transition and left scene depth active over UI, fog-of-war, and shadow
+  overlays. Stage defaults now also preserve the first transition from stage
+  1's `TEXCOORDINDEX=1` to War3's shared texcoord 0. Fixed-function BORDER
+  addressing selects `D3DSAMP_BORDERCOLOR` in WGSL instead of stretching an
+  opaque edge texel beyond projected shadow/fog masks. The GDI cursor capture
+  fallback is now enabled by default because the browser cursor is hidden; set
+  `D9WG_GDI_CURSOR=0` only for a title that intentionally draws its own cursor
+  geometry.
 
 Still unimplemented, each returning `D3DERR_INVALIDCALL` (or the closest
 matching real error) rather than pretending: volume textures
 (`CreateVolumeTexture`), user clip planes (`MaxUserClipPlanes` reports 0, so
 nothing asks for them — WGSL has no clip-distance facility, see plan section
 9.11), instancing (`SetStreamSourceFreq`), `ProcessVertices`, additional swap
-chains, palettes, patches, `MultiplyTransform`, and
-`GetRenderTargetData`/`GetFrontBufferData` for GPU-produced pixels (plan
-section 2.2). `d3d9_protocol.h` reserves the opcodes the first few would need,
-frozen at v0.1 so archived traces stay decodable across milestones.
+chains, palettes, patches, `MultiplyTransform`, arbitrary GPU-produced
+`GetRenderTargetData`, and `GetFrontBufferData` (plan section 2.2).
+`d3d9_protocol.h` reserves the opcodes the first few would need, frozen at v0.1
+so archived traces stay decodable across milestones.
 
-Also still rejected, and worth knowing about because it is a *vertex format*
-rather than an API call: `UBYTE4`/`SHORT2`/`SHORT4`/`UDEC3`/`DEC3N`. D3D9
-delivers the first three to a shader as unnormalised floats while WebGPU's
-`uint8x4`/`sint16x2` deliver integer vectors, so supporting them needs the
-shader module to know the declaration — which breaks the one-module-per-shader
-caching the translator's variant scheme depends on. The last two are packed
-10:10:10 with no WebGPU format at all. They appear mainly in skinned meshes
-(plan M5).
-
-Set `D9WG_SHADER_MODEL=0` in the guest environment to make `GetDeviceCaps`
-report the M1 fixed-function profile again (`VertexShaderVersion`/
-`PixelShaderVersion` = `(0,0)`). That exists so a rendering regression can be
-bisected against the known-good fixed-function path without rebuilding the
-DLL — it is a diagnostic, not a supported configuration.
+Set `D9WG_CAPS_PROFILE=ffp` in the guest environment to make `GetDeviceCaps`
+report the supported M4.5 fixed-function profile (`VertexShaderVersion`/
+`PixelShaderVersion` = `(0,0)`); `D9WG_CAPS_PROFILE=sm2` is the default M5
+profile. The legacy `D9WG_SHADER_MODEL=0` spelling remains accepted.
 
 Build an XP-compatible DLL without a C runtime dependency:
 
@@ -166,8 +189,9 @@ Tests:
 - `../tests/d3d9_webgpu_executor_test.js` — real D9WG batches against a fake
   WebGPU device that enforces bind-group/`writeBuffer` validation rules;
 - `../tests/d3d9_webgpu_browser_test.html` — the same paths against real
-  WebGPU in a browser, including a translated `vs_2_0`/`ps_2_0` pair and a lit,
-  two-stage, cube-sampling draw rendered into a texture and read back.
+  WebGPU in a browser, including a translated `vs_2_0`/`ps_2_0` pair with an
+  M5 compact vertex input, a lit two-stage cube-sampling draw rendered into a
+  texture, partial Clear/ColorFill, and an sRGB back-buffer write.
   Run it against real WebGPU rather than trusting `naga` alone: `naga` and Tint
   disagree on real cases, and the M3 round found one only Tint catches (a bind
   group layout must declare `viewDimension`, because `naga` validates a module

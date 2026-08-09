@@ -516,12 +516,16 @@
             case SRCMOD_DZ: {
                 const name = this.fresh("dz");
                 this.emit("let " + name + " = " + expression + ";");
-                return "(" + name + " / max(" + name + ".z, 1e-8))";
+                return "(" + name + " / select(-max(abs(" + name +
+                    ".z), 1e-8), max(abs(" + name + ".z), 1e-8), " +
+                    name + ".z >= 0.0))";
             }
             case SRCMOD_DW: {
                 const name = this.fresh("dw");
                 this.emit("let " + name + " = " + expression + ";");
-                return "(" + name + " / max(" + name + ".w, 1e-8))";
+                return "(" + name + " / select(-max(abs(" + name +
+                    ".w), 1e-8), max(abs(" + name + ".w), 1e-8), " +
+                    name + ".w >= 0.0))";
             }
             case SRCMOD_ABS: return "abs(" + expression + ")";
             case SRCMOD_ABSNEG: return "-abs(" + expression + ")";
@@ -1316,14 +1320,41 @@
             const inputs = Array.from(this.usedInputs.entries())
                 .filter(entry => entry[1])
                 .sort((a, b) => a[0] - b[0]);
+            const conversions = this.options.inputConversions || {};
+            const conversionKinds = new Set(Object.values(conversions));
+            if (conversionKinds.has("udec3")) {
+                out.push("fn d9_unpack_udec3(value: u32) -> vec4<f32> {");
+                out.push("    return vec4<f32>(f32(value & 0x3ffu), " +
+                    "f32((value >> 10u) & 0x3ffu), " +
+                    "f32((value >> 20u) & 0x3ffu), 1.0);");
+                out.push("}");
+                out.push("");
+            }
+            if (conversionKinds.has("dec3n")) {
+                out.push("fn d9_snorm10(value: u32) -> f32 {");
+                out.push("    let signed_value = i32(value << 22u) >> 22;");
+                out.push("    return max(f32(signed_value) / 511.0, -1.0);");
+                out.push("}");
+                out.push("fn d9_unpack_dec3n(value: u32) -> vec4<f32> {");
+                out.push("    return vec4<f32>(d9_snorm10(value & 0x3ffu), " +
+                    "d9_snorm10((value >> 10u) & 0x3ffu), " +
+                    "d9_snorm10((value >> 20u) & 0x3ffu), 1.0);");
+                out.push("}");
+                out.push("");
+            }
             out.push("struct D9VertexOutput {");
             out.push("    @builtin(position) position: vec4<f32>,");
             for (let slot = 0; slot < VARYING_COUNT; ++slot)
                 out.push("    @location(" + slot + ") varying" + slot + ": vec4<f32>,");
             out.push("};");
             out.push("");
+            const inputType = location => ({
+                ubyte4: "vec4<u32>", short2: "vec2<i32>",
+                short4: "vec4<i32>", udec3: "u32", dec3n: "u32",
+            })[conversions[location]] || "vec4<f32>";
             const parameters = inputs.map(entry =>
-                "@location(" + entry[0] + ") in" + entry[0] + ": vec4<f32>");
+                "@location(" + entry[0] + ") in" + entry[0] + ": " +
+                    inputType(entry[0]));
             out.push("@vertex");
             out.push("fn d9_vs_main(" + parameters.join(", ") + ") -> D9VertexOutput {");
             // A D3DCOLOR-typed attribute is packed ARGB in memory, so WebGPU's
@@ -1333,11 +1364,26 @@
             // declaration -- and the swizzle rides on the copy into the
             // register instead of costing a CPU pass over the vertex data.
             // This is why a shader can have more than one translated variant
-            // (see bgraInputLocations in compileShader's options).
+            // (see bgraInputLocations/inputConversions in compileShader's
+            // options). Compact integer declarations need the same treatment:
+            // WebGPU exposes integer vertex formats as integer WGSL values,
+            // while D3D9 always presents them to v# as a float4.
             const bgra = new Set(this.options.bgraInputLocations || []);
+            const inputValue = location => {
+                const name = "in" + location;
+                switch (conversions[location]) {
+                case "ubyte4":
+                case "short4": return "vec4<f32>(" + name + ")";
+                case "short2":
+                    return "vec4<f32>(vec2<f32>(" + name + "), 0.0, 1.0)";
+                case "udec3": return "d9_unpack_udec3(" + name + ")";
+                case "dec3n": return "d9_unpack_dec3n(" + name + ")";
+                default: return name + (bgra.has(location) ? ".bgra" : "");
+                }
+            };
             for (const entry of inputs)
-                out.push("    vin" + entry[0] + " = in" + entry[0] +
-                    (bgra.has(entry[0]) ? ".bgra" : "") + ";");
+                out.push("    vin" + entry[0] + " = " +
+                    inputValue(entry[0]) + ";");
             out.push("    d9_body();");
             out.push("    var result: D9VertexOutput;");
             // D3D9 clip space is z in [0, w]; WebGPU's is identical, so the

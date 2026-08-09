@@ -358,6 +358,27 @@ for (const [name, list] of CORPUS) {
     ++validated;
 }
 
+// M5's declaration-specific vertex variants change the WGSL input scalar
+// types and inject unpack helpers, so validate each conversion with naga too.
+for (const [name, kind] of [["ubyte4", "ubyte4"], ["short2", "short2"],
+        ["short4", "short4"], ["udec3", "udec3"], ["dec3n", "dec3n"]]) {
+    const result = pipeline.compileShader(new Uint32Array(CORPUS[0][1]), {
+        inputConversions: { 0: kind },
+    });
+    if (!result.ok) {
+        failures.push({ name: "M5 " + name,
+            message: "translation failed: " + result.error });
+        continue;
+    }
+    const file = path.join(directory, "m5_" + name + ".wgsl");
+    fs.writeFileSync(file, result.wgsl);
+    const run = spawnSync(naga, [file], { encoding: "utf8" });
+    if (run.status !== 0)
+        failures.push({ name: "M5 " + name,
+            message: (run.stderr || run.stdout || "").trim(), source: result.wgsl });
+    else ++validated;
+}
+
 // The synthesised fixed-function stages are part of the same contract and
 // pair with translated shaders inside a pipeline, so they get validated here
 // too rather than only being exercised through the fake-device executor test.
@@ -503,6 +524,12 @@ for (const [name, list] of CORPUS) {
                 }), null)]);
         }
     }
+    fixedFunction.push(["ff ps projected border colour",
+        executor.buildFixedFunctionPixelShader(psBase({
+            stages: [stage({ projected: true, transformCount: 3,
+                addressU: 4, addressV: 4, addressW: 1,
+                borderColor: 0x80402010 })],
+        }), null)]);
     for (const fogMode of [1, 2, 3]) {
         fixedFunction.push(["ff ps fog " + fogMode,
             executor.buildFixedFunctionPixelShader(psBase({

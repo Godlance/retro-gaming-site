@@ -14,11 +14,12 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const { D3D9WebGPUExecutor } = require("../d3d9-webgpu/d3d9_executor.js");
+const { D3D9WebGPUExecutor, buildFixedFunctionPixelShader } =
+    require("../d3d9-webgpu/d3d9_executor.js");
 const shaderPipeline = require("../d3d9-webgpu/d3d9_shader_pipeline.js");
 
 const OP = {
-    HELLO: 1, CREATE_DEVICE: 2, RESET: 3, PRESENT: 4, CLEAR: 5,
+    HELLO: 1, CREATE_DEVICE: 2, RESET: 3, PRESENT: 4, CLEAR: 5, COLOR_FILL: 9,
     BEGIN_SCENE: 6, END_SCENE: 7,
     CREATE_BUFFER: 0x100, UPDATE_BUFFER: 0x101, DESTROY_RESOURCE: 0x103,
     CREATE_TEXTURE_2D: 0x110, UPDATE_TEXTURE: 0x113,
@@ -38,8 +39,10 @@ const OP = {
 
 const D9WG_MAGIC = 0x47573944;
 const BATCH_FLAG_PRESENT = 1;
-const DECLUSAGE = { POSITION: 0, NORMAL: 3, TEXCOORD: 5, POSITIONT: 9, COLOR: 10 };
-const DECLTYPE = { FLOAT1: 0, FLOAT2: 1, FLOAT3: 2, FLOAT4: 3, D3DCOLOR: 4 };
+const DECLUSAGE = { POSITION: 0, BLENDWEIGHT: 1, BLENDINDICES: 2, NORMAL: 3,
+    TEXCOORD: 5, TANGENT: 6, BINORMAL: 7, POSITIONT: 9, COLOR: 10 };
+const DECLTYPE = { FLOAT1: 0, FLOAT2: 1, FLOAT3: 2, FLOAT4: 3, D3DCOLOR: 4,
+    UBYTE4: 5, SHORT2: 6, SHORT4: 7, UBYTE4N: 8, UDEC3: 13, DEC3N: 14 };
 const DEVICE = 0x00100002;
 
 // ---- D9WG batch builder ----
@@ -204,6 +207,24 @@ const VS_BYTECODE = [
     END,
 ];
 
+// M5 skeletal-layout fixture. The maths is intentionally small; the important
+// contract here is that BLENDWEIGHT/BLENDINDICES and the compact auxiliary
+// semantics all reach v# with D3D9 float4 values, ready for a real matrix
+// palette shader to index the c# register file.
+const VS_M5_SKINNING_INPUTS = [
+    VS(2, 0),
+    instr(SIO.DCL, 2), dcl(DECLUSAGE.POSITION), dst(REG.INPUT, 0),
+    instr(SIO.DCL, 2), dcl(DECLUSAGE.BLENDWEIGHT), dst(REG.INPUT, 1),
+    instr(SIO.DCL, 2), dcl(DECLUSAGE.BLENDINDICES), dst(REG.INPUT, 2),
+    instr(SIO.DCL, 2), dcl(DECLUSAGE.TEXCOORD), dst(REG.INPUT, 3),
+    instr(SIO.DCL, 2), dcl(DECLUSAGE.TANGENT), dst(REG.INPUT, 4),
+    instr(SIO.DCL, 2), dcl(DECLUSAGE.NORMAL), dst(REG.INPUT, 5),
+    instr(SIO.DCL, 2), dcl(DECLUSAGE.BINORMAL), dst(REG.INPUT, 6),
+    instr(SIO.M4x4, 3), dst(REG.RASTOUT, 0), src(REG.INPUT, 0), src(REG.CONST, 0),
+    instr(SIO.ADD, 3), dst(REG.ATTROUT, 0), src(REG.INPUT, 1), src(REG.INPUT, 2),
+    END,
+];
+
 // ps_2_0: dcl_2d s0 / dcl t0 / texld r0, t0, s0 / mul oC0, r0, c1
 const PS_BYTECODE = [
     PS(2, 0),
@@ -249,6 +270,14 @@ function makeFakeWebGPU() {
             this.ops.push(["scissor", ...a]);
             calls.push(["setScissorRect", ...a]);
         }
+        setBlendConstant(value) {
+            this.ops.push(["blendConstant", value]);
+            calls.push(["setBlendConstant", value]);
+        }
+        setStencilReference(value) {
+            this.ops.push(["stencilReference", value]);
+            calls.push(["setStencilReference", value]);
+        }
         setVertexBuffer(slot, buffer, offset) {
             this.ops.push(["vertexBuffer", slot, buffer, offset]);
         }
@@ -266,6 +295,9 @@ function makeFakeWebGPU() {
             this.passes.push(pass);
             calls.push(["beginRenderPass", descriptor, pass]);
             return pass;
+        }
+        copyTextureToTexture(...args) {
+            calls.push(["copyTextureToTexture", ...args]);
         }
         finish() { return { encoder: this }; }
     }
@@ -715,6 +747,35 @@ await test("a second draw with the same sampler state reuses the cached sampler"
     await executor.idle();
     assert.equal(executor.stats.samplersCreated, 1);
     assert.equal(executor.stats.samplerHits, 1);
+});
+
+await test("fixed-function BORDER sampler state reaches the generated shader",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD),
+    ];
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 4, 4, 1, 21, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x102, elements)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        command(OP.SET_SAMPLER_STATE, u32(DEVICE, 0, 1, 4)),
+        command(OP.SET_SAMPLER_STATE, u32(DEVICE, 0, 2, 4)),
+        command(OP.SET_SAMPLER_STATE, u32(DEVICE, 0, 4, 0x80402010)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    const wgsl = find("createRenderPipeline").pop()[1].fragment.module.code;
+    assert.ok(wgsl.includes("let tex0 = select(vec4<f32>("));
+    assert.ok(wgsl.includes("0.25098039") && wgsl.includes("0.50196078"));
+    assert.ok(!executor.stats.unreadStateIds ||
+        !(executor.stats.unreadStateIds.samplerStates || []).includes(4),
+    "BORDERCOLOR is consumed together with BORDER addressing");
 });
 
 await test("multi-stream declarations bind one vertex buffer per stream", async () => {
@@ -1787,6 +1848,84 @@ await test("a cube texture binds as a cube view and uploads per face",
         "the cascade must declare a cube sampler:\n" + wgsl);
 });
 
+await test("exhausting the debug preview budget never drops a game texture upload",
+        async () => {
+    const { executor, find } = makeExecutor();
+    executor.previewBudget = 0;
+    const payload = Buffer.alloc(48);
+    payload.writeUInt32LE(0x611, 0);
+    payload.writeUInt32LE(0, 4);
+    payload.writeUInt32LE(0, 8);
+    payload.writeUInt32LE(0, 12);
+    payload.writeUInt32LE(0, 16);
+    payload.writeUInt32LE(4, 20);
+    payload.writeUInt32LE(4, 24);
+    payload.writeUInt32LE(1, 28);
+    payload.writeUInt32LE(16, 32);
+    payload.writeUInt32LE(0, 36);
+    payload.writeUInt32LE(64, 40);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x611, 4, 4, 1, 21, 0, 1)),
+        command(OP.UPDATE_TEXTURE, payload, Buffer.alloc(64, 0x7f), 44),
+    ]));
+    await executor.idle();
+    assert.equal(executor.stats.texturePreviewsSkipped, 1,
+        "the bounded diagnostic copy should be skipped");
+    assert.equal(executor.stats.textureUploads, 1,
+        "the actual upload must still be counted");
+    assert.ok(find("writeTexture").some(call =>
+        call[1].texture && call[1].texture.descriptor.size.width === 4),
+        "preview exhaustion must not bypass queue.writeTexture");
+});
+
+await test("a texture updated after a recorded draw is renamed", async () => {
+    const { executor, find } = makeExecutor();
+    const upload = fill => {
+        const payload = Buffer.alloc(48);
+        payload.writeUInt32LE(0x612, 0);
+        payload.writeUInt32LE(0, 4);
+        payload.writeUInt32LE(0, 8);
+        payload.writeUInt32LE(0, 12);
+        payload.writeUInt32LE(0, 16);
+        payload.writeUInt32LE(4, 20);
+        payload.writeUInt32LE(4, 24);
+        payload.writeUInt32LE(1, 28);
+        payload.writeUInt32LE(16, 32);
+        payload.writeUInt32LE(0, 36);
+        payload.writeUInt32LE(64, 40);
+        return command(OP.UPDATE_TEXTURE, payload, Buffer.alloc(64, fill), 44);
+    };
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD),
+    ];
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 60)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x612, 4, 4, 1, 21, 0, 1)),
+        upload(0x11),
+        command(OP.SET_FVF, fvfPayload(0x102, elements)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x612, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        upload(0x22),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.textureUpdateHazards, 1);
+    assert.equal(executor.stats.textureRenames, 1);
+    const groups = find("createBindGroup").filter(call =>
+        call[1].entries.some(entry => entry.binding === 2));
+    assert.equal(groups.length, 2);
+    const firstView = groups[0][1].entries.find(entry => entry.binding === 2).resource;
+    const secondView = groups[1][1].entries.find(entry => entry.binding === 2).resource;
+    assert.notEqual(firstView.texture, secondView.texture,
+        "the earlier bind group must retain the old GPU texture");
+});
+
 await test("D3DRS_SCISSORTESTENABLE gates the scissor rect", async () => {
     const { executor, find } = makeExecutor();
     const scissor = Buffer.alloc(20);
@@ -1998,6 +2137,27 @@ await test("D3DSAMP_SRGBTEXTURE samples through an -srgb view", async () => {
         "the second draw must sample through the -srgb view");
 });
 
+await test("D3DRS_SRGBWRITEENABLE renders through an -srgb target view", async () => {
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, 194, 1, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.srgbWriteRequests, 1);
+    assert.equal(executor.stats.srgbWriteUnavailable, 0);
+    assert.deepEqual(find("configure").pop()[1].viewFormats,
+        ["bgra8unorm-srgb"]);
+    assert.equal(find("createRenderPipeline").pop()[1]
+        .fragment.targets[0].format, "bgra8unorm-srgb");
+});
+
 await test("a state nothing reads is listed rather than silently dropped",
         async () => {
     // The expensive failures on this path have all been silent: a state the app
@@ -2017,6 +2177,247 @@ await test("a state nothing reads is listed rather than silently dropped",
         renderStates: [D3DRS_WRAP0],
         samplerStates: [D3DSAMP_MIPMAPLODBIAS],
     }, "only the unread ones, and each listed once");
+});
+
+await test("M5 compact declarations feed skeletal shader inputs without CPU repacking",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const shader = shaderCreatePayload(0x40000021, VS_M5_SKINNING_INPUTS);
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.UBYTE4N, DECLUSAGE.BLENDWEIGHT),
+        element(0, 16, DECLTYPE.UBYTE4, DECLUSAGE.BLENDINDICES),
+        element(0, 20, DECLTYPE.SHORT2, DECLUSAGE.TEXCOORD),
+        element(0, 24, DECLTYPE.SHORT4, DECLUSAGE.TANGENT),
+        element(0, 32, DECLTYPE.DEC3N, DECLUSAGE.NORMAL),
+        element(0, 36, DECLTYPE.UDEC3, DECLUSAGE.BINORMAL),
+    ];
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 400)),
+        command(OP.CREATE_VERTEX_DECLARATION,
+            declarationPayload(0x30000021, elements)),
+        command(OP.CREATE_VERTEX_SHADER, shader.payload, shader.blob,
+            shader.blobOffsetField),
+        command(OP.SET_VERTEX_DECLARATION, u32(DEVICE, 0x30000021)),
+        command(OP.SET_VERTEX_SHADER, u32(DEVICE, 0x40000021)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 40)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.drawsWithCompactVertexInputs, 1);
+    const pipeline = find("createRenderPipeline").pop()[1];
+    assert.deepEqual(pipeline.vertex.buffers[0].attributes.map(a => a.format),
+        ["float32x3", "unorm8x4", "uint8x4", "sint16x2", "sint16x4",
+            "uint32", "uint32"]);
+    const wgsl = pipeline.vertex.module.code;
+    assert.ok(wgsl.includes("@location(2) in2: vec4<u32>"));
+    assert.ok(wgsl.includes("d9_unpack_dec3n(in5)"));
+    assert.ok(wgsl.includes("d9_unpack_udec3(in6)"));
+});
+
+await test("shadow render states map to signed projection, exact blend and depth-stencil",
+        async () => {
+    const floatBitsOf = value => {
+        const bits = new ArrayBuffer(4);
+        new Float32Array(bits)[0] = value;
+        return new Uint32Array(bits)[0];
+    };
+    const R = { SRCBLEND: 19, DESTBLEND: 20, ALPHABLENDENABLE: 27,
+        STENCILENABLE: 52, STENCILFAIL: 53, STENCILZFAIL: 54,
+        STENCILPASS: 55, STENCILFUNC: 56, STENCILREF: 57,
+        STENCILMASK: 58, STENCILWRITEMASK: 59, BLENDFACTOR: 193,
+        DEPTHBIAS: 195, SLOPE: 175, SEPARATEALPHA: 206,
+        SRCBLENDALPHA: 207, DESTBLENDALPHA: 208, BLENDOPALPHA: 209 };
+    const { executor, find } = makeExecutor();
+    const states = [
+        [R.ALPHABLENDENABLE, 1], [R.SRCBLEND, 14], [R.DESTBLEND, 15],
+        [R.BLENDFACTOR, 0x80402010], [R.SEPARATEALPHA, 1],
+        [R.SRCBLENDALPHA, 2], [R.DESTBLENDALPHA, 1],
+        [R.BLENDOPALPHA, 1], [R.STENCILENABLE, 1], [R.STENCILFAIL, 3],
+        [R.STENCILZFAIL, 4], [R.STENCILPASS, 5], [R.STENCILFUNC, 7],
+        [R.STENCILREF, 0x55], [R.STENCILMASK, 0xff],
+        [R.STENCILWRITEMASK, 0x0f], [R.DEPTHBIAS, floatBitsOf(1 / 0x1000000)],
+        [R.SLOPE, floatBitsOf(1.5)],
+    ].map(([id, value]) => command(OP.SET_RENDER_STATE,
+        u32(DEVICE, id, value, 0)));
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        ...states,
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    const pipeline = find("createRenderPipeline").pop()[1];
+    assert.deepEqual(pipeline.fragment.targets[0].blend, {
+        color: { srcFactor: "constant", dstFactor: "one-minus-constant",
+            operation: "add" },
+        alpha: { srcFactor: "one", dstFactor: "zero", operation: "add" },
+    });
+    assert.equal(pipeline.depthStencil.depthBias, 1);
+    assert.equal(pipeline.depthStencil.depthBiasSlopeScale, 1.5);
+    assert.deepEqual(pipeline.depthStencil.stencilFront, {
+        compare: "greater-equal", failOp: "replace",
+        depthFailOp: "increment-clamp", passOp: "decrement-clamp",
+    });
+    assert.equal(pipeline.depthStencil.stencilReadMask, 0xff);
+    assert.equal(pipeline.depthStencil.stencilWriteMask, 0x0f);
+    assert.deepEqual(find("setBlendConstant").pop()[1], {
+        r: 0x40 / 255, g: 0x20 / 255, b: 0x10 / 255, a: 0x80 / 255,
+    });
+    assert.equal(find("setStencilReference").pop()[1], 0x55);
+
+    const projected = buildFixedFunctionPixelShader({
+        usesTextureFactor: false, specularEnable: false, fogMode: 0,
+        alphaTest: { enabled: false, func: 8, reference: 0 },
+        stages: [{ index: 0, colorOp: 2, colorArg0: 1, colorArg1: 2,
+            colorArg2: 1, alphaOp: 2, alphaArg0: 1, alphaArg1: 2,
+            alphaArg2: 1, resultArg: 1, samplesTexture: true,
+            textureType: "2d", coordVarying: 0, projected: true,
+            transformCount: 3, usesConstant: false }],
+    }, null);
+    assert.ok(projected.includes("select(-max(abs("),
+        "projected shadows must preserve a negative q divisor");
+
+    const bordered = buildFixedFunctionPixelShader({
+        usesTextureFactor: false, specularEnable: false, fogMode: 0,
+        alphaTest: { enabled: false, func: 8, reference: 0 },
+        stages: [{ index: 0, colorOp: 2, colorArg0: 1, colorArg1: 2,
+            colorArg2: 1, alphaOp: 2, alphaArg0: 1, alphaArg1: 2,
+            alphaArg2: 1, resultArg: 1, samplesTexture: true,
+            textureType: "2d", coordVarying: 0, projected: true,
+            transformCount: 3, usesConstant: false, addressU: 4,
+            addressV: 4, addressW: 1, borderColor: 0x80402010 }],
+    }, null);
+    assert.ok(bordered.includes("let tex0 = select(vec4<f32>("),
+        "BORDER addressing must select the D3D border colour in WGSL");
+    assert.ok(bordered.includes(".x >= 0.0") &&
+        bordered.includes(".y <= 1.0"),
+        "both BORDER axes must reject projected coordinates outside [0,1]");
+    assert.ok(bordered.includes("0.25098039") &&
+        bordered.includes("0.50196078"),
+        "D3DCOLOR border bytes must be converted from ARGB to RGBA");
+});
+
+await test("D3D9 default blending is ONE/ZERO when blending is first enabled",
+        async () => {
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, 27, 1, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.deepEqual(find("createRenderPipeline").pop()[1]
+        .fragment.targets[0].blend, {
+        color: { srcFactor: "one", dstFactor: "zero", operation: "add" },
+        alpha: { srcFactor: "one", dstFactor: "zero", operation: "add" },
+    });
+});
+
+await test("M4 ColorFill preserves pixels outside a partial rectangle", async () => {
+    const D3DUSAGE_RENDERTARGET = 1;
+    const payload = Buffer.alloc(32);
+    payload.writeUInt32LE(DEVICE, 0);
+    payload.writeUInt32LE(0x501, 4);
+    payload.writeUInt32LE(0, 8);
+    payload.writeUInt32LE(0x80402010, 12);
+    [4, 6, 20, 22].forEach((value, index) =>
+        payload.writeInt32LE(value, 16 + index * 4));
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x501, 64, 64, 1, 21, D3DUSAGE_RENDERTARGET, 0)),
+        command(OP.COLOR_FILL, payload),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.blitsSkipped, 0);
+    assert.equal(executor.stats.colorFills, 1);
+    const pass = find("beginRenderPass").pop()[2];
+    assert.equal(pass.descriptor.colorAttachments[0].loadOp, "load",
+        "a sub-rect fill must retain the rest of the attachment");
+    assert.deepEqual(pass.ops.find(op => op[0] === "viewport").slice(1, 5),
+        [4, 6, 16, 16]);
+    assert.deepEqual(pass.ops.find(op => op[0] === "draw"), ["draw", 3]);
+});
+
+await test("M4 target fills and copies retain D3D command order", async () => {
+    const D3DUSAGE_RENDERTARGET = 1;
+    const fill = Buffer.alloc(32);
+    fill.writeUInt32LE(DEVICE, 0);
+    fill.writeUInt32LE(0x501, 4);
+    fill.writeUInt32LE(0, 8);
+    fill.writeUInt32LE(0xff204060, 12);
+    [0, 0, 64, 64].forEach((value, index) =>
+        fill.writeInt32LE(value, 16 + index * 4));
+    const stretch = Buffer.alloc(56);
+    stretch.writeUInt32LE(DEVICE, 0);
+    stretch.writeUInt32LE(0x501, 4);
+    stretch.writeUInt32LE(0, 8);
+    [0, 0, 64, 64].forEach((value, index) =>
+        stretch.writeInt32LE(value, 12 + index * 4));
+    stretch.writeUInt32LE(0x502, 28);
+    stretch.writeUInt32LE(0, 32);
+    [0, 0, 64, 64].forEach((value, index) =>
+        stretch.writeInt32LE(value, 36 + index * 4));
+    stretch.writeUInt32LE(1, 52);
+    const { executor, fake } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x501, 64, 64, 1, 21, D3DUSAGE_RENDERTARGET, 0)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x502, 64, 64, 1, 21, D3DUSAGE_RENDERTARGET, 0)),
+        command(OP.COLOR_FILL, fill),
+        command(0x8, stretch),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    const fillIndex = fake.calls.findIndex(call => call[0] === "beginRenderPass");
+    const copyIndex = fake.calls.findIndex(call => call[0] ===
+        "copyTextureToTexture");
+    assert.ok(fillIndex >= 0 && copyIndex > fillIndex,
+        "ColorFill must be encoded before the following StretchRect copy");
+    assert.equal(executor.stats.queueSubmits, 1,
+        "ordered target operations share the Present submission");
+});
+
+await test("M4 Clear honours its rectangle list", async () => {
+    const clear = Buffer.alloc(40);
+    clear.writeUInt32LE(DEVICE, 0);
+    clear.writeUInt32LE(1, 4); // D3DCLEAR_TARGET
+    clear.writeUInt32LE(0xff336699, 8);
+    clear.writeFloatLE(1, 12);
+    clear.writeUInt32LE(0, 16);
+    clear.writeUInt32LE(1, 20);
+    [8, 10, 28, 34].forEach((value, index) =>
+        clear.writeInt32LE(value, 24 + index * 4));
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CLEAR, clear),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.partialClears, 1);
+    const pass = find("beginRenderPass").pop()[2];
+    assert.equal(pass.descriptor.colorAttachments[0].loadOp, "load");
+    assert.deepEqual(pass.ops.find(op => op[0] === "viewport").slice(1, 5),
+        [8, 10, 20, 24]);
+    assert.deepEqual(pass.ops.find(op => op[0] === "draw"), ["draw", 3]);
 });
 
 // ---- report ----

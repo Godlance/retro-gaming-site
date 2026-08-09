@@ -1198,8 +1198,10 @@ War3 确实不需要等 M2 的 shader 编译管线就能跑到主菜单**（caps
    （renaming）**：当被写的缓冲已经被本帧**已录制**的绘制读过时，分配一
    块新的 GPU 缓冲承载新内容，旧的留给先前的绘制并在提交后回收。判据是
    "本帧是否已被绘制引用"，所以"上传一次、绘制多次"这条常规路径一次都不
-   会触发重命名。`bufferRenames` 计数暴露实际发生频率；纹理有同类暴露面
-   但重命名代价高得多，目前只用 `textureUpdateHazards` 计数、暂不修复。
+   会触发重命名。`bufferRenames` 计数暴露实际发生频率。纹理的同类冒险也
+   已用按 mip/array-layer 保存的 CPU 影子完成重命名；旧 view 留给已录制
+   的 bind group，新 view 供后续绘制使用，`textureUpdateHazards` 与
+   `textureRenames` 分别统计检测和实际修复次数。
 
    遗留的性能风险：重命名会整份重传该缓冲的影子。对整块改写（DISCARD 的
    典型用法）不比 guest 本来发的数据更多，但"对一个大缓冲做小范围局部
@@ -1252,8 +1254,8 @@ War3 进入实战场景）需要在真实 v86 XP 客户机里人工执行——W
 版本，进战役，观察 host 端 `v86gl.d3d9Executor.getStats()` 的
 `shadersTranslated`/`shaderTranslationFailures`/`drawsSkippedForBadShader`/
 `shaderCompileErrors`/`droppedDraws` 五项。若画面出现回归，先用
-`D9WG_SHADER_MODEL=0` 把 caps 退回 M1 的固定管线档，确认问题是否出在
-shader 路径上——这个开关就是为这次二分而加的。
+`D9WG_CAPS_PROFILE=ffp` 把 caps 切到 M4.5 固定管线档，确认问题是否出在
+shader 路径上；旧的 `D9WG_SHADER_MODEL=0` 仍作为兼容写法。
 
 **2026-08-07 第二次真机运行后补的三项**（几何修好之后暴露出来的）：
 
@@ -1332,7 +1334,8 @@ shader 路径上——这个开关就是为这次二分而加的。
 3. **D3D9 硬件光标 + `CreateOffscreenPlainSurface`**（新 opcode
    `0x21A`-`0x21C`）。实测 War3 两个光标 API 都不调、而是把指针当几何体
    画，所以这条对它是死代码；但对确实使用硬件光标的游戏是必需的，保留。
-   GDI 光标抓取作为回退，默认关闭（`D9WG_GDI_CURSOR=1` 启用）。
+   GDI 光标抓取作为回退在当时默认关闭；这条默认值已被 2026-08-09 的战役
+   验收推翻，现在默认启用，只有 `D9WG_GDI_CURSOR=0` 才关闭。
 4. **压缩纹理 `rowsPerImage` 传的是像素行数**而非块行数（BCn 块是 4x4），
    规范错误，已修。
 
@@ -1363,11 +1366,12 @@ shader 路径上——这个开关就是为这次二分而加的。
 - ~~**MRT 的 `oC1`-`oC3` 被丢弃**，只写 `oC0`（MRT 本体在 M4）。~~
   **M3 已解决**：翻译器按 shader 实际写入的最高 `oC#` 生成连续的
   `@location` 输出，host 端绑定至多四个颜色附件。
-- **`UBYTE4`/`SHORT2`/`SHORT4`/`UDEC3`/`DEC3N` 顶点格式仍被拒绝**。前三种
-  在 D3D9 里以未归一化的浮点送进 shader，而 WebGPU 的 `uint8x4`/`sint16x2`
-  给的是整型向量，要修就得让 shader 模块知道顶点声明，从而破坏
-  "一个 shader 一个模块"的缓存前提；后两种是 10:10:10 打包，WebGPU 没有
-  对应格式。它们主要出现在蒙皮网格里，归入 M5。
+- ~~**`UBYTE4`/`SHORT2`/`SHORT4`/`UDEC3`/`DEC3N` 顶点格式仍被拒绝**。~~
+  **M5 已解决**：前三种分别用 `uint8x4`/`sint16x2`/`sint16x4` 取入并在
+  declaration-specific WGSL variant 中扩展为 D3D9 规定的未归一化 float4；
+  后两种以 `uint32` 取入，在 WGSL 中解包 10:10:10（`DEC3N` 同时做符号扩展
+  和 snorm 归一化）。variant key 同时包含 BGRA swizzle 与紧凑格式转换，
+  不会污染同一 shader 的其他顶点声明。
 - **vs_3_0 顶点纹理采样**按 9.9 节明确拒绝（`dcl sampler` 出现在 vertex
   shader 里直接翻译失败），caps 里 `VertexTextureFilterCaps` 报 0。这是
   WoW（M5）的需求，M3 的两个目标游戏都用不到，仍未做。
@@ -1464,9 +1468,10 @@ M3 的主体工作就是把它们变成真的。
   都不是后台缓冲 → 真正的 `copyTextureToTexture`（无 pass 无 shader）；其余
   → 一次 blit pass（全视口四边形采样源，`setViewport` 限定目标矩形），覆盖
   缩放、格式转换和后台缓冲；压缩格式作为目标仍不实现并计数（BCn 不能当
-  render attachment，没有东西可画进去）。部分矩形的 `ColorFill` 同样明确
-  不实现并计数——WebGPU 的 `loadOp: "clear"` 覆盖整个附件，`setScissorRect`
-  并不收窄它，扩大范围会擦掉 app 保留的像素。
+  render attachment，没有东西可画进去）。~~部分矩形的 `ColorFill` 明确
+  不实现并计数。~~ M4 已用 viewport 限定的全屏三角形 draw 实现局部填充，
+  保留矩形外像素；带 rect list 的 `Clear` 也使用同一类独立 pass 完成颜色、
+  深度与 stencil 的按位选择性局部清除。
 - **涉及后台缓冲的 blit 必须延迟到 Present**，与绘制同理：swapchain 贴图只在
   获取它的那个任务内有效，而一帧会跨多次 PCI 提交到达。第一版在命令到达处
   立刻执行，结果是 NFS9 每帧报一条"host 无法寻址这个 surface"——**后台缓冲
@@ -1540,12 +1545,12 @@ pipeline key 与 layout，并为每种维度准备一张 1x1 白色兜底纹理�
   WGSL 没有 clip distance，按 9.11 节必须变成"顶点算距离 + 片元
   discard"，而这会改动两个阶段共同遵守的 varying 契约，需要同时改翻译器
   与固定管线两侧。
-- **`UBYTE4`/`SHORT2`/`SHORT4`/`UDEC3`/`DEC3N` 顶点格式**仍被拒绝（M5，
-  见下方 M2 的已知折衷）。
+- ~~**`UBYTE4`/`SHORT2`/`SHORT4`/`UDEC3`/`DEC3N` 顶点格式**仍被拒绝。~~
+  M5 已用声明相关的 WGSL 输入转换完成。
 - **vs_3_0 顶点纹理采样**（9.9）仍拒绝，`VertexTextureFilterCaps` 报 0。
   这是 WoW（M5）的需求，两个目标游戏都用不到。
-- **纹理的写后录制冒险**（`textureUpdateHazards`）仍只计数不修复：重命名
-  一张纹理要整份重新分配并重传所有层级，代价远高于缓冲区，先量频率。
+- ~~**纹理的写后录制冒险**（`textureUpdateHazards`）仍只计数不修复。~~
+  已实现纹理重命名；`textureFullCopyRenameBytes` 暴露重传成本。
 - **`glbridge/webgpu-runtime/` 共享模块**仍未抽取（第 17 章本就排在里程碑
   之后）。
 
@@ -1556,8 +1561,8 @@ pipeline key 与 layout，并为每种维度准备一张 1x1 白色兜底纹理�
 `renderTargetsCreated`/`renderTargetBinds`/`renderPasses`/
 `blitsSkipped`/`shadersTranslated`/`shaderTranslationFailures`。
 `blitsSkipped` 非零说明它依赖了压缩格式目标的 `StretchRect` 或部分矩形
-`ColorFill`，那是下一步该做的事；`blitsThroughBackBuffer` 则量出这个游戏
-到底有多依赖抓帧后处理。
+`StretchRect` 的压缩目标或其他真实缺口；部分 `ColorFill` 已不再进入该计数。
+`blitsThroughBackBuffer` 则量出这个游戏到底有多依赖抓帧后处理。
 
 **2026-08-08：M2 的验收终于兑现，验收目标是极品飞车 9（Most Wanted, 2005）。**
 
@@ -1601,8 +1606,10 @@ M2 的状态记录里写着"SM2.0 路径的真实游戏验收仍然悬空"——
    上的观感就是**过曝成白色**，而不是"gamma 有点不对"。WebGPU 没有
    sampler 级的 sRGB——它是纹理**格式**的属性——所以实现方式是建纹理时声明
    `viewFormats: ["...-srgb"]`，绑定时按该 stage 的 sampler state 选择用哪个
-   view。`D3DRS_SRGBWRITEENABLE`（写回时编码）仍未实现：它需要渲染目标的
-   `-srgb` view，因而要进 pipeline key，现在只计数告警。
+   view。`D3DRS_SRGBWRITEENABLE`（写回时编码）也已在 M5 完成：canvas 与
+   可渲染纹理创建时声明兼容的 `-srgb` view，目标解析与 pipeline key 按该
+   render state 选择线性或 sRGB 格式；没有 sRGB sibling 的目标会计入
+   `srgbWriteUnavailable`，不会静默假装已经编码。
 
 **并且新增了一条纪律性设施：未被读取的状态审计。** 这条路径上代价最高的
 失败全都是静默的——app 明显在意的某个状态（否则它不会去 Set）渲染器从来
@@ -1610,6 +1617,53 @@ M2 的状态记录里写着"SM2.0 路径的真实游戏验收仍然悬空"——
 `onSetRenderState`/`onSetSamplerState` 现在把每个不在消费白名单里的 state id
 记进 `getStats().unreadStateIds`（只记 id 不记次数，天然有界）。这把"这里
 为什么看起来不对"从猜测变成一张有限的清单。上面第 4 条正是用这个思路找到的。
+
+**2026-08-08：Warcraft III 投影阴影黑块修复。** 截图里覆盖大片地形的黑色
+三角/梯形不是 shadow texture 本身，而是 `D3DTTFF_PROJECTED` 的齐次除法把
+负 `q` 写成了 `max(q, 1e-6)`：投影仪背后的坐标因此变成极大的正 UV，整块
+地形三角形反复采到阴影贴图边缘的不透明 texel。fixed-function cascade 与
+shader `_dz`/`_dw` modifier 现在都用保留符号的 epsilon 除数。与此同时补齐
+War3 阴影 pass 会依赖的 blend factor/separate alpha、双面 stencil/reference、
+constant/slope depth bias，并修复同一 render pass 内关闭 scissor 后仍沿用上一
+draw 矩形的动态状态泄漏。对应回归同时覆盖 WGSL 文本、pipeline descriptor 与
+真实 WebGPU validation。
+
+**2026-08-09：Warcraft III 战役 UI、战争迷雾、阴影与鼠标的共同状态根因。**
+进入战役后才同时暴露出的四种表象，并不是四个互不相关的贴图缺陷，而是 guest
+状态缓存从错误初值开始：`device_init_states()` 把 render state、texture-stage
+state 全部清成 0，sampler state 在 Reset 时甚至没有重置；但三个 `Set*State`
+入口都会在“缓存值等于新值”时省略协议命令。D3D9 的真实默认值大量不是 0，
+因此第一次显式切换会被错误吞掉：
+
+- UI/文字/图标 pass 常先设 `ZENABLE=FALSE`、`ZWRITEENABLE=FALSE`。旧缓存认为
+  它们已经是 FALSE，不发命令；host 按正确的 D3D9 默认值继续开着深度测试与
+  深度写入，场景深度便会挡住后画的 glyph/icon quad；
+- 迷雾和投影遮罩常让 stage 1 复用 texcoord 0。D3D9 的
+  `D3DTSS_TEXCOORDINDEX` 默认值是 stage 自己的编号，因此 stage 1 默认应为 1；
+  旧缓存却是 0，War3 第一次写 0 时被省略，host 继续从不存在/错误的 texcoord 1
+  取样，表现为整层遮罩错误或消失；
+- `COLORARG*`/`ALPHAARG*` 也存在同类非零默认值，错误的首个状态省略会直接改变
+  UI glyph alpha 与多层纹理合成；
+- shadow/fog overlay 的 `ZWRITEENABLE=FALSE` 被省略后还会污染后续深度，令表象
+  随绘制顺序变化，看起来像随机阴影错误。
+
+现在 guest 初始化完整的 D3D9 render/texture-stage/sampler 默认值，Reset 同样
+恢复它们；host 的初始 blend factor 也由错误的 `SRCALPHA/INVSRCALPHA` 对齐为
+D3D9 的 `ONE/ZERO`。这样“相等则省略”才是合法优化。除此之外，固定管线实现了
+`D3DTADDRESS_BORDER` + `D3DSAMP_BORDERCOLOR` 的 shader 级越界替换（WebGPU
+sampler 没有 border colour），避免投影坐标落到域外时把边缘不透明 texel 扩散
+到整块地形；GDI 指针回退改为默认启用，应用自己设置的 D3D9 hardware cursor
+仍有更高优先级，确实自己画鼠标几何的游戏可用 `D9WG_GDI_CURSOR=0` 关闭。
+
+站点同时把 `game.html` 中两个 D3D9 host 脚本的 cache key 从旧的
+`d3d9-m3-20260808d` 提升到 `d3d9-m5-war3-state-20260809`。只重新执行
+`build.sh` 会更新 guest DLL，但投影除法、BORDER 和 WebGPU pipeline 都在 host
+JavaScript 中；不提升 URL 的浏览器缓存可能让新 DLL 继续搭配旧 executor，造成
+“已经重编 DLL 但画面完全没变”的假阴性。
+
+对应自动验证为：52 个 executor batch 回归、31 个 shader translator 回归、
+113 个由 Naga 实编译的 WGSL 变体，以及真实 Chrome/WebGPU 页面（90 条命令，
+5 个 draw，`droppedDraws=0`、`shaderCompileErrors=0`、WebGPU validation PASS）。
 
 ### M3.5：真实游戏 shader 语料（新增，前置于任何翻译器改动）
 
@@ -1633,19 +1687,28 @@ D3D9 游戏都是语料贡献者，哪怕它在 v86 里只能跑到主菜单就�
 
 ### M4：独立 sampler state 收尾 + MRT + WoW 登录/选角
 
-**2026-08-08：本节的渲染能力清单已在 M3 提前完成**（理由与范围见 M3 状态
-记录），剩下的只有 WoW 客户端本身的验收，以及三项 M3 明确未做的：
+**2026-08-08：本节的渲染能力清单已完成**（渲染目标主体在 M3 提前完成，
+本轮补齐局部操作与精确来源回读）。剩下的是 WoW 客户端本身的人工验收：
 
 - ~~MRT（12 章后半部分）。~~ M3 完成。
-- ~~`StretchRect`/`ColorFill`。~~ M3 完成（缩放 `StretchRect` 与部分矩形
-  `ColorFill` 明确不实现并计数）。`GetRenderTargetData`（对已知来源内容）
-  仍未做。
+- ~~`StretchRect`/`ColorFill`。~~ M3 完成主体；M4 补齐部分矩形
+  `ColorFill` 和带 rect list 的颜色/深度/stencil `Clear`。
+- ~~`GetRenderTargetData`（对已知来源内容）。~~ guest 为 render target
+  懒建 CPU 镜像；完整 `Clear`/`ColorFill` 与同格式等尺寸的已知源
+  `StretchRect` 可以精确回读，任何 draw 都会令镜像失效。任意 GPU draw
+  结果的同步回读仍按 2.2 节明确不做。
 - ~~Occlusion/Event Query（第 13 章）。~~ M3 以 guest 侧保守结果完成；
   真正的 GPU 侧计数需要第 6.7 节的 host→guest 回传通道，仍未做。
 - 验收：WoW 登录界面、服务器列表、角色选择（含单个 3D 角色模型预览与
   基础光照）稳定运行。
 
 ### M4.5（可选，用于提前拆解风险）：WoW 固定管线/最低画质路径
+
+**2026-08-08：能力协商已实现。** `D9WG_CAPS_PROFILE=ffp`（也接受 `m4.5`/
+`low`）把 `VertexShaderVersion`/`PixelShaderVersion` 如实降为 0，保留 M1-M4
+已实现的固定管线、贴图与 MRT caps；`sm2`/`m5` 是默认档。旧的
+`D9WG_SHADER_MODEL=0` 只作为兼容别名保留。是否存在可用的 WoW 低画质路径
+仍需要真实客户端验收。
 
 - 背景与前提条件见第 4.7 节。仅在阶段 0 的 WoW API trace 确认"客户端
   真的存在可用的低 shader 版本降级路径"之后才排入计划；如果确认降级
@@ -1658,6 +1721,19 @@ D3D9 游戏都是语料贡献者，哪怕它在 v86 里只能跑到主菜单就�
   的健全性检查（sanity check），而不是最终交付标准。
 
 ### M5：WoW 主世界渲染
+
+**2026-08-08：代码侧主世界渲染清单已完成，真实 WoW 验收待办。**
+
+- 蒙皮声明新增 `UBYTE4`/`SHORT2`/`SHORT4`/`UDEC3`/`DEC3N`，与已有的
+  `BLENDWEIGHT`/`BLENDINDICES` 语义、shader 常量寄存器和 dirty-range 骨骼
+  调色板上传合起来覆盖该路径。
+- M3 已完成的多级 fixed-function texture cascade、cube texture 和 SM2
+  translator 覆盖地形多层混合与环境反射；本轮补齐 sRGB render-target 写入。
+- 完整接入 blend factor/separate alpha、双面 stencil、stencil reference、
+  constant/slope depth bias，并修复 render-pass 内 scissor 动态状态泄漏。
+- 自动验证为 31 项 shader pipeline、112 个 Naga WGSL、50 项 executor；
+  真实 Chrome/WebGPU 页同时覆盖局部 Clear/ColorFill、UBYTE4 shader 输入、
+  cube/RTT 和 sRGB back-buffer view，GPU validation 为 PASS。
 
 - 顶点蒙皮（`BLENDWEIGHT`/`BLENDINDICES` 声明 + vertex shader 里的
   骨骼矩阵调色板，矩阵调色板通过 `SetVertexShaderConstantF` 大批量更新，
@@ -1924,7 +2000,8 @@ vkd3d-shader(wasm)、Tint(wasm) 的构建脚本
 **建议的下一步：**
 
 1. 人工跑 M2 的验收：War3 进入实战场景，按 M2 状态记录里列的五项统计
-   判读结果（必要时用 `D9WG_SHADER_MODEL=0` 二分）。这是目前唯一
+   判读结果（必要时用 `D9WG_CAPS_PROFILE=ffp` 二分；旧的
+   `D9WG_SHADER_MODEL=0` 仍兼容）。这是目前唯一
    卡在自动化之外的验证。
 2. 顺带在同一次运行里跑 `glbridge/sample/d3d9_shader_test.exe`（已随
    `build_smoke_test.sh` 构建），它比整局游戏更容易定位失败点。

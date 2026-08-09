@@ -183,13 +183,33 @@
     const D3DRS_CULLMODE = 22;
     const D3DRS_ZFUNC = 23;
     const D3DRS_ALPHABLENDENABLE = 27;
+    const D3DRS_STENCILENABLE = 52;
+    const D3DRS_STENCILFAIL = 53;
+    const D3DRS_STENCILZFAIL = 54;
+    const D3DRS_STENCILPASS = 55;
+    const D3DRS_STENCILFUNC = 56;
+    const D3DRS_STENCILREF = 57;
+    const D3DRS_STENCILMASK = 58;
+    const D3DRS_STENCILWRITEMASK = 59;
     const D3DRS_COLORWRITEENABLE = 168;
+    const D3DRS_SLOPESCALEDEPTHBIAS = 175;
     const D3DRS_SCISSORTESTENABLE = 174;
+    const D3DRS_TWOSIDEDSTENCILMODE = 185;
+    const D3DRS_CCW_STENCILFAIL = 186;
+    const D3DRS_CCW_STENCILZFAIL = 187;
+    const D3DRS_CCW_STENCILPASS = 188;
+    const D3DRS_CCW_STENCILFUNC = 189;
     const D3DRS_SRGBWRITEENABLE = 194;
     const D3DRS_COLORWRITEENABLE1 = 190;
     const D3DRS_COLORWRITEENABLE2 = 191;
     const D3DRS_COLORWRITEENABLE3 = 192;
     const D3DRS_BLENDOP = 171;
+    const D3DRS_BLENDFACTOR = 193;
+    const D3DRS_DEPTHBIAS = 195;
+    const D3DRS_SEPARATEALPHABLENDENABLE = 206;
+    const D3DRS_SRCBLENDALPHA = 207;
+    const D3DRS_DESTBLENDALPHA = 208;
+    const D3DRS_BLENDOPALPHA = 209;
     // Fixed-function fog. fill_caps() in d3d9_proxy.c advertises
     // D3DPRASTERCAPS_FOGVERTEX/FOGTABLE/WFOG, so a game is entitled to expect
     // these to work; ignoring them left Warcraft III's fogged scenery drawn at
@@ -292,10 +312,9 @@
         "greater", "not-equal", "greater-equal", "always",
     ];
 
-    // D3DBLEND -> GPUBlendFactor. D3D9 numbers these from 1; the entries left
-    // undefined are the ones WebGPU has no direct equivalent for
-    // (BOTHSRCALPHA/BOTHINVSRCALPHA are legacy two-sided factors, and the
-    // BLENDFACTOR pair needs a pipeline-level constant we do not plumb yet).
+    // D3DBLEND -> GPUBlendFactor. The BOTH* values are resolved as a source /
+    // destination pair in pipelineStateFor(); BLENDFACTOR maps to WebGPU's
+    // dynamic blend constant and is installed before each draw.
     const BLEND_FACTORS = [
         undefined,
         "zero",                 // D3DBLEND_ZERO = 1
@@ -309,11 +328,21 @@
         "dst",                  // D3DBLEND_DESTCOLOR
         "one-minus-dst",        // D3DBLEND_INVDESTCOLOR
         "src-alpha-saturated",  // D3DBLEND_SRCALPHASAT
+        undefined,              // D3DBLEND_BOTHSRCALPHA (pair alias)
+        undefined,              // D3DBLEND_BOTHINVSRCALPHA (pair alias)
+        "constant",             // D3DBLEND_BLENDFACTOR
+        "one-minus-constant",   // D3DBLEND_INVBLENDFACTOR
     ];
 
     // D3DBLENDOP -> GPUBlendOperation
     const BLEND_OPS = [
         undefined, "add", "subtract", "reverse-subtract", "min", "max",
+    ];
+
+    // D3DSTENCILOP -> GPUStencilOperation.
+    const STENCIL_OPS = [
+        undefined, "keep", "zero", "replace", "increment-clamp",
+        "decrement-clamp", "invert", "increment-wrap", "decrement-wrap",
     ];
 
     // WebGPU's depth format for the auto depth-stencil surface. D3D9 apps ask
@@ -348,11 +377,16 @@
         [DECLTYPE_FLOAT3]: ["float32x3", 12],
         [DECLTYPE_FLOAT4]: ["float32x4", 16],
         [DECLTYPE_D3DCOLOR]: ["unorm8x4", 4],
+        5: ["uint8x4", 4],     // D3DDECLTYPE_UBYTE4
+        6: ["sint16x2", 4],    // D3DDECLTYPE_SHORT2
+        7: ["sint16x4", 8],    // D3DDECLTYPE_SHORT4
         8: ["unorm8x4", 4],    // D3DDECLTYPE_UBYTE4N
         9: ["snorm16x2", 4],   // D3DDECLTYPE_SHORT2N
         10: ["snorm16x4", 8],  // D3DDECLTYPE_SHORT4N
         11: ["unorm16x2", 4],  // D3DDECLTYPE_USHORT2N
         12: ["unorm16x4", 8],  // D3DDECLTYPE_USHORT4N
+        13: ["uint32", 4],     // D3DDECLTYPE_UDEC3 (unpacked in WGSL)
+        14: ["uint32", 4],     // D3DDECLTYPE_DEC3N (unpacked in WGSL)
         15: ["float16x2", 4],  // D3DDECLTYPE_FLOAT16_2
         16: ["float16x4", 8],  // D3DDECLTYPE_FLOAT16_4
     };
@@ -361,6 +395,7 @@
     const D3DSAMP_ADDRESSU = 1;
     const D3DSAMP_ADDRESSV = 2;
     const D3DSAMP_ADDRESSW = 3;
+    const D3DSAMP_BORDERCOLOR = 4;
     const D3DSAMP_MAGFILTER = 5;
     const D3DSAMP_MINFILTER = 6;
     const D3DSAMP_MIPFILTER = 7;
@@ -391,6 +426,7 @@
     // the code below, not about the enum.
     const CONSUMED_SAMPLER_STATES = new Set([
         D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW,
+        D3DSAMP_BORDERCOLOR,
         D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
         D3DSAMP_MAXANISOTROPY, D3DSAMP_SRGBTEXTURE,
     ]);
@@ -400,13 +436,22 @@
         D3DRS_ALPHAFUNC, D3DRS_SRCBLEND, D3DRS_DESTBLEND, D3DRS_CULLMODE,
         D3DRS_ZFUNC, D3DRS_ALPHABLENDENABLE, D3DRS_COLORWRITEENABLE,
         D3DRS_COLORWRITEENABLE1, D3DRS_COLORWRITEENABLE2, D3DRS_COLORWRITEENABLE3,
-        D3DRS_BLENDOP, D3DRS_FOGENABLE, D3DRS_FOGCOLOR, D3DRS_FOGTABLEMODE,
+        D3DRS_BLENDOP, D3DRS_BLENDFACTOR, D3DRS_SEPARATEALPHABLENDENABLE,
+        D3DRS_SRCBLENDALPHA, D3DRS_DESTBLENDALPHA, D3DRS_BLENDOPALPHA,
+        D3DRS_STENCILENABLE, D3DRS_STENCILFAIL, D3DRS_STENCILZFAIL,
+        D3DRS_STENCILPASS, D3DRS_STENCILFUNC, D3DRS_STENCILREF,
+        D3DRS_STENCILMASK, D3DRS_STENCILWRITEMASK,
+        D3DRS_TWOSIDEDSTENCILMODE, D3DRS_CCW_STENCILFAIL,
+        D3DRS_CCW_STENCILZFAIL, D3DRS_CCW_STENCILPASS,
+        D3DRS_CCW_STENCILFUNC, D3DRS_DEPTHBIAS, D3DRS_SLOPESCALEDEPTHBIAS,
+        D3DRS_FOGENABLE, D3DRS_FOGCOLOR, D3DRS_FOGTABLEMODE,
         D3DRS_FOGSTART, D3DRS_FOGEND, D3DRS_FOGDENSITY, D3DRS_FOGVERTEXMODE,
         D3DRS_RANGEFOGENABLE, D3DRS_LIGHTING, D3DRS_AMBIENT,
         D3DRS_SPECULARENABLE, D3DRS_TEXTUREFACTOR, D3DRS_COLORVERTEX,
         D3DRS_LOCALVIEWER, D3DRS_NORMALIZENORMALS, D3DRS_DIFFUSEMATERIALSOURCE,
         D3DRS_SPECULARMATERIALSOURCE, D3DRS_AMBIENTMATERIALSOURCE,
         D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_SCISSORTESTENABLE,
+        D3DRS_SRGBWRITEENABLE,
     ]);
 
     const D3DTS_VIEW = 2;
@@ -453,11 +498,17 @@
         return (value + alignment - 1) & ~(alignment - 1);
     }
 
+    function floatFromDWORD(value) {
+        FLOAT_BITS_U32[0] = value >>> 0;
+        return FLOAT_BITS_F32[0];
+    }
+
     // The "-srgb" sibling of a GPU format, or null when there is none. A view
     // can only use a format listed in the texture's viewFormats at creation, so
     // this has to be known up front rather than at bind time.
     function srgbSiblingOf(gpuFormat) {
         return {
+            "bgra8unorm": "bgra8unorm-srgb",
             "rgba8unorm": "rgba8unorm-srgb",
             "bc1-rgba-unorm": "bc1-rgba-unorm-srgb",
             "bc2-rgba-unorm": "bc2-rgba-unorm-srgb",
@@ -1204,12 +1255,47 @@ ${coordBody}${fogBody}    return result;
                 // component count, not the texture's dimensionality.
                 const divisor = coord + "." +
                     ["x", "x", "y", "z", "w"][stage.transformCount || 4];
-                coordExpression = "(" + coordExpression + " / max(" + divisor +
-                    ", 1e-6))";
+                // Preserve the sign of q. Clamping a negative divisor with
+                // max(q, epsilon) turns every behind-projector coordinate into
+                // an enormous positive UV; Warcraft III's projected tree
+                // shadows then sample the opaque edge texel over whole terrain
+                // triangles, producing the characteristic black wedges.
+                const safeDivisor = "select(-max(abs(" + divisor +
+                    "), 1e-6), max(abs(" + divisor + "), 1e-6), " +
+                    divisor + " >= 0.0)";
+                coordExpression = "(" + coordExpression + " / (" +
+                    safeDivisor + "))";
             }
-            samples.push("    let tex" + stage.index + " = textureSample(d9_tex" +
-                stage.index + ", d9_smp" + stage.index + ", " +
-                coordExpression + ");");
+            const sampled = "textureSample(d9_tex" + stage.index +
+                ", d9_smp" + stage.index + ", " + coordExpression + ")";
+            const borderAxes = stage.textureType === "cube" ? [] :
+                (stage.textureType === "3d"
+                    ? [[stage.addressU, "x"], [stage.addressV, "y"],
+                       [stage.addressW, "z"]]
+                    : [[stage.addressU, "x"], [stage.addressV, "y"]])
+                .filter(axis => axis[0] === 4).map(axis => axis[1]);
+            if (borderAxes.length) {
+                // WebGPU has no border-colour sampler.  Clamp for the physical
+                // sample, then replace every coordinate outside the D3D unit
+                // domain on an axis whose addressing mode is BORDER.  This is
+                // especially important after projected division: sampling an
+                // opaque edge texel outside a shadow/fog projector turns whole
+                // terrain triangles into black masks.
+                const inside = borderAxes.map(axis => "(" + coordExpression +
+                    ")." + axis + " >= 0.0 && (" + coordExpression + ")." +
+                    axis + " <= 1.0").join(" && ");
+                const color = stage.borderColor === undefined
+                    ? 0 : stage.borderColor >>> 0;
+                const component = shift =>
+                    (((color >>> shift) & 0xff) / 255).toFixed(8);
+                const border = "vec4<f32>(" + component(16) + ", " +
+                    component(8) + ", " + component(0) + ", " +
+                    component(24) + ")";
+                samples.push("    let tex" + stage.index + " = select(" +
+                    border + ", " + sampled + ", " + inside + ");");
+            } else {
+                samples.push("    let tex" + stage.index + " = " + sampled + ";");
+            }
         }
 
         // The argument pool. `current` and `temp` are the two mutable registers
@@ -1392,6 +1478,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 unsupportedCommands: 0, malformedBatches: 0,
                 droppedDraws: 0,
                 texturesCreated: 0, textureUploads: 0, textureBytesUploaded: 0,
+                texturePreviewsSkipped: 0,
                 drawsWithTexture: 0, drawsWithFallbackTexture: 0,
                 shadersTranslated: 0, shaderTranslationFailures: 0,
                 shaderVariantsTranslated: 0,
@@ -1411,6 +1498,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 // applyBufferUpdate). Zero means the deferred-draw path never
                 // had a write-after-record hazard to begin with.
                 bufferRenames: 0, textureUpdateHazards: 0,
+                textureRenames: 0, textureFullCopyRenameBytes: 0,
                 bufferFullCopyRenames: 0, bufferNoOverwriteWrites: 0,
                 emptySurfaceReports: 0, surfaceChanges: 0, sessionChanges: 0,
                 deviceLosses: 0, deviceRecoveries: 0,
@@ -1420,11 +1508,13 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 texturesRejected: 0,
                 srgbTextureSamples: 0, srgbViewsCreated: 0,
                 srgbTextureUnavailable: 0, srgbWriteRequests: 0,
+                srgbWriteUnavailable: 0,
                 cubeTexturesCreated: 0, renderTargetsCreated: 0,
                 renderTargetBinds: 0, renderPasses: 0,
                 depthTargetSizeMismatches: 0,
                 blits: 0, blitsSkipped: 0, blitsThroughBackBuffer: 0,
                 colorFills: 0,
+                partialClears: 0,
                 drawsWithScissor: 0,
                 drawsWithIncompleteMipChain: 0,
                 lastDrawTexture: 0,
@@ -1433,6 +1523,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 drawsWithUnmappedBlend: 0, drawsWithUnappliedFog: 0,
                 drawsWithUnappliedLighting: 0,
                 programmableDraws: 0, drawsSkippedForBadShader: 0,
+                drawsWithCompactVertexInputs: 0,
                 constantUploadBytes: 0,
             };
         }
@@ -1480,6 +1571,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 this.format = this.format || (this.gpu &&
                     typeof this.gpu.getPreferredCanvasFormat === "function" ?
                     this.gpu.getPreferredCanvasFormat() : "bgra8unorm");
+                this.swapchainSrgbFormat = srgbSiblingOf(this.format);
                 // A canvas context defaults to RENDER_ATTACHMENT only. The
                 // back buffer also has to be readable and writable as a texture,
                 // because StretchRect to and from it is how a D3D9 game does
@@ -1487,6 +1579,8 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 // process it, put it back.
                 this.context.configure({
                     device: this.device, format: this.format,
+                    ...(this.swapchainSrgbFormat
+                        ? { viewFormats: [this.swapchainSrgbFormat] } : {}),
                     alphaMode: "opaque",
                     usage: TEXTURE_USAGE_RENDER_ATTACHMENT |
                         TEXTURE_USAGE_COPY_SRC | TEXTURE_USAGE_COPY_DST |
@@ -1748,7 +1842,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             const sessionKey = sessionHigh * 0x100000000 + sessionLow;
             if (this.sessionKey !== null && this.sessionKey !== sessionKey) {
                 ++this.stats.sessionChanges;
-                console.warn("[d3d9-webgpu] a new guest process (session 0x" +
+                console.info("[d3d9-webgpu] a new guest process (session 0x" +
                     sessionHigh.toString(16) + sessionLow.toString(16).padStart(8, "0") +
                     ") replaced session 0x" +
                     this.sessionKey.toString(16) + "; the previous process's " +
@@ -2058,7 +2152,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             }
         }
 
-        onClear(bytes, view, offset) {
+        onClear(bytes, view, offset, length) {
             const deviceHandle = view.getUint32(offset, true);
             const flags = view.getUint32(offset + 4, true);
             const color = view.getUint32(offset + 8, true);
@@ -2070,18 +2164,46 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             // actually has an auto depth-stencil surface.
             const targets = this.renderTargetsFor(state);
             if (!targets) return;
-            const clearsDepth = (flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL))
-                !== 0 && targets.hasDepth;
-            if (!clearsColor && !clearsDepth) return;
+            const clearsDepth = (flags & D3DCLEAR_ZBUFFER) !== 0 && targets.hasDepth;
+            const clearsStencil = (flags & D3DCLEAR_STENCIL) !== 0 && targets.hasDepth;
+            if (!clearsColor && !clearsDepth && !clearsStencil) return;
             const a = ((color >>> 24) & 0xff) / 255;
             const r = ((color >>> 16) & 0xff) / 255;
             const g = ((color >>> 8) & 0xff) / 255;
             const b = (color & 0xff) / 255;
             const frame = this.ensureFrame();
+            const rectCount = view.getUint32(offset + 20, true);
+            if (rectCount) {
+                if (24 + rectCount * 16 > length) {
+                    ++this.stats.malformedBatches;
+                    throw new Error("D9WG Clear rectangles overrun the command");
+                }
+                const rects = [];
+                for (let index = 0; index < rectCount; ++index) {
+                    const base = offset + 24 + index * 16;
+                    const left = Math.max(0, Math.min(targets.width,
+                        view.getInt32(base, true)));
+                    const top = Math.max(0, Math.min(targets.height,
+                        view.getInt32(base + 4, true)));
+                    const right = Math.max(left, Math.min(targets.width,
+                        view.getInt32(base + 8, true)));
+                    const bottom = Math.max(top, Math.min(targets.height,
+                        view.getInt32(base + 12, true)));
+                    if (right > left && bottom > top)
+                        rects.push({ left, top, right, bottom });
+                }
+                if (rects.length) {
+                    frame.ops.push({ kind: "rect-clear", targets, clearsColor,
+                        clearsDepth, clearsStencil, color: { r, g, b, a },
+                        depth, stencil, rects });
+                    ++this.stats.partialClears;
+                }
+                return;
+            }
             frame.ops.push({
                 kind: "clear", targets,
                 clearsColor: clearsColor || !!this.debug.forceClearColor,
-                clearsDepth,
+                clearsDepth, clearsStencil,
                 color: this.debug.forceClearColor || { r, g, b, a },
                 depth, stencil,
             });
@@ -2105,32 +2227,43 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 const encoder = this.device.createCommandEncoder();
                 const swapTexture = this.context.getCurrentTexture();
                 const swapView = swapTexture.createView();
+                const swapSrgbView = this.swapchainSrgbFormat
+                    ? swapTexture.createView({ format: this.swapchainSrgbFormat })
+                    : swapView;
                 // Every op carries the target set it was recorded against (see
                 // renderTargetsFor). A pass covers the longest run of ops that
                 // share a target set; a Clear always starts a new one, because
                 // WebGPU expresses a clear only as a pass's loadOp.
                 let pass = null;
                 let openKey = null;
-                const beginPass = (targets, clearColor, clearDepth) => {
+                let scissorActive = false;
+                const beginPass = (targets, clearColor, clearDepthStencil) => {
                     const descriptor = {
                         colorAttachments: targets.colors.map(color => ({
-                            view: color.swapchain ? swapView : color.view,
+                            view: color.swapchain
+                                ? (color.format === this.swapchainSrgbFormat
+                                    ? swapSrgbView : swapView)
+                                : color.view,
                             loadOp: clearColor ? "clear" : "load",
                             storeOp: "store",
                             ...(clearColor ? { clearValue: clearColor } : {}),
                         })),
                     };
                     if (targets.depthView) {
+                        const clearsDepth = clearDepthStencil &&
+                            clearDepthStencil.depth !== undefined;
+                        const clearsStencil = clearDepthStencil &&
+                            clearDepthStencil.stencil !== undefined;
                         descriptor.depthStencilAttachment = {
                             view: targets.depthView,
-                            depthLoadOp: clearDepth ? "clear" : "load",
+                            depthLoadOp: clearsDepth ? "clear" : "load",
                             depthStoreOp: "store",
-                            stencilLoadOp: clearDepth ? "clear" : "load",
+                            stencilLoadOp: clearsStencil ? "clear" : "load",
                             stencilStoreOp: "store",
-                            ...(clearDepth ? {
-                                depthClearValue: clearDepth.depth,
-                                stencilClearValue: clearDepth.stencil,
-                            } : {}),
+                            ...(clearsDepth ? {
+                                depthClearValue: clearDepthStencil.depth } : {}),
+                            ...(clearsStencil ? {
+                                stencilClearValue: clearDepthStencil.stencil } : {}),
                         };
                     }
                     ++this.stats.renderPasses;
@@ -2155,10 +2288,34 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                     frame.ops.length = 0;
                 }
                 for (const op of frame.ops) {
+                    if (op.kind === "copy") {
+                        if (pass) { pass.end(); pass = null; openKey = null; }
+                        scissorActive = false;
+                        encoder.copyTextureToTexture(op.source, op.destination,
+                            op.size);
+                        continue;
+                    }
                     if (op.kind === "blit") {
                         // A blit is its own pass against its own attachment.
                         if (pass) { pass.end(); pass = null; openKey = null; }
-                        this.replayBlit(encoder, op, swapView);
+                        scissorActive = false;
+                        const transient = this.replayBlit(encoder, op, swapView);
+                        if (transient) frame.transientBuffers.push(transient);
+                        continue;
+                    }
+                    if (op.kind === "rect-clear") {
+                        if (pass) { pass.end(); pass = null; openKey = null; }
+                        scissorActive = false;
+                        const transient = this.replayRectClear(encoder, op,
+                            swapView, swapSrgbView);
+                        if (transient) frame.transientBuffers.push(transient);
+                        continue;
+                    }
+                    if (op.kind === "color-fill") {
+                        if (pass) { pass.end(); pass = null; openKey = null; }
+                        scissorActive = false;
+                        const transient = this.replayColorFill(encoder, op);
+                        if (transient) frame.transientBuffers.push(transient);
                         continue;
                     }
                     if (op.kind === "clear") {
@@ -2168,24 +2325,38 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                         // hence the two independent load ops.
                         pass = beginPass(op.targets,
                             op.clearsColor ? op.color : null,
-                            op.clearsDepth
-                                ? { depth: op.depth, stencil: op.stencil }
-                                : null);
+                            (op.clearsDepth || op.clearsStencil) ? {
+                                ...(op.clearsDepth ? { depth: op.depth } : {}),
+                                ...(op.clearsStencil ? { stencil: op.stencil } : {}),
+                            } : null);
                         openKey = op.targets.key;
+                        scissorActive = false;
                         continue;
                     }
                     if (!pass || openKey !== op.targets.key) {
                         if (pass) pass.end();
                         pass = beginPass(op.targets, null, null);
                         openKey = op.targets.key;
+                        scissorActive = false;
                     }
                     pass.setPipeline(op.pipeline);
                     pass.setBindGroup(0, op.bindGroup);
+                    pass.setBlendConstant(op.blendConstant);
+                    pass.setStencilReference(op.stencilReference);
                     pass.setViewport(op.viewport.x, op.viewport.y,
                             op.viewport.width, op.viewport.height, 0, 1);
-                    if (op.scissor)
+                    if (op.scissor) {
                         pass.setScissorRect(op.scissor.x, op.scissor.y,
                                 op.scissor.width, op.scissor.height);
+                        scissorActive = true;
+                    } else if (scissorActive) {
+                        // Scissor is dynamic pass state. If the previous draw
+                        // enabled it, omitting this call would leak that old rect
+                        // into a draw for which D3DRS_SCISSORTESTENABLE is off.
+                        pass.setScissorRect(0, 0, op.targets.width,
+                                op.targets.height);
+                        scissorActive = false;
+                    }
                     for (let slot = 0; slot < op.vertexBuffers.length; ++slot) {
                         const binding = op.vertexBuffers[slot];
                         pass.setVertexBuffer(slot, binding.buffer, binding.offset);
@@ -2556,7 +2727,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 return;
             }
             const srgbFormat = isDepth ? null : srgbSiblingOf(gpuFormat);
-            const gpuTexture = this.createTextureOrNull({
+            const textureDescriptor = {
                 label: isDepth ? "D3D9 depth surface"
                     : (isTarget ? "D3D9 render target" : undefined),
                 size: { width, height, depthOrArrayLayers: 1 },
@@ -2573,7 +2744,8 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                     // StretchRect into a compressed texture stays unsupported.
                     ((isTarget || (!isDepth && !isCompressedFormat(format)))
                         ? TEXTURE_USAGE_RENDER_ATTACHMENT : 0),
-            }, format);
+            };
+            const gpuTexture = this.createTextureOrNull(textureDescriptor, format);
             if (!gpuTexture) return;
             ++this.stats.texturesCreated;
             if (isTarget) ++this.stats.renderTargetsCreated;
@@ -2584,6 +2756,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             this.resources.set(handle, {
                 kind: RESOURCE_TEXTURE_2D, textureType: "2d",
                 gpuTexture, gpuFormat, srgbFormat, format, usage, width, height,
+                textureDescriptor,
                 levelCount: Math.max(1, levelCount),
                 // A mip level the guest never uploads has undefined contents.
                 // Sampling one is not "slightly blurry" -- it is whatever was
@@ -2599,6 +2772,99 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 uploadedLevels: (isTarget || isDepth) ? null : new Set(),
                 view: isDepth ? null : gpuTexture.createView(),
             });
+        }
+
+        textureShadowFor(resource, level, layer, compressed) {
+            if (!resource.textureShadows) resource.textureShadows = new Map();
+            const key = level + ":" + layer;
+            let shadow = resource.textureShadows.get(key);
+            if (shadow) return shadow;
+            const width = Math.max(1, resource.width >> level);
+            const height = Math.max(1, resource.height >> level);
+            let bytesPerRow;
+            let rowsPerImage;
+            if (compressed) {
+                const blockBytes = resource.format === D3DFMT_DXT1 ? 8 : 16;
+                bytesPerRow = Math.ceil(width / 4) * blockBytes;
+                rowsPerImage = Math.ceil(height / 4);
+            } else {
+                bytesPerRow = width * 4;
+                rowsPerImage = height;
+            }
+            shadow = { level, layer, width, height, bytesPerRow, rowsPerImage,
+                compressed, data: new Uint8Array(bytesPerRow * rowsPerImage) };
+            resource.textureShadows.set(key, shadow);
+            return shadow;
+        }
+
+        updateTextureShadow(resource, level, layer, x, y, width, height,
+                payload, sourceBytesPerRow, compressed) {
+            const shadow = this.textureShadowFor(resource, level, layer,
+                compressed);
+            const blockBytes = compressed
+                ? (resource.format === D3DFMT_DXT1 ? 8 : 16) : 4;
+            const destinationX = compressed ? Math.floor(x / 4) : x;
+            const destinationY = compressed ? Math.floor(y / 4) : y;
+            const rowBytes = compressed
+                ? Math.ceil(width / 4) * blockBytes : width * 4;
+            const rowCount = compressed ? Math.ceil(height / 4) : height;
+            for (let row = 0; row < rowCount; ++row) {
+                const destinationOffset =
+                    (destinationY + row) * shadow.bytesPerRow +
+                    destinationX * blockBytes;
+                const available = Math.max(0,
+                    Math.min(rowBytes, shadow.data.length - destinationOffset,
+                        payload.length - row * sourceBytesPerRow));
+                if (available)
+                    shadow.data.set(payload.subarray(row * sourceBytesPerRow,
+                        row * sourceBytesPerRow + available), destinationOffset);
+            }
+        }
+
+        renameTextureForUpdate(resource) {
+            if (!resource.textureDescriptor ||
+                    (resource.usage & (D3DUSAGE_RENDERTARGET |
+                        D3DUSAGE_DEPTHSTENCIL)) !== 0)
+                return false;
+            let replacement;
+            try {
+                replacement = this.device.createTexture({
+                    ...resource.textureDescriptor,
+                    label: "D3D9 renamed texture",
+                });
+            } catch (error) {
+                this.warnOnce("texture-rename-failed",
+                    "a texture updated after an earlier draw could not be " +
+                    "renamed; that earlier draw may see the newer pixels", {
+                        format: resource.format,
+                        size: resource.width + "x" + resource.height,
+                        message: error && error.message,
+                    });
+                return false;
+            }
+            if (resource.textureShadows) {
+                for (const shadow of resource.textureShadows.values()) {
+                    this.device.queue.writeTexture({ texture: replacement,
+                        mipLevel: shadow.level,
+                        origin: { x: 0, y: 0, z: shadow.layer } }, shadow.data,
+                        { bytesPerRow: shadow.bytesPerRow,
+                            rowsPerImage: shadow.rowsPerImage },
+                        { width: shadow.width, height: shadow.height,
+                            depthOrArrayLayers: 1 });
+                    this.stats.textureFullCopyRenameBytes += shadow.data.length;
+                }
+            }
+            const oldTexture = resource.gpuTexture;
+            resource.gpuTexture = replacement;
+            resource.view = replacement.createView({ dimension:
+                resource.textureType === "cube" ? "cube" : "2d" });
+            resource.srgbView = null;
+            resource.blitViews = null;
+            resource.targetViews = null;
+            resource.frameReferenced = 0;
+            this.retireGPUObject(oldTexture);
+            ++this.stats.textureRenames;
+            return true;
         }
 
         onUpdateTexture(bytes, view, offset) {
@@ -2617,17 +2883,16 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             const dataOffset = view.getUint32(offset + 44, true);
             const resource = this.resources.get(handle);
             if (!resource || !resource.gpuTexture) return;
-            // Textures have the same write-after-record exposure as buffers,
-            // but renaming one costs a full reallocation plus a re-upload of
-            // every level, so this only counts occurrences for now. War3's
-            // ratio (roughly one upload per two frames) says it is rare in
-            // practice; a game that drives a dynamic texture per draw would
-            // show up here first.
-            if (this.frame && resource.frameReferenced === this.frame.serial)
-                ++this.stats.textureUpdateHazards;
             const source = new Uint8Array(bytes.buffer, bytes.byteOffset + dataOffset, dataBytes);
             const compressed = resource.format === D3DFMT_DXT1 ||
                 resource.format === D3DFMT_DXT3 || resource.format === D3DFMT_DXT5;
+            // Bind groups are built eagerly and retain the old view. Renaming
+            // here therefore preserves pixels for draws already recorded in
+            // this frame while later draws bind the replacement texture.
+            if (this.frame && resource.frameReferenced === this.frame.serial) {
+                ++this.stats.textureUpdateHazards;
+                this.renameTextureForUpdate(resource);
+            }
             let payload = source;
             let bytesPerRow = rowPitch;
             if (!compressed) {
@@ -2641,6 +2906,8 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 payload = expanded;
                 bytesPerRow = width * 4;
             }
+            this.updateTextureShadow(resource, level, z, x, y, width, height,
+                payload, bytesPerRow, compressed);
             ++this.stats.textureUploads;
             this.stats.textureBytesUploaded += payload.length;
             // Keyed per layer as well as per level: a cube whose face 0 has a
@@ -2660,14 +2927,26 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             // total cost (previewBudget below).
             if (!compressed && level === 0 && z === 0 && width <= 256 &&
                     height <= 256 && x === 0 && y === 0) {
-                const bytes = width * height * 4;
+                const previewBytes = width * height * 4;
                 if (!resource.preview) {
                     if (this.previewBudget === undefined)
                         this.previewBudget = 16 * 1024 * 1024;
-                    if (this.previewBudget < bytes) return;
-                    this.previewBudget -= bytes;
+                    if (this.previewBudget >= previewBytes) {
+                        this.previewBudget -= previewBytes;
+                        resource.preview = {
+                            width, height, rgba: payload.slice()
+                        };
+                    } else {
+                        // The preview is diagnostics only. Returning here used
+                        // to drop the real queue.writeTexture below once War3
+                        // had loaded 16 MiB of menu atlases. Textures first
+                        // touched in battle (fog/minimap/command icons/software
+                        // cursor) consequently stayed black or transparent.
+                        ++this.stats.texturePreviewsSkipped;
+                    }
+                } else {
+                    resource.preview = { width, height, rgba: payload.slice() };
                 }
-                resource.preview = { width, height, rgba: payload.slice() };
             }
             // rowsPerImage counts *block* rows for a block-compressed format,
             // not pixel rows -- BCn blocks are 4x4, so a DXT upload that
@@ -2690,13 +2969,14 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             const edge = view.getUint32(offset + 8, true);
             const levelCount = Math.max(1, view.getUint32(offset + 12, true));
             const format = view.getUint32(offset + 16, true);
+            const usage = view.getUint32(offset + 20, true);
             const gpuFormat = formatToGPU(format);
             if (!gpuFormat) {
                 console.warn("[d3d9-webgpu] unsupported cube texture format", format);
                 return;
             }
             const srgbFormat = srgbSiblingOf(gpuFormat);
-            const gpuTexture = this.createTextureOrNull({
+            const textureDescriptor = {
                 label: "D3D9 cube " + edge,
                 size: { width: edge, height: edge, depthOrArrayLayers: 6 },
                 format: gpuFormat,
@@ -2704,14 +2984,16 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 mipLevelCount: levelCount,
                 usage: TEXTURE_USAGE_COPY_DST | TEXTURE_USAGE_COPY_SRC |
                     TEXTURE_USAGE_TEXTURE_BINDING,
-            }, format);
+            };
+            const gpuTexture = this.createTextureOrNull(textureDescriptor, format);
             if (!gpuTexture) return;
             ++this.stats.texturesCreated;
             ++this.stats.cubeTexturesCreated;
             this.resources.set(handle, {
                 kind: RESOURCE_TEXTURE_CUBE, textureType: "cube",
                 gpuTexture, gpuFormat, srgbFormat,
-                format, width: edge, height: edge, layerCount: 6,
+                format, usage, width: edge, height: edge, layerCount: 6,
+                textureDescriptor,
                 levelCount,
                 // Keyed by level*6+face, so the incomplete-mip warning counts a
                 // cube's faces independently -- a game that fills face 0's whole
@@ -2787,6 +3069,8 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
         // same key can share a pass, and a change of key has to end it.
         renderTargetsFor(state) {
             const colors = [];
+            const wantsSRGB = (state.renderStates.get(D3DRS_SRGBWRITEENABLE) || 0)
+                !== 0;
             let width = state.viewport.width || state.surface.width || 1;
             let height = state.viewport.height || state.surface.height || 1;
             let key = "";
@@ -2794,11 +3078,13 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 const handle = state.renderTargets[index];
                 if (!handle) {
                     if (index === 0) {
-                        colors.push({ view: null, format: this.format,
+                        const format = wantsSRGB && this.swapchainSrgbFormat
+                            ? this.swapchainSrgbFormat : this.format;
+                        colors.push({ view: null, format,
                             swapchain: true });
                         width = state.surface.width || width;
                         height = state.surface.height || height;
-                        key += "bb;";
+                        key += "bb" + (format === this.format ? "" : "s") + ";";
                     }
                     continue;
                 }
@@ -2815,15 +3101,19 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                     continue;
                 }
                 const level = state.renderTargetLevels[index] || 0;
-                const targetView = this.targetViewFor(resource, level);
-                colors.push({ view: targetView, format: resource.gpuFormat ||
-                    formatToGPU(resource.format), swapchain: false,
+                const srgb = wantsSRGB && !!resource.srgbFormat;
+                if (wantsSRGB && !resource.srgbFormat)
+                    ++this.stats.srgbWriteUnavailable;
+                const targetView = this.targetViewFor(resource, level, srgb);
+                colors.push({ view: targetView,
+                    format: srgb ? resource.srgbFormat : (resource.gpuFormat ||
+                        formatToGPU(resource.format)), swapchain: false,
                     resource });
                 if (index === 0) {
                     width = Math.max(1, resource.width >> level);
                     height = Math.max(1, resource.height >> level);
                 }
-                key += handle + "." + level + ";";
+                key += handle + "." + level + (srgb ? "s" : "") + ";";
             }
             if (!colors.length) return null;
 
@@ -2955,17 +3245,17 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 height !== destinationHeight;
             const swapchainInvolved = !source || !destination;
             if (!swapchainInvolved && !scaled && sourceFormat === destinationFormat) {
-                const encoder = this.device.createCommandEncoder(
-                    { label: "D3D9 StretchRect copy" });
-                encoder.copyTextureToTexture(
-                    { texture: source.gpuTexture, mipLevel: sourceLevel,
-                      origin: { x: sourceRect.left, y: sourceRect.top, z: 0 } },
-                    { texture: destination.gpuTexture, mipLevel: destinationLevel,
-                      origin: { x: destinationRect.left, y: destinationRect.top,
-                                z: 0 } },
-                    { width, height, depthOrArrayLayers: 1 });
-                this.device.queue.submit([encoder.finish()]);
-                ++this.stats.queueSubmits;
+                const frame = this.ensureFrame();
+                frame.ops.push({ kind: "copy",
+                    source: { texture: source.gpuTexture, mipLevel: sourceLevel,
+                        origin: { x: sourceRect.left, y: sourceRect.top, z: 0 } },
+                    destination: { texture: destination.gpuTexture,
+                        mipLevel: destinationLevel,
+                        origin: { x: destinationRect.left,
+                            y: destinationRect.top, z: 0 } },
+                    size: { width, height, depthOrArrayLayers: 1 } });
+                source.frameReferenced = frame.serial;
+                destination.frameReferenced = frame.serial;
                 ++this.stats.blits;
                 return;
             }
@@ -3015,15 +3305,17 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
         }
 
         // Shared with renderTargetsFor(): a render-attachment view of one level.
-        targetViewFor(resource, level) {
+        targetViewFor(resource, level, srgb) {
             if (!resource.targetViews) resource.targetViews = new Map();
-            let cached = resource.targetViews.get(level);
+            const key = level + (srgb ? "s" : "");
+            let cached = resource.targetViews.get(key);
             if (!cached) {
                 cached = resource.gpuTexture.createView({
                     baseMipLevel: level, mipLevelCount: 1, dimension: "2d",
                     baseArrayLayer: 0, arrayLayerCount: 1,
+                    ...(srgb ? { format: resource.srgbFormat } : {}),
                 });
-                resource.targetViews.set(level, cached);
+                resource.targetViews.set(key, cached);
             }
             return cached;
         }
@@ -3099,7 +3391,7 @@ fn d9_ps_main(stage_in: D9BlitOutput) -> @location(0) vec4<f32> {
         replayBlit(encoder, op, swapView) {
             const sourceView = op.sourceView || swapView;
             const destinationView = op.destinationView || swapView;
-            if (!sourceView || !destinationView) return;
+            if (!sourceView || !destinationView) return null;
             const entry = this.blitPipelineFor(op.destinationFormat,
                 op.filterPoint);
             const uniform = this.device.createBuffer({
@@ -3108,7 +3400,6 @@ fn d9_ps_main(stage_in: D9BlitOutput) -> @location(0) vec4<f32> {
             });
             this.device.queue.writeBuffer(uniform, 0,
                 new Float32Array(op.sourceRect));
-            this.retireAfterSubmit(uniform);
             const bindGroup = this.device.createBindGroup({
                 layout: entry.bindGroupLayout,
                 entries: [
@@ -3128,9 +3419,189 @@ fn d9_ps_main(stage_in: D9BlitOutput) -> @location(0) vec4<f32> {
                 op.viewport[3], 0, 1);
             pass.draw(6);
             pass.end();
+            return uniform;
         }
 
-        // ColorFill is expressed as a one-op clear pass, which is what it is.
+        rectClearPipelineFor(targets, clearsColor, clearsDepth, clearsStencil) {
+            const key = [targets.formats.join(","), clearsColor ? "c" : "-",
+                clearsDepth ? "d" : "-", clearsStencil ? "s" : "-"].join("|");
+            if (!this.rectClearPipelines) this.rectClearPipelines = new Map();
+            let entry = this.rectClearPipelines.get(key);
+            if (entry) return entry;
+            const colorFields = targets.formats.map((_, index) =>
+                "    @location(" + index + ") color" + index + ": vec4<f32>,");
+            const colorWrites = targets.formats.map((_, index) =>
+                "    result.color" + index + " = clear.color;");
+            const depthField = clearsDepth
+                ? "    @builtin(frag_depth) depth: f32," : "";
+            const depthWrite = clearsDepth
+                ? "    result.depth = clear.depth.x;" : "";
+            const module = this.moduleFor(`struct D9RectClearUniforms {
+    color: vec4<f32>,
+    depth: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> clear: D9RectClearUniforms;
+
+struct D9RectClearOutput {
+${colorFields.join("\n")}
+${depthField}
+};
+
+@vertex
+fn d9_vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    var positions = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    return vec4<f32>(positions[index], 0.0, 1.0);
+}
+
+@fragment
+fn d9_ps_main() -> D9RectClearOutput {
+    var result: D9RectClearOutput;
+${colorWrites.join("\n")}
+${depthWrite}
+    return result;
+}
+`, "d3d9 rectangle clear " + key);
+            const bindGroupLayout = this.device.createBindGroupLayout({
+                entries: [{ binding: 0, visibility: SHADER_STAGE_FRAGMENT,
+                    buffer: { type: "uniform" } }],
+            });
+            const descriptor = {
+                label: "D3D9 rectangle clear " + key,
+                layout: this.device.createPipelineLayout(
+                    { bindGroupLayouts: [bindGroupLayout] }),
+                vertex: { module, entryPoint: "d9_vs_main" },
+                fragment: { module, entryPoint: "d9_ps_main",
+                    targets: targets.formats.map(format => ({ format,
+                        writeMask: clearsColor ? 0xF : 0 })) },
+                primitive: { topology: "triangle-list" },
+            };
+            if (targets.hasDepth) {
+                const stencil = clearsStencil ? { compare: "always",
+                    failOp: "keep", depthFailOp: "keep", passOp: "replace" } : {};
+                descriptor.depthStencil = { format: DEPTH_FORMAT,
+                    depthWriteEnabled: clearsDepth, depthCompare: "always",
+                    stencilFront: stencil, stencilBack: stencil,
+                    stencilReadMask: clearsStencil ? 0xff : 0,
+                    stencilWriteMask: clearsStencil ? 0xff : 0 };
+            }
+            entry = { pipeline: this.device.createRenderPipeline(descriptor),
+                bindGroupLayout };
+            this.rectClearPipelines.set(key, entry);
+            return entry;
+        }
+
+        replayRectClear(encoder, op, swapView, swapSrgbView) {
+            const entry = this.rectClearPipelineFor(op.targets, op.clearsColor,
+                op.clearsDepth, op.clearsStencil);
+            const uniform = this.device.createBuffer({ size: 32,
+                usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST });
+            this.device.queue.writeBuffer(uniform, 0, new Float32Array([
+                op.color.r, op.color.g, op.color.b, op.color.a,
+                op.depth, 0, 0, 0,
+            ]));
+            const bindGroup = this.device.createBindGroup({
+                layout: entry.bindGroupLayout,
+                entries: [{ binding: 0, resource: { buffer: uniform } }],
+            });
+            const descriptor = {
+                colorAttachments: op.targets.colors.map(color => ({
+                    view: color.swapchain
+                        ? (color.format === this.swapchainSrgbFormat
+                            ? swapSrgbView : swapView)
+                        : color.view,
+                    loadOp: "load", storeOp: "store",
+                })),
+            };
+            if (op.targets.depthView) descriptor.depthStencilAttachment = {
+                view: op.targets.depthView,
+                depthLoadOp: "load", depthStoreOp: "store",
+                stencilLoadOp: "load", stencilStoreOp: "store",
+            };
+            const pass = encoder.beginRenderPass(descriptor);
+            ++this.stats.renderPasses;
+            pass.setPipeline(entry.pipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.setStencilReference(op.stencil & 0xff);
+            for (const rect of op.rects) {
+                pass.setViewport(rect.left, rect.top, rect.right - rect.left,
+                    rect.bottom - rect.top, 0, 1);
+                pass.draw(3);
+            }
+            pass.end();
+            return uniform;
+        }
+
+        colorFillPipelineFor(format) {
+            if (!this.colorFillPipelines) this.colorFillPipelines = new Map();
+            let entry = this.colorFillPipelines.get(format);
+            if (entry) return entry;
+            const module = this.moduleFor(`struct D9ColorFillUniforms {
+    color: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> fill: D9ColorFillUniforms;
+
+@vertex
+fn d9_vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    var positions = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    return vec4<f32>(positions[index], 0.0, 1.0);
+}
+
+@fragment
+fn d9_ps_main() -> @location(0) vec4<f32> {
+    return fill.color;
+}
+`, "d3d9 ColorFill " + format);
+            const bindGroupLayout = this.device.createBindGroupLayout({
+                entries: [{ binding: 0, visibility: SHADER_STAGE_FRAGMENT,
+                    buffer: { type: "uniform" } }],
+            });
+            const pipeline = this.device.createRenderPipeline({
+                label: "D3D9 ColorFill " + format,
+                layout: this.device.createPipelineLayout(
+                    { bindGroupLayouts: [bindGroupLayout] }),
+                vertex: { module, entryPoint: "d9_vs_main" },
+                fragment: { module, entryPoint: "d9_ps_main",
+                    targets: [{ format }] },
+                primitive: { topology: "triangle-list" },
+            });
+            entry = { pipeline, bindGroupLayout };
+            this.colorFillPipelines.set(format, entry);
+            return entry;
+        }
+
+        replayColorFill(encoder, op) {
+            const pass = encoder.beginRenderPass({ colorAttachments: [{
+                view: op.targetView, loadOp: op.isFull ? "clear" : "load",
+                storeOp: "store", ...(op.isFull ? { clearValue: {
+                    r: op.rgba[0], g: op.rgba[1], b: op.rgba[2], a: op.rgba[3],
+                } } : {}),
+            }] });
+            ++this.stats.renderPasses;
+            let transient = null;
+            if (!op.isFull) {
+                const entry = this.colorFillPipelineFor(op.format);
+                transient = this.device.createBuffer({ size: 16,
+                    usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST });
+                this.device.queue.writeBuffer(transient, 0,
+                    new Float32Array(op.rgba));
+                const bindGroup = this.device.createBindGroup({
+                    layout: entry.bindGroupLayout,
+                    entries: [{ binding: 0, resource: { buffer: transient } }],
+                });
+                pass.setPipeline(entry.pipeline);
+                pass.setBindGroup(0, bindGroup);
+                pass.setViewport(op.left, op.top, op.right - op.left,
+                    op.bottom - op.top, 0, 1);
+                pass.draw(3);
+            }
+            pass.end();
+            return transient;
+        }
+
+        // A full ColorFill is a clear pass; a partial one is a viewport-limited
+        // draw. This keeps the pixels outside the requested RECT intact.
         onColorFill(bytes, view, offset) {
             const resource = this.resources.get(view.getUint32(offset + 4, true));
             const level = view.getUint32(offset + 8, true);
@@ -3158,35 +3629,25 @@ fn d9_ps_main(stage_in: D9BlitOutput) -> @location(0) vec4<f32> {
             const bottom = view.getInt32(offset + 28, true);
             const fullWidth = Math.max(1, resource.width >> level);
             const fullHeight = Math.max(1, resource.height >> level);
-            // WebGPU's loadOp:"clear" clears the whole attachment and
-            // setScissorRect does not narrow it, so a sub-rect fill cannot be
-            // expressed this way. Widening it would erase pixels the app kept.
-            if (left > 0 || top > 0 || right < fullWidth || bottom < fullHeight) {
-                ++this.stats.blitsSkipped;
-                this.warnOnce("colorfill-subrect",
-                    "a ColorFill of part of a surface is not implemented: a " +
-                    "WebGPU clear covers the whole attachment, so honouring the " +
-                    "rect would need a scissored draw. The surface is left " +
-                    "unchanged rather than being cleared past the rect", {
-                        rect: [left, top, right, bottom],
-                        surface: fullWidth + "x" + fullHeight,
-                    });
+            const clippedLeft = Math.max(0, Math.min(fullWidth, left));
+            const clippedTop = Math.max(0, Math.min(fullHeight, top));
+            const clippedRight = Math.max(clippedLeft,
+                Math.min(fullWidth, right));
+            const clippedBottom = Math.max(clippedTop,
+                Math.min(fullHeight, bottom));
+            if (clippedRight === clippedLeft || clippedBottom === clippedTop)
                 return;
-            }
-            const encoder = this.device.createCommandEncoder(
-                { label: "D3D9 ColorFill" });
-            const pass = encoder.beginRenderPass({
-                colorAttachments: [{ view: targetView, loadOp: "clear",
-                    storeOp: "store", clearValue: {
-                        r: ((color >>> 16) & 0xff) / 255,
-                        g: ((color >>> 8) & 0xff) / 255,
-                        b: (color & 0xff) / 255,
-                        a: ((color >>> 24) & 0xff) / 255,
-                    } }],
-            });
-            pass.end();
-            this.device.queue.submit([encoder.finish()]);
-            ++this.stats.queueSubmits;
+            const rgba = [((color >>> 16) & 0xff) / 255,
+                ((color >>> 8) & 0xff) / 255, (color & 0xff) / 255,
+                ((color >>> 24) & 0xff) / 255];
+            const isFull = clippedLeft === 0 && clippedTop === 0 &&
+                clippedRight === fullWidth && clippedBottom === fullHeight;
+            const frame = this.ensureFrame();
+            frame.ops.push({ kind: "color-fill", targetView,
+                format: formatToGPU(resource.format), rgba, isFull,
+                left: clippedLeft, top: clippedTop,
+                right: clippedRight, bottom: clippedBottom });
+            resource.frameReferenced = frame.serial;
             ++this.stats.colorFills;
         }
 
@@ -3264,6 +3725,10 @@ fn d9_ps_main(stage_in: D9BlitOutput) -> @location(0) vec4<f32> {
                 const value = state.textureStageStates.get(stage * 64 + id);
                 return value === undefined ? fallback : value;
             };
+            const samplerState = (stage, id, fallback) => {
+                const value = state.samplerStates.get(stage * 64 + id);
+                return value === undefined ? fallback : value;
+            };
             const stages = [];
             let usesTextureFactor = false;
             let usesSpecular = false;
@@ -3293,6 +3758,10 @@ fn d9_ps_main(stage_in: D9BlitOutput) -> @location(0) vec4<f32> {
                     textureType: "2d",
                     transformCount: 0,
                     projected: false,
+                    addressU: samplerState(index, D3DSAMP_ADDRESSU, 1),
+                    addressV: samplerState(index, D3DSAMP_ADDRESSV, 1),
+                    addressW: samplerState(index, D3DSAMP_ADDRESSW, 1),
+                    borderColor: samplerState(index, D3DSAMP_BORDERCOLOR, 0),
                 };
                 // Which arguments a stage reads decides what has to be declared
                 // and uploaded for it. Getting this wrong in either direction is
@@ -3526,15 +3995,6 @@ fn d9_ps_main(stage_in: D9BlitOutput) -> @location(0) vec4<f32> {
             this.noteUnreadState("renderState", CONSUMED_RENDER_STATES, stateId);
             if (stateId === D3DRS_SRGBWRITEENABLE && value !== 0) {
                 ++this.stats.srgbWriteRequests;
-                this.warnOnce("srgb-write",
-                    "the app asks for sRGB encoding on writes " +
-                    "(D3DRS_SRGBWRITEENABLE). WebGPU expresses that as the " +
-                    "render target's format, not as a render state, so it is " +
-                    "not applied and the result is written linear -- which " +
-                    "reads as too dark for the affected passes. Unlike the " +
-                    "matching read path (D3DSAMP_SRGBTEXTURE, now honoured), " +
-                    "this one needs an -srgb view of the target and therefore a " +
-                    "new pipeline key, so it is reported rather than guessed at");
             }
         }
 
@@ -4043,36 +4503,92 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             const depthCompare = this.debug.disableDepthTest ? "always"
                 : (COMPARE_FUNCS[get(D3DRS_ZFUNC, 4)] || "less-equal");
 
-            // Every `|| fallback` below is a silent substitution: an
-            // unmapped D3DBLEND value quietly became src-alpha, which renders
-            // as something plausible-but-wrong rather than as an error. That
-            // is the same blind spot as the stubs that returned
-            // D3DERR_INVALIDCALL without a trace, so count and name it.
-            //
-            // D3DBLEND 12-15 (BOTHSRCALPHA, BOTHINVSRCALPHA, BLENDFACTOR,
-            // INVBLENDFACTOR) have no direct WebGPU equivalent: the BOTH*
-            // pair sets source and destination factors together, and the
-            // BLENDFACTOR pair needs the pipeline's blend constant, which is
-            // not plumbed through yet.
             const blendEnabled = get(D3DRS_ALPHABLENDENABLE, 0) !== 0;
-            const rawSrc = get(D3DRS_SRCBLEND, 5);
-            const rawDst = get(D3DRS_DESTBLEND, 6);
-            const rawOp = get(D3DRS_BLENDOP, 1);
-            const srcFactor = BLEND_FACTORS[rawSrc] || "src-alpha";
-            const dstFactor = BLEND_FACTORS[rawDst] || "one-minus-src-alpha";
-            const blendOp = BLEND_OPS[rawOp] || "add";
-            if (blendEnabled && (!BLEND_FACTORS[rawSrc] || !BLEND_FACTORS[rawDst]
-                    || !BLEND_OPS[rawOp])) {
+            const resolveBlend = (rawSrc, rawDst) => {
+                // The legacy BOTH* source values override both halves of the
+                // pair. D3D9 exposes them as one enum; WebGPU exposes the two
+                // factors separately, so the mapping is exact once resolved.
+                if (rawSrc === 12)
+                    return { src: "src-alpha", dst: "one-minus-src-alpha",
+                        valid: true };
+                if (rawSrc === 13)
+                    return { src: "one-minus-src-alpha", dst: "src-alpha",
+                        valid: true };
+                return { src: BLEND_FACTORS[rawSrc], dst: BLEND_FACTORS[rawDst],
+                    valid: !!BLEND_FACTORS[rawSrc] && !!BLEND_FACTORS[rawDst] };
+            };
+            // D3D9 starts at ONE/ZERO.  Using SRCALPHA/INVSRCALPHA here was
+            // mostly hidden while blending stayed disabled, but it changes an
+            // app that enables blending before choosing new factors from an
+            // overwrite into a translucent UI/overlay pass.
+            const rawColorSrc = get(D3DRS_SRCBLEND, 2);
+            const rawColorDst = get(D3DRS_DESTBLEND, 1);
+            const rawColorOp = get(D3DRS_BLENDOP, 1);
+            const colorBlend = resolveBlend(rawColorSrc, rawColorDst);
+            const separateAlpha =
+                get(D3DRS_SEPARATEALPHABLENDENABLE, 0) !== 0;
+            const rawAlphaSrc = separateAlpha
+                ? get(D3DRS_SRCBLENDALPHA, 2) : rawColorSrc;
+            const rawAlphaDst = separateAlpha
+                ? get(D3DRS_DESTBLENDALPHA, 1) : rawColorDst;
+            const rawAlphaOp = separateAlpha
+                ? get(D3DRS_BLENDOPALPHA, 1) : rawColorOp;
+            const alphaBlend = separateAlpha
+                ? resolveBlend(rawAlphaSrc, rawAlphaDst) : colorBlend;
+            const srcFactor = colorBlend.src || "src-alpha";
+            const dstFactor = colorBlend.dst || "one-minus-src-alpha";
+            const blendOp = BLEND_OPS[rawColorOp] || "add";
+            const alphaSrcFactor = alphaBlend.src || "one";
+            const alphaDstFactor = alphaBlend.dst || "zero";
+            const alphaBlendOp = BLEND_OPS[rawAlphaOp] || "add";
+            if (blendEnabled && (!colorBlend.valid || !alphaBlend.valid ||
+                    !BLEND_OPS[rawColorOp] || !BLEND_OPS[rawAlphaOp])) {
                 ++this.stats.drawsWithUnmappedBlend;
-                this.warnOnce("unmapped-blend-" + rawSrc + "-" + rawDst + "-" + rawOp,
+                this.warnOnce("unmapped-blend-" + [rawColorSrc, rawColorDst,
+                    rawColorOp, rawAlphaSrc, rawAlphaDst, rawAlphaOp].join("-"),
                     "a draw asks for a blend mode with no WebGPU equivalent; " +
                     "it silently falls back to src-alpha/inv-src-alpha, which " +
                     "renders as plausible-but-wrong compositing", {
-                        D3DRS_SRCBLEND: rawSrc, mappedSrc: BLEND_FACTORS[rawSrc],
-                        D3DRS_DESTBLEND: rawDst, mappedDst: BLEND_FACTORS[rawDst],
-                        D3DRS_BLENDOP: rawOp, mappedOp: BLEND_OPS[rawOp],
+                        D3DRS_SRCBLEND: rawColorSrc, mappedSrc: colorBlend.src,
+                        D3DRS_DESTBLEND: rawColorDst, mappedDst: colorBlend.dst,
+                        D3DRS_BLENDOP: rawColorOp, mappedOp: BLEND_OPS[rawColorOp],
                     });
             }
+            const blendColor = get(D3DRS_BLENDFACTOR, 0xffffffff) >>> 0;
+            const blendConstant = {
+                r: ((blendColor >>> 16) & 0xff) / 255,
+                g: ((blendColor >>> 8) & 0xff) / 255,
+                b: (blendColor & 0xff) / 255,
+                a: ((blendColor >>> 24) & 0xff) / 255,
+            };
+
+            // D3D9 stores both bias states as float bit patterns in DWORDs.
+            // Its constant bias is in normalised depth units; depth24 WebGPU
+            // expresses the same offset in one-ULP integer steps.
+            const rawDepthBias = floatFromDWORD(get(D3DRS_DEPTHBIAS, 0));
+            const scaledDepthBias = Number.isFinite(rawDepthBias)
+                ? Math.round(rawDepthBias * 0x1000000) : 0;
+            const depthBias = Math.max(-0x80000000,
+                Math.min(0x7fffffff, scaledDepthBias));
+            const rawSlopeBias = floatFromDWORD(
+                get(D3DRS_SLOPESCALEDEPTHBIAS, 0));
+            const depthBiasSlopeScale = Number.isFinite(rawSlopeBias)
+                ? rawSlopeBias : 0;
+
+            const stencilEnabled = hasDepth &&
+                get(D3DRS_STENCILENABLE, 0) !== 0;
+            const stencilFace = (failId, depthFailId, passId, funcId) => ({
+                compare: COMPARE_FUNCS[get(funcId, 8)] || "always",
+                failOp: STENCIL_OPS[get(failId, 1)] || "keep",
+                depthFailOp: STENCIL_OPS[get(depthFailId, 1)] || "keep",
+                passOp: STENCIL_OPS[get(passId, 1)] || "keep",
+            });
+            const stencilFront = stencilFace(D3DRS_STENCILFAIL,
+                D3DRS_STENCILZFAIL, D3DRS_STENCILPASS, D3DRS_STENCILFUNC);
+            const stencilBack = get(D3DRS_TWOSIDEDSTENCILMODE, 0) !== 0
+                ? stencilFace(D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILZFAIL,
+                    D3DRS_CCW_STENCILPASS, D3DRS_CCW_STENCILFUNC)
+                : stencilFront;
 
             // D3D9's front face is clockwise, so D3DCULL_CW means "cull the
             // front" and D3DCULL_CCW (its default) means "cull the back".
@@ -4101,9 +4617,15 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 reference: get(D3DRS_ALPHAREF, 0) & 0xFF,
             };
 
-            return { depthEnabled, depthWrite, depthCompare, blendEnabled,
-                srcFactor, dstFactor, blendOp, cullMode, writeMask,
-                alphaTest, hasDepth, extraWriteMasks,
+            return { depthEnabled, depthWrite, depthCompare, depthBias,
+                depthBiasSlopeScale, blendEnabled, srcFactor, dstFactor,
+                blendOp, alphaSrcFactor, alphaDstFactor, alphaBlendOp,
+                blendConstant, cullMode, writeMask, alphaTest, hasDepth,
+                stencilEnabled, stencilFront, stencilBack,
+                stencilReadMask: get(D3DRS_STENCILMASK, 0xffffffff) >>> 0,
+                stencilWriteMask: get(D3DRS_STENCILWRITEMASK, 0xffffffff) >>> 0,
+                stencilReference: get(D3DRS_STENCILREF, 0) >>> 0,
+                extraWriteMasks,
                 // Every colour attachment of the pass this pipeline runs in has
                 // to appear in its fragment targets, in order -- WebGPU matches
                 // them positionally, so an MRT pass needs the whole list baked
@@ -4162,7 +4684,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 descriptor.maxAnisotropy = Math.min(16, maxAnisotropy);
             if (addressU === 4 || addressV === 4 || addressW === 4)
                 this.warnOnce("address-border", "D3DTADDRESS_BORDER has no " +
-                    "WebGPU equivalent; clamping to edge instead");
+                    "native WebGPU sampler mode; the physical sample clamps " +
+                    "to edge and the fixed-function fragment shader replaces " +
+                    "out-of-domain coordinates with D3DSAMP_BORDERCOLOR");
             if (addressU === 5 || addressV === 5 || addressW === 5)
                 this.warnOnce("address-mirroronce", "D3DTADDRESS_MIRRORONCE " +
                     "has no WebGPU equivalent; clamping to edge instead");
@@ -4327,7 +4851,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                      stage.colorArg2, stage.alphaOp, stage.alphaArg0,
                      stage.alphaArg1, stage.alphaArg2, stage.resultArg,
                      stage.samplesTexture ? stage.textureType : "-",
-                     stage.coordVarying, stage.projected ? "p" + stage.transformCount : ""
+                     stage.coordVarying, stage.projected ? "p" + stage.transformCount : "",
+                     stage.samplesTexture
+                         ? [stage.addressU, stage.addressV, stage.addressW,
+                            stage.borderColor >>> 0].join("b") : ""
                     ].join(".")).join("|") +
                     (pixelSignature.usesTextureFactor ? "_tf" : "") +
                     (pixelSignature.specularEnable ? "_s" : "") +
@@ -4352,22 +4879,35 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 // Only the declaration knows which attributes are D3DCOLOR and
                 // therefore arrive byte-swapped; see bgraInputLocations.
                 const bgra = [];
+                const inputConversions = {};
                 for (const element of elements) {
                     const location = inputLocations.get(
                         element.usage * 16 + element.usageIndex);
                     if (location !== undefined && element.type === DECLTYPE_D3DCOLOR)
                         bgra.push(location);
+                    if (location === undefined) continue;
+                    const conversion = {
+                        5: "ubyte4", 6: "short2", 7: "short4",
+                        13: "udec3", 14: "dec3n",
+                    }[element.type];
+                    if (conversion) inputConversions[location] = conversion;
                 }
                 bgra.sort((a, b) => a - b);
-                const variantKey = bgra.join(",");
+                const conversionKey = Object.keys(inputConversions)
+                    .map(Number).sort((a, b) => a - b)
+                    .map(location => location + ":" + inputConversions[location])
+                    .join(",");
+                const variantKey = "b:" + bgra.join(",") + "|c:" + conversionKey;
+                const needsVariant = bgra.length || conversionKey.length;
                 let variant = vsResource.variants.get(variantKey);
                 if (!variant) {
-                    variant = bgra.length
+                    variant = needsVariant
                         ? shaderPipeline.compileShader(vsResource.tokens,
-                            { bgraInputLocations: bgra })
+                            { bgraInputLocations: bgra, inputConversions })
                         : vsResource.translated;
                     vsResource.variants.set(variantKey, variant);
-                    if (bgra.length && variant.ok) ++this.stats.shaderVariantsTranslated;
+                    if (needsVariant && variant.ok)
+                        ++this.stats.shaderVariantsTranslated;
                 }
                 if (!variant.ok)
                     return { error: "vertex shader translation failed: " + variant.error,
@@ -4381,6 +4921,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                         element.usage * 16 + element.usageIndex);
                     return location === undefined ? -1 : location;
                 };
+                if (conversionKey.length)
+                    ++this.stats.drawsWithCompactVertexInputs;
             } else {
                 const signature = fixedVertexSignature;
                 signature.fogMode = fogMode;
@@ -4528,9 +5070,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                             color: { srcFactor: pipelineState.srcFactor,
                                      dstFactor: pipelineState.dstFactor,
                                      operation: pipelineState.blendOp },
-                            alpha: { srcFactor: pipelineState.srcFactor,
-                                     dstFactor: pipelineState.dstFactor,
-                                     operation: pipelineState.blendOp },
+                            alpha: { srcFactor: pipelineState.alphaSrcFactor,
+                                     dstFactor: pipelineState.alphaDstFactor,
+                                     operation: pipelineState.alphaBlendOp },
                         };
                     }
                     return target;
@@ -4563,6 +5105,16 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                         ? pipelineState.depthWrite : false,
                     depthCompare: pipelineState.depthEnabled
                         ? pipelineState.depthCompare : "always",
+                    depthBias: pipelineState.depthBias,
+                    depthBiasSlopeScale: pipelineState.depthBiasSlopeScale,
+                    stencilFront: pipelineState.stencilEnabled
+                        ? pipelineState.stencilFront : {},
+                    stencilBack: pipelineState.stencilEnabled
+                        ? pipelineState.stencilBack : {},
+                    stencilReadMask: pipelineState.stencilEnabled
+                        ? pipelineState.stencilReadMask : 0,
+                    stencilWriteMask: pipelineState.stencilEnabled
+                        ? pipelineState.stencilWriteMask : 0,
                 };
             }
             pipeline = this.device.createRenderPipeline(descriptor);
@@ -4923,6 +5475,13 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             }
             const pipeline = this.pipelineFor(program, pipelineState,
                 geometry.topology, geometry.stripIndexFormat);
+            // The bind group captures concrete GPUTextureView objects. Create
+            // the frame first so bindGroupFor can mark those textures as read;
+            // a later UPDATE_TEXTURE can then rename instead of retroactively
+            // changing this already-recorded draw. A draw without a preceding
+            // Clear is legal and used by War3's UI passes, so relying on Clear
+            // to create the frame misses exactly those textures.
+            const frame = this.ensureFrame();
             const constants = this.constantBufferFor(state, program);
             const bindGroup = this.bindGroupFor(state, pipeline, program, constants);
             // Bind each stream the pipeline declared a layout for, in the same
@@ -4938,7 +5497,6 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 }
                 vertexBuffers.push({ buffer: binding.buffer, offset: binding.offset });
             }
-            const frame = this.ensureFrame();
             // Mark every buffer this draw reads as "observed at this frame's
             // contents". applyBufferUpdate() uses that to notice a write that
             // would retroactively change what an already-recorded draw sees.
@@ -4959,6 +5517,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 kind: "draw", pipeline, bindGroup, targets,
                 viewport: { ...state.viewport },
                 scissor: scissorEnabled ? { ...state.scissorRect } : null,
+                blendConstant: pipelineState.blendConstant,
+                stencilReference: pipelineState.stencilReference,
                 vertexBuffers, indexInfo: geometry.indexInfo,
                 vertexCount: geometry.vertexCount,
             });

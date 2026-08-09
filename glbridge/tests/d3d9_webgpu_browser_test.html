@@ -26,7 +26,8 @@ canvas { width: 640px; height: 480px; }
     const surface = (handle, width, height) =>
         u32(handle, 0x1234, 0, 0, width, height);
     const createDevice = (handle, width, height) =>
-        u32(handle, 0x1234, 0, 0, width, height, 22, 1, 0x20, 0, 0);
+        u32(handle, 0x1234, 0, 0, width, height, 22, 1, 0x20, 1,
+            75 /* D3DFMT_D24S8 */);
     const transform = (handle, state, matrix) => {
         const payload = new Uint8Array(72);
         const view = new DataView(payload.buffer);
@@ -66,6 +67,7 @@ canvas { width: 640px; height: 480px; }
     const DECLTYPE_FLOAT3 = 2;
     const DECLTYPE_FLOAT4 = 3;
     const DECLTYPE_D3DCOLOR = 4;
+    const DECLTYPE_UBYTE4 = 5;
     const DECLUSAGE_POSITION = 0;
     const DECLUSAGE_TEXCOORD = 5;
     const DECLUSAGE_POSITIONT = 9;
@@ -214,12 +216,14 @@ canvas { width: 640px; height: 480px; }
         ]);
         const vertexShaderHandle = 0x40000001;
         const pixelShaderHandle = 0x40000003;
-        // POSITION(float3) + COLOR(D3DCOLOR) + TEXCOORD0(float2), stride 24 --
+        // POSITION(float3) + COLOR(UBYTE4) + TEXCOORD0(float2), stride 24 --
         // the three semantics the vertex shader dcl's, in a different element
-        // order than the fixed-function stage would assume.
+        // order than the fixed-function stage would assume. UBYTE4 is an M5
+        // compact declaration type: WebGPU delivers vec4<u32>, while D3D9
+        // promises unnormalised float components to the shader.
         const shaderElements = [
             element(0, DECLTYPE_FLOAT3, DECLUSAGE_POSITION),
-            element(12, DECLTYPE_D3DCOLOR, DECLUSAGE_COLOR),
+            element(12, DECLTYPE_UBYTE4, DECLUSAGE_COLOR),
             element(16, DECLTYPE_FLOAT2, DECLUSAGE_TEXCOORD),
         ];
         const shaderVertices = new Uint8Array(3 * 24);
@@ -376,8 +380,13 @@ canvas { width: 640px; height: 480px; }
         await Promise.race([
             executor.initialize(),
             new Promise((unused, reject) => setTimeout(() =>
-                reject(new Error("WebGPU initialization timed out")), 8000)),
+                reject(new Error("WebGPU initialization timed out")), 20000)),
         ]);
+        // Diagnostic previews must never gate the real texture upload. Zeroing
+        // the budget exercises the War3 battle regression where menu atlases
+        // consumed the budget and later fog/UI/cursor uploads were returned
+        // from before queue.writeTexture.
+        executor.previewBudget = 0;
         executor.device.pushErrorScope("validation");
         await executor.submit(batch([
             command(1, u32(32, 0, sessionLow, sessionHigh)),
@@ -391,13 +400,25 @@ canvas { width: 640px; height: 480px; }
                 64, 0, texture.byteLength, 0),
                 [{ offsetField: 44, data: texture }]),
             command(0x204, u32(deviceHandle, 0, 0, 640, 480, 0, 0x3F800000, 0)),
-            command(5, u32(deviceHandle, 1, 0xFF101820, 0x3F800000, 0, 0)),
+            // M4 partial depth+stencil Clear validates frag_depth and stencil
+            // replacement in the dynamically generated utility pipeline.
+            command(5, concatBytes([
+                u32(deviceHandle, 6, 0, 0x3F000000, 0x5A, 1),
+                u32(0, 0, 32, 32),
+            ])),
+            command(5, u32(deviceHandle, 7, 0xFF101820, 0x3F800000, 0, 0)),
             command(6, u32(deviceHandle, 0)),
             command(0x20E, setFVF(deviceHandle, 0x144, screenElements)),
             command(0x203, u32(deviceHandle, 0, textureHandle, 0)),
             command(0x302, u32(deviceHandle, 4, 1, 28, 3,
                 screenVertices.byteLength, 0, 0),
                 [{ offsetField: 24, data: screenVertices }]),
+            // The first draw's bind group has captured the original texture
+            // view. Updating it now must rename the texture so that draw keeps
+            // the old pixels and later draws see these new ones.
+            command(0x113, u32(textureHandle, 0, 0, 0, 0, 16, 16, 1,
+                64, 0, texture.byteLength, 0),
+                [{ offsetField: 44, data: texture }]),
             command(0x206, transform(deviceHandle, 2, identity)),
             command(0x206, transform(deviceHandle, 3, identity)),
             command(0x206, transform(deviceHandle, 256, identity)),
@@ -444,6 +465,11 @@ canvas { width: 640px; height: 480px; }
             // browser and not only by naga.
             command(0x110, u32(deviceHandle, renderTargetHandle, 128, 128, 1, 21,
                 1 /* D3DUSAGE_RENDERTARGET */, 0)),
+            // M4: both utility pipelines are generated dynamically, so they
+            // need real Tint/WebGPU validation in addition to fake-device
+            // unit tests. First fill a sub-rectangle, then clear another one.
+            command(9, u32(deviceHandle, renderTargetHandle, 0, 0xFF305070,
+                8, 8, 120, 120)),
             command(0x111, u32(deviceHandle, cubeHandle, 8, 1, 21, 0, 1, 0)),
             // All six faces: an unwritten face has undefined contents, and the
             // executor counts that (drawsWithIncompleteMipChain) rather than
@@ -455,6 +481,10 @@ canvas { width: 640px; height: 480px; }
             command(0x20F, u32(deviceHandle, 0, renderTargetHandle, 0)),
             command(0x210, u32(deviceHandle, 0, 0, 0)), // no depth with it
             command(0x204, u32(deviceHandle, 0, 0, 128, 128, 0, 0x3F800000, 0)),
+            command(5, concatBytes([
+                u32(deviceHandle, 1, 0xFF203040, 0x3F800000, 0, 1),
+                u32(16, 16, 112, 112),
+            ])),
             command(5, u32(deviceHandle, 1, 0xFF203040, 0x3F800000, 0, 0)),
             command(0x200, u32(deviceHandle, 137, 1, 0)),   // LIGHTING
             command(0x200, u32(deviceHandle, 139, 0x00303030, 0)), // AMBIENT
@@ -488,9 +518,20 @@ canvas { width: 640px; height: 480px; }
             command(0x203, u32(deviceHandle, 0, renderTargetHandle, 0)),
             command(0x203, u32(deviceHandle, 1, 0, 0)),
             command(0x20E, setFVF(deviceHandle, 0x144, screenElements)),
+            // Warcraft III uses projected mask textures for shadows/fog. A
+            // WebGPU sampler cannot express D3DTADDRESS_BORDER, so this forces
+            // the fixed-function fragment variant which replaces out-of-range
+            // coordinates with D3DSAMP_BORDERCOLOR; real Tint validates it.
+            command(0x201, u32(deviceHandle, 0, 1, 4)),  // ADDRESSU=BORDER
+            command(0x201, u32(deviceHandle, 0, 2, 4)),  // ADDRESSV=BORDER
+            command(0x201, u32(deviceHandle, 0, 4, 0x00000000)),
+            // M5: the final back-buffer draw uses an sRGB attachment view, so
+            // Tint validates the -srgb pipeline/view pairing on a real canvas.
+            command(0x200, u32(deviceHandle, 194, 1, 0)),
             command(0x302, u32(deviceHandle, 4, 1, 28, 3,
                 rtQuadVertices.byteLength, 0, 0),
                 [{ offsetField: 24, data: rtQuadVertices }]),
+            command(0x200, u32(deviceHandle, 194, 0, 0)),
 
             // StretchRect the back buffer into the render target and back out
             // again. Only a real browser exercises the interesting part: the
@@ -516,12 +557,11 @@ canvas { width: 640px; height: 480px; }
         const expected = {
             drawCalls: 5, upDrawCalls: 5, presents: 1, pipelineCreations: 5,
             malformedBatches: 0, unsupportedCommands: 0, droppedDraws: 0,
-            // Two shaders translated, plus one extra variant because the
-            // declaration types COLOR0 as D3DCOLOR and the vertex module has
-            // to swizzle it.
+            // Two shaders translated, plus one declaration-specific M5 variant
+            // which widens the UBYTE4 COLOR0 input to D3D9's float vector.
             shadersTranslated: 2, shaderTranslationFailures: 0,
             shaderVariantsTranslated: 1, shaderCompileErrors: 0,
-            programmableDraws: 1,
+            programmableDraws: 1, drawsWithCompactVertexInputs: 1,
             // M3: the lit draw goes into a render target, then the target is
             // sampled back on the back buffer -- two targets, so at least two
             // passes, and the cube texture is sampled by the cascade.
@@ -530,9 +570,14 @@ canvas { width: 640px; height: 480px; }
             // A refused texture would mean the device did not get the BC
             // feature; the DXT1 upload above is the only way to notice.
             texturesRejected: 0,
+            textureUploads: 9, texturePreviewsSkipped: 3,
+            textureUpdateHazards: 1, textureRenames: 1,
+            textureFullCopyRenameBytes: 1024,
             // Both StretchRects touch the back buffer, so both must go through
             // the deferred blit rather than being skipped.
             blits: 2, blitsSkipped: 0, blitsThroughBackBuffer: 2,
+            colorFills: 1, partialClears: 2, srgbWriteRequests: 1,
+            srgbWriteUnavailable: 0,
             drawsWithUnsupportedTextureOp: 0,
             depthTargetSizeMismatches: 0,
             drawsWithIncompleteMipChain: 0,
@@ -544,7 +589,7 @@ canvas { width: 640px; height: 480px; }
             drawsWithUnappliedLighting: 1,
             // Draws 1 and 2 sample with D3D9's default sampler state; draw 3
             // with the CLAMP/LINEAR one set above.
-            samplersCreated: 2,
+            samplersCreated: 3,
         };
         const mismatches = Object.keys(expected)
             .filter(key => stats[key] !== expected[key])

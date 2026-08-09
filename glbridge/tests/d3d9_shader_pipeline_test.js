@@ -603,6 +603,35 @@ test("uniform sizing: the reflection describes the exact packed layout", () => {
         reflection.boolRegionBytes);
 });
 
+test("M5 compact skinning inputs are converted to D3D9 float4 registers", () => {
+    const result = pipeline.compileShader(tokens(VS_1_1_TRANSFORM), {
+        inputConversions: { 0: "dec3n", 1: "ubyte4" },
+    });
+    assert.ok(result.ok, result.error);
+    assert.ok(result.wgsl.includes("@location(0) in0: u32"),
+        "DEC3N must arrive as its packed uint32 storage");
+    assert.ok(result.wgsl.includes("d9_unpack_dec3n(in0)"),
+        "DEC3N was not sign-extended and normalised");
+    assert.ok(result.wgsl.includes("@location(1) in1: vec4<u32>"),
+        "UBYTE4 must use an integer vertex input");
+    assert.ok(result.wgsl.includes("vin1 = vec4<f32>(in1)"),
+        "UBYTE4 was not converted to the float4 D3D9 exposes");
+});
+
+test("projection source modifiers preserve a negative divisor", () => {
+    const result = compileOk([
+        VS(2, 0),
+        instruction(OP.DCL, { length: 2 }), dclToken(USAGE.POSITION),
+            dst(REG.INPUT, 0),
+        instruction(OP.MOV, { length: 2 }), dst(REG.TEMP, 0),
+            src(REG.INPUT, 0, { modifier: 9 /* _dz */ }),
+        instruction(OP.MOV, { length: 2 }), dst(REG.RASTOUT, 0), src(REG.TEMP, 0),
+        END,
+    ], "signed projective divide");
+    assert.ok(result.wgsl.includes("select(-max(abs("),
+        "negative q must not be clamped to a positive epsilon");
+});
+
 test("generated WGSL is brace-balanced and declares every register it reads", () => {
     for (const [name, list] of [
         ["vs_1_1", VS_1_1_TRANSFORM], ["ps_1_1", PS_1_1_MODULATE],
