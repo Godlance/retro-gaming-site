@@ -379,6 +379,27 @@ for (const [name, kind] of [["ubyte4", "ubyte4"], ["short2", "short2"],
     else ++validated;
 }
 
+// M6 point primitives use a translated vertex-shader variant with instance
+// attributes and @builtin(vertex_index) quad expansion.
+{
+    const result = pipeline.compileShader(new Uint32Array(CORPUS[0][1]), {
+        pointExpansion: true, pointSprite: true,
+    });
+    const file = path.join(directory, "m6_programmable_point_sprite.wgsl");
+    if (!result.ok) {
+        failures.push({ name: "M6 programmable point sprite",
+            message: "translation failed: " + result.error });
+    } else {
+        fs.writeFileSync(file, result.wgsl);
+        const run = spawnSync(naga, [file], { encoding: "utf8" });
+        if (run.status !== 0)
+            failures.push({ name: "M6 programmable point sprite",
+                message: (run.stderr || run.stdout || "").trim(),
+                source: result.wgsl });
+        else ++validated;
+    }
+}
+
 // The synthesised fixed-function stages are part of the same contract and
 // pair with translated shaders inside a pipeline, so they get validated here
 // too rather than only being exercised through the fake-device executor test.
@@ -391,9 +412,11 @@ for (const [name, kind] of [["ubyte4", "ubyte4"], ["short2", "short2"],
     const vsBase = overrides => Object.assign({
         positionType: "world", hasColor: false, colorIsBGRA: false,
         hasColor1: false, color1IsBGRA: false, hasNormal: false,
+        hasPointSize: false,
         texCoordSets: [], hasTexCoord: false, coordStages: [],
         fogMode: 0, fogRange: false, normalizeNormals: false,
         needsViewSpace: false, lighting: null, clipPlaneCount: 0,
+        pointExpansion: false, pointSprite: false, pointScale: false,
     }, overrides);
     for (const positionType of ["world", "screen"]) {
         for (const hasColor of [false, true]) {
@@ -466,6 +489,14 @@ for (const [name, kind] of [["ubyte4", "ubyte4"], ["short2", "short2"],
                 }))]);
         }
     }
+    fixedFunction.push(["ff vs point sprite scaled",
+        executor.buildFixedFunctionVertexShader(vsBase({
+            hasColor: true, hasPointSize: true, needsViewSpace: true,
+            pointExpansion: true, pointSprite: true, pointScale: true,
+            texCoordSets: [0], hasTexCoord: true,
+            coordStages: [{ index: 0, texCoordIndex: 0, tciMode: 0,
+                transformCount: 0, projected: false }],
+        }))]);
 
     // A pixel signature with a single default stage.
     const stage = overrides => Object.assign({

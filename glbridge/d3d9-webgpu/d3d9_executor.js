@@ -57,6 +57,16 @@
         throw new Error("d3d9_executor.js requires d3d9_shader_pipeline.js to " +
             "be loaded first");
 
+    const DEFAULT_SHADER_WORKER_URL = (() => {
+        try {
+            if (typeof document === "undefined" || !document.currentScript ||
+                    !document.currentScript.src)
+                return null;
+            return new URL("d3d9_shader_worker.js",
+                document.currentScript.src).href;
+        } catch (error) { return null; }
+    })();
+
     const D9WG_MAGIC = 0x47573944; // "D9WG"
     const D9WG_VERSION_MAJOR = 1;
     const D9WG_VERSION_MINOR = 0;
@@ -148,6 +158,12 @@
     // WebGPU's minUniformBufferOffsetAlignment default. The vertex and pixel
     // constant regions share one buffer, so the pixel region starts here.
     const UNIFORM_OFFSET_ALIGNMENT = 256;
+    // M6 keeps per-draw constants in one persistent buffer. 16 MiB covers
+    // tens of thousands of ordinary UI/particle draws while remaining small
+    // compared with the texture working set of the target games. A frame that
+    // exceeds it falls back to a retired one-off buffer rather than wrapping
+    // over constants that have already been recorded.
+    const UNIFORM_RING_BYTES = 16 * 1024 * 1024;
 
     const D3DFMT_A8R8G8B8 = 21;
     const D3DFMT_X8R8G8B8 = 22;
@@ -244,6 +260,16 @@
     const D3DRS_SPECULARMATERIALSOURCE = 146;
     const D3DRS_AMBIENTMATERIALSOURCE = 147;
     const D3DRS_EMISSIVEMATERIALSOURCE = 148;
+    // Point primitives/point sprites. WebGPU only exposes one-pixel points,
+    // so M6 expands every D3D point to a six-vertex quad in the vertex stage.
+    const D3DRS_POINTSIZE = 154;
+    const D3DRS_POINTSIZE_MIN = 155;
+    const D3DRS_POINTSPRITEENABLE = 156;
+    const D3DRS_POINTSCALEENABLE = 157;
+    const D3DRS_POINTSCALE_A = 158;
+    const D3DRS_POINTSCALE_B = 159;
+    const D3DRS_POINTSCALE_C = 160;
+    const D3DRS_POINTSIZE_MAX = 166;
 
     // D3DLIGHTTYPE
     const D3DLIGHT_POINT = 1, D3DLIGHT_SPOT = 2, D3DLIGHT_DIRECTIONAL = 3;
@@ -451,7 +477,10 @@
         D3DRS_LOCALVIEWER, D3DRS_NORMALIZENORMALS, D3DRS_DIFFUSEMATERIALSOURCE,
         D3DRS_SPECULARMATERIALSOURCE, D3DRS_AMBIENTMATERIALSOURCE,
         D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_SCISSORTESTENABLE,
-        D3DRS_SRGBWRITEENABLE,
+        D3DRS_SRGBWRITEENABLE, D3DRS_POINTSIZE, D3DRS_POINTSIZE_MIN,
+        D3DRS_POINTSPRITEENABLE, D3DRS_POINTSCALEENABLE,
+        D3DRS_POINTSCALE_A, D3DRS_POINTSCALE_B, D3DRS_POINTSCALE_C,
+        D3DRS_POINTSIZE_MAX,
     ]);
 
     const D3DTS_VIEW = 2;
@@ -724,6 +753,7 @@
     const FF_LOCATION_COLOR1 = 2;
     const FF_LOCATION_NORMAL = 3;
     const FF_LOCATION_TEXCOORD0 = 4; // .. 11 for TEXCOORD0..7
+    const FF_LOCATION_PSIZE = 12;
 
     // D3D9's alpha test has no fixed-function equivalent in WebGPU: it has to
     // become a `discard` in the fragment shader, which means the comparison
@@ -765,9 +795,11 @@
         if (element.usage === DECLUSAGE_TEXCOORD &&
                 element.usageIndex < MAX_TEXCOORD_SETS)
             return FF_LOCATION_TEXCOORD0 + element.usageIndex;
-        // PSIZE (point sprites) and the skinning usages are accepted by the
-        // guest's declaration validator so lit or skinned vertex data does not
-        // have to be reformatted, but no fixed-function stage reads them.
+        if (element.usage === DECLUSAGE_PSIZE)
+            return element.usageIndex === 0 ? FF_LOCATION_PSIZE : -1;
+        // Skinning usages are accepted by the guest's declaration validator so
+        // lit or skinned vertex data does not have to be reformatted, but no
+        // fixed-function stage reads them.
         return -1;
     }
 
@@ -865,6 +897,14 @@
             fields.push({ name: "clip_planes",
                 type: "array<vec4<f32>, " + signature.clipPlaneCount + ">",
                 bytes: 16 * signature.clipPlaneCount });
+        if (signature.pointExpansion) {
+            fields.push(
+                { name: "point_viewport", type: "vec4<f32>", bytes: 16 },
+                // x=size, y=min, z=max, w reserved.
+                { name: "point_params", type: "vec4<f32>", bytes: 16 });
+            if (signature.pointScale)
+                fields.push({ name: "point_scale", type: "vec4<f32>", bytes: 16 });
+        }
         return uniformBlockLayout(fields);
     }
 
@@ -953,8 +993,12 @@
             parameters.push(vertexInputDeclaration(FF_LOCATION_COLOR1));
         if (signature.hasNormal)
             parameters.push(vertexInputDeclaration(FF_LOCATION_NORMAL));
+        if (signature.hasPointSize)
+            parameters.push(vertexInputDeclaration(FF_LOCATION_PSIZE));
         for (const set of signature.texCoordSets)
             parameters.push(vertexInputDeclaration(FF_LOCATION_TEXCOORD0 + set));
+        if (signature.pointExpansion)
+            parameters.push("@builtin(vertex_index) d9_vertex_index: u32");
 
         const varyings = [];
         for (let slot = 0; slot < VARYING_COUNT; ++slot)
@@ -1176,6 +1220,43 @@
                 (VARYING_TEXCOORD0 + stage.index) + " = " + expression + ";\n";
         }
 
+        let pointBody = "";
+        if (signature.pointExpansion) {
+            const baseSize = signature.hasPointSize
+                ? "in" + FF_LOCATION_PSIZE + ".x" : "uniforms.point_params.x";
+            pointBody +=
+                "    let d9_point_uvs = array<vec2<f32>, 6>(\n" +
+                "        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0),\n" +
+                "        vec2<f32>(0.0, 1.0), vec2<f32>(0.0, 1.0),\n" +
+                "        vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0));\n" +
+                "    let d9_point_uv = d9_point_uvs[d9_vertex_index % 6u];\n" +
+                "    var d9_point_size = " + baseSize + ";\n";
+            if (signature.pointScale) {
+                pointBody +=
+                    "    let d9_point_distance = length(position_view.xyz);\n" +
+                    "    let d9_point_denom = max(uniforms.point_scale.x +\n" +
+                    "        uniforms.point_scale.y * d9_point_distance +\n" +
+                    "        uniforms.point_scale.z * d9_point_distance * d9_point_distance, 1e-6);\n" +
+                    "    d9_point_size = d9_point_size * uniforms.point_viewport.y *\n" +
+                    "        inverseSqrt(d9_point_denom);\n";
+            }
+            pointBody +=
+                "    d9_point_size = clamp(d9_point_size, uniforms.point_params.y,\n" +
+                "        max(uniforms.point_params.y, uniforms.point_params.z));\n" +
+                "    let d9_point_ndc = vec2<f32>(\n" +
+                "        (d9_point_uv.x * 2.0 - 1.0) * d9_point_size / uniforms.point_viewport.x,\n" +
+                "        (1.0 - d9_point_uv.y * 2.0) * d9_point_size / uniforms.point_viewport.y);\n" +
+                "    result.position = vec4<f32>(result.position.xy +\n" +
+                "        d9_point_ndc * result.position.w, result.position.zw);\n";
+            if (signature.pointSprite) {
+                for (let stage = 0; stage < MAX_TEXCOORD_SETS; ++stage) {
+                    pointBody += "    result.varying" +
+                        (VARYING_TEXCOORD0 + stage) +
+                        " = vec4<f32>(d9_point_uv, 0.0, 1.0);\n";
+                }
+            }
+        }
+
         const lightStruct = lighting && lighting.lights.length ? `struct D9Light {
     diffuse: vec4<f32>,
     specular: vec4<f32>,
@@ -1203,7 +1284,7 @@ ${varyings.map((_, slot) =>
         "    result.varying" + slot + " = vec4<f32>(0.0);").join("\n")}
 ${viewSpaceBody}${colorBody}    result.varying${VARYING_COLOR0} = out_diffuse;
     result.varying${shaderPipeline.VARYING_COLOR1} = out_specular;
-${coordBody}${fogBody}    return result;
+${coordBody}${fogBody}${pointBody}    return result;
 }
 `;
     }
@@ -1419,6 +1500,56 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
 `;
     }
 
+    function createIndexedDBShaderCacheStorage(indexedDB) {
+        const databaseName = "d9wg-shader-cache";
+        const storeName = "snapshots";
+        const open = () => new Promise((resolve, reject) => {
+            const request = indexedDB.open(databaseName, 1);
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                if (!db.objectStoreNames.contains(storeName))
+                    db.createObjectStore(storeName);
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error ||
+                new Error("could not open the shader-cache database"));
+            request.onblocked = () => reject(new Error(
+                "shader-cache database upgrade is blocked by another page"));
+        });
+        return {
+            async load(key) {
+                const db = await open();
+                try {
+                    return await new Promise((resolve, reject) => {
+                        const request = db.transaction(storeName, "readonly")
+                            .objectStore(storeName).get(key);
+                        request.onsuccess = () => resolve(request.result || null);
+                        request.onerror = () => reject(request.error ||
+                            new Error("could not read the shader cache"));
+                    });
+                } finally {
+                    db.close();
+                }
+            },
+            async save(key, payload) {
+                const db = await open();
+                try {
+                    await new Promise((resolve, reject) => {
+                        const transaction = db.transaction(storeName, "readwrite");
+                        transaction.objectStore(storeName).put(payload, key);
+                        transaction.oncomplete = () => resolve();
+                        transaction.onerror = () => reject(transaction.error ||
+                            new Error("could not write the shader cache"));
+                        transaction.onabort = () => reject(transaction.error ||
+                            new Error("shader-cache transaction was aborted"));
+                    });
+                } finally {
+                    db.close();
+                }
+            },
+        };
+    }
+
     class D3D9WebGPUExecutor {
         constructor(canvas, options) {
             if (!canvas) throw new Error("D3D9 WebGPU canvas is required");
@@ -1433,10 +1564,38 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             this.devices = new Map();      // device_handle -> device state
             this.resources = new Map();    // resource_handle -> resource state
             this.pipelineCache = new Map(); // layout signature -> GPURenderPipeline
+            this.bindGroupCache = new Map(); // GPU resources -> GPUBindGroup
+            this.maxBindGroups = Math.max(256,
+                this.options.maxBindGroups || 4096);
+            this.uniformRingCapacity = Math.max(64 * 1024,
+                this.options.uniformRingBytes || UNIFORM_RING_BYTES);
+            this.uniformRing = null;
+            this.uniformRingCursor = 0;
+            this.objectIds = new WeakMap();
+            this.nextObjectId = 1;
             // Bytecode hash -> {ok, wgsl, reflection}. Survives device loss:
             // WGSL text is not tied to a GPUDevice (plan 8.5), only the
             // GPUShaderModules in moduleCache are.
             this.shaderCache = new shaderPipeline.D3D9ShaderCache();
+            this.shaderCacheStorageKey = "d9wg.shader-cache.m6.20260809.v1";
+            let indexedDBStorage = null;
+            try {
+                if (!this.options.shaderCacheStorage && global.window &&
+                        global.indexedDB) {
+                    indexedDBStorage = createIndexedDBShaderCacheStorage(
+                        global.indexedDB);
+                }
+            } catch (error) { /* persistence is optional for restricted origins */ }
+            this.shaderCacheStorage = this.options.shaderCacheStorage ||
+                indexedDBStorage;
+            this.shaderCacheStorageBackend = this.options.shaderCacheStorage ?
+                "injected" : (indexedDBStorage ? "indexeddb" : "memory");
+            this.persistentShaderCachePromise = null;
+            this.shaderCacheSaveTimer = null;
+            this.shaderCacheDirty = false;
+            this.shaderWorker = null;
+            this.shaderWorkerRequests = new Map();
+            this.shaderWorkerSerial = 0;
             this.moduleCache = new Map();  // wgsl -> GPUShaderModule
             this.samplerCache = new Map(); // sampler-state signature -> GPUSampler
             // D3D9 hardware cursor: bitmap, hotspot, position, visibility.
@@ -1475,6 +1634,9 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 batches: 0, commands: 0, presents: 0, queueSubmits: 0,
                 drawCalls: 0, indexedDrawCalls: 0, upDrawCalls: 0,
                 pipelineCreations: 0, pipelineHits: 0,
+                bindGroupCreations: 0, bindGroupHits: 0,
+                bindGroupCacheEvictions: 0,
+                uniformSlotReuses: 0, uniformRingOverflows: 0,
                 unsupportedCommands: 0, malformedBatches: 0,
                 droppedDraws: 0,
                 texturesCreated: 0, textureUploads: 0, textureBytesUploaded: 0,
@@ -1483,6 +1645,10 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 shadersTranslated: 0, shaderTranslationFailures: 0,
                 shaderVariantsTranslated: 0,
                 shaderModulesCreated: 0, shaderCompileErrors: 0,
+                shaderCachePersistentLoads: 0,
+                shaderCachePersistentSaves: 0,
+                shaderCachePersistentFailures: 0,
+                shaderWorkerCompiles: 0, shaderWorkerFallbacks: 0,
                 samplersCreated: 0, samplerHits: 0,
                 // Flicker diagnostics. WebGPU does not preserve a canvas's
                 // contents across Present, so a frame that draws without ever
@@ -1525,12 +1691,25 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 programmableDraws: 0, drawsSkippedForBadShader: 0,
                 drawsWithCompactVertexInputs: 0,
                 constantUploadBytes: 0,
+                pointSpriteDraws: 0, pointSpriteInstances: 0,
+                indexedPointExpansions: 0,
+            };
+            this.mrtAttachmentDraws = [0, 0, 0, 0, 0];
+            this.lastFrameStats = {
+                pipelineCreations: 0, bindGroupCreations: 0,
+                queueSubmits: 0, renderPasses: 0,
             };
         }
 
         initialize() {
             if (this.readyPromise) return this.readyPromise;
             this.readyPromise = (async () => {
+                // Persistent I/O must not delay adapter/device acquisition.
+                // The first submitted batch awaits the same promise before it
+                // can create a shader, so starting both jobs here preserves
+                // cache hits without putting IndexedDB on the startup path.
+                this.restorePersistentShaderCache();
+                this.initializeShaderWorker();
                 if (!this.device) {
                     if (!this.gpu || typeof this.gpu.requestAdapter !== "function")
                         throw new Error("WebGPU is unavailable");
@@ -1597,6 +1776,12 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                     new Uint8Array([255, 255, 255, 255]),
                     { bytesPerRow: 4, rowsPerImage: 1 },
                     { width: 1, height: 1, depthOrArrayLayers: 1 });
+                this.uniformRing = this.device.createBuffer({
+                    label: "D3D9 uniform ring",
+                    size: this.uniformRingCapacity,
+                    usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
+                });
+                this.uniformRingCursor = 0;
                 this.watchForDeviceLoss();
                 return this;
             })().catch(error => {
@@ -1607,9 +1792,110 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             return this.readyPromise;
         }
 
+        async restorePersistentShaderCache() {
+            if (this.persistentShaderCachePromise)
+                return this.persistentShaderCachePromise;
+            this.persistentShaderCachePromise = (async () => {
+                try {
+                    let payload = null;
+                    const storage = this.shaderCacheStorage;
+                    if (storage && typeof storage.load === "function") {
+                        payload = await storage.load(this.shaderCacheStorageKey);
+                    }
+                    if (typeof payload === "string") payload = JSON.parse(payload);
+                    const restored = this.shaderCache.importEntries(payload);
+                    if (restored) this.stats.shaderCachePersistentLoads += restored;
+                } catch (error) {
+                    ++this.stats.shaderCachePersistentFailures;
+                    this.warnOnce("shader-cache-load",
+                        "persistent shader cache could not be restored; using the " +
+                        "in-memory cache for this session", { message: String(error) });
+                }
+            })();
+            return this.persistentShaderCachePromise;
+        }
+
+        initializeShaderWorker() {
+            if (this.options.useShaderWorker === false || this.shaderWorker)
+                return;
+            const WorkerClass = this.options.Worker || global.Worker;
+            const url = this.options.shaderWorkerUrl || DEFAULT_SHADER_WORKER_URL;
+            if (typeof WorkerClass !== "function" || !url) return;
+            try {
+                const worker = new WorkerClass(url);
+                worker.onmessage = event => {
+                    const message = event.data || {};
+                    const pending = this.shaderWorkerRequests.get(message.id);
+                    if (!pending) return;
+                    this.shaderWorkerRequests.delete(message.id);
+                    pending.resolve(message.result);
+                };
+                worker.onerror = event => {
+                    const error = new Error("shader compiler worker failed: " +
+                        ((event && event.message) || "unknown worker error"));
+                    for (const pending of this.shaderWorkerRequests.values())
+                        pending.reject(error);
+                    this.shaderWorkerRequests.clear();
+                    try { worker.terminate(); } catch (ignored) {}
+                    if (this.shaderWorker === worker) this.shaderWorker = null;
+                };
+                this.shaderWorker = worker;
+            } catch (error) {
+                ++this.stats.shaderWorkerFallbacks;
+                this.warnOnce("shader-worker-create",
+                    "shader compile Worker is unavailable; compiling on the " +
+                    "executor thread", { message: String(error) });
+            }
+        }
+
+        compileShaderInWorker(tokens) {
+            if (!this.shaderWorker) return null;
+            const id = ++this.shaderWorkerSerial;
+            return new Promise((resolve, reject) => {
+                this.shaderWorkerRequests.set(id, { resolve, reject });
+                try {
+                    this.shaderWorker.postMessage({ id,
+                        tokens: Array.from(tokens) });
+                } catch (error) {
+                    this.shaderWorkerRequests.delete(id);
+                    reject(error);
+                }
+            });
+        }
+
+        schedulePersistentShaderCacheSave() {
+            const storage = this.shaderCacheStorage;
+            if (!storage || typeof storage.save !== "function") return;
+            if (this.shaderCacheSaveTimer !== null)
+                global.clearTimeout(this.shaderCacheSaveTimer);
+            this.shaderCacheSaveTimer = global.setTimeout(() => {
+                this.shaderCacheSaveTimer = null;
+                this.flushPersistentShaderCache();
+            }, 250);
+        }
+
+        async flushPersistentShaderCache() {
+            if (!this.shaderCacheDirty) return;
+            this.shaderCacheDirty = false;
+            try {
+                const payload = this.shaderCache.exportEntries(2 * 1024 * 1024);
+                const storage = this.shaderCacheStorage;
+                if (!storage || typeof storage.save !== "function") return;
+                await storage.save(this.shaderCacheStorageKey, payload);
+                ++this.stats.shaderCachePersistentSaves;
+            } catch (error) {
+                this.shaderCacheDirty = true;
+                ++this.stats.shaderCachePersistentFailures;
+                this.warnOnce("shader-cache-save",
+                    "persistent shader cache could not be saved; translated " +
+                    "WGSL remains cached in memory", { message: String(error) });
+            }
+        }
+
         submit(bytes, metadata) {
             const owned = bytes instanceof Uint8Array ? bytes.slice() : new Uint8Array(bytes || []);
             this.work = this.work.then(() => this.initialize())
+                .then(() => this.restorePersistentShaderCache())
                 .then(() => this.executeBatch(owned, metadata || {}))
                 .catch(error => {
                     this.failed = error;
@@ -1623,7 +1909,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
 
         // ---- batch decode ----
 
-        executeBatch(bytes, metadata) {
+        async executeBatch(bytes, metadata) {
             const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
             if (bytes.byteLength < D9WG_BATCH_HEADER_BYTES) {
                 ++this.stats.malformedBatches;
@@ -1660,7 +1946,9 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 }
                 const payloadOffset = offset + D9WG_COMMAND_HEADER_BYTES;
                 const payloadBytes = size - D9WG_COMMAND_HEADER_BYTES;
-                this.dispatchCommand(opcode, bytes, view, payloadOffset, payloadBytes);
+                const pending = this.dispatchCommand(opcode, bytes, view,
+                    payloadOffset, payloadBytes);
+                if (pending && typeof pending.then === "function") await pending;
                 offset += size;
                 ++decoded;
                 ++this.stats.commands;
@@ -1672,6 +1960,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
 
             const present = (view.getUint32(12, true) & D9WG_BATCH_FLAG_PRESENT) !== 0;
             if (present) this.finishFrame();
+            if (this.shaderCacheDirty) this.schedulePersistentShaderCacheSave();
         }
 
         dispatchCommand(opcode, bytes, view, offset, length) {
@@ -1683,7 +1972,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 ++this.stats.unsupportedCommands;
                 return;
             }
-            handler.call(this, bytes, view, offset, length);
+            return handler.call(this, bytes, view, offset, length);
         }
 
         // ---- device/resource state ----
@@ -1976,9 +2265,11 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             }
             this.devices.clear();
             this.resources.clear();
-            // Pipelines and bind group layouts are keyed by state, not by
-            // handle, so they stay valid and useful across a process change.
-            // The cursor belonged to the departing process, though.
+            // Pipelines are keyed by state and stay useful across a process
+            // change. Bind groups capture concrete texture views, so clear
+            // those references when their owning resources depart.
+            this.bindGroupCache.clear();
+            // The cursor belonged to the departing process too.
             this.cursor.visible = false;
             this.retireGPUObject(this.cursor.texture);
             this.cursor.texture = null;
@@ -2034,6 +2325,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             this.devices.clear();
             this.resources.clear();
             this.pipelineCache.clear();
+            this.bindGroupCache.clear();
             this.moduleCache.clear();
             this.samplerCache.clear();
             this.cursor = { ...this.cursor, texture: null, view: null,
@@ -2041,6 +2333,10 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 bindGroupLayout: null, visible: false };
             this.fallbackTexture = null;
             this.fallbackView = null;
+            this.uniformRing = null;
+            this.uniformRingCursor = 0;
+            this.objectIds = new WeakMap();
+            this.nextObjectId = 1;
             this.device = null;
             this.context = null;
             this.readyPromise = null;
@@ -2133,7 +2429,15 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             if (this.frame) return this.frame;
             // `serial` identifies this frame for the write-after-record check in
             // applyBufferUpdate(); it must be unique per frame, never reused.
-            this.frame = { ops: [], transientBuffers: [], serial: ++this.frameSerial };
+            this.uniformRingCursor = 0;
+            this.frame = { ops: [], transientBuffers: [], uniformSlots: new Map(),
+                serial: ++this.frameSerial,
+                statStart: {
+                    pipelineCreations: this.stats.pipelineCreations,
+                    bindGroupCreations: this.stats.bindGroupCreations,
+                    queueSubmits: this.stats.queueSubmits,
+                    renderPasses: this.stats.renderPasses,
+                } };
             return this.frame;
         }
 
@@ -2340,7 +2644,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                         scissorActive = false;
                     }
                     pass.setPipeline(op.pipeline);
-                    pass.setBindGroup(0, op.bindGroup);
+                    pass.setBindGroup(0, op.bindGroup, op.dynamicOffsets || []);
                     pass.setBlendConstant(op.blendConstant);
                     pass.setStencilReference(op.stencilReference);
                     pass.setViewport(op.viewport.x, op.viewport.y,
@@ -2370,7 +2674,10 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                         // StartVertex is already folded into each stream's
                         // setVertexBuffer offset (see boundStreams), so
                         // firstVertex stays 0 here.
-                        pass.draw(op.vertexCount || 0);
+                        if ((op.instanceCount || 1) === 1)
+                            pass.draw(op.vertexCount || 0);
+                        else
+                            pass.draw(op.vertexCount || 0, op.instanceCount);
                     }
                 }
                 if (pass) pass.end();
@@ -2380,6 +2687,17 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 ++this.stats.queueSubmits;
             }
             ++this.stats.presents;
+            const start = frame.statStart || {};
+            this.lastFrameStats = {
+                pipelineCreations: this.stats.pipelineCreations -
+                    (start.pipelineCreations || 0),
+                bindGroupCreations: this.stats.bindGroupCreations -
+                    (start.bindGroupCreations || 0),
+                queueSubmits: this.stats.queueSubmits -
+                    (start.queueSubmits || 0),
+                renderPasses: this.stats.renderPasses -
+                    (start.renderPasses || 0),
+            };
             const transientBuffers = frame.transientBuffers;
             if (transientBuffers && transientBuffers.length) {
                 const destroy = () => { for (const b of transientBuffers) b.destroy(); };
@@ -2501,8 +2819,28 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                     density: asFloat(D3DRS_FOGDENSITY),
                 };
             }
+            const shaderCache = this.shaderCache.snapshot();
             return { ...this.stats, devicesLive: this.devices.size,
                 resourcesLive: this.resources.size,
+                pipelinesCached: this.pipelineCache.size,
+                bindGroupsCached: this.bindGroupCache.size,
+                samplersCached: this.samplerCache.size,
+                mrtAttachmentDraws: this.mrtAttachmentDraws.slice(1),
+                lastFrame: { ...this.lastFrameStats },
+                shaderCache,
+                shaderCachePersistentBackend: this.shaderCacheStorageBackend,
+                shaderCacheHits: shaderCache.hits,
+                shaderCacheMisses: shaderCache.misses,
+                shadersCached: shaderCache.cached,
+                shaderWGSLBytesCached: shaderCache.totalWGSLBytes,
+                shaderCompileLatencyMs: { ...shaderCache.compileLatencyMs },
+                // M4 deliberately answers occlusion queries conservatively in
+                // the guest instead of allocating host GPU query slots. Expose
+                // that policy explicitly so zero slot usage cannot be mistaken
+                // for a broken or unobserved query path.
+                occlusionQueries: { mode: "guest-conservative",
+                    slotsUsed: 0, slotsCapacity: 0,
+                    slotExhaustionFallbacks: 0 },
                 surface: device ? { ...device.surface } : null,
                 window: this.windowState ? { ...this.windowState } : null,
                 fog };
@@ -3678,6 +4016,7 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             let hasColor1 = false;
             let color1IsBGRA = false;
             let hasNormal = false;
+            let hasPointSize = false;
             const texCoordSets = [];
             for (const element of elements) {
                 if (element.usage === DECLUSAGE_POSITION && element.usageIndex === 0)
@@ -3695,6 +4034,8 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                     color1IsBGRA = element.type === DECLTYPE_D3DCOLOR;
                 } else if (element.usage === DECLUSAGE_NORMAL && element.usageIndex === 0)
                     hasNormal = true;
+                else if (element.usage === DECLUSAGE_PSIZE && element.usageIndex === 0)
+                    hasPointSize = true;
                 else if (element.usage === DECLUSAGE_TEXCOORD &&
                         element.usageIndex < MAX_TEXCOORD_SETS &&
                         !texCoordSets.includes(element.usageIndex))
@@ -3703,7 +4044,7 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             if (!positionType) return null;
             texCoordSets.sort((a, b) => a - b);
             return { positionType, hasColor, colorIsBGRA, hasColor1,
-                color1IsBGRA, hasNormal, texCoordSets,
+                color1IsBGRA, hasNormal, hasPointSize, texCoordSets,
                 hasTexCoord: texCoordSets.length > 0 };
         }
 
@@ -3921,7 +4262,7 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
         // inputs. Elements no shader input consumes are simply left out --
         // they still occupy bytes in the vertex, but the stride comes from
         // SetStreamSource, never from summing the elements.
-        vertexBufferLayoutsFor(elements, state, locationFor) {
+        vertexBufferLayoutsFor(elements, state, locationFor, instanceData) {
             const perStream = new Map();
             for (const element of elements) {
                 const location = locationFor(element);
@@ -3938,6 +4279,7 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 let entry = perStream.get(element.stream);
                 if (!entry) {
                     entry = { stream: element.stream, arrayStride: stream.stride,
+                        stepMode: instanceData ? "instance" : "vertex",
                         attributes: [] };
                     perStream.set(element.stream, entry);
                 }
@@ -4136,7 +4478,7 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
         // is stored with its error rather than dropped -- recordDraw() then
         // skips draws that bind it and counts them, which is the difference
         // between "this shader is unsupported" and "the game stopped drawing".
-        onCreateShader(bytes, view, offset, kind) {
+        async onCreateShader(bytes, view, offset, kind) {
             const handle = view.getUint32(offset + 4, true);
             const tokenCount = view.getUint32(offset + 8, true);
             const codeOffset = view.getUint32(offset + 12, true);
@@ -4151,7 +4493,37 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             const tokens = new Uint32Array(tokenCount);
             for (let i = 0; i < tokenCount; ++i)
                 tokens[i] = view.getUint32(codeOffset + i * 4, true);
-            const translated = this.shaderCache.compile(tokens, hashLow, hashHigh);
+            const compilesBefore = this.shaderCache.stats.compiles;
+            let translated = this.shaderCache.get(hashLow, hashHigh);
+            if (!translated) {
+                const started = typeof performance !== "undefined" && performance.now
+                    ? performance.now() : Date.now();
+                const workerCompile = this.compileShaderInWorker(tokens);
+                if (workerCompile) {
+                    try {
+                        translated = await workerCompile;
+                        if (!translated || typeof translated.ok !== "boolean")
+                            throw new Error("shader worker returned an invalid result");
+                        ++this.stats.shaderWorkerCompiles;
+                        const ended = typeof performance !== "undefined" && performance.now
+                            ? performance.now() : Date.now();
+                        translated = this.shaderCache.store(hashLow, hashHigh,
+                            translated, ended - started);
+                    } catch (error) {
+                        ++this.stats.shaderWorkerFallbacks;
+                        this.warnOnce("shader-worker-runtime",
+                            "shader compile Worker failed; falling back to the " +
+                            "executor thread", { message: String(error) });
+                        translated = this.shaderCache.compile(tokens,
+                            hashLow, hashHigh);
+                    }
+                } else {
+                    translated = this.shaderCache.compile(tokens,
+                        hashLow, hashHigh);
+                }
+            }
+            if (this.shaderCache.stats.compiles !== compilesBefore)
+                this.shaderCacheDirty = true;
             if (translated.ok) ++this.stats.shadersTranslated;
             else {
                 ++this.stats.shaderTranslationFailures;
@@ -4172,11 +4544,11 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
         }
 
         onCreateVertexShader(bytes, view, offset) {
-            this.onCreateShader(bytes, view, offset, RESOURCE_VERTEX_SHADER);
+            return this.onCreateShader(bytes, view, offset, RESOURCE_VERTEX_SHADER);
         }
 
         onCreatePixelShader(bytes, view, offset) {
-            this.onCreateShader(bytes, view, offset, RESOURCE_PIXEL_SHADER);
+            return this.onCreateShader(bytes, view, offset, RESOURCE_PIXEL_SHADER);
         }
 
         onSetVertexShader(bytes, view, offset) {
@@ -4701,7 +5073,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         // Resolves the two stages into GPUShaderModules plus everything the
         // pipeline and bind group need. Returns {error} instead of throwing
         // for anything the caller should turn into a counted skipped draw.
-        programFor(state, elements, pipelineState) {
+        programFor(state, elements, pipelineState, drawOptions) {
+            drawOptions = drawOptions || {};
             const alphaTest = pipelineState.alphaTest;
             const alphaTestKey = alphaTest.enabled
                 ? "_a" + alphaTest.func + "_" + alphaTest.reference : "";
@@ -4897,13 +5270,19 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     .map(Number).sort((a, b) => a - b)
                     .map(location => location + ":" + inputConversions[location])
                     .join(",");
-                const variantKey = "b:" + bgra.join(",") + "|c:" + conversionKey;
-                const needsVariant = bgra.length || conversionKey.length;
+                const pointKey = drawOptions.pointExpansion
+                    ? "|p:" + (drawOptions.pointSprite ? "s" : "q") : "";
+                const variantKey = "b:" + bgra.join(",") + "|c:" +
+                    conversionKey + pointKey;
+                const needsVariant = bgra.length || conversionKey.length ||
+                    !!drawOptions.pointExpansion;
                 let variant = vsResource.variants.get(variantKey);
                 if (!variant) {
                     variant = needsVariant
                         ? shaderPipeline.compileShader(vsResource.tokens,
-                            { bgraInputLocations: bgra, inputConversions })
+                            { bgraInputLocations: bgra, inputConversions,
+                              pointExpansion: !!drawOptions.pointExpansion,
+                              pointSprite: !!drawOptions.pointSprite })
                         : vsResource.translated;
                     vsResource.variants.set(variantKey, variant);
                     if (needsVariant && variant.ok)
@@ -4925,6 +5304,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     ++this.stats.drawsWithCompactVertexInputs;
             } else {
                 const signature = fixedVertexSignature;
+                signature.pointExpansion = !!drawOptions.pointExpansion;
+                signature.pointSprite = signature.pointExpansion &&
+                    (rs.get(D3DRS_POINTSPRITEENABLE) || 0) !== 0;
+                signature.pointScale = signature.pointExpansion &&
+                    signature.positionType !== "screen" &&
+                    (rs.get(D3DRS_POINTSCALEENABLE) || 0) !== 0;
                 signature.fogMode = fogMode;
                 signature.fogRange = (rs.get(D3DRS_RANGEFOGENABLE) || 0) !== 0;
                 signature.normalizeNormals =
@@ -4936,6 +5321,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 // coordinate generation modes and for range-based fog.
                 signature.needsViewSpace = signature.positionType !== "screen" && (
                     !!signature.lighting ||
+                    signature.pointScale ||
                     (signature.fogRange && !!fogMode) ||
                     signature.coordStages.some(stage =>
                         stage.tciMode !== D3DTSS_TCI_PASSTHRU));
@@ -4943,6 +5329,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     (signature.hasColor ? (signature.colorIsBGRA ? "_cb" : "_c") : "") +
                     (signature.hasColor1 ? (signature.color1IsBGRA ? "_sb" : "_s") : "") +
                     (signature.hasNormal ? "_n" : "") +
+                    (signature.hasPointSize ? "_ps" : "") +
                     "_t" + signature.texCoordSets.join(".") +
                     "_x" + signature.coordStages.map(stage =>
                         [stage.index, stage.texCoordIndex, stage.tciMode,
@@ -4958,7 +5345,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                             signature.lighting.ambientSource,
                             signature.lighting.specularSource,
                             signature.lighting.emissiveSource].join("") : "") +
-                    (fogMode ? "_f" + fogMode + (signature.fogRange ? "r" : "") : "");
+                    (fogMode ? "_f" + fogMode + (signature.fogRange ? "r" : "") : "") +
+                    (signature.pointExpansion ? "_point" +
+                        (signature.pointSprite ? "s" : "") +
+                        (signature.pointScale ? "a" : "") : "");
                 vertexModule = this.moduleFor(
                     buildFixedFunctionVertexShader(signature), "d3d9 " + vertexKey);
                 vertexReflection = null;
@@ -4970,7 +5360,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     "getCompilationInfo error logged at module creation)",
                     shaderError: true };
 
-            const vertexBuffers = this.vertexBufferLayoutsFor(elements, state, locationFor);
+            const vertexBuffers = this.vertexBufferLayoutsFor(elements, state,
+                locationFor, !!drawOptions.pointExpansion);
             if (!vertexBuffers.length)
                 return { error: "no vertex stream supplies any attribute the " +
                     "vertex stage reads" };
@@ -4988,7 +5379,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 pixelUniformBytes: pixelReflection ? pixelReflection.uniformBytes
                     : (pixelUniformLayout && pixelUniformLayout.entries.length
                         ? pixelUniformLayout.byteLength : 0),
-                fogMode };
+                fogMode, pointExpansion: !!drawOptions.pointExpansion,
+                pointSprite: !!drawOptions.pointSprite };
         }
 
         // The per-stage coordinate plan the fixed-function vertex stage needs:
@@ -5033,11 +5425,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             // binding 1 the pixel stage's; samplers take 2+2n / 3+2n, the
             // numbering d3d9_shader_pipeline.js emits.
             const bindGroupEntries = [
-                { binding: 0, visibility: SHADER_STAGE_VERTEX, buffer: { type: "uniform" } },
+                { binding: 0, visibility: SHADER_STAGE_VERTEX,
+                  buffer: { type: "uniform", hasDynamicOffset: true } },
             ];
             if (program.pixelUniformBytes)
                 bindGroupEntries.push({ binding: 1, visibility: SHADER_STAGE_FRAGMENT,
-                    buffer: { type: "uniform" } });
+                    buffer: { type: "uniform", hasDynamicOffset: true } });
             for (const index of program.samplerIndices) {
                 // The view dimension has to be declared here, not left to
                 // default to "2d": WebGPU checks the layout against what the
@@ -5077,7 +5470,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     }
                     return target;
                 });
-            const primitive = { topology, cullMode: pipelineState.cullMode,
+            const primitive = { topology,
+                cullMode: program.pointExpansion ? "none" : pipelineState.cullMode,
                 frontFace: "cw" };
             // WebGPU needs to know the restart-index width up front for an
             // indexed strip draw; it must be absent for every other topology.
@@ -5088,7 +5482,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 vertex: {
                     module: program.vertexModule, entryPoint: "d9_vs_main",
                     buffers: program.vertexBuffers.map(layout =>
-                        ({ arrayStride: layout.arrayStride, attributes: layout.attributes })),
+                        ({ arrayStride: layout.arrayStride,
+                           stepMode: layout.stepMode || "vertex",
+                           attributes: layout.attributes })),
                 },
                 fragment: { module: program.fragmentModule, entryPoint: "d9_ps_main",
                     targets: colorTargets },
@@ -5119,15 +5515,56 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             }
             pipeline = this.device.createRenderPipeline(descriptor);
             pipeline._bindGroupLayout = bindGroupLayout;
+            pipeline._d9wgId = this.objectId(pipeline);
             ++this.stats.pipelineCreations;
             this.pipelineCache.set(key, pipeline);
             return pipeline;
         }
 
-        // One uniform buffer per draw holding both stages' constants, the
-        // pixel region starting at a 256-byte boundary so it can be bound
-        // separately. A stage with no translated shader gets the
-        // fixed-function transform block in the same slot instead.
+        objectId(value) {
+            if ((typeof value !== "object" && typeof value !== "function") ||
+                    value === null)
+                return String(value);
+            let id = this.objectIds.get(value);
+            if (!id) {
+                id = this.nextObjectId++;
+                this.objectIds.set(value, id);
+            }
+            return id;
+        }
+
+        allocateUniformSlot(byteCount) {
+            const size = alignUp(byteCount, UNIFORM_OFFSET_ALIGNMENT);
+            const offset = alignUp(this.uniformRingCursor,
+                UNIFORM_OFFSET_ALIGNMENT);
+            if (this.uniformRing && size <= this.uniformRingCapacity - offset) {
+                this.uniformRingCursor = offset + size;
+                return { buffer: this.uniformRing, offset, transient: false };
+            }
+            const buffer = this.device.createBuffer({
+                label: "D3D9 uniform ring overflow",
+                size,
+                usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
+            });
+            ++this.stats.uniformRingOverflows;
+            this.retireAfterSubmit(buffer);
+            return { buffer, offset: 0, transient: true };
+        }
+
+        uniformBytesHash(bytes) {
+            let hash = 0x811c9dc5;
+            for (let index = 0; index < bytes.length; ++index) {
+                hash ^= bytes[index];
+                hash = Math.imul(hash, 0x01000193) >>> 0;
+            }
+            return hash >>> 0;
+        }
+
+        // Both stages share one persistent uniform ring. Each binding uses the
+        // same dynamic base offset, while binding 1's static pixelOffset keeps
+        // the two register files separate. Identical blocks inside one frame
+        // reuse a slot, which is common for particle/UI runs whose only state
+        // changes are vertex data and blend ordering.
         constantBufferFor(state, program) {
             const vertexBytes = program.vertexReflection
                 ? program.vertexReflection.uniformBytes
@@ -5140,7 +5577,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
             if (program.vertexReflection) {
                 this.writeConstantRegisters(backing, 0, program.vertexReflection,
-                    state.vsConstF, state.vsConstI, state.vsConstB);
+                    state.vsConstF, state.vsConstI, state.vsConstB, state);
             } else {
                 this.writeFixedVertexUniforms(state, program, backing, 0);
             }
@@ -5152,14 +5589,37 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 this.writeFixedPixelUniforms(state, program, backing, pixelOffset);
             }
 
-            const buffer = this.device.createBuffer({
-                size: backing.byteLength,
-                usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
-            });
-            this.device.queue.writeBuffer(buffer, 0, backing);
+            const bytes = new Uint8Array(backing);
+            const frame = this.ensureFrame();
+            const hash = this.uniformBytesHash(bytes);
+            const key = vertexBytes + ":" + pixelOffset + ":" + pixelBytes +
+                ":" + hash.toString(16);
+            const candidates = frame.uniformSlots.get(key) || [];
+            for (const candidate of candidates) {
+                if (candidate.bytes.length !== bytes.length) continue;
+                let equal = true;
+                for (let index = 0; index < bytes.length; ++index) {
+                    if (candidate.bytes[index] !== bytes[index]) {
+                        equal = false;
+                        break;
+                    }
+                }
+                if (!equal) continue;
+                ++this.stats.uniformSlotReuses;
+                return { buffer: candidate.buffer, dynamicOffset: candidate.offset,
+                    vertexBytes, pixelOffset, pixelBytes,
+                    transient: candidate.transient };
+            }
+
+            const slot = this.allocateUniformSlot(backing.byteLength);
+            this.device.queue.writeBuffer(slot.buffer, slot.offset, backing);
             this.stats.constantUploadBytes += backing.byteLength;
-            this.retireAfterSubmit(buffer);
-            return { buffer, vertexBytes, pixelOffset, pixelBytes };
+            candidates.push({ buffer: slot.buffer, offset: slot.offset,
+                transient: slot.transient, bytes: bytes.slice() });
+            frame.uniformSlots.set(key, candidates);
+            return { buffer: slot.buffer, dynamicOffset: slot.offset,
+                vertexBytes, pixelOffset, pixelBytes,
+                transient: slot.transient };
         }
 
         // Fills the fixed-function vertex block. The field list comes from
@@ -5213,6 +5673,31 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 if (!stage.transformCount) continue;
                 floats.set(state.transforms.get(D3DTS_TEXTURE0 + stage.index) ||
                     IDENTITY4x4, at("texture_transform" + stage.index));
+            }
+            if (signature.pointExpansion) {
+                const pointFloat = (id, fallback) => {
+                    const raw = rs.get(id);
+                    return raw === undefined ? fallback : floatFromDWORD(raw);
+                };
+                const pointViewport = at("point_viewport");
+                const width = Math.max(1, state.viewport.width || 1);
+                const height = Math.max(1, state.viewport.height || 1);
+                floats[pointViewport] = width;
+                floats[pointViewport + 1] = height;
+                floats[pointViewport + 2] = 1 / width;
+                floats[pointViewport + 3] = 1 / height;
+                const pointParams = at("point_params");
+                floats[pointParams] = pointFloat(D3DRS_POINTSIZE, 1);
+                floats[pointParams + 1] = Math.max(0,
+                    pointFloat(D3DRS_POINTSIZE_MIN, 1));
+                floats[pointParams + 2] = Math.max(floats[pointParams + 1],
+                    pointFloat(D3DRS_POINTSIZE_MAX, 64));
+                if (signature.pointScale) {
+                    const pointScale = at("point_scale");
+                    floats[pointScale] = pointFloat(D3DRS_POINTSCALE_A, 1);
+                    floats[pointScale + 1] = pointFloat(D3DRS_POINTSCALE_B, 0);
+                    floats[pointScale + 2] = pointFloat(D3DRS_POINTSCALE_C, 0);
+                }
             }
             if (!signature.lighting) return;
 
@@ -5308,7 +5793,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         // 32-bit slot per bool b#. `def`/`defi`/`defb` literals are written
         // last because a shader's own constant definitions take effect while
         // it is bound, over whatever the app last set for that register.
-        writeConstantRegisters(backing, byteOffset, reflection, constF, constI, constB) {
+        writeConstantRegisters(backing, byteOffset, reflection, constF, constI,
+                constB, state) {
             const floats = new Float32Array(backing, byteOffset,
                 reflection.floatConstCount * 4);
             floats.set(constF.subarray(0, Math.min(constF.length, floats.length)));
@@ -5330,6 +5816,26 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             for (const item of reflection.boolDefaults) {
                 if (item.register >= bools.length) continue;
                 bools[item.register] = item.value ? 1 : 0;
+            }
+            if (reflection.pointExpansion && state) {
+                const values = new Float32Array(backing, byteOffset);
+                const viewport = reflection.pointViewportOffset / 4;
+                const width = Math.max(1, state.viewport.width || 1);
+                const height = Math.max(1, state.viewport.height || 1);
+                values[viewport] = width;
+                values[viewport + 1] = height;
+                values[viewport + 2] = 1 / width;
+                values[viewport + 3] = 1 / height;
+                const point = reflection.pointParamsOffset / 4;
+                const pointFloat = (id, fallback) => {
+                    const raw = state.renderStates.get(id);
+                    return raw === undefined ? fallback : floatFromDWORD(raw);
+                };
+                values[point] = pointFloat(D3DRS_POINTSIZE, 1);
+                values[point + 1] = Math.max(0,
+                    pointFloat(D3DRS_POINTSIZE_MIN, 1));
+                values[point + 2] = Math.max(values[point + 1],
+                    pointFloat(D3DRS_POINTSIZE_MAX, 64));
             }
         }
 
@@ -5396,6 +5902,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         bindGroupFor(state, pipeline, program, constants) {
             const entries = [{ binding: 0, resource: { buffer: constants.buffer,
                 offset: 0, size: Math.max(16, constants.vertexBytes) } }];
+            const identity = [pipeline._d9wgId || this.objectId(pipeline),
+                this.objectId(constants.buffer), constants.vertexBytes,
+                constants.pixelOffset, constants.pixelBytes];
             if (program.pixelUniformBytes)
                 entries.push({ binding: 1, resource: { buffer: constants.buffer,
                     offset: constants.pixelOffset,
@@ -5433,16 +5942,47 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 const wantsSRGB = texture &&
                     (state.samplerStates.get(index * 64 + D3DSAMP_SRGBTEXTURE)
                         || 0) !== 0;
+                const view = texture
+                    ? this.sampledViewFor(texture, wantsSRGB)
+                    : this.fallbackViewFor(dimension);
+                const sampler = this.samplerFor(state, index);
                 entries.push(
                     { binding: 2 + index * 2,
-                      resource: texture
-                        ? this.sampledViewFor(texture, wantsSRGB)
-                        : this.fallbackViewFor(dimension) },
+                      resource: view },
                     { binding: 3 + index * 2,
-                      resource: this.samplerFor(state, index) });
+                      resource: sampler });
+                identity.push(index, this.objectId(view), this.objectId(sampler));
             }
-            return this.device.createBindGroup(
+            const dynamicOffsets = program.pixelUniformBytes
+                ? [constants.dynamicOffset, constants.dynamicOffset]
+                : [constants.dynamicOffset];
+            // Overflow buffers are destroyed after this submit, so a group
+            // that captures one must not outlive the frame. The persistent
+            // ring is the steady-state path and is safe to cache.
+            const cacheable = !constants.transient;
+            const key = identity.join(":");
+            if (cacheable) {
+                const cached = this.bindGroupCache.get(key);
+                if (cached) {
+                    this.bindGroupCache.delete(key);
+                    this.bindGroupCache.set(key, cached);
+                    ++this.stats.bindGroupHits;
+                    return { group: cached, dynamicOffsets };
+                }
+            }
+            const group = this.device.createBindGroup(
                 { layout: pipeline._bindGroupLayout, entries });
+            ++this.stats.bindGroupCreations;
+            if (cacheable) {
+                while (this.bindGroupCache.size >= this.maxBindGroups) {
+                    const oldest = this.bindGroupCache.keys().next();
+                    if (oldest.done) break;
+                    this.bindGroupCache.delete(oldest.value);
+                    ++this.stats.bindGroupCacheEvictions;
+                }
+                this.bindGroupCache.set(key, group);
+            }
+            return { group, dynamicOffsets };
         }
 
         // Builds the pipeline/uniform buffer/bind group eagerly (none of
@@ -5467,14 +6007,20 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 return;
             }
             const pipelineState = this.pipelineStateFor(state, targets);
-            const program = this.programFor(state, elements, pipelineState);
+            const pointExpansion = geometry.topology === "point-list" &&
+                !geometry.indexInfo;
+            const pointSprite = pointExpansion &&
+                (state.renderStates.get(D3DRS_POINTSPRITEENABLE) || 0) !== 0;
+            const program = this.programFor(state, elements, pipelineState,
+                { pointExpansion, pointSprite });
             if (program.error) {
                 if (program.shaderError) ++this.stats.drawsSkippedForBadShader;
                 this.noteDroppedDraw(which, state, [program.error]);
                 return;
             }
             const pipeline = this.pipelineFor(program, pipelineState,
-                geometry.topology, geometry.stripIndexFormat);
+                pointExpansion ? "triangle-list" : geometry.topology,
+                pointExpansion ? undefined : geometry.stripIndexFormat);
             // The bind group captures concrete GPUTextureView objects. Create
             // the frame first so bindGroupFor can mark those textures as read;
             // a later UPDATE_TEXTURE can then rename instead of retroactively
@@ -5483,7 +6029,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             // to create the frame misses exactly those textures.
             const frame = this.ensureFrame();
             const constants = this.constantBufferFor(state, program);
-            const bindGroup = this.bindGroupFor(state, pipeline, program, constants);
+            const binding = this.bindGroupFor(state, pipeline, program, constants);
             // Bind each stream the pipeline declared a layout for, in the same
             // order, so slot N in the pipeline is slot N here.
             const vertexBuffers = [];
@@ -5513,15 +6059,24 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 (state.renderStates.get(D3DRS_SCISSORTESTENABLE) || 0) !== 0 &&
                 !!state.scissorRect;
             if (scissorEnabled) ++this.stats.drawsWithScissor;
+            const attachmentCount = Math.max(1, Math.min(4,
+                (targets.colors && targets.colors.length) || 1));
+            ++this.mrtAttachmentDraws[attachmentCount];
             frame.ops.push({
-                kind: "draw", pipeline, bindGroup, targets,
+                kind: "draw", pipeline, bindGroup: binding.group,
+                dynamicOffsets: binding.dynamicOffsets, targets,
                 viewport: { ...state.viewport },
                 scissor: scissorEnabled ? { ...state.scissorRect } : null,
                 blendConstant: pipelineState.blendConstant,
                 stencilReference: pipelineState.stencilReference,
                 vertexBuffers, indexInfo: geometry.indexInfo,
-                vertexCount: geometry.vertexCount,
+                vertexCount: pointExpansion ? 6 : geometry.vertexCount,
+                instanceCount: pointExpansion ? geometry.vertexCount : 1,
             });
+            if (pointExpansion) {
+                ++this.stats.pointSpriteDraws;
+                this.stats.pointSpriteInstances += geometry.vertexCount || 0;
+            }
             // The pointer is almost always the final thing a frame draws, so
             // the texture bound by the last draw is the quickest way to name
             // the cursor's texture without hunting through the whole atlas set.
@@ -5575,6 +6130,51 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                         (extraVertexOffset || 0) * (binding.stride || 0) });
             }
             return streams;
+        }
+
+        // WebGPU cannot combine an index buffer with instance-rate source
+        // attributes to select an arbitrary point for each instance. Indexed
+        // point lists are uncommon but legal, so compact the referenced
+        // vertices from the guest-maintained CPU shadows into transient,
+        // sequential streams before using the same quad-expansion pipeline.
+        expandIndexedPointStreams(state, streams, indexResource, firstIndex,
+                indexCount, baseVertex) {
+            if (!indexResource || !indexResource.shadow) return null;
+            const wide = indexResource.indexFormat === "uint32";
+            const indices = wide
+                ? new Uint32Array(indexResource.shadow.buffer,
+                    indexResource.shadow.byteOffset,
+                    indexResource.shadow.byteLength >>> 2)
+                : new Uint16Array(indexResource.shadow.buffer,
+                    indexResource.shadow.byteOffset,
+                    indexResource.shadow.byteLength >>> 1);
+            if (firstIndex + indexCount > indices.length) return null;
+            const result = new Map();
+            for (const [streamIndex, binding] of streams) {
+                const streamState = state.streams.get(streamIndex);
+                const stride = streamState && streamState.stride;
+                const shadow = binding.resource && binding.resource.shadow;
+                if (!stride || !shadow) return null;
+                const outputBytes = indexCount * stride;
+                const output = new Uint8Array(alignUp(outputBytes, 4));
+                for (let point = 0; point < indexCount; ++point) {
+                    const vertex = Number(indices[firstIndex + point]) + baseVertex;
+                    if (vertex < 0) return null;
+                    const source = binding.offset + vertex * stride;
+                    if (source < 0 || source + stride > shadow.length) return null;
+                    output.set(shadow.subarray(source, source + stride), point * stride);
+                }
+                const buffer = this.device.createBuffer({
+                    label: "D3D9 indexed point expansion",
+                    size: Math.max(4, output.byteLength),
+                    usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+                });
+                this.writeBufferAligned(buffer, 0, output, 0, outputBytes);
+                this.retireAfterSubmit(buffer);
+                result.set(streamIndex, { buffer, offset: 0 });
+            }
+            ++this.stats.indexedPointExpansions;
+            return result;
         }
 
         onDrawPrimitive(bytes, view, offset) {
@@ -5641,6 +6241,20 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 return;
             }
             const streams = this.boundStreams(state, 0);
+            if (primitiveType === D3DPT_POINTLIST) {
+                const expanded = this.expandIndexedPointStreams(state, streams,
+                    ib, startIndex, indexCount, baseVertexIndex);
+                if (!expanded) {
+                    this.noteDroppedDraw("DrawIndexedPrimitive", state,
+                        ["indexed point list could not be compacted from buffer shadows"]);
+                    return;
+                }
+                this.recordDraw(state, elements, "DrawIndexedPrimitive", {
+                    topology: "point-list", streams: expanded,
+                    indexInfo: null, vertexCount: indexCount,
+                });
+                return;
+            }
             if (primitiveType === D3DPT_TRIANGLEFAN) {
                 // Re-index the fan through the buffer's CPU mirror; the GPU
                 // copy is write-only from here.
@@ -5744,6 +6358,47 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             if (elementCount === null) {
                 this.noteDroppedDraw("DrawIndexedPrimitiveUP", state,
                     ["unsupported primitive type " + primitiveType]);
+                return;
+            }
+            if (primitiveType === D3DPT_POINTLIST) {
+                const wide = indexFormatValue === D3DFMT_INDEX32;
+                const indexWidth = wide ? 4 : 2;
+                if (elementCount * indexWidth > indexBytes) {
+                    this.noteDroppedDraw("DrawIndexedPrimitiveUP", state,
+                        ["point index payload is shorter than its primitive count"]);
+                    return;
+                }
+                const outputBytes = elementCount * stride;
+                const output = new Uint8Array(alignUp(outputBytes, 4));
+                for (let point = 0; point < elementCount; ++point) {
+                    const indexOffset = indexDataOffset + point * indexWidth;
+                    const vertex = wide ? view.getUint32(indexOffset, true)
+                        : view.getUint16(indexOffset, true);
+                    const source = vertexDataOffset + vertex * stride;
+                    if (source < vertexDataOffset ||
+                            source + stride > vertexDataOffset + vertexBytes ||
+                            source + stride > bytes.byteLength) {
+                        this.noteDroppedDraw("DrawIndexedPrimitiveUP", state,
+                            ["point index references vertex data outside the payload"]);
+                        return;
+                    }
+                    output.set(bytes.subarray(source, source + stride), point * stride);
+                }
+                const vertexBuffer = this.device.createBuffer({
+                    label: "D3D9 indexed UP point expansion",
+                    size: Math.max(4, output.byteLength),
+                    usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+                });
+                this.writeBufferAligned(vertexBuffer, 0, output, 0, outputBytes);
+                this.retireAfterSubmit(vertexBuffer);
+                this.recordDrawWithStride(state, elements,
+                    "DrawIndexedPrimitiveUP", {
+                        topology: "point-list",
+                        streams: new Map([[0, { buffer: vertexBuffer, offset: 0 }]]),
+                        indexInfo: null, vertexCount: elementCount,
+                    }, stride);
+                ++this.stats.indexedPointExpansions;
+                ++this.stats.upDrawCalls;
                 return;
             }
             const vertexBuffer = this.device.createBuffer({

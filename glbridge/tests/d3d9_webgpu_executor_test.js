@@ -40,7 +40,7 @@ const OP = {
 const D9WG_MAGIC = 0x47573944;
 const BATCH_FLAG_PRESENT = 1;
 const DECLUSAGE = { POSITION: 0, BLENDWEIGHT: 1, BLENDINDICES: 2, NORMAL: 3,
-    TEXCOORD: 5, TANGENT: 6, BINORMAL: 7, POSITIONT: 9, COLOR: 10 };
+    PSIZE: 4, TEXCOORD: 5, TANGENT: 6, BINORMAL: 7, POSITIONT: 9, COLOR: 10 };
 const DECLTYPE = { FLOAT1: 0, FLOAT2: 1, FLOAT3: 2, FLOAT4: 3, D3DCOLOR: 4,
     UBYTE4: 5, SHORT2: 6, SHORT4: 7, UBYTE4N: 8, UDEC3: 13, DEC3N: 14 };
 const DEVICE = 0x00100002;
@@ -410,10 +410,10 @@ function makeFakeWebGPU() {
         } };
 }
 
-function makeExecutor() {
+function makeExecutor(options = {}) {
     const fake = makeFakeWebGPU();
     const canvas = { width: 1, height: 1, getContext: () => fake.context };
-    const executor = new D3D9WebGPUExecutor(canvas, { gpu: fake.gpu });
+    const executor = new D3D9WebGPUExecutor(canvas, { gpu: fake.gpu, ...options });
     return { fake, executor,
         find: name => fake.calls.filter(call => call[0] === name),
         last: name => {
@@ -473,6 +473,50 @@ await test("fixed-function FVF triangle still renders (M1 regression guard)", as
     const passes = fake.calls.filter(c => c[0] === "beginRenderPass");
     assert.equal(passes.length, 1);
     assert.deepEqual(passes[0][2].ops.filter(op => op[0] === "draw"), [["draw", 3]]);
+});
+
+await test("point sprites expand one source point into an instanced textured quad", async () => {
+    const D3DRS_POINTSIZE = 154, D3DRS_POINTSPRITEENABLE = 156;
+    const D3DRS_POINTSCALEENABLE = 157;
+    const { executor, fake, find } = makeExecutor();
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT1, DECLUSAGE.PSIZE),
+        element(0, 16, DECLTYPE.D3DCOLOR, DECLUSAGE.COLOR),
+    ];
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 20 * 8)),
+        command(OP.SET_FVF, fvfPayload(0x142, elements)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_POINTSIZE,
+            0x41000000, 0)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_POINTSPRITEENABLE, 1, 0)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_POINTSCALEENABLE, 1, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(1, 0, 8)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.pointSpriteDraws, 1);
+    assert.equal(executor.stats.pointSpriteInstances, 8);
+    const pipeline = find("createRenderPipeline").pop()[1];
+    assert.equal(pipeline.primitive.topology, "triangle-list");
+    assert.equal(pipeline.primitive.cullMode, "none",
+        "expanded points must not inherit triangle culling");
+    assert.equal(pipeline.vertex.buffers[0].stepMode, "instance");
+    assert.ok(pipeline.vertex.buffers[0].attributes.some(attribute =>
+        attribute.shaderLocation === 12 && attribute.format === "float32"),
+        "D3DDECLUSAGE_PSIZE must feed the point-size input");
+    assert.ok(pipeline.vertex.module.code.includes("d9_point_uvs"));
+    assert.ok(pipeline.vertex.module.code.includes("inverseSqrt(d9_point_denom)"),
+        "D3DRS_POINTSCALEENABLE must apply A/B/C distance attenuation");
+    assert.ok(pipeline.vertex.module.code.includes("result.varying2 = vec4<f32>(d9_point_uv"),
+        "point-sprite UVs must replace TEXCOORD0");
+    const pass = fake.calls.filter(call => call[0] === "beginRenderPass").pop()[2];
+    assert.deepEqual(pass.ops.filter(op => op[0] === "draw"), [["draw", 6, 8]],
+        "eight points should be one six-vertex instanced draw");
 });
 
 await test("fixed-function attribute locations follow semantics, not element order", async () => {
@@ -583,6 +627,60 @@ await test("programmable vs+ps: modules, bindings and constants all line up", as
     const pixelBase = entries.get(1).resource.offset;
     assert.equal(data.getFloat32(pixelBase + 16, true), 0.25, "ps c1.x");
     assert.equal(data.getFloat32(pixelBase + 28, true), 1, "ps c1.w");
+});
+
+await test("persistent WGSL cache is restored before CREATE_SHADER executes", async () => {
+    const cache = new shaderPipeline.D3D9ShaderCache();
+    const stream = new Uint32Array(VS_BYTECODE);
+    const hash = shaderPipeline.hashTokens(stream);
+    cache.compile(stream, hash.low, hash.high);
+    const payload = cache.exportEntries();
+    let loads = 0;
+    const storage = {
+        async load() { ++loads; return payload; },
+        async save() { throw new Error("a restored hit must not schedule a save"); },
+    };
+    const { executor } = makeExecutor({ shaderCacheStorage: storage });
+    const vs = shaderCreatePayload(0x40000100, VS_BYTECODE);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_VERTEX_SHADER, vs.payload, vs.blob, vs.blobOffsetField),
+    ]));
+    await executor.idle();
+    const stats = executor.getStats();
+    assert.equal(loads, 1);
+    assert.equal(stats.shaderCachePersistentLoads, 1);
+    assert.equal(stats.shaderCachePersistentBackend, "injected");
+    assert.equal(stats.shaderCacheMisses, 0);
+    assert.equal(stats.shaderCacheHits, 1);
+    assert.equal(stats.shadersCached, 1);
+    assert.ok(stats.shaderWGSLBytesCached > 0);
+    assert.deepEqual(stats.occlusionQueries, { mode: "guest-conservative",
+        slotsUsed: 0, slotsCapacity: 0, slotExhaustionFallbacks: 0 });
+});
+
+await test("CREATE_SHADER translation can run through the M6 Worker path", async () => {
+    class CompileWorker {
+        postMessage(message) {
+            queueMicrotask(() => this.onmessage({ data: { id: message.id,
+                result: shaderPipeline.compileShader(
+                    new Uint32Array(message.tokens)) } }));
+        }
+        terminate() {}
+    }
+    const { executor } = makeExecutor({ Worker: CompileWorker,
+        shaderWorkerUrl: "fake://d3d9_shader_worker.js" });
+    const vs = shaderCreatePayload(0x40000101, VS_BYTECODE);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_VERTEX_SHADER, vs.payload, vs.blob, vs.blobOffsetField),
+    ]));
+    await executor.idle();
+    const stats = executor.getStats();
+    assert.equal(stats.shaderWorkerCompiles, 1);
+    assert.equal(stats.shaderWorkerFallbacks, 0);
+    assert.equal(stats.shaderCacheMisses, 1);
+    assert.equal(stats.shaderCompileLatencyMs.samples, 1);
 });
 
 await test("shader `def` literals override app-set constants for that register", async () => {

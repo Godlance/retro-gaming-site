@@ -517,6 +517,28 @@ test("the shader cache evicts least-recently-used entries at its limit", () => {
     assert.strictEqual(cache.stats.evictions, 1);
 });
 
+test("shader cache reports compile latency/size and survives persistence", () => {
+    const times = [10, 12.5];
+    const cache = new pipeline.D3D9ShaderCache({ clock: () => times.shift() });
+    const stream = tokens(VS_1_1_TRANSFORM);
+    const hash = pipeline.hashTokens(stream);
+    const translated = cache.compile(stream, hash.low, hash.high);
+    const stats = cache.snapshot();
+    assert.equal(stats.misses, 1);
+    assert.equal(stats.compileLatencyMs.p50, 2.5);
+    assert.equal(stats.compileLatencyMs.p95, 2.5);
+    assert.equal(stats.cached, 1);
+    assert.equal(stats.totalWGSLBytes, translated.wgsl.length * 2);
+
+    const restored = new pipeline.D3D9ShaderCache();
+    assert.equal(restored.importEntries(cache.exportEntries()), 1);
+    const before = restored.stats.compiles;
+    assert.equal(restored.compile(stream, hash.low, hash.high).ok, true);
+    assert.equal(restored.stats.compiles, before,
+        "a restored shader should be a cache hit, not a retranslation");
+    assert.equal(restored.snapshot().restored, 1);
+});
+
 test("arithmetic opcodes translate to their WGSL equivalents", () => {
     const cases = [
         [OP.ADD, 2, "(vin0) + (vin0)"],
@@ -630,6 +652,30 @@ test("projection source modifiers preserve a negative divisor", () => {
     ], "signed projective divide");
     assert.ok(result.wgsl.includes("select(-max(abs("),
         "negative q must not be clamped to a positive epsilon");
+});
+
+test("point-sprite vertex variants expand oPts into a six-vertex quad", () => {
+    const bytecode = [
+        VS(2, 0),
+        instruction(OP.DCL, { length: 2 }), dclToken(USAGE.POSITION),
+            dst(REG.INPUT, 0),
+        instruction(OP.MOV, { length: 2 }), dst(REG.RASTOUT, 0),
+            src(REG.INPUT, 0),
+        instruction(OP.MOV, { length: 2 }), dst(REG.RASTOUT, 2),
+            src(REG.CONST, 0),
+        END,
+    ];
+    const result = pipeline.compileShader(tokens(bytecode),
+        { pointExpansion: true, pointSprite: true });
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.reflection.writesPointSize, true);
+    assert.equal(result.reflection.pointExpansion, true);
+    assert.equal(result.reflection.pointParamsOffset + 16,
+        result.reflection.uniformBytes);
+    assert.ok(result.wgsl.includes("@builtin(vertex_index) d9_vertex_index"));
+    assert.ok(result.wgsl.includes("var d9_point_size = o_pointsize.x"));
+    assert.ok(result.wgsl.includes("result.varying2 = vec4<f32>(d9_point_uv"),
+        "POINTSPRITEENABLE must synthesize TEXCOORD0");
 });
 
 test("generated WGSL is brace-balanced and declares every register it reads", () => {

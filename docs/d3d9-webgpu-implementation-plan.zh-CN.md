@@ -1080,9 +1080,10 @@ War3 确实不需要等 M2 的 shader 编译管线就能跑到主菜单**（caps
 诊断方法上的一条教训值得记下：**guest 与 host 两侧都存在"静默失败"盲区**
 ——已实现但因参数不支持而返回 `D3DERR_INVALIDCALL` 的调用、以及 host 端
 被 `if (...) return;` 吞掉的绘制，都不会留下任何痕迹，与"游戏根本没调用"
-无法区分。补上带完整参数的首次命中日志（guest 侧 `TRACE_FIRST`/
-`TRACE_PROBE`，host 侧 `noteDroppedDraw` 与 `droppedDraws` 计数）之后，
-定位速度显著提升。`d3d9_executor.js` 里的 `debug.forceClearColor` /
+无法区分。开发阶段曾临时加入 guest 侧首次命中日志，并配合 host 侧
+`noteDroppedDraw` 与 `droppedDraws` 计数定位问题；发布版已移除 guest
+日志及其文件 I/O，只保留有界的 host 统计。`d3d9_executor.js` 里的
+`debug.forceClearColor` /
 `shaderMode` / `disableCull` / `disableDepthTest` 开关保留在代码中，用于
 把"画面不对"快速二分成显示、几何、颜色来源等独立环节。
 
@@ -1753,6 +1754,35 @@ D3D9 游戏都是语料贡献者，哪怕它在 v86 里只能跑到主菜单就�
   `SetStreamSourceFreq`）。
 - 性能预算收敛（第 16 章）。
 
+**2026-08-09：M6 host 核心已实现，进入目标游戏人工验收阶段。**
+
+- `D3DPT_POINTLIST` 已转换为单次 instanced triangle-list：每个源点生成 6 个
+  quad 顶点，支持固定管线 `D3DRS_POINTSIZE`、每顶点 `PSIZE`、min/max、
+  A/B/C 距离衰减和 `POINTSPRITEENABLE` 自动 UV；可编程 VS 的 `oPts` 同样
+  进入这条扩展路径。带索引的 point list 会先按 CPU shadow 压成连续实例流。
+- 已有 MRT/RTT/`StretchRect` 路径继续承担后处理，不增加只为某个效果存在的
+  协议命令；back-buffer 抓取与异格式 blit 仍由真实 WebGPU 浏览器测试覆盖。
+- 基础 shader 字节码翻译在专用 Worker 中执行；Worker 不可用或运行失败时
+  明确计数并回退到主线程。翻译结果通过 IndexedDB 跨会话保存，按 LRU
+  顺序限制为 2 MiB；持久化内容是 WGSL/反射信息，不是 `GPUShaderModule`。
+- 常量上传改为每设备一块 16 MiB persistent uniform ring + dynamic offset，
+  并增加有界 bind-group cache。相同 draw 常量在一帧内复用槽位；只有 ring
+  溢出才创建临时 uniform buffer，且会进入 `uniformRingOverflows`。
+- `getStats()` 新增 shader cache hit/miss、p50/p95/p99、缓存 WGSL 字节数、
+  Worker/持久化计数、bind-group 命中/淘汰、uniform 复用/溢出、每帧创建/
+  submit/pass 数、点精灵数量和 MRT attachment 分布。M4 的 occlusion query
+  仍是 guest 端 conservative-visible 策略，因此明确报告 mode 与 0 个 host
+  slot，避免把“没有 host slot 池”误判成统计失效。
+- `d3d9_webgpu_perf_test.js` 的 150 draw 稳态负载在 2 次 warm-up 后达到：
+  **0 pipeline、0 bind-group、0 buffer 创建，1 render pass、1 submit、无回读**，
+  满足第 16.1 节预算。当前自动回归为 33 项 shader pipeline、57 项 executor、
+  115 个 Naga WGSL；真实 Chrome/WebGPU 页含点精灵在内为 PASS。
+
+`vs_3_0` 顶点纹理采样和 `SetStreamSourceFreq` 仍按“若真实客户端需要才实现”
+处理，当前 caps 不宣称支持。M6 只有在真实 XP/v86 目标游戏中完成至少一个
+粒子密集场景和一个后处理场景的截图/指标验收后，才可标记为最终完成；上述
+状态不替代第 16.3 节的人工验收门槛。
+
 每个里程碑结束时，未达标功能不得通过"假装支持"糊弄过关：延续 D3D8 路径
 "未实现返回 `D3DERR_INVALIDCALL`、caps 诚实"的纪律。
 
@@ -1873,10 +1903,11 @@ D3D8 路径 README 里 MapleStory 验收段落的写法：具体到"第几关""�
 
 ### 19.2 编译结果的跨会话持久缓存
 
-建议用浏览器 `IndexedDB` 存储 `{bytecode_hash -> wgsl_source}` 映射
+实现使用浏览器 `IndexedDB` 存储 `{bytecode_hash -> translation_result}` 映射
 （不持久化 `GPUShaderModule` 本身，它是运行时对象，每次加载都要用
-缓存的 WGSL 源码重新 `createShaderModule`）。淘汰策略：LRU + 总大小
-上限，超限淘汰最久未使用的条目。这一项直接影响 WoW 场景下"第二次
+缓存的 WGSL 源码重新 `createShaderModule`）。淘汰策略为 LRU，持久快照上限
+2 MiB，schema 版本由 storage key 隔离；IndexedDB 不可用时只退回会话内
+内存缓存并增加失败统计。这一项直接影响 WoW 场景下"第二次
 打开网页时加载资料片内容是否还要重新跑一遍全部 shader 编译"的体验，
 优先级高于大多数 M6 的其他优化项。
 

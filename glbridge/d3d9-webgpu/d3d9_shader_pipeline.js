@@ -1219,6 +1219,10 @@
             out.push("    f: array<vec4<f32>, " + floatCount + ">,");
             out.push("    i: array<vec4<i32>, " + intCount + ">,");
             out.push("    b: array<vec4<u32>, " + boolVectors + ">,");
+            if (kind === "vertex" && this.options.pointExpansion) {
+                out.push("    point_viewport: vec4<f32>,");
+                out.push("    point_params: vec4<f32>,");
+            }
             out.push("};");
             out.push("@group(0) @binding(" + (kind === "vertex" ? 0 : 1) +
                 ") var<uniform> d9c: D9Constants;");
@@ -1355,6 +1359,8 @@
             const parameters = inputs.map(entry =>
                 "@location(" + entry[0] + ") in" + entry[0] + ": " +
                     inputType(entry[0]));
+            if (this.options.pointExpansion)
+                parameters.push("@builtin(vertex_index) d9_vertex_index: u32");
             out.push("@vertex");
             out.push("fn d9_vs_main(" + parameters.join(", ") + ") -> D9VertexOutput {");
             // A D3DCOLOR-typed attribute is packed ARGB in memory, so WebGPU's
@@ -1392,6 +1398,28 @@
             out.push("    result.position = o_position;");
             for (let slot = 0; slot < VARYING_COUNT; ++slot)
                 out.push("    result.varying" + slot + " = o_varying" + slot + ";");
+            if (this.options.pointExpansion) {
+                out.push("    let d9_point_uvs = array<vec2<f32>, 6>(");
+                out.push("        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0),");
+                out.push("        vec2<f32>(0.0, 1.0), vec2<f32>(0.0, 1.0),");
+                out.push("        vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0));");
+                out.push("    let d9_point_uv = d9_point_uvs[d9_vertex_index % 6u];");
+                out.push("    var d9_point_size = " + (this.usesPointSize
+                    ? "o_pointsize.x;" : "d9c.point_params.x;"));
+                out.push("    d9_point_size = clamp(d9_point_size, d9c.point_params.y,");
+                out.push("        max(d9c.point_params.y, d9c.point_params.z));");
+                out.push("    let d9_point_ndc = vec2<f32>(");
+                out.push("        (d9_point_uv.x * 2.0 - 1.0) * d9_point_size / d9c.point_viewport.x,");
+                out.push("        (1.0 - d9_point_uv.y * 2.0) * d9_point_size / d9c.point_viewport.y);");
+                out.push("    result.position = vec4<f32>(result.position.xy +");
+                out.push("        d9_point_ndc * result.position.w, result.position.zw);");
+                if (this.options.pointSprite) {
+                    for (let stage = 0; stage < 8; ++stage) {
+                        out.push("    result.varying" + (VARYING_TEXCOORD0 + stage) +
+                            " = vec4<f32>(d9_point_uv, 0.0, 1.0);");
+                    }
+                }
+            }
             out.push("    return result;");
             out.push("}");
         }
@@ -1499,6 +1527,10 @@
             const boolDefaults = [];
             for (const [register, value] of this.boolDefaults)
                 boolDefaults.push({ register, value });
+            const registerUniformBytes = floatCount * 16 + intCount * 16 +
+                boolVectors * 16;
+            const pointExpansion = this.kind === "vertex" &&
+                !!this.options.pointExpansion;
             return {
                 kind: this.kind,
                 version: { major: this.major, minor: this.minor },
@@ -1517,10 +1549,14 @@
                 floatDefaults, intDefaults, boolDefaults,
                 levelZeroSamples: this.levelZeroSamples,
                 warnings: this.warnings.slice(),
-                uniformBytes: floatCount * 16 + intCount * 16 + boolVectors * 16,
+                uniformBytes: registerUniformBytes + (pointExpansion ? 32 : 0),
                 floatRegionBytes: floatCount * 16,
                 intRegionBytes: intCount * 16,
                 boolRegionBytes: boolVectors * 16,
+                pointExpansion,
+                pointSprite: pointExpansion && !!this.options.pointSprite,
+                pointViewportOffset: pointExpansion ? registerUniformBytes : -1,
+                pointParamsOffset: pointExpansion ? registerUniformBytes + 16 : -1,
             };
         }
     }
@@ -1580,7 +1616,13 @@
             this.options = options || {};
             this.limit = this.options.limit || 4096;
             this.entries = new Map();
-            this.stats = { compiles: 0, hits: 0, failures: 0, evictions: 0 };
+            this.clock = this.options.clock || (() =>
+                typeof performance !== "undefined" && performance.now
+                    ? performance.now() : Date.now());
+            this.compileTimes = [];
+            this.totalWGSLBytes = 0;
+            this.stats = { compiles: 0, hits: 0, failures: 0, evictions: 0,
+                restored: 0 };
         }
 
         key(hashLow, hashHigh) {
@@ -1601,18 +1643,88 @@
         compile(tokens, hashLow, hashHigh, options) {
             const existing = this.get(hashLow, hashHigh);
             if (existing) return existing;
+            const started = this.clock();
             const result = compileShader(tokens, options);
+            const elapsed = Math.max(0, this.clock() - started);
+            return this.store(hashLow, hashHigh, result, elapsed);
+        }
+
+        store(hashLow, hashHigh, result, elapsed) {
+            const key = this.key(hashLow, hashHigh);
+            const existing = this.entries.get(key);
+            if (existing) return existing;
+            elapsed = Math.max(0, Number(elapsed) || 0);
+            this.compileTimes.push(elapsed);
+            if (this.compileTimes.length > this.limit)
+                this.compileTimes.shift();
             ++this.stats.compiles;
             if (!result.ok) ++this.stats.failures;
-            const key = this.key(hashLow, hashHigh);
             this.entries.set(key, result);
+            if (result.ok) this.totalWGSLBytes += result.wgsl.length * 2;
             while (this.entries.size > this.limit) {
                 const oldest = this.entries.keys().next();
                 if (oldest.done) break;
+                const evicted = this.entries.get(oldest.value);
+                if (evicted && evicted.ok)
+                    this.totalWGSLBytes -= evicted.wgsl.length * 2;
                 this.entries.delete(oldest.value);
                 ++this.stats.evictions;
             }
             return result;
+        }
+
+        snapshot() {
+            const sorted = this.compileTimes.slice().sort((a, b) => a - b);
+            const percentile = value => {
+                if (!sorted.length) return 0;
+                return sorted[Math.min(sorted.length - 1,
+                    Math.max(0, Math.ceil(value * sorted.length) - 1))];
+            };
+            return { hits: this.stats.hits, misses: this.stats.compiles,
+                failures: this.stats.failures, evictions: this.stats.evictions,
+                restored: this.stats.restored,
+                cached: this.entries.size,
+                totalWGSLBytes: Math.max(0, this.totalWGSLBytes),
+                compileLatencyMs: { p50: percentile(0.50),
+                    p95: percentile(0.95), p99: percentile(0.99),
+                    samples: sorted.length } };
+        }
+
+        exportEntries(maxBytes) {
+            const limit = maxBytes || 2 * 1024 * 1024;
+            const entries = [];
+            let bytes = 0;
+            // Newest LRU entries are at the end; keep as many of those as the
+            // persistent budget permits, then restore their original order.
+            for (const [key, result] of Array.from(this.entries).reverse()) {
+                const item = { key, result };
+                const encoded = JSON.stringify(item);
+                if (bytes + encoded.length * 2 > limit) continue;
+                entries.push(item);
+                bytes += encoded.length * 2;
+            }
+            entries.reverse();
+            return { version: 1, entries };
+        }
+
+        importEntries(payload) {
+            if (!payload || payload.version !== 1 || !Array.isArray(payload.entries))
+                return 0;
+            let restored = 0;
+            for (const item of payload.entries) {
+                if (!item || typeof item.key !== "string" || !item.result) continue;
+                const result = item.result;
+                if (result.ok && (typeof result.wgsl !== "string" ||
+                        !result.reflection)) continue;
+                if (!result.ok && typeof result.error !== "string") continue;
+                if (this.entries.has(item.key)) continue;
+                this.entries.set(item.key, result);
+                if (result.ok) this.totalWGSLBytes += result.wgsl.length * 2;
+                ++restored;
+                if (this.entries.size >= this.limit) break;
+            }
+            this.stats.restored += restored;
+            return restored;
         }
     }
 

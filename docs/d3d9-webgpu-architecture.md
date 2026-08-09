@@ -121,7 +121,11 @@ standalone risk.
    select.
 5. M5: terrain splatting, skinned characters, environment maps — WoW world
    rendering.
-6. M6: particle systems, post-process passes, performance hardening.
+6. M6: particle systems, post-process passes, performance hardening. The host
+   core landed on 2026-08-09: point lists expand to instanced quads, shader
+   translation runs in a Worker with a bounded IndexedDB LRU, and draw
+   constants use a persistent uniform ring plus dynamic offsets. Final M6
+   status still requires the target-game manual effects/performance pass.
 
 Each unsupported method continues the D3D8 path's rule: return
 `D3DERR_INVALIDCALL` rather than silently drop rendering work.
@@ -133,6 +137,14 @@ D3D9: track **first-use shader-compile latency** (bytecode hash miss →
 vkd3d-shader → SPIR-V → Tint → WGSL → `createShaderModule`) separately from
 per-frame steady-state cost, because WoW's shader variety means cache warm-up
 is a real, user-visible cost that the D3D8 path never had to budget for.
+
+`D3D9Executor.getStats()` therefore reports cache hit/miss and compile-latency
+p50/p95/p99, cached WGSL bytes, Worker and persistent-cache outcomes, uniform
+ring reuse/overflow, bind-group cache behaviour, MRT attachment distribution,
+and the current frame's pipeline/bind-group/submit/pass counts. The M6 steady
+state regression drives 150 draws after two warm-up frames and pins the result
+to zero pipeline/bind-group/buffer creation, one render pass, one queue submit,
+and no GPU readback.
 
 ## Relationship to the D3D8 path
 

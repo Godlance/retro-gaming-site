@@ -63,12 +63,14 @@ canvas { width: 640px; height: 480px; }
     const setFVF = (handle, fvf, elements) =>
         concatBytes([u32(handle, fvf, elements.length, 0), ...elements]);
 
+    const DECLTYPE_FLOAT1 = 0;
     const DECLTYPE_FLOAT2 = 1;
     const DECLTYPE_FLOAT3 = 2;
     const DECLTYPE_FLOAT4 = 3;
     const DECLTYPE_D3DCOLOR = 4;
     const DECLTYPE_UBYTE4 = 5;
     const DECLUSAGE_POSITION = 0;
+    const DECLUSAGE_PSIZE = 4;
     const DECLUSAGE_TEXCOORD = 5;
     const DECLUSAGE_POSITIONT = 9;
     const DECLUSAGE_COLOR = 10;
@@ -182,6 +184,25 @@ canvas { width: 640px; height: 480px; }
                 worldView.setFloat32(offset + 8, vertex[2], true);
                 worldView.setUint32(offset + 12, 0xFF20C0FF, true);
             });
+        // Draw 6 (M6): a POSITIONT point sprite carrying a per-vertex PSIZE.
+        // The executor expands this one D3D point into a six-vertex instanced
+        // quad because WebGPU has no programmable point-size primitive.
+        const pointElements = [
+            element(0, DECLTYPE_FLOAT4, DECLUSAGE_POSITIONT),
+            element(16, DECLTYPE_FLOAT1, DECLUSAGE_PSIZE),
+            element(20, DECLTYPE_D3DCOLOR, DECLUSAGE_COLOR),
+            element(24, DECLTYPE_FLOAT2, DECLUSAGE_TEXCOORD),
+        ];
+        const pointVertex = new Uint8Array(32);
+        const pointView = new DataView(pointVertex.buffer);
+        pointView.setFloat32(0, 500, true);
+        pointView.setFloat32(4, 350, true);
+        pointView.setFloat32(8, 0.25, true);
+        pointView.setFloat32(12, 1, true);
+        pointView.setFloat32(16, 72, true);
+        pointView.setUint32(20, 0xFFFFFFFF, true);
+        pointView.setFloat32(24, 0, true);
+        pointView.setFloat32(28, 0, true);
         const identity = [
             1, 0, 0, 0, 0, 1, 0, 0,
             0, 0, 1, 0, 0, 0, 0, 1,
@@ -533,6 +554,19 @@ canvas { width: 640px; height: 480px; }
                 [{ offsetField: 24, data: rtQuadVertices }]),
             command(0x200, u32(deviceHandle, 194, 0, 0)),
 
+            // M6 point-sprite validation on a real WebGPU pipeline. The
+            // generated quad samples the complete texture via automatic
+            // [0,1] point UVs rather than the source vertex's TEXCOORD0.
+            command(0x200, u32(deviceHandle, 154, 0x42800000, 0)), // POINTSIZE=64
+            command(0x200, u32(deviceHandle, 156, 1, 0)),          // POINTSPRITE
+            command(0x200, u32(deviceHandle, 157, 0, 0)),          // no scaling
+            command(0x203, u32(deviceHandle, 0, textureHandle, 0)),
+            command(0x20E, setFVF(deviceHandle, 0x144, pointElements)),
+            command(0x302, u32(deviceHandle, 1, 1, 32, 1,
+                pointVertex.byteLength, 0, 0),
+                [{ offsetField: 24, data: pointVertex }]),
+            command(0x200, u32(deviceHandle, 156, 0, 0)),
+
             // StretchRect the back buffer into the render target and back out
             // again. Only a real browser exercises the interesting part: the
             // swap chain's format (getPreferredCanvasFormat, normally
@@ -550,16 +584,21 @@ canvas { width: 640px; height: 480px; }
             command(0x103, u32(dxtHandle, 3)),
             command(4, surface(deviceHandle, 640, 480)),
         ]));
+        // Make persistence deterministic for this page: production batches
+        // debounce IndexedDB writes, while the headless screenshot runner may
+        // freeze timers immediately after capturing the result.
+        await executor.flushPersistentShaderCache();
         const validation = await executor.device.popErrorScope();
         if (executor.failed) throw executor.failed;
         if (validation) throw validation;
         const stats = executor.getStats();
         const expected = {
-            drawCalls: 5, upDrawCalls: 5, presents: 1, pipelineCreations: 5,
+            drawCalls: 6, upDrawCalls: 6, presents: 1, pipelineCreations: 6,
             malformedBatches: 0, unsupportedCommands: 0, droppedDraws: 0,
             // Two shaders translated, plus one declaration-specific M5 variant
             // which widens the UBYTE4 COLOR0 input to D3D9's float vector.
             shadersTranslated: 2, shaderTranslationFailures: 0,
+            pointSpriteDraws: 1, pointSpriteInstances: 1,
             shaderVariantsTranslated: 1, shaderCompileErrors: 0,
             programmableDraws: 1, drawsWithCompactVertexInputs: 1,
             // M3: the lit draw goes into a render target, then the target is
