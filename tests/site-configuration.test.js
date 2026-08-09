@@ -11,16 +11,17 @@ function read(relativePath) {
     return fs.readFileSync(path.join(ROOT, relativePath), "utf8");
 }
 
-test("Warcraft III is replaced by the MapleStory disk in both game catalogs", function() {
+test("Warcraft III is available in both game catalogs with its cover", function() {
     const app = read("app.js");
     const library = read("library.js");
     const assets = read("game-assets.js");
 
     assert.doesNotMatch(app, /restoredLegacyState/);
-    assert.doesNotMatch(app, /'warcraft3'\s*:/);
-    assert.doesNotMatch(library, /warcraft3\s*:/);
-    assert.doesNotMatch(assets, /warcraft3\s*:/);
-    assert.equal(fs.existsSync(path.join(ROOT, "images/warcraft3.jpeg")), false);
+    assert.match(app, /'warcraft3'\s*:\s*\{/);
+    assert.match(app, /disk:\s*R2_URL_2 \+ '\/game\/warcraft3\/warcraft3\.img\.zst'/);
+    assert.match(library, /warcraft3:\s*\["Warcraft III",\s*"2002",\s*"Strategy",\s*"Windows XP"\]/);
+    assert.match(assets, /warcraft3:\s*"images\/warcraft3\.jpg"/);
+    assert.equal(fs.existsSync(path.join(ROOT, "images/warcraft3.jpg")), true);
     assert.match(app, /disk:\s*'game\/maplestory\.img'/);
     assert.match(library, /maplestory:\s*\["MapleStory v83"/);
 });

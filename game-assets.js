@@ -19,9 +19,9 @@ window.RETRO_GAME_COVERS = Object.freeze({
     planescape_torment: "images/planescapetorment.jpeg",
     simcity_3000: "images/simcity3000.jpeg",
     icewind_dale_1: "images/icewindale1.jpeg",
-    icewind_dale_2: "images/icewindale2.jpeg",
     need_for_speed_3: "images/nfs3.jpeg",
     dino_crisis: "images/dinocrisis.jpeg",
     resident_evil_2: "images/residentevil2.jpeg",
-    maplestory: "images/maplestory.jpeg"
+    maplestory: "images/maplestory.jpeg",
+    warcraft3: "images/warcraft3.jpg"
 });

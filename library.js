@@ -20,11 +20,11 @@ const GAMES_LIBRARY = {
     planescape_torment: ["Planescape: Torment", "1999", "RPG", "Windows XP"],
     simcity_3000: ["SimCity 3000", "1999", "Simulation", "Windows 98"],
     icewind_dale_1: ["Icewind Dale 1", "2000", "RPG", "Windows XP"],
-    icewind_dale_2: ["Icewind Dale 2", "2002", "RPG", "Windows XP"],
     need_for_speed_3: ["Need for Speed 3", "1998", "Racing", "Windows 98"],
     dino_crisis: ["Dino Crisis", "2000", "Survival", "Windows 98"],
     resident_evil_2: ["Resident Evil 2", "1999", "Survival", "Windows 98"],
-    maplestory: ["MapleStory v83", "2003", "MMORPG", "Windows XP"]
+    maplestory: ["MapleStory v83", "2003", "MMORPG", "Windows XP"],
+    warcraft3: ["Warcraft III", "2002", "Strategy", "Windows XP"]
 };
 
 const COVER_PALETTES = [

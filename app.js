@@ -162,15 +162,6 @@ const GAMES = {
         size: 2621440000,
         stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_icewinddale1.bin.zst',
     },
-    'icewind_dale_2': {
-        name: 'Icewind Dale 2',
-        memorySize: 256 * 1024 * 1024,
-        systemDisk: '/windowsxp/windowsxpmultidisk/windowsxp_multidisk_C_2G.img.zst',
-        systemDiskSize: 2147483648,
-        disk: R2_URL_2 + '/game/icewinddale2/icewinddale2.img.zst',
-        size: 2097152000,
-        stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_icewinddale2.bin.zst',
-    },
     'need_for_speed_3': {
         name: 'Need for Speed 3',
         memorySize: 256 * 1024 * 1024,
@@ -198,7 +189,7 @@ const GAMES = {
         size: 4294967296,
         stateurl: R2_URL_2 + '/windows98/states/windows98_audio_vga_2d_multidisk_residentevil2.bin.zst',
     },
-        'maplestory': {
+    'maplestory': {
         name: 'MapleStory v83',
         memorySize: 1024 * 1024 * 1024,
         systemDisk: '/windowsxp/windowsxpmultidisk/windowsxp_multidisk_C_2G.img.zst',
@@ -206,7 +197,16 @@ const GAMES = {
         disk: R2_URL_2 + '/game/maplestory/maplestory.img.zst',
         size: 2202009600,
         stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_maplestory.bin.zst',
-    }   
+    },
+    'warcraft3': {
+        name: 'Warcraft III',
+        memorySize: 1024 * 1024 * 1024,
+        systemDisk: '/windowsxp/windowsxpmultidisk/windowsxp_multidisk_C_2G.img.zst',
+        systemDiskSize: 2147483648,
+        disk: R2_URL_2 + '/game/warcraft3/warcraft3.img.zst',
+        size: 2634022912,
+        stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_warcraft3.bin.zst',
+    }
 };
 
 const progressContainer = document.getElementById("progress_container");
@@ -220,9 +220,9 @@ const GAME_PAGE_META = {
     starcraft: ["1998", "Strategy"], commandos_1: ["1998", "Tactics"], Diablo_1: ["1997", "Action RPG"],
     richman_4: ["1998", "Board game"], rollercoaster_tycoon_2: ["2002", "Simulation"], fallout_2: ["1998", "RPG"],
     age_of_empires_2: ["1999", "Strategy"], civilization_2: ["1996", "Strategy"], planescape_torment: ["1999", "RPG"],
-    simcity_3000: ["1999", "Simulation"], icewind_dale_1: ["2000", "RPG"], icewind_dale_2: ["2002", "RPG"],
+    simcity_3000: ["1999", "Simulation"], icewind_dale_1: ["2000", "RPG"],
     need_for_speed_3: ["1998", "Racing"], dino_crisis: ["2000", "Survival"], resident_evil_2: ["1999", "Survival"],
-    maplestory: ["2003", "MMORPG"]
+    maplestory: ["2003", "MMORPG"], warcraft3: ["2002", "Strategy"]
 };
 const COVER_PALETTES = [
     ["#2c351b", "#a4cf54"], ["#321c1b", "#d3614f"], ["#172f35", "#55abc2"], ["#312541", "#9c70d2"],
