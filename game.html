@@ -6,7 +6,7 @@
     <meta name="description" content="Play a preserved classic PC game in your browser with v86.">
     <title>Play — Retro Gaming Site</title>
     <link rel="icon" href="data:,">
-    <link rel="stylesheet" href="styles.css?v=maplestory-accounts-20260802">
+    <link rel="stylesheet" href="styles.css?v=v8ft-v1-phase5-20260813">
 </head>
 <body class="game-page">
     <header class="site-header">
@@ -58,6 +58,10 @@
                         </button>
                     </div>
                     <div class="custom-controls" id="custom_controls"></div>
+                    <button class="control-button file-transfer-button hidden" id="file_transfer_btn"
+                            type="button" aria-haspopup="dialog" aria-expanded="false">
+                        <span class="control-icon" aria-hidden="true">⇅</span><span>File transfer</span>
+                    </button>
                     <button class="control-button fullscreen-button" id="fullscreen_btn" type="button">
                         <span class="control-icon" aria-hidden="true">⛶</span><span>Full screen</span>
                     </button>
@@ -85,6 +89,106 @@
                     </div>
                 </div>
             </section>
+
+            <div class="file-transfer-overlay hidden" id="file_transfer_overlay" aria-hidden="true">
+                <section class="file-transfer-dialog" role="dialog" aria-modal="false"
+                         aria-labelledby="file_transfer_title">
+                    <header class="file-transfer-header">
+                        <div>
+                            <p class="section-kicker">Windows XP files</p>
+                            <h2 id="file_transfer_title">Upload &amp; download</h2>
+                        </div>
+                        <div class="file-transfer-header-actions">
+                            <span class="file-transfer-connection" id="file_transfer_connection">Offline</span>
+                            <button class="file-transfer-close" id="file_transfer_close" type="button"
+                                    aria-label="Close file transfer panel">×</button>
+                        </div>
+                    </header>
+
+                    <div class="file-transfer-body">
+                        <aside class="file-transfer-shares" aria-label="Windows XP locations">
+                            <span class="file-transfer-label">Locations</span>
+                            <div id="file_transfer_shares"></div>
+                        </aside>
+
+                        <div class="file-transfer-browser">
+                            <div class="file-transfer-toolbar">
+                                <nav class="file-transfer-breadcrumbs" id="file_transfer_breadcrumbs"
+                                     aria-label="Current folder"></nav>
+                                <button class="file-transfer-icon-button" id="file_transfer_refresh"
+                                        type="button" title="Refresh this folder" aria-label="Refresh this folder">↻</button>
+                            </div>
+
+                            <div class="file-transfer-notice" id="file_transfer_notice" role="status">
+                                Connect to the Windows XP file agent to browse files.
+                            </div>
+
+                            <div class="file-transfer-table-wrap">
+                                <table class="file-transfer-table">
+                                    <thead>
+                                        <tr>
+                                            <th class="file-transfer-check-cell">
+                                                <input id="file_transfer_select_all" type="checkbox"
+                                                       aria-label="Select all files on this page">
+                                            </th>
+                                            <th>Name</th>
+                                            <th>Type</th>
+                                            <th>Size</th>
+                                            <th>Modified</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="file_transfer_entries"></tbody>
+                                </table>
+                                <div class="file-transfer-empty" id="file_transfer_empty">
+                                    No folder selected.
+                                </div>
+                            </div>
+
+                            <button class="file-transfer-more hidden" id="file_transfer_more" type="button">
+                                Load more
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="file-transfer-dropzone" id="file_transfer_dropzone">
+                        <div>
+                            <strong id="file_transfer_upload_summary">Choose one or more files</strong>
+                            <span id="file_transfer_upload_hint">Files upload to the folder shown above.</span>
+                        </div>
+                        <button class="file-transfer-secondary" id="file_transfer_choose" type="button">
+                            Choose files
+                        </button>
+                        <input id="file_transfer_upload_input" class="hidden" type="file" multiple>
+                    </div>
+
+                    <div class="file-transfer-progress hidden" id="file_transfer_progress">
+                        <div class="file-transfer-progress-copy">
+                            <strong id="file_transfer_progress_title">Preparing transfer…</strong>
+                            <span id="file_transfer_progress_detail"></span>
+                        </div>
+                        <div class="file-transfer-progress-track" aria-hidden="true">
+                            <span id="file_transfer_progress_bar"></span>
+                        </div>
+                    </div>
+
+                    <footer class="file-transfer-footer">
+                        <p id="file_transfer_footer_note">
+                            Uploaded files only persist in this browser session until you save state.
+                        </p>
+                        <div class="file-transfer-actions">
+                            <button class="file-transfer-secondary hidden" id="file_transfer_cancel" type="button">
+                                Cancel transfer
+                            </button>
+                            <button class="file-transfer-secondary" id="file_transfer_download" type="button" disabled>
+                                Download selected
+                            </button>
+                            <button class="file-transfer-primary" id="file_transfer_upload" type="button" disabled>
+                                Upload files
+                            </button>
+                        </div>
+                    </footer>
+                </section>
+            </div>
 
             <section class="game-account-panel" id="game_account_panel" hidden aria-labelledby="game_account_title">
                 <div>
@@ -114,7 +218,7 @@
         <a href="index.html">Browse all games</a>
     </footer>
 
-    <script src="libv86.js?v=webgl-clean-v1-20260801"></script>
+    <script src="libv86.js?v=parallel-port-20260809"></script>
     <script src="glbridge/libglwasm/gl4es.js?v=webgl-clean-v1-20260801"></script>
     <script src="glbridge/libglwasm/gl4es_loader.js?v=webgl-clean-v1-20260801"></script>
     <script src="glbridge/d3d8-webgpu/d3d8_executor.js?v=direct-webgpu-m6-session-v4-20260802"></script>
@@ -123,7 +227,12 @@
     <script src="glbridge/d3d9-webgpu/d3d9_shader_pipeline.js?v=d3d9-m5-war3-battle-20260809"></script>
     <script src="glbridge/d3d9-webgpu/d3d9_executor.js?v=d3d9-m5-war3-battle-20260809"></script>
     <script src="glbridge/v86_network_bridge.js?v=direct-webgpu-m6-session-v4-20260802"></script>
+    <script src="file-transfer/v8ft-protocol.js?v=v8ft-v1-phase3-20260811"></script>
+    <script src="file-transfer/v8ft-client.js?v=v8ft-v1-phase4-20260812"></script>
+    <script src="file-transfer/operation-coordinator.js?v=v8ft-v1-phase4-20260812"></script>
+    <script src="file-transfer/v8ft-manager.js?v=v8ft-v1-phase4-20260812"></script>
+    <script src="file-transfer/v8ft-ui.js?v=v8ft-v1-phase5-20260813"></script>
     <script src="game-assets.js?v=warcraft3-20260809"></script>
-    <script src="app.js?v=maplestory-20260802"></script>
+    <script src="app.js?v=v8ft-v1-phase5-20260813"></script>
 </body>
 </html>

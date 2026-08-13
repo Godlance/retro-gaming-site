@@ -2,7 +2,38 @@
 
 let emulator = null;
 let v86gl = null;
-let stateOperationInProgress = false;
+let v8ftClient = null;
+let v8ftManager = null;
+let v8ftUI = null;
+let operationCoordinator = null;
+
+function createOperationCoordinator() {
+    if (typeof window.V86OperationCoordinator === "function") {
+        return new window.V86OperationCoordinator();
+    }
+
+    // Keep the existing game and save-state controls usable if the optional
+    // file-transfer scripts fail to load. The full manager is simply disabled.
+    console.warn("v86 operation coordinator script did not load; file transfer is disabled");
+    let state = "idle";
+    return {
+        get state() { return state; },
+        tryBegin(kind) {
+            if (state !== "idle") return null;
+            state = kind;
+            let ended = false;
+            return {
+                kind,
+                end() {
+                    if (ended) return false;
+                    ended = true;
+                    state = "idle";
+                    return true;
+                },
+            };
+        },
+    };
+}
 
 const R2_URL_1 = "https://retrogamingsiteresource.dpdns.org";
 const R2_URL_2 = "https://resource2.19930724.xyz";
@@ -377,6 +408,18 @@ function startEmulator9xMultiDisk(gameId) {
     const game = GAMES[gameId];
 
     if (emulator) {
+        if (v8ftManager) {
+            if (v8ftUI) v8ftUI.attachManager(null);
+            v8ftManager.destroy();
+            v8ftManager = null;
+            v8ftClient = null;
+            window.v86FileTransferManager = null;
+            window.v86FileTransferV1 = null;
+        } else if (v8ftClient) {
+            v8ftClient.destroy();
+            v8ftClient = null;
+            window.v86FileTransferV1 = null;
+        }
         emulator.stop();
         emulator.destroy();
         emulator = null;
@@ -432,6 +475,20 @@ function startEmulator9xMultiDisk(gameId) {
         audio: true,
         autostart: true
     });
+    if (new URLSearchParams(window.location.search).get("v8ft") === "1") {
+        if (typeof window.V86FileTransferManager === "function") {
+            v8ftManager = new window.V86FileTransferManager(emulator, {
+                coordinator: operationCoordinator,
+            });
+            v8ftClient = v8ftManager.client;
+            window.v86FileTransferManager = v8ftManager;
+            window.v86FileTransferV1 = v8ftClient;
+            if (v8ftUI) v8ftUI.attachManager(v8ftManager);
+            console.info("V8FT v1 Phase 4 manager enabled as window.v86FileTransferManager");
+        } else {
+            console.error("V8FT v1 manager scripts did not load");
+        }
+    }
     attachEmulatorListeners(emulator, gameId);
 }
 
@@ -564,6 +621,14 @@ window.onload = function() {
         document.querySelector(".emulator-panel").classList.add("hidden");
         return;
     }
+    operationCoordinator = createOperationCoordinator();
+    window.v86OperationCoordinator = operationCoordinator;
+    if (typeof window.V86FileTransferUI === "function") {
+        v8ftUI = new window.V86FileTransferUI();
+        window.v86FileTransferUI = v8ftUI;
+    } else {
+        console.warn("V8FT Phase 5 UI script did not load");
+    }
     populateGamePage(gameId, selectedGame);
     renderGamesList();
     updateStatus("Preparing " + selectedGame.name + "…");
@@ -574,8 +639,9 @@ window.onload = function() {
             updateStatus("Emulator not running!");
             return;
         }
-        if (stateOperationInProgress) {
-            updateStatus("Another state operation is already running");
+        const operationLease = operationCoordinator.tryBegin("saving-state");
+        if (!operationLease) {
+            updateStatus("Cannot save state while " + operationCoordinator.state + " is active");
             return;
         }
 
@@ -583,7 +649,6 @@ window.onload = function() {
         const activeEmulator = emulator;
         const activeBridge = v86gl;
         const wasRunning = activeEmulator.is_running();
-        stateOperationInProgress = true;
         button.disabled = true;
         updateStatus("Saving state...");
         try {
@@ -617,21 +682,26 @@ window.onload = function() {
                     console.error("Failed to resume emulator after save:", err);
                 }
             }
-            stateOperationInProgress = false;
+            operationLease.end();
         }
     };
 
     // Setup load state button
     document.getElementById("load_state_btn").onclick = function() {
+        if (operationCoordinator.state !== "idle") {
+            updateStatus("Cannot restore state while " + operationCoordinator.state + " is active");
+            return;
+        }
         document.getElementById("load_state_file").click();
     };
 
     document.getElementById("load_state_file").onchange = async function(e) {
         var file = e.target.files[0];
         if (!file || !emulator) return;
-        if (stateOperationInProgress) {
+        const operationLease = operationCoordinator.tryBegin("restoring-state");
+        if (!operationLease) {
             this.value = "";
-            updateStatus("Another state operation is already running");
+            updateStatus("Cannot restore state while " + operationCoordinator.state + " is active");
             return;
         }
 
@@ -641,19 +711,41 @@ window.onload = function() {
         const wasRunning = activeEmulator.is_running();
         let bridgeRestorePending = false;
         let restoreCompleted = false;
-        stateOperationInProgress = true;
+        let reconnectManager = false;
         updateStatus("Restoring state...");
         try {
             const stateData = await file.arrayBuffer();
+            if (v8ftManager && v8ftManager.emulator === activeEmulator) {
+                await v8ftManager.beginStateRestore();
+            }
             if (wasRunning) {
                 await activeEmulator.stop();
+            }
+            if (v8ftManager && v8ftManager.emulator === activeEmulator) {
+                v8ftManager.clearRestoreInput("pre-restore");
             }
             if (activeBridge && typeof activeBridge.beginStateRestore === "function") {
                 activeBridge.beginStateRestore();
                 bridgeRestorePending = true;
             }
+            if (com1Phase0Benchmark && com1Phase0Benchmark.emulator === activeEmulator) {
+                com1Phase0Benchmark.resetAfterRestore();
+                com1Phase0Benchmark.clearUart0Input();
+            }
+            if (!v8ftManager && v8ftClient && v8ftClient.emulator === activeEmulator) {
+                v8ftClient.resetAfterRestore();
+                v8ftClient.clearUart0Input();
+            }
 
             await activeEmulator.restore_state(stateData);
+            if (com1Phase0Benchmark && com1Phase0Benchmark.emulator === activeEmulator) {
+                com1Phase0Benchmark.clearUart0Input();
+            }
+            if (v8ftManager && v8ftManager.emulator === activeEmulator) {
+                v8ftManager.finishStateRestoreBeforeRun();
+            } else if (v8ftClient && v8ftClient.emulator === activeEmulator) {
+                v8ftClient.clearUart0Input();
+            }
             if (activeBridge && typeof activeBridge.finishStateRestore === "function") {
                 await activeBridge.finishStateRestore();
                 bridgeRestorePending = false;
@@ -667,6 +759,8 @@ window.onload = function() {
             if (wasRunning) {
                 await activeEmulator.run();
             }
+            reconnectManager = !!(v8ftManager && v8ftManager.emulator === activeEmulator &&
+                activeEmulator.is_running());
 
             updateStatus("State Restored!");
         } catch (err) {
@@ -680,8 +774,13 @@ window.onload = function() {
             // A partially restored VM must stay paused; running it with an
             // incomplete WebGL reconstruction would recreate the corruption.
         } finally {
-            stateOperationInProgress = false;
+            operationLease.end();
             input.value = "";
+            if (reconnectManager) {
+                v8ftManager.reconnectAfterRestore().then(function(info) {
+                    if (info) console.info("V8FT reconnected after state restore", info);
+                });
+            }
         }
     };
 
@@ -760,12 +859,7 @@ window.onload = function() {
         });
     }
 
-    // preview=1 keeps visual QA from downloading multi-gigabyte game disks.
-    if (new URLSearchParams(window.location.search).get("preview") === "1") {
-        updateStatus("Preview mode — emulator download paused");
-    } else {
-        launchGameMultiDisk(gameId);
-    }
+    launchGameMultiDisk(gameId);
 };
 
 function updateStatus(text) {
