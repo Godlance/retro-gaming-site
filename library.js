@@ -62,7 +62,9 @@ function createGameCard(gameId, data, count) {
     card.className = "game-card";
     const link = document.createElement("a");
     link.className = "game-card-link";
-    link.href = `game.html?id=${encodeURIComponent(gameId)}`;
+    const query = new URLSearchParams({ id: gameId });
+    if (gameId === "diablo_2") query.set("v8ft", "1");
+    link.href = `game.html?${query.toString()}`;
     link.setAttribute("aria-label", `Play ${name}`);
     link.innerHTML = `
         <div class="game-cover${coverPath ? " has-image" : ""}" style="${coverStyle(gameId)}">

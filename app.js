@@ -308,19 +308,6 @@ function populateGamePage(gameId, game) {
         cover.querySelector("span").textContent = gameInitials(game.name);
     }
 
-    if (gameId === "diablo_2") {
-        const customControls = document.getElementById("custom_controls");
-        const button = document.createElement("button");
-        button.className = "control-button";
-        button.type = "button";
-        button.innerHTML = '<span class="control-icon" aria-hidden="true">◇</span><span>D2 save tools</span>';
-        button.addEventListener("click", function() {
-            const event = new CustomEvent("retro:game-action", { cancelable: true, detail: { gameId, actionId: "save-files", emulator } });
-            window.dispatchEvent(event);
-            if (!event.defaultPrevented) updateStatus("Diablo II save-file hook is ready for the next integration step");
-        });
-        customControls.appendChild(button);
-    }
 }
 
 function renderGamesList() {

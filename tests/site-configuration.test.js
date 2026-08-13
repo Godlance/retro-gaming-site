@@ -34,3 +34,14 @@ test("MapleStory registration is linked below the emulator", function() {
     assert.match(page, /href="register\.html"/);
     assert.match(app, /gameId !== "maplestory"/);
 });
+
+test("Diablo II library links enable V8FT without the old save-tools hook", function() {
+    const page = read("game.html");
+    const app = read("app.js");
+    const library = read("library.js");
+
+    assert.match(library, /gameId === "diablo_2"/);
+    assert.match(library, /query\.set\("v8ft", "1"\)/);
+    assert.doesNotMatch(app, /D2 save tools|retro:game-action|save-files/);
+    assert.doesNotMatch(page, /custom_controls/);
+});

@@ -7,7 +7,7 @@
 
 ## 1. 背景与当前仓库条件
 
-当前站点在浏览器中运行完整的 Windows 98/XP，并通过两块异步 IDE 镜像分别提供系统盘和游戏盘。Diablo II 页面已经预留 `D2 save tools` 自定义动作，但尚未实现实际文件传输。多个游戏共用同一块 Windows XP 系统盘（`windowsxp_multidisk_C_2G.img.zst`），因此 agent 只需安装一次即可服务所有基于该系统盘的游戏。
+当前站点在浏览器中运行完整的 Windows 98/XP，并通过两块异步 IDE 镜像分别提供系统盘和游戏盘。Diablo II 从游戏库进入时自动启用通用 `File transfer`；旧的专用存档按钮已移除。多个游戏共用同一块 Windows XP 系统盘（`windowsxp_multidisk_C_2G.img.zst`），因此 agent 只需安装一次即可服务所有基于该系统盘的游戏。
 
 当前 v86 构建已经提供所需的双向串口接口：
 
@@ -733,7 +733,7 @@ restore 的完整时序必须固定为（对应现有 handler 中 `restore_state
 
 ## 8. 用户界面与流程
 
-现有 [app.js](../app.js) 中针对 `diablo_2` 的 `D2 save tools` 按钮已经通过 `retro:game-action` 自定义事件解耦，这个结构可以复用：把按钮改成通用的"文件传输"，注入条件从"gameId 是 `diablo_2`"改为"该游戏的 state 已包含 agent"（由 feature flag 控制）。
+通用 `File transfer` 入口直接由 Phase 5 UI 管理，不再经过游戏专属事件。当前游戏库只为 `diablo_2` 链接添加 `v8ft=1`；其他游戏保持原 URL，后续应在对应 state 已安装 agent 后再按游戏开启。
 
 面板分三个区域：左侧 share 列表，中间当前目录的条目表，底部传输队列与进度。
 
@@ -1058,12 +1058,13 @@ replacement 与 D3D/WebGPU 满载回归；产品于 2026-08-12 接受这两项�
 可多选文件下载：单文件保留安全化文件名直接下载，多文件在浏览器本地打包为
 UTF-8、stored method ZIP，不依赖网络库。成功上传后始终显示 state 持久性提示。
 桌面 1600×1100 与窄屏 700×900 的无头浏览器视觉检查均无横向溢出；Phase 5
-UI/ZIP/多文件行为测试为 7/7 通过。游戏专属快捷方式是可选增强，本次通用入口
-不依赖 `retro:game-action`；虚拟滚动也暂未加入，目录继续使用显式分页加载。
+UI/ZIP/多文件行为测试为 7/7 通过。游戏专属快捷方式是可选增强；旧的 Diablo II
+专用按钮和事件 hook 已移除，游戏库为 Diablo II 自动添加 `v8ft=1`。虚拟滚动
+暂未加入，目录继续使用显式分页加载。
 
 任务：
 
-- [x] 在控制栏接入通用文件传输入口；现有 `retro:game-action` 不再是通用入口的前置依赖。
+- [x] 在控制栏接入通用文件传输入口，删除 Diablo II 专用按钮/hook，并在游戏库按游戏启用。
 - [x] 实现 share 列表、目录浏览、面包屑、手动刷新与游标分页；大目录虚拟滚动保留为优化项。
 - [x] 实现多选上传、拖放、逐文件覆盖确认、配额、耗时预估及长操作确认。
 - [x] 实现多选下载、单文件直接下载与本地 stored ZIP 打包。
