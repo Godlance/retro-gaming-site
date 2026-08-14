@@ -2,7 +2,6 @@
 
 let emulator = null;
 let v86gl = null;
-let v8ftClient = null;
 let v8ftManager = null;
 let v8ftUI = null;
 let operationCoordinator = null;
@@ -399,12 +398,7 @@ function startEmulator9xMultiDisk(gameId) {
             if (v8ftUI) v8ftUI.attachManager(null);
             v8ftManager.destroy();
             v8ftManager = null;
-            v8ftClient = null;
             window.v86FileTransferManager = null;
-            window.v86FileTransferV1 = null;
-        } else if (v8ftClient) {
-            v8ftClient.destroy();
-            v8ftClient = null;
             window.v86FileTransferV1 = null;
         }
         emulator.stop();
@@ -467,9 +461,8 @@ function startEmulator9xMultiDisk(gameId) {
             v8ftManager = new window.V86FileTransferManager(emulator, {
                 coordinator: operationCoordinator,
             });
-            v8ftClient = v8ftManager.client;
             window.v86FileTransferManager = v8ftManager;
-            window.v86FileTransferV1 = v8ftClient;
+            window.v86FileTransferV1 = v8ftManager.client;
             if (v8ftUI) v8ftUI.attachManager(v8ftManager);
             console.info("V8FT v1 Phase 4 manager enabled as window.v86FileTransferManager");
         } else {
@@ -715,23 +708,10 @@ window.onload = function() {
                 activeBridge.beginStateRestore();
                 bridgeRestorePending = true;
             }
-            if (com1Phase0Benchmark && com1Phase0Benchmark.emulator === activeEmulator) {
-                com1Phase0Benchmark.resetAfterRestore();
-                com1Phase0Benchmark.clearUart0Input();
-            }
-            if (!v8ftManager && v8ftClient && v8ftClient.emulator === activeEmulator) {
-                v8ftClient.resetAfterRestore();
-                v8ftClient.clearUart0Input();
-            }
 
             await activeEmulator.restore_state(stateData);
-            if (com1Phase0Benchmark && com1Phase0Benchmark.emulator === activeEmulator) {
-                com1Phase0Benchmark.clearUart0Input();
-            }
             if (v8ftManager && v8ftManager.emulator === activeEmulator) {
                 v8ftManager.finishStateRestoreBeforeRun();
-            } else if (v8ftClient && v8ftClient.emulator === activeEmulator) {
-                v8ftClient.clearUart0Input();
             }
             if (activeBridge && typeof activeBridge.finishStateRestore === "function") {
                 await activeBridge.finishStateRestore();
