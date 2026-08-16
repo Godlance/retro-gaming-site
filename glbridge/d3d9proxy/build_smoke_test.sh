@@ -14,7 +14,9 @@ for test_name in \
     texture \
     world \
     reset \
-    shader
+    shader \
+    swapchain \
+    surface_lifetime
 do
     "$compiler" -mwindows -std=gnu99 -Os -s -nostdlib \
         -Wall -Wextra -Werror \

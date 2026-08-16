@@ -32,8 +32,413 @@
 #include <initguid.h>
 #include <d3d9.h>
 #include <stdint.h>
+#ifdef D9WG_DIAGNOSTIC_TRACE
+#include <stdarg.h>
+#endif
 #include "../winproxy/v86gl_ioctl.h"
 #include "d3d9_protocol.h"
+
+#ifdef D9WG_DIAGNOSTIC_TRACE
+/*
+ * Small, CRT-free first-chance diagnostic trace. This is compiled only by
+ * build_diagnostic.sh; the ordinary d3d9.dll has no file I/O or VEH overhead.
+ * Every line is one WriteFile call.  Ordinary calls are flushed in batches so
+ * tracing does not perturb the game as much; an exception and process detach
+ * explicitly flush their complete diagnostic tail.
+ */
+static HANDLE g_trace_file = INVALID_HANDLE_VALUE;
+static PVOID g_trace_veh;
+static volatile LONG g_trace_in_veh;
+static volatile LONG g_trace_call_sequence;
+static volatile LONG g_trace_last_enter_sequence;
+static volatile LONG g_trace_last_exit_sequence;
+static volatile LONG g_trace_last_hresult;
+static volatile LONG g_trace_last_output;
+static const char *g_trace_last_enter_method = "none";
+static const char *g_trace_last_exit_method = "none";
+static HMODULE g_trace_exe_module;
+static HMODULE g_trace_self_module;
+static char g_trace_exe_path[MAX_PATH];
+static char g_trace_self_path[MAX_PATH];
+static volatile LONG g_trace_vb_count;
+static volatile LONG g_trace_ib_count;
+static volatile LONG g_trace_vb_bytes;
+static volatile LONG g_trace_ib_bytes;
+static volatile LONG g_trace_last_freed_surface;
+#define D9_TRACE_MAX_RANGES 4096
+typedef struct D9TraceRange {
+    const char *kind;
+    DWORD ordinal;
+    DWORD object;
+    DWORD start;
+    DWORD end;
+} D9TraceRange;
+static D9TraceRange g_trace_ranges[D9_TRACE_MAX_RANGES];
+static volatile LONG g_trace_range_count;
+
+static void trace_open(HINSTANCE instance)
+{
+    char path[MAX_PATH];
+    DWORD length = GetModuleFileNameA(instance, path, MAX_PATH);
+
+    g_trace_self_module = (HMODULE)instance;
+    g_trace_exe_module = GetModuleHandleA(NULL);
+    ZeroMemory(g_trace_self_path, sizeof(g_trace_self_path));
+    ZeroMemory(g_trace_exe_path, sizeof(g_trace_exe_path));
+    GetModuleFileNameA(g_trace_self_module, g_trace_self_path,
+            MAX_PATH - 1);
+    GetModuleFileNameA(g_trace_exe_module, g_trace_exe_path, MAX_PATH - 1);
+    if (!length || length >= MAX_PATH)
+        return;
+    while (length && path[length - 1] != '\\' && path[length - 1] != '/')
+        --length;
+    if (length + sizeof("d3d9_trace_4294967295.log") > MAX_PATH)
+        return;
+    wsprintfA(path + length, "d3d9_trace_%lu.log", GetCurrentProcessId());
+    g_trace_file = CreateFileA(path, GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, NULL);
+}
+
+static void trace_write(const char *format, ...)
+{
+    char message[768];
+    char line[896];
+    DWORD written;
+    va_list arguments;
+
+    if (g_trace_file == INVALID_HANDLE_VALUE)
+        return;
+    va_start(arguments, format);
+    wvsprintfA(message, format, arguments);
+    va_end(arguments);
+    wsprintfA(line, "[%08lX %lu:%lu] %s\r\n", GetTickCount(),
+            GetCurrentProcessId(), GetCurrentThreadId(), message);
+    WriteFile(g_trace_file, line, (DWORD)lstrlenA(line), &written, NULL);
+}
+
+static void trace_flush(void)
+{
+    if (g_trace_file != INVALID_HANDLE_VALUE)
+        FlushFileBuffers(g_trace_file);
+}
+
+static void trace_mark_enter(const char *method)
+{
+    LONG sequence = InterlockedIncrement(&g_trace_call_sequence);
+    g_trace_last_enter_method = method;
+    InterlockedExchange(&g_trace_last_enter_sequence, sequence);
+}
+
+static void trace_mark_exit(const char *method, HRESULT result,
+        const void *output)
+{
+    LONG sequence = InterlockedIncrement(&g_trace_call_sequence);
+    g_trace_last_exit_method = method;
+    InterlockedExchange(&g_trace_last_hresult, (LONG)result);
+    InterlockedExchange(&g_trace_last_output, (LONG)(uintptr_t)output);
+    InterlockedExchange(&g_trace_last_exit_sequence, sequence);
+}
+
+static void trace_buffer_created(BOOL index_buffer, UINT length)
+{
+    if (index_buffer) {
+        InterlockedIncrement(&g_trace_ib_count);
+        InterlockedExchangeAdd(&g_trace_ib_bytes, (LONG)length);
+    } else {
+        InterlockedIncrement(&g_trace_vb_count);
+        InterlockedExchangeAdd(&g_trace_vb_bytes, (LONG)length);
+    }
+}
+
+static void trace_register_range(const char *kind, DWORD ordinal,
+        const void *object, const void *start, DWORD byte_count)
+{
+    LONG slot;
+    D9TraceRange *range;
+    DWORD address = (DWORD)(uintptr_t)start;
+
+    if (!start || !byte_count)
+        return;
+    slot = InterlockedIncrement(&g_trace_range_count) - 1;
+    if (slot < 0 || slot >= D9_TRACE_MAX_RANGES)
+        return;
+    range = &g_trace_ranges[slot];
+    range->ordinal = ordinal;
+    range->object = (DWORD)(uintptr_t)object;
+    range->start = address;
+    range->end = address + byte_count;
+    range->kind = kind;
+}
+
+static void trace_match_address(const char *label, DWORD address)
+{
+    LONG count = InterlockedCompareExchange(&g_trace_range_count, 0, 0);
+    LONG index;
+    BOOL matched = FALSE;
+
+    if (count > D9_TRACE_MAX_RANGES)
+        count = D9_TRACE_MAX_RANGES;
+    for (index = 0; index < count; ++index) {
+        D9TraceRange *range = &g_trace_ranges[index];
+        if (!range->kind || address < range->start || address >= range->end)
+            continue;
+        trace_write("POINTER_MATCH label=%s address=%08lX kind=%s "
+                "ordinal=%lu object=%08lX range=%08lX-%08lX offset=%lu",
+                label, address, range->kind, range->ordinal, range->object,
+                range->start, range->end, address - range->start);
+        matched = TRUE;
+    }
+    if (!matched)
+        trace_write("POINTER_MATCH label=%s address=%08lX kind=none",
+                label, address);
+}
+
+static void trace_hex_line(const char *label, DWORD address, const BYTE *data)
+{
+    trace_write("%s %08lX: %02X %02X %02X %02X %02X %02X %02X %02X "
+            "%02X %02X %02X %02X %02X %02X %02X %02X", label, address,
+            data[0], data[1], data[2], data[3], data[4], data[5], data[6],
+            data[7], data[8], data[9], data[10], data[11], data[12], data[13],
+            data[14], data[15]);
+}
+
+static void trace_memory_block(const char *label, DWORD address)
+{
+    BYTE data[64];
+    SIZE_T received = 0;
+
+    ZeroMemory(data, sizeof(data));
+    if (!address || !ReadProcessMemory(GetCurrentProcess(),
+            (LPCVOID)(uintptr_t)address, data, sizeof(data), &received)
+            || received != sizeof(data)) {
+        trace_write("%s read failed address=%08lX got=%lu error=%lu", label,
+                address, (DWORD)received, GetLastError());
+        return;
+    }
+    trace_hex_line(label, address, data);
+    trace_hex_line(label, address + 16u, data + 16);
+    trace_hex_line(label, address + 32u, data + 32);
+    trace_hex_line(label, address + 48u, data + 48);
+}
+
+static LONG WINAPI trace_vectored_exception(PEXCEPTION_POINTERS pointers)
+{
+    EXCEPTION_RECORD *record;
+    CONTEXT *context;
+    ULONG_PTR parameter0 = 0;
+    ULONG_PTR parameter1 = 0;
+    BOOL deep_dump = FALSE;
+
+    if (!pointers || !pointers->ExceptionRecord)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedCompareExchange(&g_trace_in_veh, 1, 0))
+        return EXCEPTION_CONTINUE_SEARCH;
+    record = pointers->ExceptionRecord;
+    context = pointers->ContextRecord;
+    if (record->NumberParameters > 0)
+        parameter0 = record->ExceptionInformation[0];
+    if (record->NumberParameters > 1)
+        parameter1 = record->ExceptionInformation[1];
+#if defined(__i386__) || defined(_M_IX86)
+    if (context) {
+        trace_write("EXCEPTION code=%08lX flags=%08lX address=%08lX "
+                "params=%lu p0=%08lX p1=%08lX eip=%08lX esp=%08lX "
+                "ebp=%08lX eax=%08lX ebx=%08lX ecx=%08lX edx=%08lX "
+                "esi=%08lX edi=%08lX",
+                record->ExceptionCode, record->ExceptionFlags,
+                (DWORD)(uintptr_t)record->ExceptionAddress,
+                record->NumberParameters, (DWORD)parameter0,
+                (DWORD)parameter1, context->Eip, context->Esp, context->Ebp,
+                context->Eax, context->Ebx, context->Ecx, context->Edx,
+                context->Esi, context->Edi);
+        deep_dump = record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+                || record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION;
+    } else
+#endif
+    {
+        trace_write("EXCEPTION code=%08lX flags=%08lX address=%08lX "
+                "params=%lu p0=%08lX p1=%08lX",
+                record->ExceptionCode, record->ExceptionFlags,
+                (DWORD)(uintptr_t)record->ExceptionAddress,
+                record->NumberParameters, (DWORD)parameter0,
+                (DWORD)parameter1);
+    }
+    trace_write("LAST enter_seq=%ld enter=%s exit_seq=%ld exit=%s hr=%08lX out=%08lX "
+            "vb=%ld/%luB ib=%ld/%luB",
+            InterlockedCompareExchange(&g_trace_last_enter_sequence, 0, 0),
+            g_trace_last_enter_method,
+            InterlockedCompareExchange(&g_trace_last_exit_sequence, 0, 0),
+            g_trace_last_exit_method,
+            (DWORD)InterlockedCompareExchange(&g_trace_last_hresult, 0, 0),
+            (DWORD)InterlockedCompareExchange(&g_trace_last_output, 0, 0),
+            InterlockedCompareExchange(&g_trace_vb_count, 0, 0),
+            (DWORD)InterlockedCompareExchange(&g_trace_vb_bytes, 0, 0),
+            InterlockedCompareExchange(&g_trace_ib_count, 0, 0),
+            (DWORD)InterlockedCompareExchange(&g_trace_ib_bytes, 0, 0));
+#if defined(__i386__) || defined(_M_IX86)
+    if (context && deep_dump
+            && record->ExceptionCode != EXCEPTION_STACK_OVERFLOW) {
+        MEMORY_BASIC_INFORMATION memory;
+        SIZE_T queried;
+        BYTE code[48];
+        SIZE_T received = 0;
+        HANDLE process = GetCurrentProcess();
+        DWORD code_start = context->Eip >= 16 ? context->Eip - 16
+                : context->Eip;
+        DWORD stack_values[16];
+        DWORD stack_valid = 0;
+        DWORD index;
+        DWORD outer_field_18 = 0;
+        DWORD candidate_vtbl = 0;
+
+        ZeroMemory(&memory, sizeof(memory));
+        queried = VirtualQuery((LPCVOID)(uintptr_t)context->Eip, &memory,
+                sizeof(memory));
+        if (queried) {
+            DWORD allocation = (DWORD)(uintptr_t)memory.AllocationBase;
+            const char *owner = "unknown";
+            if (memory.AllocationBase == g_trace_exe_module)
+                owner = "exe";
+            else if (memory.AllocationBase == g_trace_self_module)
+                owner = "proxy";
+            trace_write("EIP_REGION owner=%s base=%08lX allocation=%08lX rva=%08lX "
+                    "size=%08lX state=%08lX protect=%08lX type=%08lX",
+                    owner, (DWORD)(uintptr_t)memory.BaseAddress, allocation,
+                    context->Eip - allocation, (DWORD)memory.RegionSize,
+                    memory.State, memory.Protect, memory.Type);
+        } else {
+            trace_write("EIP_REGION VirtualQuery failed error=%lu",
+                    GetLastError());
+        }
+
+        ZeroMemory(code, sizeof(code));
+        if (ReadProcessMemory(process, (LPCVOID)(uintptr_t)code_start, code,
+                sizeof(code), &received) && received == sizeof(code)) {
+            trace_hex_line("CODE", code_start, code);
+            trace_hex_line("CODE", code_start + 16, code + 16);
+            trace_hex_line("CODE", code_start + 32, code + 32);
+        } else {
+            trace_write("CODE read failed start=%08lX got=%lu error=%lu",
+                    code_start, (DWORD)received, GetLastError());
+        }
+
+        ZeroMemory(stack_values, sizeof(stack_values));
+        for (index = 0; index < 16; ++index) {
+            DWORD value = 0;
+            received = 0;
+            if (ReadProcessMemory(process,
+                    (LPCVOID)(uintptr_t)(context->Esp + index * 4u), &value,
+                    sizeof(value), &received) && received == sizeof(value)) {
+                stack_values[index] = value;
+                stack_valid |= 1u << index;
+            }
+        }
+        trace_write("STACK esp=%08lX valid=%04lX +00=%08lX +04=%08lX +08=%08lX +0C=%08lX",
+                context->Esp, stack_valid, stack_values[0], stack_values[1],
+                stack_values[2], stack_values[3]);
+        trace_write("STACK esp=%08lX +10=%08lX +14=%08lX +18=%08lX +1C=%08lX",
+                context->Esp, stack_values[4], stack_values[5],
+                stack_values[6], stack_values[7]);
+        trace_write("STACK esp=%08lX +20=%08lX +24=%08lX +28=%08lX +2C=%08lX",
+                context->Esp, stack_values[8], stack_values[9],
+                stack_values[10], stack_values[11]);
+        trace_write("STACK esp=%08lX +30=%08lX +34=%08lX +38=%08lX +3C=%08lX",
+                context->Esp, stack_values[12], stack_values[13],
+                stack_values[14], stack_values[15]);
+
+        received = 0;
+        if (ReadProcessMemory(process,
+                (LPCVOID)(uintptr_t)(context->Eax + 0x18u), &outer_field_18,
+                sizeof(outer_field_18), &received)
+                && received == sizeof(outer_field_18)) {
+            received = 0;
+            if (!ReadProcessMemory(process,
+                    (LPCVOID)(uintptr_t)outer_field_18, &candidate_vtbl,
+                    sizeof(candidate_vtbl), &received)
+                    || received != sizeof(candidate_vtbl))
+                candidate_vtbl = 0;
+            trace_write("OBJECT_CHAIN outer=%08lX outer_plus_18=%08lX "
+                    "candidate_vtbl=%08lX ecx=%08lX last_freed_surface=%08lX "
+                    "candidate_matches_last_free=%lu",
+                    context->Eax, outer_field_18, candidate_vtbl,
+                    context->Ecx,
+                    (DWORD)InterlockedCompareExchange(
+                            &g_trace_last_freed_surface, 0, 0),
+                    outer_field_18 == (DWORD)InterlockedCompareExchange(
+                            &g_trace_last_freed_surface, 0, 0));
+        } else {
+            trace_write("OBJECT_CHAIN outer=%08lX +18 read failed got=%lu error=%lu",
+                    context->Eax, (DWORD)received, GetLastError());
+        }
+        trace_memory_block("EAX_OBJECT", context->Eax);
+        if (outer_field_18 && outer_field_18 != context->Eax)
+            trace_memory_block("FIELD18_OBJECT", outer_field_18);
+        if (context->Ecx && context->Ecx != outer_field_18
+                && context->Ecx != context->Eax)
+            trace_memory_block("ECX_OBJECT", context->Ecx);
+        trace_match_address("EAX", context->Eax);
+        trace_match_address("FIELD18", outer_field_18);
+        if (context->Ecx != outer_field_18)
+            trace_match_address("ECX", context->Ecx);
+
+        {
+            DWORD frame = context->Ebp;
+            for (index = 0; index < 8 && frame; ++index) {
+                DWORD pair[2];
+                DWORD next;
+                received = 0;
+                if (frame & 3u || !ReadProcessMemory(process,
+                        (LPCVOID)(uintptr_t)frame, pair, sizeof(pair), &received)
+                        || received != sizeof(pair))
+                    break;
+                trace_write("FRAME %lu ebp=%08lX return=%08lX next=%08lX",
+                        index, frame, pair[1], pair[0]);
+                if (pair[1] >= 16u)
+                    trace_memory_block("RETURN_CODE", pair[1] - 16u);
+                next = pair[0];
+                if (next <= frame || next - frame > 1024u * 1024u)
+                    break;
+                frame = next;
+            }
+        }
+    }
+#endif
+    trace_flush();
+    InterlockedExchange(&g_trace_in_veh, 0);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void trace_close(void)
+{
+    if (g_trace_file != INVALID_HANDLE_VALUE) {
+        trace_flush();
+        CloseHandle(g_trace_file);
+        g_trace_file = INVALID_HANDLE_VALUE;
+    }
+}
+
+#define TRACE(...) trace_write(__VA_ARGS__)
+#define TRACE_FLUSH() trace_flush()
+#define TRACE_MARK_ENTER(method) trace_mark_enter(method)
+#define TRACE_MARK_EXIT(method, result, output) \
+    trace_mark_exit(method, result, output)
+#define TRACE_BUFFER_CREATED(index_buffer, length) \
+    trace_buffer_created(index_buffer, length)
+#define TRACE_SURFACE_FREED(surface) \
+    InterlockedExchange(&g_trace_last_freed_surface, \
+            (LONG)(uintptr_t)(surface))
+#define TRACE_REGISTER_RANGE(kind, ordinal, object, start, size) \
+    trace_register_range(kind, ordinal, object, start, (DWORD)(size))
+#else
+#define TRACE(...) ((void)0)
+#define TRACE_FLUSH() ((void)0)
+#define TRACE_MARK_ENTER(method) ((void)0)
+#define TRACE_MARK_EXIT(method, result, output) ((void)0)
+#define TRACE_BUFFER_CREATED(index_buffer, length) ((void)0)
+#define TRACE_SURFACE_FREED(surface) ((void)0)
+#define TRACE_REGISTER_RANGE(kind, ordinal, object, start, size) ((void)0)
+#endif
 
 #define D9_MAX_RENDER_STATES 256u
 #define D9_MAX_TEXTURE_STAGES 8u
@@ -99,6 +504,7 @@
 
 typedef struct D9Direct3D D9Direct3D;
 typedef struct D9Device D9Device;
+typedef struct D9SwapChain D9SwapChain;
 typedef struct D9VertexBuffer D9VertexBuffer;
 typedef struct D9IndexBuffer D9IndexBuffer;
 typedef struct D9Texture D9Texture;
@@ -111,6 +517,16 @@ typedef struct D9Query D9Query;
 
 typedef struct D9TextureLevel {
     BYTE *shadow;
+    /* The one surface GetSurfaceLevel hands out for this level, created on
+     * first request and destroyed with the texture.  D3D9 makes a level
+     * surface a sub-object of its texture rather than a free-standing COM
+     * object: the same pointer comes back every call, and its refcount is the
+     * texture's, so an app may legally drop its surface reference and keep
+     * using the pointer for as long as it still holds the texture.  Kart Rider
+     * does exactly that -- GetSurfaceLevel, LockRect, Release, UnlockRect --
+     * and a per-call surface that frees itself at refcount 0 turns that into a
+     * call through a freed vtable. */
+    D9Surface *level_surface;
     /* TRUE only when every pixel in shadow is known. Render targets allocate
      * this lazily for M4 Clear/ColorFill/copy readback and invalidate it on any
      * GPU draw, so GetRenderTargetData can return known content without ever
@@ -137,8 +553,22 @@ struct D9Direct3D {
     LONG refcount;
 };
 
+/*
+ * The primary swap chain is created implicitly with the device.  Keep its
+ * COM identity embedded in D9Device so repeated GetSwapChain(0) calls return
+ * the same object, just as the native runtime does.  The device itself does
+ * not own a COM reference to this object (that would form a cycle); every
+ * external swap-chain reference holds one ordinary device reference instead.
+ */
+struct D9SwapChain {
+    IDirect3DSwapChain9 iface;
+    LONG refcount;
+    D9Device *device;
+};
+
 struct D9Device {
     IDirect3DDevice9 iface;
+    D9SwapChain implicit_swap_chain;
     LONG refcount;
     LONG child_parent_refs;
     BOOL releasing_owned_refs;
@@ -343,6 +773,18 @@ struct D9Surface {
      * LockRect/UnlockRect share the texture's shadow storage and upload path.
      * NULL for the GetBackBuffer surface, which is not backed by anything. */
     D9Texture *texture;
+    /* TRUE when this surface is one of the texture's level sub-objects, held
+     * in D9TextureLevel::level_surface and living exactly as long as the
+     * texture.  Its AddRef/Release forward to the texture and it is freed only
+     * during texture teardown.  FALSE for the surface create_target_texture
+     * builds, which points at a texture too but owns it the other way round:
+     * that surface holds the texture's only reference and takes its own
+     * refcount, so forwarding there would be a cycle. */
+    BOOL texture_child;
+    /* Non-NULL for the implicit back buffer.  This is a non-owning pointer:
+     * the surface's tracked device reference already keeps the embedded swap
+     * chain alive, while GetContainer takes a fresh public chain reference. */
+    D9SwapChain *swap_chain;
     UINT level;
     UINT width;
     UINT height;
@@ -388,6 +830,7 @@ static void state_block_record_indices(D9Device *device);
 
 static IDirect3D9Vtbl g_d3d_vtbl;
 static IDirect3DDevice9Vtbl g_device_vtbl;
+static IDirect3DSwapChain9Vtbl g_swap_chain_vtbl;
 static IDirect3DVertexBuffer9Vtbl g_vb_vtbl;
 static IDirect3DIndexBuffer9Vtbl g_ib_vtbl;
 static IDirect3DTexture9Vtbl g_texture_vtbl;
@@ -426,6 +869,11 @@ static D9Direct3D *d3d_from_iface(IDirect3D9 *iface)
 static D9Device *device_from_iface(IDirect3DDevice9 *iface)
 {
     return (D9Device *)iface;
+}
+
+static D9SwapChain *swap_chain_from_iface(IDirect3DSwapChain9 *iface)
+{
+    return (D9SwapChain *)iface;
 }
 
 static D9VertexBuffer *vb_from_iface(IDirect3DVertexBuffer9 *iface)
@@ -800,6 +1248,82 @@ static BOOL emit_command(uint16_t opcode, const void *payload,
     return result;
 }
 
+/*
+ * Reports a refusal or failure to the host so it lands in the browser console.
+ *
+ * This exists because the guest's own trace file is written inside a VM whose
+ * filesystem the developer cannot reach from the page, so until now the one
+ * fact that ends a "the picture is wrong" investigation -- the app asked for
+ * something and was told no -- was recorded only where nobody could read it.
+ * Compiled into the ordinary DLL, not just the diagnostic one: needing a
+ * special build to find out that a call was refused is most of the problem.
+ *
+ * Deduplicated by exact text. A failure inside a per-frame path would otherwise
+ * bill one message per frame forever, which costs batch space and drowns the
+ * console; the first occurrence is the informative one. The table is small and
+ * never grows past its cap, so a pathological caller cannot leak through it.
+ */
+/* Bumped whenever guest-visible behaviour changes, so the console can say
+ * which DLL is actually loaded rather than leaving it to be inferred. */
+#define D9_PROXY_BUILD "guest-log-20260816"
+
+#define D9_HOSTLOG_MAX_DISTINCT 128u
+
+static char g_hostlog_seen[D9_HOSTLOG_MAX_DISTINCT][D9WG_LOG_MAX_TEXT];
+static UINT g_hostlog_seen_count;
+static BOOL g_hostlog_overflowed;
+
+static BOOL hostlog_already_sent(const char *text)
+{
+    UINT index;
+    for (index = 0; index < g_hostlog_seen_count; ++index) {
+        if (lstrcmpA(g_hostlog_seen[index], text) == 0)
+            return TRUE;
+    }
+    if (g_hostlog_seen_count < D9_HOSTLOG_MAX_DISTINCT) {
+        lstrcpynA(g_hostlog_seen[g_hostlog_seen_count], text,
+                (int)D9WG_LOG_MAX_TEXT);
+        ++g_hostlog_seen_count;
+        return FALSE;
+    }
+    /* Past the cap every further distinct message would be re-sent forever;
+     * say so once and go quiet rather than flooding. */
+    if (g_hostlog_overflowed)
+        return TRUE;
+    g_hostlog_overflowed = TRUE;
+    return FALSE;
+}
+
+static void host_log(uint32_t severity, const char *format, ...)
+{
+    char text[D9WG_LOG_MAX_TEXT];
+    uint8_t payload[sizeof(D9WGGuestLog) + D9WG_LOG_MAX_TEXT];
+    D9WGGuestLog *header = (D9WGGuestLog *)payload;
+    va_list arguments;
+    int length;
+
+    va_start(arguments, format);
+    wvsprintfA(text, format, arguments);
+    va_end(arguments);
+    if (hostlog_already_sent(text))
+        return;
+    length = lstrlenA(text);
+    if (length > (int)D9WG_LOG_MAX_TEXT)
+        length = (int)D9WG_LOG_MAX_TEXT;
+    header->severity = severity;
+    header->text_bytes = (uint32_t)length;
+    CopyMemory(payload + sizeof(*header), text, (SIZE_T)length);
+    emit_command(D9WG_OP_GUEST_LOG, payload,
+            (uint32_t)(sizeof(*header) + (uint32_t)length));
+}
+
+#define HOSTLOG_INFO(...) \
+    host_log(D9WG_LOG_SEVERITY_INFO, __VA_ARGS__)
+#define HOSTLOG_REFUSED(...) \
+    host_log(D9WG_LOG_SEVERITY_REFUSED, __VA_ARGS__)
+#define HOSTLOG_FAILED(...) \
+    host_log(D9WG_LOG_SEVERITY_FAILED, __VA_ARGS__)
+
 static BOOL emit_buffer_update(uint32_t handle, uint32_t destination_offset,
         const void *data, uint32_t byte_count, uint32_t lock_flags)
 {
@@ -842,18 +1366,36 @@ static BOOL texture_format_layout(D3DFORMAT format, UINT *block_width,
     *block_width = 1;
     *block_height = 1;
     switch (format) {
+    case D3DFMT_R8G8B8:
+        *block_bytes = 3;
+        return TRUE;
     case D3DFMT_A8R8G8B8:
     case D3DFMT_X8R8G8B8:
+    case D3DFMT_A8B8G8R8:
+    case D3DFMT_X8B8G8R8:
+    case D3DFMT_X8L8V8U8:
+    case D3DFMT_Q8W8V8U8:
+    case D3DFMT_V16U16:
+    case D3DFMT_A2W10V10U10:
         *block_bytes = 4;
         return TRUE;
     case D3DFMT_R5G6B5:
     case D3DFMT_X1R5G5B5:
     case D3DFMT_A1R5G5B5:
     case D3DFMT_A4R4G4B4:
+    case D3DFMT_A8R3G3B2:
+    case D3DFMT_X4R4G4B4:
+    case D3DFMT_A8L8:
+    case D3DFMT_V8U8:
+    case D3DFMT_L6V5U5:
+    case D3DFMT_CxV8U8:
+    case D3DFMT_L16:
         *block_bytes = 2;
         return TRUE;
+    case D3DFMT_R3G3B2:
     case D3DFMT_L8:
     case D3DFMT_A8:
+    case D3DFMT_A4L4:
         *block_bytes = 1;
         return TRUE;
     case D3DFMT_DXT1:
@@ -861,7 +1403,9 @@ static BOOL texture_format_layout(D3DFORMAT format, UINT *block_width,
         *block_height = 4;
         *block_bytes = 8;
         return TRUE;
+    case D3DFMT_DXT2:
     case D3DFMT_DXT3:
+    case D3DFMT_DXT4:
     case D3DFMT_DXT5:
         *block_width = 4;
         *block_height = 4;
@@ -892,17 +1436,53 @@ static BOOL texture_level_layout(D3DFORMAT format, UINT width, UINT height,
 static BOOL supported_texture_format(D3DFORMAT format)
 {
     switch (format) {
+    case D3DFMT_R8G8B8:
     case D3DFMT_A8R8G8B8:
     case D3DFMT_X8R8G8B8:
     case D3DFMT_R5G6B5:
     case D3DFMT_X1R5G5B5:
     case D3DFMT_A1R5G5B5:
     case D3DFMT_A4R4G4B4:
+    case D3DFMT_R3G3B2:
+    case D3DFMT_A8R3G3B2:
+    case D3DFMT_X4R4G4B4:
+    case D3DFMT_A8B8G8R8:
+    case D3DFMT_X8B8G8R8:
     case D3DFMT_L8:
     case D3DFMT_A8:
+    case D3DFMT_A8L8:
+    case D3DFMT_A4L4:
+    case D3DFMT_V8U8:
+    case D3DFMT_L6V5U5:
+    case D3DFMT_X8L8V8U8:
+    case D3DFMT_Q8W8V8U8:
+    case D3DFMT_V16U16:
+    case D3DFMT_A2W10V10U10:
+    case D3DFMT_CxV8U8:
+    case D3DFMT_L16:
     case D3DFMT_DXT1:
+    case D3DFMT_DXT2:
     case D3DFMT_DXT3:
+    case D3DFMT_DXT4:
     case D3DFMT_DXT5:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+/* Sampling support and render-target support are deliberately separate.
+ * Luminance, signed bump-map and block-compressed textures are valid shader
+ * inputs, but not valid outputs for the proxy's RGBA render path. */
+static BOOL supported_render_target_format(D3DFORMAT format)
+{
+    switch (format) {
+    case D3DFMT_A8R8G8B8:
+    case D3DFMT_X8R8G8B8:
+    case D3DFMT_R5G6B5:
+    case D3DFMT_X1R5G5B5:
+    case D3DFMT_A1R5G5B5:
+    case D3DFMT_A4R4G4B4:
         return TRUE;
     default:
         return FALSE;
@@ -1657,6 +2237,20 @@ static void emit_hello_once(void)
     hello.session_id_low = g_session_id_low;
     hello.session_id_high = g_session_id_high;
     emit_command(D9WG_OP_HELLO, &hello, sizeof(hello));
+    /*
+     * Identify this DLL in the browser console, once per process.
+     *
+     * Without it, "no [d3d9-guest] lines appeared" has two readings that call
+     * for opposite next steps -- the guest refused nothing, or the guest is an
+     * older DLL that cannot report at all -- and nothing else distinguishes
+     * them. The host executor ships with the page and updates on reload while
+     * this DLL lives inside a disk image and only changes when someone copies
+     * it in, so "new host, stale guest" is the ordinary state of things, not an
+     * edge case. One line of proof-of-life makes every later silence mean
+     * exactly one thing.
+     */
+    HOSTLOG_INFO("proxy build %s loaded; refusals and failures will be "
+            "reported here", D9_PROXY_BUILD);
 }
 
 static void initialize_session_id(HINSTANCE instance)
@@ -1961,7 +2555,15 @@ static void device_clear_bindings(D9Device *device)
 
 static void device_release_owned_references(D9Device *device)
 {
+    TRACE("ENTER Device.ReleaseOwnedReferences device=%08lX refs=%ld child_refs=%ld",
+            device->handle,
+            InterlockedCompareExchange(&device->refcount, 0, 0),
+            InterlockedCompareExchange(&device->child_parent_refs, 0, 0));
     device_clear_bindings(device);
+    TRACE("LEAVE Device.ReleaseOwnedReferences device=%08lX refs=%ld child_refs=%ld",
+            device->handle,
+            InterlockedCompareExchange(&device->refcount, 0, 0),
+            InterlockedCompareExchange(&device->child_parent_refs, 0, 0));
 }
 
 static BOOL recreate_device_resources(D9Device *device)
@@ -2414,14 +3016,20 @@ static HRESULT WINAPI d3d_check_device_format(IDirect3D9 *iface,
         DWORD usage, D3DRESOURCETYPE resource_type, D3DFORMAT format)
 {
     BOOL ok = FALSE;
+    HRESULT result;
     (void)iface; (void)adapter_format;
     if (!adapter && type == D3DDEVTYPE_HAL) {
         const DWORD unsupported_usage = D3DUSAGE_AUTOGENMIPMAP
-                | D3DUSAGE_DMAP | D3DUSAGE_NPATCHES | D3DUSAGE_SOFTWAREPROCESSING;
+                | D3DUSAGE_DMAP | D3DUSAGE_NPATCHES
+                | D3DUSAGE_SOFTWAREPROCESSING
+                | D3DUSAGE_QUERY_LEGACYBUMPMAP;
         if ((resource_type == D3DRTYPE_TEXTURE
                     || resource_type == D3DRTYPE_CUBETEXTURE)
                 && !(usage & D3DUSAGE_DEPTHSTENCIL)
                 && !(usage & unsupported_usage)
+                && (!(usage & D3DUSAGE_RENDERTARGET)
+                    || (resource_type == D3DRTYPE_TEXTURE
+                        && supported_render_target_format(format)))
                 && supported_texture_format(format))
             ok = TRUE;
         else if (resource_type == D3DRTYPE_SURFACE
@@ -2430,10 +3038,30 @@ static HRESULT WINAPI d3d_check_device_format(IDirect3D9 *iface,
             ok = TRUE;
         else if (resource_type == D3DRTYPE_SURFACE
                 && (usage & D3DUSAGE_RENDERTARGET)
-                && supported_texture_format(format))
+                && supported_render_target_format(format))
             ok = TRUE;
     }
-    return ok ? D3D_OK : D3DERR_NOTAVAILABLE;
+    result = ok ? D3D_OK : D3DERR_NOTAVAILABLE;
+    TRACE("%s CheckDeviceFormat adapter=%lu type=%lu adapter_fmt=%08lX "
+            "usage=%08lX resource_type=%lu format=%08lX -> %08lX",
+            SUCCEEDED(result) ? "OK" : "FAIL", adapter, (DWORD)type,
+            (DWORD)adapter_format, usage, (DWORD)resource_type,
+            (DWORD)format, (DWORD)result);
+    /*
+     * D3DERR_NOTAVAILABLE is a legitimate answer, not a refusal, which is
+     * exactly why it needs reporting: an app that asks whether it may use a
+     * format and is told no does not fail, it quietly does without -- loads no
+     * texture, draws no model, logs nothing. That is indistinguishable from
+     * "the app never wanted to draw it", and the difference is the whole
+     * question when content is missing with a clean command stream. Deduped by
+     * text, so each distinct usage/type/format triple costs one line however
+     * many times it is probed.
+     */
+    if (!ok)
+        HOSTLOG_REFUSED("CheckDeviceFormat said no: format=%08lX usage=%08lX "
+                "resource_type=%lu (an app told no here silently does "
+                "without)", (DWORD)format, usage, (DWORD)resource_type);
+    return result;
 }
 
 static HRESULT WINAPI d3d_check_multisample(IDirect3D9 *iface, UINT adapter,
@@ -2501,31 +3129,74 @@ static HRESULT WINAPI d3d_create_device(IDirect3D9 *iface, UINT adapter,
     RECT client;
     POINT origin;
 
-    if (!device_out)
+    TRACE("CALL CreateDevice adapter=%lu type=%lu focus=%08lX behavior=%08lX",
+            adapter, (DWORD)type, (DWORD)(uintptr_t)focus_window, behavior);
+
+    if (!device_out) {
+        TRACE("FAIL CreateDevice missing output -> %08lX",
+                (DWORD)D3DERR_INVALIDCALL);
         return D3DERR_INVALIDCALL;
+    }
     *device_out = NULL;
-    if (adapter || type != D3DDEVTYPE_HAL || !parameters)
+    if (adapter || type != D3DDEVTYPE_HAL || !parameters) {
+        TRACE("FAIL CreateDevice invalid arguments -> %08lX",
+                (DWORD)D3DERR_INVALIDCALL);
         return D3DERR_INVALIDCALL;
-    if (parameters->MultiSampleType != D3DMULTISAMPLE_NONE)
+    }
+    TRACE("CreateDevice params %lux%lu fmt=%08lX count=%lu multisample=%lu "
+            "quality=%lu swap=%lu windowed=%lu auto_depth=%lu "
+            "depth_fmt=%08lX flags=%08lX interval=%08lX hwnd=%08lX",
+            parameters->BackBufferWidth, parameters->BackBufferHeight,
+            (DWORD)parameters->BackBufferFormat, parameters->BackBufferCount,
+            (DWORD)parameters->MultiSampleType, parameters->MultiSampleQuality,
+            (DWORD)parameters->SwapEffect, (DWORD)parameters->Windowed,
+            (DWORD)parameters->EnableAutoDepthStencil,
+            (DWORD)parameters->AutoDepthStencilFormat, parameters->Flags,
+            parameters->PresentationInterval,
+            (DWORD)(uintptr_t)parameters->hDeviceWindow);
+    if (parameters->MultiSampleType != D3DMULTISAMPLE_NONE) {
+        TRACE("FAIL CreateDevice unsupported multisample=%lu -> %08lX",
+                (DWORD)parameters->MultiSampleType,
+                (DWORD)D3DERR_NOTAVAILABLE);
         return D3DERR_NOTAVAILABLE;
+    }
     if (parameters->EnableAutoDepthStencil
             && !supported_depth_stencil_format(
-                    parameters->AutoDepthStencilFormat))
+                    parameters->AutoDepthStencilFormat)) {
+        TRACE("FAIL CreateDevice unsupported depth_fmt=%08lX -> %08lX",
+                (DWORD)parameters->AutoDepthStencilFormat,
+                (DWORD)D3DERR_NOTAVAILABLE);
         return D3DERR_NOTAVAILABLE;
+    }
     if (parameters->BackBufferFormat != D3DFMT_UNKNOWN
-            && !supported_backbuffer_format(parameters->BackBufferFormat))
+            && !supported_backbuffer_format(parameters->BackBufferFormat)) {
+        TRACE("FAIL CreateDevice unsupported backbuffer_fmt=%08lX -> %08lX",
+                (DWORD)parameters->BackBufferFormat,
+                (DWORD)D3DERR_NOTAVAILABLE);
         return D3DERR_NOTAVAILABLE;
+    }
     if (parameters->BackBufferWidth > 8192
-            || parameters->BackBufferHeight > 8192)
+            || parameters->BackBufferHeight > 8192) {
+        TRACE("FAIL CreateDevice oversized backbuffer=%lux%lu -> %08lX",
+                parameters->BackBufferWidth, parameters->BackBufferHeight,
+                (DWORD)D3DERR_INVALIDCALL);
         return D3DERR_INVALIDCALL;
-    if (parameters->BackBufferCount > 3)
+    }
+    if (parameters->BackBufferCount > 3) {
+        TRACE("FAIL CreateDevice backbuffer_count=%lu -> %08lX",
+                parameters->BackBufferCount, (DWORD)D3DERR_INVALIDCALL);
         return D3DERR_INVALIDCALL;
+    }
 
     device = (D9Device *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             sizeof(*device));
-    if (!device)
+    if (!device) {
+        TRACE("FAIL CreateDevice allocation -> %08lX", (DWORD)E_OUTOFMEMORY);
         return E_OUTOFMEMORY;
+    }
     device->iface.lpVtbl = &g_device_vtbl;
+    device->implicit_swap_chain.iface.lpVtbl = &g_swap_chain_vtbl;
+    device->implicit_swap_chain.device = device;
     device->refcount = 1;
     device->parent = d3d;
     IDirect3D9_AddRef(iface);
@@ -2576,11 +3247,16 @@ static HRESULT WINAPI d3d_create_device(IDirect3D9 *iface, UINT adapter,
     if (!emit_command(D9WG_OP_CREATE_DEVICE, &command, sizeof(command))) {
         IDirect3D9_Release(iface);
         HeapFree(GetProcessHeap(), 0, device);
+        TRACE("FAIL CreateDevice transport -> %08lX",
+                (DWORD)D3DERR_DRIVERINTERNALERROR);
         return D3DERR_DRIVERINTERNALERROR;
     }
     claim_fullscreen_foreground(device, window);
     emit_window_state(device, window);
     *device_out = &device->iface;
+    TRACE("OK CreateDevice handle=%08lX surface=%lux%lu hwnd=%08lX",
+            device->handle, command.width, command.height,
+            (DWORD)(uintptr_t)window);
     return D3D_OK;
 }
 
@@ -2608,12 +3284,33 @@ static ULONG WINAPI device_add_ref(IDirect3DDevice9 *iface)
 static ULONG WINAPI device_release(IDirect3DDevice9 *iface)
 {
     D9Device *device = device_from_iface(iface);
-    ULONG refs = (ULONG)InterlockedDecrement(&device->refcount);
+    LONG refs_before = InterlockedCompareExchange(&device->refcount, 0, 0);
+    LONG children_before = InterlockedCompareExchange(
+            &device->child_parent_refs, 0, 0);
+    ULONG refs;
 
-    if (device->releasing_owned_refs)
+    TRACE_MARK_ENTER("Device.Release");
+    TRACE("ENTER Device.Release object=%08lX vtbl=%08lX handle=%08lX "
+            "refs=%ld child_refs=%ld releasing=%lu",
+            (DWORD)(uintptr_t)iface, (DWORD)(uintptr_t)iface->lpVtbl,
+            device->handle, refs_before, children_before,
+            (DWORD)device->releasing_owned_refs);
+    (void)refs_before;
+    (void)children_before;
+    refs = (ULONG)InterlockedDecrement(&device->refcount);
+
+    if (device->releasing_owned_refs) {
+        TRACE("LEAVE Device.Release nested object=%08lX refs=%lu child_refs=%ld",
+                (DWORD)(uintptr_t)iface, refs,
+                InterlockedCompareExchange(&device->child_parent_refs, 0, 0));
+        TRACE_MARK_EXIT("Device.Release", (HRESULT)refs, NULL);
         return refs;
+    }
     if ((LONG)refs == InterlockedCompareExchange(
             &device->child_parent_refs, 0, 0)) {
+        TRACE("Device.Release cycle-break object=%08lX refs=%lu child_refs=%ld",
+                (DWORD)(uintptr_t)iface, refs,
+                InterlockedCompareExchange(&device->child_parent_refs, 0, 0));
         device->releasing_owned_refs = TRUE;
         device_release_owned_references(device);
         device->releasing_owned_refs = FALSE;
@@ -2621,6 +3318,8 @@ static ULONG WINAPI device_release(IDirect3DDevice9 *iface)
     }
     if (!refs) {
         D9WGDestroyResource destroy;
+        TRACE("Device.Release destroy object=%08lX handle=%08lX pending=%lu",
+                (DWORD)(uintptr_t)iface, device->handle, g_command_count);
         restore_display_mode(device);
         destroy.resource_handle = device->handle;
         destroy.resource_kind = 0;
@@ -2629,9 +3328,19 @@ static ULONG WINAPI device_release(IDirect3DDevice9 *iface)
         if (g_command_count)
             submit_batch_locked(FALSE);
         LeaveCriticalSection(&g_transport_lock);
+        TRACE("LEAVE Device.Release free object=%08lX refs=0 child_refs=%ld",
+                (DWORD)(uintptr_t)iface,
+                InterlockedCompareExchange(&device->child_parent_refs, 0, 0));
+        TRACE_MARK_EXIT("Device.Release", 0, NULL);
+        TRACE_FLUSH();
         IDirect3D9_Release(&device->parent->iface);
         HeapFree(GetProcessHeap(), 0, device);
+        return 0;
     }
+    TRACE("LEAVE Device.Release object=%08lX refs=%lu child_refs=%ld",
+            (DWORD)(uintptr_t)iface, refs,
+            InterlockedCompareExchange(&device->child_parent_refs, 0, 0));
+    TRACE_MARK_EXIT("Device.Release", (HRESULT)refs, NULL);
     return refs;
 }
 
@@ -3215,7 +3924,15 @@ static WINBOOL WINAPI device_show_cursor(IDirect3DDevice9 *iface,
 }
 
 static UINT WINAPI device_get_number_of_swap_chains(IDirect3DDevice9 *iface)
-{ (void)iface; return 1; }
+{
+    TRACE_MARK_ENTER("Device.GetNumberOfSwapChains");
+    TRACE("CALL GetNumberOfSwapChains device=%08lX -> 1",
+            device_from_iface(iface)->handle);
+    TRACE_MARK_EXIT("Device.GetNumberOfSwapChains", 1,
+            &device_from_iface(iface)->implicit_swap_chain.iface);
+    (void)iface;
+    return 1;
+}
 
 static HRESULT WINAPI device_reset(IDirect3DDevice9 *iface,
         D3DPRESENT_PARAMETERS *parameters)
@@ -3375,7 +4092,13 @@ static HRESULT WINAPI device_present(IDirect3DDevice9 *iface,
     BOOL ok;
     (void)src_rect; (void)dst_rect; (void)dirty_region;
 
+    TRACE("CALL Present device=%08lX override=%08lX",
+            device_from_iface(iface)->handle,
+            (DWORD)(uintptr_t)override_window);
     ok = emit_present_and_flush(device_from_iface(iface), override_window);
+    TRACE("%s Present device=%08lX -> %08lX", ok ? "OK" : "FAIL",
+            device_from_iface(iface)->handle,
+            (DWORD)(ok ? D3D_OK : D3DERR_DRIVERINTERNALERROR));
     return ok ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
 }
 
@@ -3511,15 +4234,43 @@ static HRESULT WINAPI device_set_viewport(IDirect3DDevice9 *iface,
 {
     D9Device *device = device_from_iface(iface);
     D9WGSetViewport command;
-    if (!viewport || !viewport->Width || !viewport->Height)
+    if (!viewport || !viewport->Width || !viewport->Height) {
+        TRACE("REJECT SetViewport empty viewport=%08lX",
+                (DWORD)(uintptr_t)viewport);
         return D3DERR_INVALIDCALL;
+    }
+    /*
+     * A rejected SetViewport is one of the worst silent failures in this
+     * surface: the call returns an error the app almost never checks, the old
+     * viewport stays, and every later draw is rendered at whatever scale that
+     * viewport implies. A title drawing a model into a small panel then gets it
+     * at full-target scale -- oversized and off-centre, with nothing anywhere
+     * saying why. Trace both outcomes; the accepted case is a few lines a frame
+     * and is what makes the rejected case legible by contrast.
+     */
     if (viewport->X > device->display_mode.Width
             || viewport->Y > device->display_mode.Height
             || viewport->Width > device->display_mode.Width - viewport->X
             || viewport->Height > device->display_mode.Height - viewport->Y
             || viewport->MinZ < 0.0f || viewport->MaxZ > 1.0f
-            || viewport->MinZ > viewport->MaxZ)
+            || viewport->MinZ > viewport->MaxZ) {
+        TRACE("REJECT SetViewport x=%lu y=%lu %lux%lu minz=%ld/1000 "
+                "maxz=%ld/1000 limit=%lux%lu",
+                viewport->X, viewport->Y, viewport->Width, viewport->Height,
+                (LONG)(viewport->MinZ * 1000.0f),
+                (LONG)(viewport->MaxZ * 1000.0f),
+                device->display_mode.Width, device->display_mode.Height);
+        HOSTLOG_REFUSED("SetViewport %lux%lu at %lu,%lu refused; the target is "
+                "%lux%lu, so every later draw keeps the previous viewport's "
+                "scale", viewport->Width, viewport->Height, viewport->X,
+                viewport->Y, device->display_mode.Width,
+                device->display_mode.Height);
         return D3DERR_INVALIDCALL;
+    }
+    TRACE("OK SetViewport x=%lu y=%lu %lux%lu minz=%ld/1000 maxz=%ld/1000",
+            viewport->X, viewport->Y, viewport->Width, viewport->Height,
+            (LONG)(viewport->MinZ * 1000.0f),
+            (LONG)(viewport->MaxZ * 1000.0f));
     state_block_record_viewport(device);
     device->viewport = *viewport;
     command.device_handle = device->handle;
@@ -3709,19 +4460,39 @@ static HRESULT WINAPI device_create_vertex_buffer(IDirect3DDevice9 *iface,
     D9Device *device = device_from_iface(iface);
     D9VertexBuffer *buffer;
     (void)shared_handle;
-    if (!buffer_out)
+    TRACE_MARK_ENTER("Device.CreateVertexBuffer");
+    if (!buffer_out) {
+        TRACE("FAIL CreateVertexBuffer length=%lu missing output -> %08lX",
+                length, (DWORD)D3DERR_INVALIDCALL);
+        TRACE_MARK_EXIT("Device.CreateVertexBuffer", D3DERR_INVALIDCALL, NULL);
         return D3DERR_INVALIDCALL;
+    }
     *buffer_out = NULL;
-    if (!length || pool > D3DPOOL_SCRATCH)
+    if (!length || pool > D3DPOOL_SCRATCH) {
+        TRACE("FAIL CreateVertexBuffer length=%lu usage=%08lX fvf=%08lX pool=%lu -> %08lX",
+                length, usage, fvf, (DWORD)pool, (DWORD)D3DERR_INVALIDCALL);
+        HOSTLOG_FAILED("CreateVertexBuffer refused: length=%lu usage=%08lX "
+                "fvf=%08lX pool=%lu", length, usage, fvf, (DWORD)pool);
+        TRACE_MARK_EXIT("Device.CreateVertexBuffer", D3DERR_INVALIDCALL, NULL);
         return D3DERR_INVALIDCALL;
+    }
     buffer = (D9VertexBuffer *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             sizeof(*buffer));
-    if (!buffer)
+    if (!buffer) {
+        TRACE("FAIL CreateVertexBuffer object allocation length=%lu -> %08lX",
+                length, (DWORD)E_OUTOFMEMORY);
+        TRACE_MARK_EXIT("Device.CreateVertexBuffer", E_OUTOFMEMORY, NULL);
+        TRACE_FLUSH();
         return E_OUTOFMEMORY;
+    }
     buffer->shadow = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             length);
     if (!buffer->shadow) {
         HeapFree(GetProcessHeap(), 0, buffer);
+        TRACE("FAIL CreateVertexBuffer shadow allocation length=%lu -> %08lX",
+                length, (DWORD)E_OUTOFMEMORY);
+        TRACE_MARK_EXIT("Device.CreateVertexBuffer", E_OUTOFMEMORY, NULL);
+        TRACE_FLUSH();
         return E_OUTOFMEMORY;
     }
     buffer->iface.lpVtbl = &g_vb_vtbl;
@@ -3735,14 +4506,33 @@ static HRESULT WINAPI device_create_vertex_buffer(IDirect3DDevice9 *iface,
     buffer->pool = pool;
 
     if (!emit_vertex_buffer_create(device, buffer)) {
+        TRACE("FAIL CreateVertexBuffer transport length=%lu handle=%08lX -> %08lX",
+                length, buffer->handle, (DWORD)D3DERR_DRIVERINTERNALERROR);
         device_child_release(device);
         HeapFree(GetProcessHeap(), 0, buffer->shadow);
         HeapFree(GetProcessHeap(), 0, buffer);
+        TRACE_MARK_EXIT("Device.CreateVertexBuffer",
+                D3DERR_DRIVERINTERNALERROR, NULL);
+        TRACE_FLUSH();
         return D3DERR_DRIVERINTERNALERROR;
     }
     buffer->next_device_resource = device->vertex_buffers;
     device->vertex_buffers = buffer;
     *buffer_out = &buffer->iface;
+    TRACE_BUFFER_CREATED(FALSE, length);
+    TRACE_REGISTER_RANGE("VB_OBJECT", g_trace_vb_count, buffer, buffer,
+            sizeof(*buffer));
+    TRACE_REGISTER_RANGE("VB_SHADOW", g_trace_vb_count, buffer,
+            buffer->shadow, buffer->length);
+#ifdef D9WG_DIAGNOSTIC_TRACE
+    if (g_trace_vb_count <= 4 || !(g_trace_vb_count & 127))
+        TRACE("OK CreateVertexBuffer count=%ld bytes=%lu length=%lu usage=%08lX fvf=%08lX pool=%lu handle=%08lX object=%08lX shadow=%08lX shadow_end=%08lX",
+                g_trace_vb_count, (DWORD)g_trace_vb_bytes, length, usage, fvf,
+                (DWORD)pool, buffer->handle, (DWORD)(uintptr_t)*buffer_out,
+                (DWORD)(uintptr_t)buffer->shadow,
+                (DWORD)(uintptr_t)(buffer->shadow + buffer->length));
+#endif
+    TRACE_MARK_EXIT("Device.CreateVertexBuffer", D3D_OK, *buffer_out);
     return D3D_OK;
 }
 
@@ -3755,25 +4545,56 @@ static HRESULT WINAPI device_create_index_buffer(IDirect3DDevice9 *iface,
     UINT index_size;
     (void)shared_handle;
 
-    if (!buffer_out)
+    TRACE_MARK_ENTER("Device.CreateIndexBuffer");
+    if (!buffer_out) {
+        TRACE("FAIL CreateIndexBuffer length=%lu missing output -> %08lX",
+                length, (DWORD)D3DERR_INVALIDCALL);
+        TRACE_MARK_EXIT("Device.CreateIndexBuffer", D3DERR_INVALIDCALL, NULL);
         return D3DERR_INVALIDCALL;
+    }
     *buffer_out = NULL;
-    if (!length || pool > D3DPOOL_SCRATCH)
+    if (!length || pool > D3DPOOL_SCRATCH) {
+        TRACE("FAIL CreateIndexBuffer length=%lu usage=%08lX format=%08lX pool=%lu -> %08lX",
+                length, usage, (DWORD)format, (DWORD)pool,
+                (DWORD)D3DERR_INVALIDCALL);
+        HOSTLOG_FAILED("CreateIndexBuffer refused: length=%lu usage=%08lX "
+                "format=%08lX pool=%lu", length, usage, (DWORD)format,
+                (DWORD)pool);
+        TRACE_MARK_EXIT("Device.CreateIndexBuffer", D3DERR_INVALIDCALL, NULL);
         return D3DERR_INVALIDCALL;
+    }
     if (format == D3DFMT_INDEX16) index_size = 2;
     else if (format == D3DFMT_INDEX32) index_size = 4;
-    else return D3DERR_INVALIDCALL;
-    if (length % index_size)
+    else {
+        TRACE("FAIL CreateIndexBuffer format=%08lX -> %08lX",
+                (DWORD)format, (DWORD)D3DERR_INVALIDCALL);
+        TRACE_MARK_EXIT("Device.CreateIndexBuffer", D3DERR_INVALIDCALL, NULL);
         return D3DERR_INVALIDCALL;
+    }
+    if (length % index_size) {
+        TRACE("FAIL CreateIndexBuffer unaligned length=%lu index_size=%lu -> %08lX",
+                length, index_size, (DWORD)D3DERR_INVALIDCALL);
+        TRACE_MARK_EXIT("Device.CreateIndexBuffer", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
 
     buffer = (D9IndexBuffer *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             sizeof(*buffer));
-    if (!buffer)
+    if (!buffer) {
+        TRACE("FAIL CreateIndexBuffer object allocation length=%lu -> %08lX",
+                length, (DWORD)E_OUTOFMEMORY);
+        TRACE_MARK_EXIT("Device.CreateIndexBuffer", E_OUTOFMEMORY, NULL);
+        TRACE_FLUSH();
         return E_OUTOFMEMORY;
+    }
     buffer->shadow = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             length);
     if (!buffer->shadow) {
         HeapFree(GetProcessHeap(), 0, buffer);
+        TRACE("FAIL CreateIndexBuffer shadow allocation length=%lu -> %08lX",
+                length, (DWORD)E_OUTOFMEMORY);
+        TRACE_MARK_EXIT("Device.CreateIndexBuffer", E_OUTOFMEMORY, NULL);
+        TRACE_FLUSH();
         return E_OUTOFMEMORY;
     }
     buffer->iface.lpVtbl = &g_ib_vtbl;
@@ -3787,14 +4608,34 @@ static HRESULT WINAPI device_create_index_buffer(IDirect3DDevice9 *iface,
     buffer->pool = pool;
 
     if (!emit_index_buffer_create(device, buffer)) {
+        TRACE("FAIL CreateIndexBuffer transport length=%lu handle=%08lX -> %08lX",
+                length, buffer->handle, (DWORD)D3DERR_DRIVERINTERNALERROR);
         device_child_release(device);
         HeapFree(GetProcessHeap(), 0, buffer->shadow);
         HeapFree(GetProcessHeap(), 0, buffer);
+        TRACE_MARK_EXIT("Device.CreateIndexBuffer",
+                D3DERR_DRIVERINTERNALERROR, NULL);
+        TRACE_FLUSH();
         return D3DERR_DRIVERINTERNALERROR;
     }
     buffer->next_device_resource = device->index_buffers;
     device->index_buffers = buffer;
     *buffer_out = &buffer->iface;
+    TRACE_BUFFER_CREATED(TRUE, length);
+    TRACE_REGISTER_RANGE("IB_OBJECT", g_trace_ib_count, buffer, buffer,
+            sizeof(*buffer));
+    TRACE_REGISTER_RANGE("IB_SHADOW", g_trace_ib_count, buffer,
+            buffer->shadow, buffer->length);
+#ifdef D9WG_DIAGNOSTIC_TRACE
+    if (g_trace_ib_count <= 4 || !(g_trace_ib_count & 127))
+        TRACE("OK CreateIndexBuffer count=%ld bytes=%lu length=%lu usage=%08lX format=%08lX pool=%lu handle=%08lX object=%08lX shadow=%08lX shadow_end=%08lX",
+                g_trace_ib_count, (DWORD)g_trace_ib_bytes, length, usage,
+                (DWORD)format, (DWORD)pool, buffer->handle,
+                (DWORD)(uintptr_t)*buffer_out,
+                (DWORD)(uintptr_t)buffer->shadow,
+                (DWORD)(uintptr_t)(buffer->shadow + buffer->length));
+#endif
+    TRACE_MARK_EXIT("Device.CreateIndexBuffer", D3D_OK, *buffer_out);
     return D3D_OK;
 }
 
@@ -3811,31 +4652,53 @@ static HRESULT WINAPI device_create_texture(IDirect3DDevice9 *iface,
     HRESULT failure = E_OUTOFMEMORY;
     (void)shared_handle;
 
-    if (!texture_out)
+    TRACE("CALL CreateTexture %lux%lu levels=%lu usage=%08lX "
+            "format=%08lX pool=%lu", width, height, levels, usage,
+            (DWORD)format, (DWORD)pool);
+
+    if (!texture_out) {
+        TRACE("FAIL CreateTexture missing output -> %08lX",
+                (DWORD)D3DERR_INVALIDCALL);
         return D3DERR_INVALIDCALL;
+    }
     *texture_out = NULL;
     if (!width || !height || width > 4096 || height > 4096
             || !supported_texture_format(format)
             || (usage & D3DUSAGE_AUTOGENMIPMAP)
             || ((usage & D3DUSAGE_DEPTHSTENCIL) && pool != D3DPOOL_DEFAULT)
-            || ((usage & D3DUSAGE_RENDERTARGET) && pool != D3DPOOL_DEFAULT)
+            || ((usage & D3DUSAGE_RENDERTARGET)
+                && (pool != D3DPOOL_DEFAULT
+                    || !supported_render_target_format(format)))
             || pool > D3DPOOL_SCRATCH) {
 
+        TRACE("FAIL CreateTexture invalid arguments -> %08lX",
+                (DWORD)D3DERR_INVALIDCALL);
+        HOSTLOG_FAILED("CreateTexture refused: %lux%lu levels=%lu usage=%08lX "
+                "format=%08lX pool=%lu", width, height, levels, usage,
+                (DWORD)format, (DWORD)pool);
         return D3DERR_INVALIDCALL;
     }
     full_levels = full_mip_level_count(width, height);
     if (!levels) levels = full_levels;
-    if (levels > full_levels)
+    if (levels > full_levels) {
+        TRACE("FAIL CreateTexture levels=%lu exceeds full_levels=%lu -> %08lX",
+                levels, full_levels, (DWORD)D3DERR_INVALIDCALL);
         return D3DERR_INVALIDCALL;
+    }
 
     texture = (D9Texture *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             sizeof(*texture));
-    if (!texture)
+    if (!texture) {
+        TRACE("FAIL CreateTexture object allocation -> %08lX",
+                (DWORD)E_OUTOFMEMORY);
         return E_OUTOFMEMORY;
+    }
     texture->levels = (D9TextureLevel *)HeapAlloc(GetProcessHeap(),
             HEAP_ZERO_MEMORY, levels * sizeof(*texture->levels));
     if (!texture->levels) {
         HeapFree(GetProcessHeap(), 0, texture);
+        TRACE("FAIL CreateTexture level allocation levels=%lu -> %08lX",
+                levels, (DWORD)E_OUTOFMEMORY);
         return E_OUTOFMEMORY;
     }
     texture->iface.lpVtbl = &g_texture_vtbl;
@@ -3884,6 +4747,21 @@ static HRESULT WINAPI device_create_texture(IDirect3DDevice9 *iface,
     texture->next_device_resource = device->texture_resources;
     device->texture_resources = texture;
     *texture_out = &texture->iface;
+    TRACE_REGISTER_RANGE("TEXTURE_OBJECT", texture->handle, texture, texture,
+            sizeof(*texture));
+    TRACE_REGISTER_RANGE("TEXTURE_SHADOW0", texture->handle, texture,
+            texture->levels[0].shadow, texture->levels[0].byte_count);
+    TRACE("OK CreateTexture handle=%08lX object=%08lX %lux%lu levels=%lu "
+            "usage=%08lX format=%08lX pool=%lu shadow0=%08lX "
+            "shadow0_end=%08lX shadow0_bytes=%lu", texture->handle,
+            (DWORD)(uintptr_t)*texture_out, width, height, levels, usage,
+            (DWORD)format, (DWORD)pool,
+            (DWORD)(uintptr_t)texture->levels[0].shadow,
+            (DWORD)(uintptr_t)(texture->levels[0].shadow
+                    ? texture->levels[0].shadow
+                            + texture->levels[0].byte_count
+                    : NULL),
+            texture->levels[0].byte_count);
     return D3D_OK;
 
 allocation_failed:
@@ -3894,6 +4772,12 @@ allocation_failed:
     device_child_release(device);
     HeapFree(GetProcessHeap(), 0, texture->levels);
     HeapFree(GetProcessHeap(), 0, texture);
+    TRACE("FAIL CreateTexture %lux%lu levels=%lu usage=%08lX "
+            "format=%08lX pool=%lu -> %08lX", width, height, levels, usage,
+            (DWORD)format, (DWORD)pool, (DWORD)failure);
+    HOSTLOG_FAILED("CreateTexture failed: %lux%lu levels=%lu usage=%08lX "
+            "format=%08lX pool=%lu hr=%08lX", width, height, levels, usage,
+            (DWORD)format, (DWORD)pool, (DWORD)failure);
     return failure;
 }
 
@@ -4699,11 +5583,70 @@ static HRESULT WINAPI device_get_pixel_shader_constant_b(
 #define DEV_STUB(name, ...) \
     static HRESULT WINAPI device_##name(IDirect3DDevice9 *iface, __VA_ARGS__)
 
+/*
+ * Every refusal here is a real API the game asked for and did not get, and a
+ * bare D3DERR_INVALIDCALL is indistinguishable from "the game never called it"
+ * -- from the host console, from the trace, from everywhere. That blind spot is
+ * what made Kart Rider's missing shop art un-diagnosable: the picture was wrong,
+ * the executor reported a clean frame with no dropped draws, and nothing
+ * anywhere recorded that the guest had been turned down. Name the refusal so
+ * the next round starts from a fact instead of a hypothesis.
+ *
+ * This is trace-only: the D9WG protocol has no guest-to-host log channel, so
+ * the diagnostic DLL is where these surface. `grep STUB` over a trace taken
+ * while reproducing tells you in one step which APIs a title actually wanted.
+ */
+#define UNSUPPORTED(name) \
+    do { \
+        TRACE("STUB %s -> D3DERR_INVALIDCALL (unimplemented)", name); \
+        HOSTLOG_REFUSED("%s is not implemented and returned " \
+                "D3DERR_INVALIDCALL", name); \
+    } while (0)
+
 DEV_STUB(create_additional_swap_chain, D3DPRESENT_PARAMETERS *params,
         IDirect3DSwapChain9 **out)
-{ (void)iface; (void)params; if (out) { *out = NULL; } return D3DERR_INVALIDCALL; }
-DEV_STUB(get_swap_chain, UINT index, IDirect3DSwapChain9 **out)
-{ (void)iface; (void)index; if (out) { *out = NULL; } return D3DERR_INVALIDCALL; }
+{
+    TRACE("STUB CreateAdditionalSwapChain device=%08lX params=%08lX outarg=%08lX -> %08lX",
+            device_from_iface(iface)->handle, (DWORD)(uintptr_t)params,
+            (DWORD)(uintptr_t)out, (DWORD)D3DERR_INVALIDCALL);
+    (void)iface;
+    (void)params;
+    if (out)
+        *out = NULL;
+    return D3DERR_INVALIDCALL;
+}
+
+static HRESULT WINAPI device_get_swap_chain(IDirect3DDevice9 *iface,
+        UINT index, IDirect3DSwapChain9 **out)
+{
+    D9Device *device = device_from_iface(iface);
+
+    TRACE_MARK_ENTER("Device.GetSwapChain");
+    TRACE("CALL GetSwapChain device=%08lX index=%lu outarg=%08lX",
+            device->handle, index, (DWORD)(uintptr_t)out);
+    if (!out) {
+        TRACE("FAIL GetSwapChain index=%lu missing output -> %08lX", index,
+                (DWORD)D3DERR_INVALIDCALL);
+        TRACE_MARK_EXIT("Device.GetSwapChain", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    *out = NULL;
+    if (index != 0) {
+        TRACE("FAIL GetSwapChain index=%lu out-of-range -> %08lX", index,
+                (DWORD)D3DERR_INVALIDCALL);
+        TRACE_MARK_EXIT("Device.GetSwapChain", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+
+    *out = &device->implicit_swap_chain.iface;
+    IDirect3DSwapChain9_AddRef(*out);
+    TRACE("OK GetSwapChain index=0 object=%08lX refs=%ld",
+            (DWORD)(uintptr_t)*out,
+            InterlockedCompareExchange(&device->implicit_swap_chain.refcount,
+                    0, 0));
+    TRACE_MARK_EXIT("Device.GetSwapChain", D3D_OK, *out);
+    return D3D_OK;
+}
 /* War3 testing confirmed that engines can gate an
  * entire render branch on this succeeding even when they never read pixels
  * back from the result (StretchRect/LockRect against it still honestly
@@ -4715,38 +5658,67 @@ static HRESULT WINAPI device_get_back_buffer(IDirect3DDevice9 *iface,
 {
     D9Device *device = device_from_iface(iface);
     D9Surface *surface;
-    (void)type;
-    if (!out)
+    TRACE_MARK_ENTER("Device.GetBackBuffer");
+    TRACE("CALL GetBackBuffer device=%08lX chain=%lu index=%lu type=%lu outarg=%08lX",
+            device->handle, swapchain, index, (DWORD)type,
+            (DWORD)(uintptr_t)out);
+    if (!out) {
+        TRACE_MARK_EXIT("Device.GetBackBuffer", D3DERR_INVALIDCALL, NULL);
         return D3DERR_INVALIDCALL;
+    }
     *out = NULL;
-    if (swapchain || index)
+    if (swapchain || index || type != D3DBACKBUFFER_TYPE_MONO) {
+        TRACE("FAIL GetBackBuffer chain=%lu index=%lu type=%lu -> %08lX",
+                swapchain, index, (DWORD)type, (DWORD)D3DERR_INVALIDCALL);
+        TRACE_MARK_EXIT("Device.GetBackBuffer", D3DERR_INVALIDCALL, NULL);
         return D3DERR_INVALIDCALL;
+    }
     surface = (D9Surface *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             sizeof(*surface));
-    if (!surface)
+    if (!surface) {
+        TRACE("FAIL GetBackBuffer allocation -> %08lX", (DWORD)E_OUTOFMEMORY);
+        TRACE_MARK_EXIT("Device.GetBackBuffer", E_OUTOFMEMORY, NULL);
         return E_OUTOFMEMORY;
+    }
     surface->iface.lpVtbl = &g_surface_vtbl;
     surface->refcount = 1;
     surface->device = device;
+    surface->swap_chain = &device->implicit_swap_chain;
     surface->width = device->display_mode.Width;
     surface->height = device->display_mode.Height;
     surface->format = device->display_mode.Format;
     device_child_add_ref(device);
     *out = &surface->iface;
+    TRACE_REGISTER_RANGE("SURFACE_BACKBUFFER", 0, surface, surface,
+            sizeof(*surface));
+    TRACE("SURFACE CREATE kind=backbuffer object=%08lX vtbl=%08lX ref=%ld "
+            "device=%08lX texture=00000000 swapchain=%08lX shadow=00000000 "
+            "level=0 size=%lux%lu format=%08lX",
+            (DWORD)(uintptr_t)*out,
+            (DWORD)(uintptr_t)surface->iface.lpVtbl, surface->refcount,
+            (DWORD)(uintptr_t)&device->iface,
+            (DWORD)(uintptr_t)&device->implicit_swap_chain.iface,
+            surface->width, surface->height, (DWORD)surface->format);
+    TRACE("OK GetBackBuffer object=%08lX %lux%lu fmt=%08lX",
+            (DWORD)(uintptr_t)*out, surface->width, surface->height,
+            (DWORD)surface->format);
+    TRACE_MARK_EXIT("Device.GetBackBuffer", D3D_OK, *out);
     return D3D_OK;
 }
 DEV_STUB(get_raster_status, UINT swapchain, D3DRASTER_STATUS *status)
-{ (void)iface; (void)swapchain; (void)status; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)swapchain; (void)status;
+  UNSUPPORTED("Device.GetRasterStatus"); return D3DERR_INVALIDCALL; }
 DEV_STUB(create_volume_texture, UINT w, UINT h, UINT d, UINT levels,
         DWORD usage, D3DFORMAT format, D3DPOOL pool,
         IDirect3DVolumeTexture9 **out, HANDLE *shared)
 { (void)iface; (void)w; (void)h; (void)d; (void)levels; (void)usage;
   (void)format; (void)pool; (void)shared;
-  if (out) { *out = NULL; } return D3DERR_INVALIDCALL; }
+  if (out) { *out = NULL; }
+  UNSUPPORTED("Device.CreateVolumeTexture"); return D3DERR_INVALIDCALL; }
 DEV_STUB(update_surface, IDirect3DSurface9 *src, const RECT *src_rect,
         IDirect3DSurface9 *dst, const POINT *dst_point)
 { (void)iface; (void)src; (void)src_rect; (void)dst; (void)dst_point;
-  return D3DERR_INVALIDCALL; }
+  UNSUPPORTED("Device.UpdateSurface"); return D3DERR_INVALIDCALL; }
 /*
  * The other classic upload route besides Lock/Unlock: fill a
  * D3DPOOL_SYSTEMMEM texture on the CPU, then blit it into the
@@ -4836,7 +5808,8 @@ static HRESULT WINAPI device_get_render_target_data(IDirect3DDevice9 *iface,
     return D3D_OK;
 }
 DEV_STUB(get_front_buffer_data, UINT swapchain, IDirect3DSurface9 *dst)
-{ (void)iface; (void)swapchain; (void)dst; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)swapchain; (void)dst;
+  UNSUPPORTED("Device.GetFrontBufferData"); return D3DERR_INVALIDCALL; }
 /* A plain system-memory surface with no GPU resource behind it. Implemented
  * because it is how an application builds a cursor bitmap for
  * SetCursorProperties; it is deliberately limited to the 32-bit formats a
@@ -4857,7 +5830,15 @@ static HRESULT WINAPI device_create_offscreen_plain_surface(
         return D3DERR_INVALIDCALL;
     *out = NULL;
     if (format != D3DFMT_A8R8G8B8 && format != D3DFMT_X8R8G8B8) {
-
+        /* The deliberate cursor-format restriction, named for the same reason
+         * as UNSUPPORTED(): an app building a CPU-side image in any other
+         * format is turned away here and has no other way to find out. */
+        TRACE("STUB CreateOffscreenPlainSurface format=%08lX %lux%lu -> "
+                "D3DERR_INVALIDCALL (only A8R8G8B8/X8R8G8B8 are supported)",
+                (DWORD)format, width, height);
+        HOSTLOG_REFUSED("CreateOffscreenPlainSurface %lux%lu format=%08lX "
+                "refused; only A8R8G8B8/X8R8G8B8 are supported here",
+                width, height, (DWORD)format);
         return D3DERR_INVALIDCALL;
     }
     if (!width || !height)
@@ -4887,11 +5868,24 @@ static HRESULT WINAPI device_create_offscreen_plain_surface(
     device_child_add_ref(device);
 
     *out = &surface->iface;
+    TRACE_REGISTER_RANGE("SURFACE_OFFSCREEN", 0, surface, surface,
+            sizeof(*surface));
+    TRACE_REGISTER_RANGE("SURFACE_SHADOW", 0, surface, surface->shadow,
+            surface->byte_count);
+    TRACE("SURFACE CREATE kind=offscreen object=%08lX vtbl=%08lX ref=%ld "
+            "device=%08lX texture=00000000 swapchain=00000000 shadow=%08lX "
+            "level=0 size=%lux%lu format=%08lX bytes=%lu",
+            (DWORD)(uintptr_t)*out,
+            (DWORD)(uintptr_t)surface->iface.lpVtbl, surface->refcount,
+            (DWORD)(uintptr_t)&device->iface,
+            (DWORD)(uintptr_t)surface->shadow, surface->width,
+            surface->height, (DWORD)surface->format, surface->byte_count);
     return D3D_OK;
 }
 DEV_STUB(multiply_transform, D3DTRANSFORMSTATETYPE state,
         const D3DMATRIX *matrix)
-{ (void)iface; (void)state; (void)matrix; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)state; (void)matrix;
+  UNSUPPORTED("Device.MultiplyTransform"); return D3DERR_INVALIDCALL; }
 /*
  * SetMaterial/SetLight/LightEnable were emitted from M1 onwards but only
  * *stored* by the host; M3's fixed-function vertex stage consumes them for
@@ -4993,9 +5987,11 @@ static HRESULT WINAPI device_get_light_enable(IDirect3DDevice9 *iface,
     return D3D_OK;
 }
 DEV_STUB(set_clip_plane, DWORD index, const float *plane)
-{ (void)iface; (void)index; (void)plane; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)index; (void)plane;
+  UNSUPPORTED("Device.SetClipPlane/GetClipPlane"); return D3DERR_INVALIDCALL; }
 DEV_STUB(get_clip_plane, DWORD index, float *plane)
-{ (void)iface; (void)index; (void)plane; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)index; (void)plane;
+  UNSUPPORTED("Device.SetClipPlane/GetClipPlane"); return D3DERR_INVALIDCALL; }
 DEV_STUB(set_clip_status, const D3DCLIPSTATUS9 *status)
 { (void)iface; (void)status; return D3DERR_INVALIDCALL; }
 DEV_STUB(get_clip_status, D3DCLIPSTATUS9 *status)
@@ -5032,9 +6028,11 @@ static HRESULT WINAPI device_set_sampler_state(IDirect3DDevice9 *iface,
             ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
 }
 DEV_STUB(set_palette_entries, UINT index, const PALETTEENTRY *entries)
-{ (void)iface; (void)index; (void)entries; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)index; (void)entries;
+  UNSUPPORTED("Device.SetPaletteEntries/GetPaletteEntries"); return D3DERR_INVALIDCALL; }
 DEV_STUB(get_palette_entries, UINT index, PALETTEENTRY *entries)
-{ (void)iface; (void)index; (void)entries; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)index; (void)entries;
+  UNSUPPORTED("Device.SetPaletteEntries/GetPaletteEntries"); return D3DERR_INVALIDCALL; }
 DEV_STUB(set_current_texture_palette, UINT index)
 { (void)iface; (void)index; return D3DERR_INVALIDCALL; }
 DEV_STUB(get_current_texture_palette, UINT *index)
@@ -5043,19 +6041,22 @@ DEV_STUB(process_vertices, UINT src_start, UINT dst_index, UINT count,
         IDirect3DVertexBuffer9 *dst, IDirect3DVertexDeclaration9 *decl,
         DWORD flags)
 { (void)iface; (void)src_start; (void)dst_index; (void)count; (void)dst;
-  (void)decl; (void)flags; return D3DERR_INVALIDCALL; }
+  (void)decl; (void)flags;
+  UNSUPPORTED("Device.ProcessVertices"); return D3DERR_INVALIDCALL; }
 DEV_STUB(set_stream_source_freq, UINT stream, UINT divider)
-{ (void)iface; (void)stream; (void)divider; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)stream; (void)divider;
+  UNSUPPORTED("Device.SetStreamSourceFreq/GetStreamSourceFreq"); return D3DERR_INVALIDCALL; }
 DEV_STUB(get_stream_source_freq, UINT stream, UINT *divider)
-{ (void)iface; (void)stream; (void)divider; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)stream; (void)divider;
+  UNSUPPORTED("Device.SetStreamSourceFreq/GetStreamSourceFreq"); return D3DERR_INVALIDCALL; }
 DEV_STUB(draw_rect_patch, UINT handle, const float *segments,
         const D3DRECTPATCH_INFO *info)
 { (void)iface; (void)handle; (void)segments; (void)info;
-  return D3DERR_INVALIDCALL; }
+  UNSUPPORTED("Device.DrawRectPatch/DrawTriPatch"); return D3DERR_INVALIDCALL; }
 DEV_STUB(draw_tri_patch, UINT handle, const float *segments,
         const D3DTRIPATCH_INFO *info)
 { (void)iface; (void)handle; (void)segments; (void)info;
-  return D3DERR_INVALIDCALL; }
+  UNSUPPORTED("Device.DrawRectPatch/DrawTriPatch"); return D3DERR_INVALIDCALL; }
 DEV_STUB(delete_patch, UINT handle)
 { (void)iface; (void)handle; return D3DERR_INVALIDCALL; }
 
@@ -5146,6 +6147,17 @@ static HRESULT create_target_texture(D9Device *device, UINT width, UINT height,
     /* The surface took over the creation reference rather than adding a second
      * one, so the texture disappears with the surface. */
     *surface_out = &surface->iface;
+    TRACE_REGISTER_RANGE("SURFACE_TARGET", texture->handle, surface, surface,
+            sizeof(*surface));
+    TRACE("SURFACE CREATE kind=target object=%08lX vtbl=%08lX ref=%ld "
+            "device=%08lX texture=%08lX texture_handle=%08lX "
+            "swapchain=00000000 shadow=00000000 level=0 size=%lux%lu "
+            "format=%08lX usage=%08lX",
+            (DWORD)(uintptr_t)*surface_out,
+            (DWORD)(uintptr_t)surface->iface.lpVtbl, surface->refcount,
+            (DWORD)(uintptr_t)&device->iface,
+            (DWORD)(uintptr_t)&texture->iface, texture->handle,
+            surface->width, surface->height, (DWORD)surface->format, usage);
     return D3D_OK;
 }
 
@@ -5160,7 +6172,7 @@ static HRESULT WINAPI device_create_render_target(IDirect3DDevice9 *iface,
 
         return D3DERR_INVALIDCALL;
     }
-    if (!supported_texture_format(format))
+    if (!supported_render_target_format(format))
         return D3DERR_INVALIDCALL;
     return create_target_texture(device_from_iface(iface), width, height, format,
             D3DUSAGE_RENDERTARGET, surface_out);
@@ -5202,6 +6214,7 @@ static HRESULT WINAPI device_set_render_target(IDirect3DDevice9 *iface,
 {
     D9Device *device = device_from_iface(iface);
     D9Surface *surface = surface_iface ? surface_from_iface(surface_iface) : NULL;
+    D9Surface *old_surface;
     D9WGSetRenderTarget command;
     uint32_t handle = 0;
     uint32_t level = 0;
@@ -5217,11 +6230,23 @@ static HRESULT WINAPI device_set_render_target(IDirect3DDevice9 *iface,
             && !(surface->texture->usage & D3DUSAGE_RENDERTARGET))
         return D3DERR_INVALIDCALL;
 
-    if (device->render_target_surfaces[index])
-        IDirect3DSurface9_Release(&device->render_target_surfaces[index]->iface);
-    device->render_target_surfaces[index] = surface;
+    old_surface = device->render_target_surfaces[index];
+    TRACE("CALL SetRenderTarget index=%lu old=%08lX new=%08lX same=%lu "
+            "old_refs=%ld new_refs=%ld", index,
+            (DWORD)(uintptr_t)old_surface, (DWORD)(uintptr_t)surface,
+            old_surface == surface,
+            old_surface ? InterlockedCompareExchange(&old_surface->refcount,
+                    0, 0) : 0,
+            surface ? InterlockedCompareExchange(&surface->refcount, 0, 0)
+                    : 0);
+    /* Take the new reference before dropping the old one.  Apart from being
+     * the usual COM replacement discipline, this keeps same-object rebinding
+     * safe even when the caller is holding only a borrowed alias. */
     if (surface)
         IDirect3DSurface9_AddRef(surface_iface);
+    device->render_target_surfaces[index] = surface;
+    if (old_surface)
+        IDirect3DSurface9_Release(&old_surface->iface);
 
     command.device_handle = device->handle;
     command.target_index = index;
@@ -5272,6 +6297,7 @@ static HRESULT WINAPI device_set_depth_stencil_surface(IDirect3DDevice9 *iface,
 {
     D9Device *device = device_from_iface(iface);
     D9Surface *surface = surface_iface ? surface_from_iface(surface_iface) : NULL;
+    D9Surface *old_surface;
     D9WGSetDepthStencilSurface command;
     uint32_t handle = 0;
     uint32_t level = 0;
@@ -5283,11 +6309,19 @@ static HRESULT WINAPI device_set_depth_stencil_surface(IDirect3DDevice9 *iface,
                 || !(surface->texture->usage & D3DUSAGE_DEPTHSTENCIL))
             return D3DERR_INVALIDCALL;
     }
-    if (device->depth_stencil_surface)
-        IDirect3DSurface9_Release(&device->depth_stencil_surface->iface);
-    device->depth_stencil_surface = surface;
+    old_surface = device->depth_stencil_surface;
+    TRACE("CALL SetDepthStencilSurface old=%08lX new=%08lX same=%lu "
+            "old_refs=%ld new_refs=%ld", (DWORD)(uintptr_t)old_surface,
+            (DWORD)(uintptr_t)surface, old_surface == surface,
+            old_surface ? InterlockedCompareExchange(&old_surface->refcount,
+                    0, 0) : 0,
+            surface ? InterlockedCompareExchange(&surface->refcount, 0, 0)
+                    : 0);
     if (surface)
         IDirect3DSurface9_AddRef(surface_iface);
+    device->depth_stencil_surface = surface;
+    if (old_surface)
+        IDirect3DSurface9_Release(&old_surface->iface);
     device->depth_stencil_unbound = surface_iface ? FALSE : TRUE;
 
     command.device_handle = device->handle;
@@ -5333,6 +6367,15 @@ static HRESULT WINAPI device_get_depth_stencil_surface(IDirect3DDevice9 *iface,
         surface->format = device->present.AutoDepthStencilFormat;
         device_child_add_ref(device);
         *surface_out = &surface->iface;
+        TRACE_REGISTER_RANGE("SURFACE_AUTO_DEPTH", 0, surface, surface,
+                sizeof(*surface));
+        TRACE("SURFACE CREATE kind=auto_depth object=%08lX vtbl=%08lX "
+                "ref=%ld device=%08lX texture=00000000 swapchain=00000000 "
+                "shadow=00000000 level=0 size=%lux%lu format=%08lX",
+                (DWORD)(uintptr_t)*surface_out,
+                (DWORD)(uintptr_t)surface->iface.lpVtbl, surface->refcount,
+                (DWORD)(uintptr_t)&device->iface, surface->width,
+                surface->height, (DWORD)surface->format);
     }
     return D3D_OK;
 }
@@ -5928,6 +6971,7 @@ static HRESULT WINAPI cube_get_cube_map_surface(IDirect3DCubeTexture9 *iface,
 
     (void)iface; (void)face; (void)level;
     if (surface_out) *surface_out = NULL;
+    UNSUPPORTED("CubeTexture.GetCubeMapSurface");
     return D3DERR_INVALIDCALL;
 }
 
@@ -7149,8 +8193,19 @@ static ULONG WINAPI texture_release(IDirect3DTexture9 *iface)
         destroy.resource_handle = texture->handle;
         destroy.resource_kind = D9WG_RESOURCE_TEXTURE_2D;
         emit_command(D9WG_OP_DESTROY_RESOURCE, &destroy, sizeof(destroy));
-        for (level = 0; level < texture->level_count; ++level)
+        for (level = 0; level < texture->level_count; ++level) {
+            /* The level's surface sub-object dies with the texture; nothing
+             * can still hold it, because every surface reference is one of the
+             * texture references that just reached zero. */
+            if (texture->levels[level].level_surface) {
+                TRACE_SURFACE_FREED(
+                        &texture->levels[level].level_surface->iface);
+                HeapFree(GetProcessHeap(), 0,
+                        texture->levels[level].level_surface);
+                texture->levels[level].level_surface = NULL;
+            }
             HeapFree(GetProcessHeap(), 0, texture->levels[level].shadow);
+        }
         HeapFree(GetProcessHeap(), 0, texture->levels);
         device_child_release(texture->device);
         HeapFree(GetProcessHeap(), 0, texture);
@@ -7257,9 +8312,18 @@ static HRESULT WINAPI texture_get_level_desc(IDirect3DTexture9 *iface,
  * created and bound but never received a single byte of pixel data (117
  * textures created, 0 uploads), rendering the whole scene black.
  *
- * The surface holds a reference on its texture and forwards Lock/Unlock to
- * the same per-level shadow storage and UPDATE_TEXTURE emitter the texture's
- * own LockRect uses, so both upload routes stay identical.
+ * The surface forwards Lock/Unlock to the same per-level shadow storage and
+ * UPDATE_TEXTURE emitter the texture's own LockRect uses, so both upload
+ * routes stay identical.
+ *
+ * D3D9 does not create a fresh surface per call: each level owns one surface
+ * sub-object, returned by every GetSurfaceLevel for that level and kept alive
+ * by the texture, with AddRef/Release forwarded to the texture's refcount.
+ * Handing back a new self-owning surface each time instead is what crashed
+ * Kart Rider -- it locks a level surface, releases its reference (legal, the
+ * texture still owns the surface), then calls UnlockRect through the pointer
+ * it kept.  Under the old code that Release freed the object, so UnlockRect
+ * read a zeroed vtable and jumped through a null pointer.
  */
 static HRESULT WINAPI texture_get_surface_level(IDirect3DTexture9 *iface,
         UINT level, IDirect3DSurface9 **surface_out)
@@ -7267,26 +8331,63 @@ static HRESULT WINAPI texture_get_surface_level(IDirect3DTexture9 *iface,
     D9Texture *texture = texture_from_iface(iface);
     D9Surface *surface;
 
-    if (!surface_out)
+    TRACE_MARK_ENTER("Texture.GetSurfaceLevel");
+    TRACE("ENTER Texture.GetSurfaceLevel texture=%08lX handle=%08lX "
+            "ref=%ld level=%lu outarg=%08lX",
+            (DWORD)(uintptr_t)iface, texture->handle,
+            InterlockedCompareExchange(&texture->refcount, 0, 0), level,
+            (DWORD)(uintptr_t)surface_out);
+    if (!surface_out) {
+        TRACE_MARK_EXIT("Texture.GetSurfaceLevel", D3DERR_INVALIDCALL, NULL);
         return D3DERR_INVALIDCALL;
+    }
     *surface_out = NULL;
-    if (level >= texture->level_count)
+    if (level >= texture->level_count) {
+        TRACE_MARK_EXIT("Texture.GetSurfaceLevel", D3DERR_INVALIDCALL, NULL);
         return D3DERR_INVALIDCALL;
-    surface = (D9Surface *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-            sizeof(*surface));
-    if (!surface)
-        return E_OUTOFMEMORY;
-    surface->iface.lpVtbl = &g_surface_vtbl;
-    surface->refcount = 1;
-    surface->device = texture->device;
-    surface->texture = texture;
-    surface->level = level;
-    surface->width = texture->levels[level].width;
-    surface->height = texture->levels[level].height;
-    surface->format = texture->format;
+    }
+    surface = texture->levels[level].level_surface;
+    if (!surface) {
+        surface = (D9Surface *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                sizeof(*surface));
+        if (!surface) {
+            TRACE_MARK_EXIT("Texture.GetSurfaceLevel", E_OUTOFMEMORY, NULL);
+            return E_OUTOFMEMORY;
+        }
+        surface->iface.lpVtbl = &g_surface_vtbl;
+        /* Unused while texture_child is set: the texture's refcount is this
+         * surface's refcount. */
+        surface->refcount = 0;
+        surface->device = texture->device;
+        surface->texture = texture;
+        surface->texture_child = TRUE;
+        surface->level = level;
+        surface->width = texture->levels[level].width;
+        surface->height = texture->levels[level].height;
+        surface->format = texture->format;
+        texture->levels[level].level_surface = surface;
+        TRACE_REGISTER_RANGE("SURFACE_TEXTURE_LEVEL", level, surface, surface,
+                sizeof(*surface));
+        TRACE("SURFACE CREATE kind=texture_level object=%08lX vtbl=%08lX "
+                "device=%08lX texture=%08lX texture_handle=%08lX "
+                "swapchain=00000000 shadow=%08lX level=%lu size=%lux%lu "
+                "format=%08lX",
+                (DWORD)(uintptr_t)&surface->iface,
+                (DWORD)(uintptr_t)surface->iface.lpVtbl,
+                (DWORD)(uintptr_t)&texture->device->iface,
+                (DWORD)(uintptr_t)&texture->iface, texture->handle,
+                (DWORD)(uintptr_t)texture->levels[level].shadow, level,
+                surface->width, surface->height, (DWORD)surface->format);
+    }
+    /* The reference handed to the caller is a reference on the texture. */
     IDirect3DTexture9_AddRef(iface);
-    device_child_add_ref(texture->device);
     *surface_out = &surface->iface;
+    TRACE("SURFACE HANDOUT kind=texture_level object=%08lX texture=%08lX "
+            "texture_handle=%08lX level=%lu texture_refs=%ld",
+            (DWORD)(uintptr_t)*surface_out, (DWORD)(uintptr_t)&texture->iface,
+            texture->handle, level,
+            InterlockedCompareExchange(&texture->refcount, 0, 0));
+    TRACE_MARK_EXIT("Texture.GetSurfaceLevel", D3D_OK, *surface_out);
     return D3D_OK;
 }
 
@@ -7522,24 +8623,112 @@ static HRESULT WINAPI surface_query_interface(IDirect3DSurface9 *iface,
 
 static ULONG WINAPI surface_add_ref(IDirect3DSurface9 *iface)
 {
-    return (ULONG)InterlockedIncrement(&surface_from_iface(iface)->refcount);
+    D9Surface *surface = surface_from_iface(iface);
+    LONG before = 0;
+    ULONG refs;
+
+    /* A texture level surface has no refcount of its own: it is a sub-object
+     * of the texture and shares its parent's, so that dropping the last
+     * surface reference cannot outlive-check the pointer the app kept. */
+    if (surface->texture_child) {
+        TRACE_MARK_ENTER("Surface.AddRef");
+        refs = IDirect3DTexture9_AddRef(&surface->texture->iface);
+        TRACE("SURFACE ADDREF object=%08lX forwarded_to_texture=%08lX "
+                "level=%lu texture_refs=%lu", (DWORD)(uintptr_t)iface,
+                (DWORD)(uintptr_t)&surface->texture->iface, surface->level,
+                refs);
+        TRACE_MARK_EXIT("Surface.AddRef", (HRESULT)refs, iface);
+        return refs;
+    }
+#ifdef D9WG_DIAGNOSTIC_TRACE
+    before = InterlockedCompareExchange(&surface->refcount, 0, 0);
+#endif
+    TRACE_MARK_ENTER("Surface.AddRef");
+    refs = (ULONG)InterlockedIncrement(&surface->refcount);
+    TRACE("SURFACE ADDREF object=%08lX vtbl=%08lX before=%ld after=%lu "
+            "texture=%08lX shadow=%08lX level=%lu",
+            (DWORD)(uintptr_t)iface,
+            (DWORD)(uintptr_t)surface->iface.lpVtbl, before, refs,
+            (DWORD)(uintptr_t)surface->texture,
+            (DWORD)(uintptr_t)surface->shadow, surface->level);
+    (void)before;
+    TRACE_MARK_EXIT("Surface.AddRef", (HRESULT)refs, iface);
+    return refs;
 }
 
 static ULONG WINAPI surface_release(IDirect3DSurface9 *iface)
 {
     D9Surface *surface = surface_from_iface(iface);
-    ULONG refs = (ULONG)InterlockedDecrement(&surface->refcount);
-    if (!refs) {
-        /* A level surface keeps its texture alive for as long as it exists
-         * (GetSurfaceLevel took that reference); the back-buffer surface has
-         * no texture and only holds the device. */
-        if (surface->texture)
-            IDirect3DTexture9_Release(&surface->texture->iface);
-        if (surface->shadow)
-            HeapFree(GetProcessHeap(), 0, surface->shadow);
-        device_child_release(surface->device);
-        HeapFree(GetProcessHeap(), 0, surface);
+    LONG before = 0;
+    ULONG refs;
+
+    /* Mirror of surface_add_ref: the release lands on the texture, and the
+     * surface object itself survives until the texture is destroyed.  This is
+     * the whole point of the sub-object model -- the app is allowed to release
+     * its surface reference and go on using the pointer. */
+    if (surface->texture_child) {
+        /* Read everything the trace needs first: this release can be the
+         * texture's last, and the texture's teardown frees this surface. */
+        D9Texture *texture = surface->texture;
+        UINT level = surface->level;
+
+        TRACE_MARK_ENTER("Surface.Release");
+        refs = IDirect3DTexture9_Release(&texture->iface);
+        TRACE("SURFACE RELEASE object=%08lX forwarded_to_texture=%08lX "
+                "level=%lu texture_refs=%lu", (DWORD)(uintptr_t)iface,
+                (DWORD)(uintptr_t)texture, level, refs);
+        (void)level;
+        TRACE_MARK_EXIT("Surface.Release", (HRESULT)refs, iface);
+        return refs;
     }
+#ifdef D9WG_DIAGNOSTIC_TRACE
+    before = InterlockedCompareExchange(&surface->refcount, 0, 0);
+#endif
+    TRACE_MARK_ENTER("Surface.Release");
+    refs = (ULONG)InterlockedDecrement(&surface->refcount);
+    TRACE("SURFACE RELEASE object=%08lX vtbl=%08lX before=%ld after=%lu "
+            "device=%08lX texture=%08lX swapchain=%08lX shadow=%08lX "
+            "level=%lu locked=%lu",
+            (DWORD)(uintptr_t)iface,
+            (DWORD)(uintptr_t)surface->iface.lpVtbl, before, refs,
+            (DWORD)(uintptr_t)surface->device,
+            (DWORD)(uintptr_t)surface->texture,
+            (DWORD)(uintptr_t)surface->swap_chain,
+            (DWORD)(uintptr_t)surface->shadow, surface->level,
+            (DWORD)surface->locked);
+    (void)before;
+    if (!refs) {
+        D9Device *device = surface->device;
+        D9Texture *texture = surface->texture;
+        BYTE *shadow = surface->shadow;
+
+        TRACE("SURFACE FREE_BEGIN object=%08lX vtbl=%08lX device=%08lX "
+                "texture=%08lX swapchain=%08lX shadow=%08lX level=%lu "
+                "size=%lux%lu format=%08lX locked=%lu",
+                (DWORD)(uintptr_t)iface,
+                (DWORD)(uintptr_t)surface->iface.lpVtbl,
+                (DWORD)(uintptr_t)device, (DWORD)(uintptr_t)texture,
+                (DWORD)(uintptr_t)surface->swap_chain,
+                (DWORD)(uintptr_t)shadow, surface->level, surface->width,
+                surface->height, (DWORD)surface->format,
+                (DWORD)surface->locked);
+        /* Only a create_target_texture surface arrives here with a texture,
+         * and it holds that texture's sole reference, so the texture goes with
+         * it.  Texture level surfaces never reach this path at all: they are
+         * sub-objects freed by texture_release.  The back-buffer, offscreen
+         * and auto-depth surfaces have no texture and only hold the device. */
+        if (texture)
+            IDirect3DTexture9_Release(&texture->iface);
+        if (shadow)
+            HeapFree(GetProcessHeap(), 0, shadow);
+        device_child_release(device);
+        TRACE("SURFACE FREE_END object=%08lX", (DWORD)(uintptr_t)iface);
+        TRACE_MARK_EXIT("Surface.Release", 0, iface);
+        TRACE_SURFACE_FREED(iface);
+        HeapFree(GetProcessHeap(), 0, surface);
+        return 0;
+    }
+    TRACE_MARK_EXIT("Surface.Release", (HRESULT)refs, iface);
     return refs;
 }
 
@@ -7587,6 +8776,16 @@ static HRESULT WINAPI surface_get_container(IDirect3DSurface9 *iface,
     if (!container)
         return D3DERR_INVALIDCALL;
     *container = NULL;
+    if (surface->swap_chain) {
+        if (!riid || (!iid_is_unknown(riid)
+                && !guid_equal(riid, &IID_IDirect3DSwapChain9)))
+            return E_NOINTERFACE;
+        *container = &surface->swap_chain->iface;
+        IDirect3DSwapChain9_AddRef(&surface->swap_chain->iface);
+        TRACE("OK Surface.GetContainer surface=%08lX swapchain=%08lX",
+                (DWORD)(uintptr_t)iface, (DWORD)(uintptr_t)*container);
+        return D3D_OK;
+    }
     if (!surface->texture)
         return D3DERR_INVALIDCALL;
     if (riid && !iid_is_unknown(riid)
@@ -7608,7 +8807,7 @@ static HRESULT WINAPI surface_get_desc(IDirect3DSurface9 *iface,
     ZeroMemory(desc, sizeof(*desc));
     desc->Format = surface->format;
     desc->Type = D3DRTYPE_SURFACE;
-    desc->Usage = 0;
+    desc->Usage = surface->swap_chain ? D3DUSAGE_RENDERTARGET : 0;
     desc->Pool = D3DPOOL_DEFAULT;
     desc->MultiSampleType = D3DMULTISAMPLE_NONE;
     desc->Width = surface->width;
@@ -7629,6 +8828,16 @@ static HRESULT WINAPI surface_lock_rect(IDirect3DSurface9 *iface,
         D3DLOCKED_RECT *locked_rect, const RECT *rect, DWORD flags)
 {
     D9Surface *surface = surface_from_iface(iface);
+    HRESULT result;
+
+    TRACE_MARK_ENTER("Surface.LockRect");
+    TRACE("ENTER Surface.LockRect object=%08lX ref=%ld texture=%08lX "
+            "shadow=%08lX level=%lu locked=%lu rect=%08lX flags=%08lX",
+            (DWORD)(uintptr_t)iface,
+            InterlockedCompareExchange(&surface->refcount, 0, 0),
+            (DWORD)(uintptr_t)surface->texture,
+            (DWORD)(uintptr_t)surface->shadow, surface->level,
+            (DWORD)surface->locked, (DWORD)(uintptr_t)rect, flags);
 
     if (surface->shadow) {
         /* A standalone CPU surface. The whole surface is handed over
@@ -7636,41 +8845,276 @@ static HRESULT WINAPI surface_lock_rect(IDirect3DSurface9 *iface,
          * lock only changes which pointer the app is given. */
         UINT x = rect ? (UINT)rect->left : 0;
         UINT y = rect ? (UINT)rect->top : 0;
-        if (!locked_rect || surface->locked)
-            return D3DERR_INVALIDCALL;
-        if (x >= surface->width || y >= surface->height)
-            return D3DERR_INVALIDCALL;
+        if (!locked_rect || surface->locked) {
+            result = D3DERR_INVALIDCALL;
+            goto done;
+        }
+        if (x >= surface->width || y >= surface->height) {
+            result = D3DERR_INVALIDCALL;
+            goto done;
+        }
         locked_rect->Pitch = (INT)surface->row_pitch;
         locked_rect->pBits = surface->shadow + y * surface->row_pitch + x * 4u;
         surface->locked = TRUE;
         (void)flags;
-        return D3D_OK;
+        result = D3D_OK;
+        goto done;
     }
     if (!surface->texture)
-        return D3DERR_INVALIDCALL;
-    return texture_lock_level(surface->texture, surface->level, locked_rect,
-            rect, flags);
+        result = D3DERR_INVALIDCALL;
+    else
+        result = texture_lock_level(surface->texture, surface->level,
+                locked_rect, rect, flags);
+done:
+    TRACE("LEAVE Surface.LockRect object=%08lX hr=%08lX pBits=%08lX "
+            "pitch=%ld", (DWORD)(uintptr_t)iface, (DWORD)result,
+            (DWORD)(uintptr_t)(SUCCEEDED(result) && locked_rect
+                    ? locked_rect->pBits : NULL),
+            SUCCEEDED(result) && locked_rect ? locked_rect->Pitch : 0);
+    TRACE_MARK_EXIT("Surface.LockRect", result,
+            SUCCEEDED(result) && locked_rect ? locked_rect->pBits : NULL);
+    return result;
 }
 
 static HRESULT WINAPI surface_unlock_rect(IDirect3DSurface9 *iface)
 {
     D9Surface *surface = surface_from_iface(iface);
+    HRESULT result;
+
+    TRACE_MARK_ENTER("Surface.UnlockRect");
+    TRACE("ENTER Surface.UnlockRect object=%08lX ref=%ld vtbl=%08lX "
+            "texture=%08lX shadow=%08lX level=%lu locked=%lu",
+            (DWORD)(uintptr_t)iface,
+            InterlockedCompareExchange(&surface->refcount, 0, 0),
+            (DWORD)(uintptr_t)surface->iface.lpVtbl,
+            (DWORD)(uintptr_t)surface->texture,
+            (DWORD)(uintptr_t)surface->shadow, surface->level,
+            (DWORD)surface->locked);
     if (surface->shadow) {
         if (!surface->locked)
-            return D3DERR_INVALIDCALL;
-        surface->locked = FALSE;
-        return D3D_OK;
+            result = D3DERR_INVALIDCALL;
+        else {
+            surface->locked = FALSE;
+            result = D3D_OK;
+        }
+    } else if (!surface->texture) {
+        result = D3DERR_INVALIDCALL;
+    } else {
+        result = texture_unlock_level(surface->texture, surface->level);
     }
-    if (!surface->texture)
-        return D3DERR_INVALIDCALL;
-    return texture_unlock_level(surface->texture, surface->level);
+    TRACE("LEAVE Surface.UnlockRect object=%08lX hr=%08lX locked=%lu",
+            (DWORD)(uintptr_t)iface, (DWORD)result,
+            (DWORD)surface->locked);
+    TRACE_MARK_EXIT("Surface.UnlockRect", result, iface);
+    return result;
 }
 
+/* GetDC/ReleaseDC is how an app draws GDI content -- text, a loaded bitmap --
+ * straight onto a D3D surface, so a refusal here is a whole class of 2D art
+ * silently never arriving. Named rather than merely refused, for the reason
+ * given above note_unsupported(). */
 static HRESULT WINAPI surface_get_dc(IDirect3DSurface9 *iface, HDC *hdc)
-{ (void)iface; if (hdc) { *hdc = NULL; } return D3DERR_INVALIDCALL; }
+{ (void)iface; if (hdc) { *hdc = NULL; }
+  UNSUPPORTED("Surface.GetDC"); return D3DERR_INVALIDCALL; }
 
 static HRESULT WINAPI surface_release_dc(IDirect3DSurface9 *iface, HDC hdc)
-{ (void)iface; (void)hdc; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)hdc;
+  UNSUPPORTED("Surface.ReleaseDC"); return D3DERR_INVALIDCALL; }
+
+/* ---- IDirect3DSwapChain9: the device's implicit primary chain ---- */
+
+static HRESULT WINAPI swap_chain_query_interface(IDirect3DSwapChain9 *iface,
+        REFIID iid, void **object)
+{
+    TRACE_MARK_ENTER("SwapChain.QueryInterface");
+    if (!object) {
+        TRACE_MARK_EXIT("SwapChain.QueryInterface", E_POINTER, NULL);
+        return E_POINTER;
+    }
+    *object = NULL;
+    if (!iid || (!iid_is_unknown(iid)
+            && !guid_equal(iid, &IID_IDirect3DSwapChain9))) {
+        TRACE_MARK_EXIT("SwapChain.QueryInterface", E_NOINTERFACE, NULL);
+        return E_NOINTERFACE;
+    }
+    *object = iface;
+    IDirect3DSwapChain9_AddRef(iface);
+    TRACE_MARK_EXIT("SwapChain.QueryInterface", S_OK, iface);
+    return S_OK;
+}
+
+static ULONG WINAPI swap_chain_add_ref(IDirect3DSwapChain9 *iface)
+{
+    D9SwapChain *swap_chain = swap_chain_from_iface(iface);
+    ULONG refs;
+
+    TRACE_MARK_ENTER("SwapChain.AddRef");
+    /* A live swap-chain pointer must keep its embedded storage alive. */
+    IDirect3DDevice9_AddRef(&swap_chain->device->iface);
+    refs = (ULONG)InterlockedIncrement(&swap_chain->refcount);
+    TRACE("CALL SwapChain.AddRef object=%08lX refs=%lu device_refs=%ld",
+            (DWORD)(uintptr_t)iface, refs,
+            InterlockedCompareExchange(&swap_chain->device->refcount, 0, 0));
+    TRACE_MARK_EXIT("SwapChain.AddRef", (HRESULT)refs, iface);
+    return refs;
+}
+
+static ULONG WINAPI swap_chain_release(IDirect3DSwapChain9 *iface)
+{
+    D9SwapChain *swap_chain = swap_chain_from_iface(iface);
+    D9Device *device = swap_chain->device;
+    ULONG device_refs;
+    ULONG refs;
+
+    TRACE_MARK_ENTER("SwapChain.Release");
+    refs = (ULONG)InterlockedDecrement(&swap_chain->refcount);
+    TRACE("CALL SwapChain.Release object=%08lX refs=%lu device_refs_before=%ld",
+            (DWORD)(uintptr_t)iface, refs,
+            InterlockedCompareExchange(&device->refcount, 0, 0));
+    /* This can free device (and therefore swap_chain); do not touch either
+     * object after the call. */
+    device_refs = IDirect3DDevice9_Release(&device->iface);
+    TRACE_MARK_EXIT("SwapChain.Release", (HRESULT)refs, NULL);
+    TRACE("LEAVE SwapChain.Release object=%08lX refs=%lu device_refs=%lu",
+            (DWORD)(uintptr_t)iface, refs, device_refs);
+    (void)device_refs;
+    return refs;
+}
+
+static HRESULT WINAPI swap_chain_present(IDirect3DSwapChain9 *iface,
+        const RECT *src_rect, const RECT *dst_rect, HWND override_window,
+        const RGNDATA *dirty_region, DWORD flags)
+{
+    D9SwapChain *swap_chain = swap_chain_from_iface(iface);
+    HRESULT result;
+
+    TRACE_MARK_ENTER("SwapChain.Present");
+    TRACE("CALL SwapChain.Present object=%08lX flags=%08lX override=%08lX",
+            (DWORD)(uintptr_t)iface, flags,
+            (DWORD)(uintptr_t)override_window);
+    (void)flags;
+    /* The bridge presents synchronously, so DONOTWAIT cannot make it return
+     * WASSTILLDRAWING.  LINEAR_CONTENT does not change the guest-side work;
+     * both flags can otherwise use the device's normal presentation path. */
+    result = device_present(&swap_chain->device->iface, src_rect, dst_rect,
+            override_window, dirty_region);
+    TRACE("%s SwapChain.Present object=%08lX -> %08lX",
+            SUCCEEDED(result) ? "OK" : "FAIL", (DWORD)(uintptr_t)iface,
+            (DWORD)result);
+    TRACE_MARK_EXIT("SwapChain.Present", result, NULL);
+    return result;
+}
+
+static HRESULT WINAPI swap_chain_get_front_buffer_data(
+        IDirect3DSwapChain9 *iface, IDirect3DSurface9 *destination)
+{
+    D9SwapChain *swap_chain = swap_chain_from_iface(iface);
+    HRESULT result;
+
+    TRACE_MARK_ENTER("SwapChain.GetFrontBufferData");
+    result = device_get_front_buffer_data(&swap_chain->device->iface, 0,
+            destination);
+    TRACE("%s SwapChain.GetFrontBufferData object=%08lX dst=%08lX -> %08lX",
+            SUCCEEDED(result) ? "OK" : "FAIL", (DWORD)(uintptr_t)iface,
+            (DWORD)(uintptr_t)destination, (DWORD)result);
+    TRACE_MARK_EXIT("SwapChain.GetFrontBufferData", result, destination);
+    return result;
+}
+
+static HRESULT WINAPI swap_chain_get_back_buffer(IDirect3DSwapChain9 *iface,
+        UINT index, D3DBACKBUFFER_TYPE type, IDirect3DSurface9 **out)
+{
+    D9SwapChain *swap_chain = swap_chain_from_iface(iface);
+    HRESULT result;
+
+    TRACE_MARK_ENTER("SwapChain.GetBackBuffer");
+    result = device_get_back_buffer(&swap_chain->device->iface, 0, index,
+            type, out);
+    TRACE("%s SwapChain.GetBackBuffer object=%08lX index=%lu type=%lu out=%08lX -> %08lX",
+            SUCCEEDED(result) ? "OK" : "FAIL", (DWORD)(uintptr_t)iface,
+            index, (DWORD)type,
+            (DWORD)(uintptr_t)(out ? *out : NULL), (DWORD)result);
+    TRACE_MARK_EXIT("SwapChain.GetBackBuffer", result, out ? *out : NULL);
+    return result;
+}
+
+static HRESULT WINAPI swap_chain_get_raster_status(IDirect3DSwapChain9 *iface,
+        D3DRASTER_STATUS *status)
+{
+    D9SwapChain *swap_chain = swap_chain_from_iface(iface);
+    HRESULT result;
+
+    TRACE_MARK_ENTER("SwapChain.GetRasterStatus");
+    result = device_get_raster_status(&swap_chain->device->iface, 0, status);
+    TRACE("%s SwapChain.GetRasterStatus object=%08lX -> %08lX",
+            SUCCEEDED(result) ? "OK" : "FAIL", (DWORD)(uintptr_t)iface,
+            (DWORD)result);
+    TRACE_MARK_EXIT("SwapChain.GetRasterStatus", result, status);
+    return result;
+}
+
+static HRESULT WINAPI swap_chain_get_display_mode(IDirect3DSwapChain9 *iface,
+        D3DDISPLAYMODE *mode)
+{
+    D9SwapChain *swap_chain = swap_chain_from_iface(iface);
+
+    TRACE_MARK_ENTER("SwapChain.GetDisplayMode");
+    if (!mode) {
+        TRACE("FAIL SwapChain.GetDisplayMode object=%08lX missing output -> %08lX",
+                (DWORD)(uintptr_t)iface, (DWORD)D3DERR_INVALIDCALL);
+        TRACE_MARK_EXIT("SwapChain.GetDisplayMode", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    *mode = swap_chain->device->display_mode;
+    TRACE("OK SwapChain.GetDisplayMode object=%08lX %lux%lu fmt=%08lX refresh=%lu",
+            (DWORD)(uintptr_t)iface, mode->Width, mode->Height,
+            (DWORD)mode->Format, mode->RefreshRate);
+    TRACE_MARK_EXIT("SwapChain.GetDisplayMode", D3D_OK, mode);
+    return D3D_OK;
+}
+
+static HRESULT WINAPI swap_chain_get_device(IDirect3DSwapChain9 *iface,
+        IDirect3DDevice9 **out)
+{
+    D9SwapChain *swap_chain = swap_chain_from_iface(iface);
+
+    TRACE_MARK_ENTER("SwapChain.GetDevice");
+    if (!out) {
+        TRACE("FAIL SwapChain.GetDevice object=%08lX missing output -> %08lX",
+                (DWORD)(uintptr_t)iface, (DWORD)D3DERR_INVALIDCALL);
+        TRACE_MARK_EXIT("SwapChain.GetDevice", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    *out = &swap_chain->device->iface;
+    IDirect3DDevice9_AddRef(*out);
+    TRACE("OK SwapChain.GetDevice object=%08lX device=%08lX refs=%ld",
+            (DWORD)(uintptr_t)iface, (DWORD)(uintptr_t)*out,
+            InterlockedCompareExchange(&swap_chain->device->refcount, 0, 0));
+    TRACE_MARK_EXIT("SwapChain.GetDevice", D3D_OK, *out);
+    return D3D_OK;
+}
+
+static HRESULT WINAPI swap_chain_get_present_parameters(
+        IDirect3DSwapChain9 *iface, D3DPRESENT_PARAMETERS *parameters)
+{
+    D9SwapChain *swap_chain = swap_chain_from_iface(iface);
+
+    TRACE_MARK_ENTER("SwapChain.GetPresentParameters");
+    if (!parameters) {
+        TRACE("FAIL SwapChain.GetPresentParameters object=%08lX missing output -> %08lX",
+                (DWORD)(uintptr_t)iface, (DWORD)D3DERR_INVALIDCALL);
+        TRACE_MARK_EXIT("SwapChain.GetPresentParameters",
+                D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    *parameters = swap_chain->device->present;
+    TRACE("OK SwapChain.GetPresentParameters object=%08lX %lux%lu fmt=%08lX count=%lu windowed=%lu",
+            (DWORD)(uintptr_t)iface, parameters->BackBufferWidth,
+            parameters->BackBufferHeight, (DWORD)parameters->BackBufferFormat,
+            parameters->BackBufferCount, (DWORD)parameters->Windowed);
+    TRACE_MARK_EXIT("SwapChain.GetPresentParameters", D3D_OK, parameters);
+    return D3D_OK;
+}
 
 /* ---- vtables ---- */
 
@@ -7692,6 +9136,19 @@ static IDirect3D9Vtbl g_d3d_vtbl = {
     .GetDeviceCaps = d3d_get_device_caps,
     .GetAdapterMonitor = d3d_get_adapter_monitor,
     .CreateDevice = d3d_create_device
+};
+
+static IDirect3DSwapChain9Vtbl g_swap_chain_vtbl = {
+    .QueryInterface = swap_chain_query_interface,
+    .AddRef = swap_chain_add_ref,
+    .Release = swap_chain_release,
+    .Present = swap_chain_present,
+    .GetFrontBufferData = swap_chain_get_front_buffer_data,
+    .GetBackBuffer = swap_chain_get_back_buffer,
+    .GetRasterStatus = swap_chain_get_raster_status,
+    .GetDisplayMode = swap_chain_get_display_mode,
+    .GetDevice = swap_chain_get_device,
+    .GetPresentParameters = swap_chain_get_present_parameters
 };
 
 static IDirect3DDevice9Vtbl g_device_vtbl = {
@@ -7924,21 +9381,30 @@ IDirect3D9 *WINAPI Direct3DCreate9(UINT sdk_version)
     D9Direct3D *d3d;
     BOOL transport_ready;
 
-    if (sdk_version != D3D_SDK_VERSION)
+    TRACE("CALL Direct3DCreate9 sdk=%lu", sdk_version);
+    if (sdk_version != D3D_SDK_VERSION) {
+        TRACE("FAIL Direct3DCreate9 sdk=%lu expected=%lu", sdk_version,
+                (UINT)D3D_SDK_VERSION);
         return NULL;
+    }
     EnterCriticalSection(&g_transport_lock);
     transport_ready = open_transport_locked();
     LeaveCriticalSection(&g_transport_lock);
-    if (!transport_ready)
+    if (!transport_ready) {
+        TRACE("FAIL Direct3DCreate9 transport");
         return NULL;
+    }
 
     d3d = (D9Direct3D *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             sizeof(*d3d));
-    if (!d3d)
+    if (!d3d) {
+        TRACE("FAIL Direct3DCreate9 allocation");
         return NULL;
+    }
     d3d->iface.lpVtbl = &g_d3d_vtbl;
     d3d->refcount = 1;
     emit_hello_once();
+    TRACE("OK Direct3DCreate9 object=%08lX", (DWORD)(uintptr_t)&d3d->iface);
     return &d3d->iface;
 }
 
@@ -7998,15 +9464,37 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(instance);
         g_module_instance = instance;
+#ifdef D9WG_DIAGNOSTIC_TRACE
+        trace_open(instance);
+        g_trace_veh = AddVectoredExceptionHandler(1, trace_vectored_exception);
+        TRACE("PROCESS_ATTACH diagnostic trace v4 surface-lifetime-20260815 "
+                "pid=%lu module=%08lX veh=%08lX",
+                GetCurrentProcessId(), (DWORD)(uintptr_t)instance,
+                (DWORD)(uintptr_t)g_trace_veh);
+        TRACE("MODULE exe=%08lX path=%s proxy=%08lX path=%s",
+                (DWORD)(uintptr_t)g_trace_exe_module, g_trace_exe_path,
+                (DWORD)(uintptr_t)g_trace_self_module, g_trace_self_path);
+        TRACE_FLUSH();
+#endif
         initialize_session_id(instance);
         InitializeCriticalSection(&g_transport_lock);
     } else if (reason == DLL_PROCESS_DETACH) {
+        TRACE("PROCESS_DETACH reserved=%08lX pending_commands=%lu",
+                (DWORD)(uintptr_t)reserved, g_command_count);
+        TRACE_FLUSH();
         EnterCriticalSection(&g_transport_lock);
         if (g_command_count)
             submit_batch_locked(FALSE);
         close_transport_locked();
         LeaveCriticalSection(&g_transport_lock);
         DeleteCriticalSection(&g_transport_lock);
+#ifdef D9WG_DIAGNOSTIC_TRACE
+        if (g_trace_veh) {
+            RemoveVectoredExceptionHandler(g_trace_veh);
+            g_trace_veh = NULL;
+        }
+        trace_close();
+#endif
     }
     return TRUE;
 }

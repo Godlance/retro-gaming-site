@@ -87,6 +87,9 @@
     const OP_DESTROY_RESOURCE = 0x103;
     const OP_STRETCH_RECT = 8;
     const OP_COLOR_FILL = 9;
+    const OP_GUEST_LOG = 11;
+    const GUEST_LOG_SEVERITY_INFO = 0;
+    const GUEST_LOG_SEVERITY_FAILED = 2;
     const OP_CREATE_TEXTURE_2D = 0x110;
     const OP_CREATE_TEXTURE_CUBE = 0x111;
     const OP_UPDATE_TEXTURE = 0x113;
@@ -165,16 +168,34 @@
     // over constants that have already been recorded.
     const UNIFORM_RING_BYTES = 16 * 1024 * 1024;
 
+    const D3DFMT_R8G8B8 = 20;
     const D3DFMT_A8R8G8B8 = 21;
     const D3DFMT_X8R8G8B8 = 22;
     const D3DFMT_R5G6B5 = 23;
     const D3DFMT_X1R5G5B5 = 24;
     const D3DFMT_A1R5G5B5 = 25;
     const D3DFMT_A4R4G4B4 = 26;
+    const D3DFMT_R3G3B2 = 27;
     const D3DFMT_A8 = 28;
+    const D3DFMT_A8R3G3B2 = 29;
+    const D3DFMT_X4R4G4B4 = 30;
+    const D3DFMT_A8B8G8R8 = 32;
+    const D3DFMT_X8B8G8R8 = 33;
     const D3DFMT_L8 = 50;
+    const D3DFMT_A8L8 = 51;
+    const D3DFMT_A4L4 = 52;
+    const D3DFMT_V8U8 = 60;
+    const D3DFMT_L6V5U5 = 61;
+    const D3DFMT_X8L8V8U8 = 62;
+    const D3DFMT_Q8W8V8U8 = 63;
+    const D3DFMT_V16U16 = 64;
+    const D3DFMT_A2W10V10U10 = 67;
+    const D3DFMT_L16 = 81;
+    const D3DFMT_CxV8U8 = 117;
     const D3DFMT_DXT1 = 0x31545844;
+    const D3DFMT_DXT2 = 0x32545844;
     const D3DFMT_DXT3 = 0x33545844;
+    const D3DFMT_DXT4 = 0x34545844;
     const D3DFMT_DXT5 = 0x35545844;
     const D3DFMT_INDEX16 = 101;
     const D3DFMT_INDEX32 = 102;
@@ -381,6 +402,8 @@
     // D3DDECLUSAGE / D3DDECLTYPE, the subset d3d9_proxy.c's
     // declaration_element_supported() lets through.
     const DECLUSAGE_POSITION = 0;
+    const DECLUSAGE_BLENDWEIGHT = 1;
+    const DECLUSAGE_BLENDINDICES = 2;
     const DECLUSAGE_NORMAL = 3;
     const DECLUSAGE_PSIZE = 4;
     const DECLUSAGE_TEXCOORD = 5;
@@ -513,9 +536,16 @@
     const TEXTURE_USAGE_TEXTURE_BINDING = 0x4;
 
     const TEXTURE_FORMAT_NAMES = {
-        21: "A8R8G8B8", 22: "X8R8G8B8", 23: "R5G6B5", 24: "X1R5G5B5",
-        25: "A1R5G5B5", 26: "A4R4G4B4", 28: "A8", 50: "L8",
-        0x31545844: "DXT1", 0x33545844: "DXT3", 0x35545844: "DXT5",
+        20: "R8G8B8", 21: "A8R8G8B8", 22: "X8R8G8B8", 23: "R5G6B5",
+        24: "X1R5G5B5", 25: "A1R5G5B5", 26: "A4R4G4B4",
+        27: "R3G3B2", 28: "A8", 29: "A8R3G3B2", 30: "X4R4G4B4",
+        32: "A8B8G8R8", 33: "X8B8G8R8", 50: "L8", 51: "A8L8",
+        52: "A4L4", 60: "V8U8", 61: "L6V5U5", 62: "X8L8V8U8",
+        63: "Q8W8V8U8", 64: "V16U16", 67: "A2W10V10U10", 81: "L16",
+        117: "CxV8U8",
+        0x31545844: "DXT1", 0x32545844: "DXT2",
+        0x33545844: "DXT3", 0x34545844: "DXT4",
+        0x35545844: "DXT5",
     };
 
     // D3D9 stores FOGSTART/FOGEND/FOGDENSITY as float bits inside a DWORD.
@@ -546,28 +576,109 @@
     }
 
     function isCompressedFormat(format) {
-        return format === D3DFMT_DXT1 || format === D3DFMT_DXT3 ||
+        return format === D3DFMT_DXT1 || format === D3DFMT_DXT2 ||
+            format === D3DFMT_DXT3 || format === D3DFMT_DXT4 ||
             format === D3DFMT_DXT5;
+    }
+
+    // WebGPU measures a block-compressed copy in whole texel blocks: copySize
+    // must be a multiple of the BCn 4x4 block, and a mip level's *physical*
+    // extent is its logical size rounded up to that grid. So the tail of a DXT
+    // mip chain has to be written as a full 4x4 block even though its logical
+    // size is 2x2 or 1x1. Passing the logical size makes writeTexture fail
+    // validation, and because that failure surfaces as an uncaptured device
+    // error rather than an exception, the level silently keeps whatever the
+    // texture was created with -- hundreds of "copySize.width (1) is not a
+    // multiple of compressed texture format block width (4)" errors while Kart
+    // Rider loaded its UI atlases, with no other symptom than the smallest mips
+    // sampling as garbage.
+    //
+    // Callers pass a block-aligned origin, which WebGPU requires independently,
+    // so rounding the extent up cannot run past the physical mip extent.
+    function blockAlignedCopyExtent(size, compressed) {
+        return compressed ? Math.ceil(size / 4) * 4 : size;
+    }
+
+    // The pixel rect a draw may touch: the D3D9 viewport (which clips, unlike
+    // WebGPU's) intersected with the scissor rect when D3DRS_SCISSORTESTENABLE
+    // is on, then clamped into the attachment -- WebGPU rejects a scissor that
+    // leaves the render target, and an app is free to set a viewport that does.
+    // An empty intersection stays empty (zero width or height), which draws
+    // nothing, exactly as D3D9 would.
+    function intersectRects(viewport, scissor, targetWidth, targetHeight) {
+        let left = viewport.x;
+        let top = viewport.y;
+        let right = viewport.x + viewport.width;
+        let bottom = viewport.y + viewport.height;
+        if (scissor) {
+            left = Math.max(left, scissor.x);
+            top = Math.max(top, scissor.y);
+            right = Math.min(right, scissor.x + scissor.width);
+            bottom = Math.min(bottom, scissor.y + scissor.height);
+        }
+        left = Math.max(0, Math.min(left, targetWidth));
+        top = Math.max(0, Math.min(top, targetHeight));
+        right = Math.max(left, Math.min(right, targetWidth));
+        bottom = Math.max(top, Math.min(bottom, targetHeight));
+        return { x: left, y: top, width: right - left, height: bottom - top };
+    }
+
+    function isHalfFloatExpansionFormat(format) {
+        return format === D3DFMT_L6V5U5 || format === D3DFMT_X8L8V8U8 ||
+            format === D3DFMT_V16U16 || format === D3DFMT_A2W10V10U10 ||
+            format === D3DFMT_L16 || format === D3DFMT_CxV8U8;
+    }
+
+    function gpuBytesPerTexel(format) {
+        return isHalfFloatExpansionFormat(format) ? 8 : 4;
+    }
+
+    function isRenderableGPUFormat(format) {
+        return format === "rgba8unorm" || format === "rgba16float";
     }
 
     function formatToGPU(format) {
         switch (format) {
+        case D3DFMT_R8G8B8:
         case D3DFMT_A8R8G8B8:
         case D3DFMT_X8R8G8B8:
         case D3DFMT_X1R5G5B5:
         case D3DFMT_A1R5G5B5:
         case D3DFMT_A4R4G4B4:
+        case D3DFMT_R3G3B2:
+        case D3DFMT_A8R3G3B2:
+        case D3DFMT_X4R4G4B4:
+        case D3DFMT_A8B8G8R8:
+        case D3DFMT_X8B8G8R8:
         case D3DFMT_R5G6B5:
         case D3DFMT_L8:
         case D3DFMT_A8:
+        case D3DFMT_A8L8:
+        case D3DFMT_A4L4:
             // All of these are CPU-expanded to tightly-packed RGBA8 on
-            // upload (see expandTexelsToRGBA8), matching the D3D8 path's
+            // upload (see expandRowToGPU), matching the D3D8 path's
             // approach: WebGPU has no native 16-bit BGR/BGRA formats.
             return "rgba8unorm";
+        case D3DFMT_V8U8:
+        case D3DFMT_Q8W8V8U8:
+            return "rgba8snorm";
+        case D3DFMT_L6V5U5:
+        case D3DFMT_X8L8V8U8:
+        case D3DFMT_V16U16:
+        case D3DFMT_A2W10V10U10:
+        case D3DFMT_L16:
+        case D3DFMT_CxV8U8:
+            // Mixed signed/unsigned bump formats, CxV8U8's reconstructed
+            // component, and high-precision L16 cannot be represented by one
+            // normalized 8-bit WebGPU format without losing their semantics.
+            // Half-float preserves the sampled values closely.
+            return "rgba16float";
         case D3DFMT_DXT1:
             return "bc1-rgba-unorm";
+        case D3DFMT_DXT2:
         case D3DFMT_DXT3:
             return "bc2-rgba-unorm";
+        case D3DFMT_DXT4:
         case D3DFMT_DXT5:
             return "bc3-rgba-unorm";
         default:
@@ -575,14 +686,124 @@
         }
     }
 
-    // Expands one source row of `count` texels at `format` into RGBA8,
-    // matching d3d9_proxy.c's texture_format_layout() block sizes (DXT
-    // formats are passed through untouched -- WebGPU accepts BCn blocks
-    // directly).
-    function expandRowToRGBA8(format, source, sourceOffset, count, dest, destOffset) {
+    const HALF_BITS_BUFFER = new ArrayBuffer(4);
+    const HALF_BITS_F32 = new Float32Array(HALF_BITS_BUFFER);
+    const HALF_BITS_U32 = new Uint32Array(HALF_BITS_BUFFER);
+
+    function floatToHalfBits(value) {
+        HALF_BITS_F32[0] = value;
+        const bits = HALF_BITS_U32[0];
+        const sign = (bits >>> 16) & 0x8000;
+        let exponent = (bits >>> 23) & 0xff;
+        let mantissa = bits & 0x7fffff;
+        if (exponent === 0xff)
+            return sign | (mantissa ? 0x7e00 : 0x7c00);
+        exponent = exponent - 127 + 15;
+        if (exponent >= 31) return sign | 0x7c00;
+        if (exponent <= 0) {
+            if (exponent < -10) return sign;
+            const normalized = mantissa | 0x800000;
+            const shift = 14 - exponent;
+            let halfMantissa = normalized >>> shift;
+            const remainderMask = (1 << shift) - 1;
+            const remainder = normalized & remainderMask;
+            const halfway = 1 << (shift - 1);
+            if (remainder > halfway ||
+                    (remainder === halfway && (halfMantissa & 1)))
+                ++halfMantissa;
+            return sign | halfMantissa;
+        }
+        let halfMantissa = mantissa >>> 13;
+        const remainder = mantissa & 0x1fff;
+        if (remainder > 0x1000 ||
+                (remainder === 0x1000 && (halfMantissa & 1))) {
+            ++halfMantissa;
+            if (halfMantissa === 0x400) {
+                halfMantissa = 0;
+                if (++exponent >= 31) return sign | 0x7c00;
+            }
+        }
+        return sign | (exponent << 10) | halfMantissa;
+    }
+
+    function writeHalf(dest, offset, value) {
+        const bits = floatToHalfBits(value);
+        dest[offset] = bits & 0xff;
+        dest[offset + 1] = bits >>> 8;
+    }
+
+    function signedNormalized(value, bitCount) {
+        const signBit = 1 << (bitCount - 1);
+        const fullRange = 1 << bitCount;
+        const signed = value & signBit ? value - fullRange : value;
+        return signed === -signBit ? -1 : signed / (signBit - 1);
+    }
+
+    // Expands one source row to the WebGPU format returned by formatToGPU().
+    // Ordinary colour/luminance formats become RGBA8 UNORM, signed bump maps
+    // become RGBA8 SNORM, and mixed/high-precision formats become RGBA16F.
+    // BCn formats bypass this routine and stay block-compressed end-to-end.
+    function expandRowToGPU(format, source, sourceOffset, count, dest, destOffset) {
         for (let i = 0; i < count; ++i) {
             let r, g, b, a;
+            if (isHalfFloatExpansionFormat(format)) {
+                let u, v, w, q;
+                if (format === D3DFMT_CxV8U8) {
+                    const at = sourceOffset + i * 2;
+                    u = signedNormalized(source[at], 8);
+                    v = signedNormalized(source[at + 1], 8);
+                    w = Math.sqrt(Math.max(0, 1 - u * u - v * v));
+                    q = 1;
+                } else if (format === D3DFMT_L16) {
+                    const at = sourceOffset + i * 2;
+                    const luminance = (source[at] |
+                        (source[at + 1] << 8)) / 65535;
+                    u = v = w = luminance;
+                    q = 1;
+                } else if (format === D3DFMT_L6V5U5) {
+                    const value = source[sourceOffset + i * 2] |
+                        (source[sourceOffset + i * 2 + 1] << 8);
+                    u = signedNormalized(value & 0x1f, 5);
+                    v = signedNormalized((value >>> 5) & 0x1f, 5);
+                    w = ((value >>> 10) & 0x3f) / 63;
+                    q = 1;
+                } else if (format === D3DFMT_X8L8V8U8) {
+                    const at = sourceOffset + i * 4;
+                    u = signedNormalized(source[at], 8);
+                    v = signedNormalized(source[at + 1], 8);
+                    w = source[at + 2] / 255;
+                    q = 1;
+                } else if (format === D3DFMT_V16U16) {
+                    const at = sourceOffset + i * 4;
+                    const rawU = source[at] | (source[at + 1] << 8);
+                    const rawV = source[at + 2] | (source[at + 3] << 8);
+                    u = signedNormalized(rawU, 16);
+                    v = signedNormalized(rawV, 16);
+                    w = q = 1;
+                } else {
+                    const at = sourceOffset + i * 4;
+                    const value = (source[at] | (source[at + 1] << 8) |
+                        (source[at + 2] << 16) |
+                        (source[at + 3] << 24)) >>> 0;
+                    u = signedNormalized(value & 0x3ff, 10);
+                    v = signedNormalized((value >>> 10) & 0x3ff, 10);
+                    w = signedNormalized((value >>> 20) & 0x3ff, 10);
+                    q = (value >>> 30) / 3;
+                }
+                const out = destOffset + i * 8;
+                writeHalf(dest, out, u);
+                writeHalf(dest, out + 2, v);
+                writeHalf(dest, out + 4, w);
+                writeHalf(dest, out + 6, q);
+                continue;
+            }
             switch (format) {
+            case D3DFMT_R8G8B8: {
+                const at = sourceOffset + i * 3;
+                b = source[at]; g = source[at + 1]; r = source[at + 2];
+                a = 0xff;
+                break;
+            }
             case D3DFMT_A8R8G8B8:
             case D3DFMT_X8R8G8B8: {
                 const value = source[sourceOffset + i * 4] |
@@ -623,14 +844,71 @@
                 a = ((value >>> 12) & 0xf) * 255 / 15;
                 break;
             }
+            case D3DFMT_R3G3B2: {
+                const value = source[sourceOffset + i];
+                r = ((value >>> 5) & 0x7) * 255 / 7;
+                g = ((value >>> 2) & 0x7) * 255 / 7;
+                b = (value & 0x3) * 255 / 3;
+                a = 0xff;
+                break;
+            }
+            case D3DFMT_A8R3G3B2: {
+                const at = sourceOffset + i * 2;
+                const value = source[at];
+                r = ((value >>> 5) & 0x7) * 255 / 7;
+                g = ((value >>> 2) & 0x7) * 255 / 7;
+                b = (value & 0x3) * 255 / 3;
+                a = source[at + 1];
+                break;
+            }
+            case D3DFMT_X4R4G4B4: {
+                const value = source[sourceOffset + i * 2] |
+                    (source[sourceOffset + i * 2 + 1] << 8);
+                r = ((value >>> 8) & 0xf) * 17;
+                g = ((value >>> 4) & 0xf) * 17;
+                b = (value & 0xf) * 17;
+                a = 0xff;
+                break;
+            }
+            case D3DFMT_A8B8G8R8:
+            case D3DFMT_X8B8G8R8: {
+                const at = sourceOffset + i * 4;
+                r = source[at]; g = source[at + 1]; b = source[at + 2];
+                a = format === D3DFMT_A8B8G8R8 ? source[at + 3] : 0xff;
+                break;
+            }
             case D3DFMT_L8:
                 r = g = b = source[sourceOffset + i];
                 a = 0xff;
                 break;
             case D3DFMT_A8:
-                r = g = b = 0xff;
+                // A8 is the sole D3D9 format whose missing colour channels
+                // default to zero rather than one.
+                r = g = b = 0;
                 a = source[sourceOffset + i];
                 break;
+            case D3DFMT_A8L8: {
+                const at = sourceOffset + i * 2;
+                r = g = b = source[at]; a = source[at + 1];
+                break;
+            }
+            case D3DFMT_A4L4: {
+                const value = source[sourceOffset + i];
+                r = g = b = (value & 0xf) * 17;
+                a = (value >>> 4) * 17;
+                break;
+            }
+            case D3DFMT_V8U8: {
+                const at = sourceOffset + i * 2;
+                r = source[at]; g = source[at + 1]; b = a = 0x7f;
+                break;
+            }
+            case D3DFMT_Q8W8V8U8: {
+                const at = sourceOffset + i * 4;
+                r = source[at]; g = source[at + 1];
+                b = source[at + 2]; a = source[at + 3];
+                break;
+            }
             default:
                 r = g = b = a = 0;
                 break;
@@ -862,6 +1140,27 @@
 
     // The vertex block. `source` names what fills the field; writeFixedVertex-
     // Uniforms below is the single place that knows how.
+    // D3D9 rasterises with the sample point at a pixel's integer corner; WebGPU,
+    // like D3D10 and everything after it, samples at the pixel centre -- half a
+    // pixel further along both axes. A D3D9 title blitting UI 1:1 has already
+    // subtracted that half pixel itself (the "Directly Mapping Texels to Pixels"
+    // adjustment every 2000s-era engine carries), so replaying its geometry
+    // unchanged puts every sample exactly on a texel boundary and bilinear
+    // filtering returns the mean of two texels. 3D art does not care -- nothing
+    // in it is pixel-aligned to begin with -- but 12px CJK glyphs turn to mush,
+    // which is exactly the split Kart Rider showed: a clean track and an
+    // unreadable shop.
+    //
+    // Adding the half pixel back in clip space, scaled by w so it stays half a
+    // pixel at any depth, is what wined3d's posFixup and DXVK's half-pixel
+    // offset both do. Screen y grows downward while NDC y grows upward, hence
+    // the sign flip on the second component.
+    const HALF_PIXEL_OFFSET_BODY =
+        "    result.position = vec4<f32>(\n" +
+        "        result.position.x + result.position.w / uniforms.viewport.x,\n" +
+        "        result.position.y - result.position.w / uniforms.viewport.y,\n" +
+        "        result.position.zw);";
+
     function fixedVertexUniformLayout(signature) {
         const fields = [
             { name: "world_view_projection", type: "mat4x4<f32>", bytes: 64 },
@@ -1007,12 +1306,25 @@
         // XYZRHW ("screen") vertices arrive already in viewport pixel space and
         // bypass the world/view/projection chain entirely. D3D9 also treats
         // them as already lit, which is why lighting is forced off for them.
-        const positionBody = signature.positionType === "screen"
+        // XYZRHW ("screen") coordinates are absolute render-target pixels, not
+        // pixels relative to the viewport -- so the viewport's origin has to
+        // come off before normalising, because setViewport puts it back when it
+        // maps NDC into the viewport rect. Omitting it made the two cancel only
+        // for a viewport at 0,0, which is every full-screen UI pass and hid the
+        // bug completely. Kart Rider draws its shop item previews through
+        // 110x109 viewports at x=368..636, and pre-transformed geometry there
+        // landed several viewport-widths outside the box and was clipped away:
+        // the panels whose contents are entirely pre-transformed came out
+        // empty, while the one item drawn from world-space geometry rendered
+        // perfectly. Same fix as wined3d's transformed-position projection
+        // matrix, which carries the -2x/w term for exactly this reason.
+        const positionBody = (signature.positionType === "screen"
             ? `    let viewport = uniforms.viewport;
-    let ndc_x = (${position}.x / viewport.x) * 2.0 - 1.0;
-    let ndc_y = 1.0 - (${position}.y / viewport.y) * 2.0;
+    let ndc_x = ((${position}.x - viewport.z) / viewport.x) * 2.0 - 1.0;
+    let ndc_y = 1.0 - ((${position}.y - viewport.w) / viewport.y) * 2.0;
     result.position = vec4<f32>(ndc_x, ndc_y, ${position}.z, 1.0);`
-            : `    result.position = uniforms.world_view_projection * ${position};`;
+            : `    result.position = uniforms.world_view_projection * ${position};`)
+            + "\n" + HALF_PIXEL_OFFSET_BODY;
 
         // View space is where D3D9 lights live and where the camera-space
         // coordinate generation modes are defined, so one block serves both.
@@ -1639,6 +1951,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 uniformSlotReuses: 0, uniformRingOverflows: 0,
                 unsupportedCommands: 0, malformedBatches: 0,
                 droppedDraws: 0,
+                guestReports: 0,
                 texturesCreated: 0, textureUploads: 0, textureBytesUploaded: 0,
                 texturePreviewsSkipped: 0,
                 drawsWithTexture: 0, drawsWithFallbackTexture: 0,
@@ -1688,6 +2001,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 drawsWithTexCoordIndex: 0, drawsWithTextureTransform: 0,
                 drawsWithUnmappedBlend: 0, drawsWithUnappliedFog: 0,
                 drawsWithUnappliedLighting: 0,
+                drawsWithUnappliedVertexBlend: 0,
                 programmableDraws: 0, drawsSkippedForBadShader: 0,
                 drawsWithCompactVertexInputs: 0,
                 constantUploadBytes: 0,
@@ -1989,9 +2303,20 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
         createDeviceState(handle) {
             return {
                 handle,
+                // Where the guest's window is on the guest desktop, resent on
+                // every Present so the page can place the overlay canvas.
+                // Deliberately NOT the back buffer's size: emit_present_and_flush
+                // fills width/height from GetClientRect, and a windowed game's
+                // client area is smaller than the back buffer it hosts.
                 surface: { hwnd: 0, x: 0, y: 0, width: 0, height: 0,
                     visible: true, sessionKey: null },
-                viewport: { x: 0, y: 0, width: 1, height: 1 },
+                // What the guest asked for at CreateDevice/Reset, and therefore
+                // the real size of the swap-chain colour attachment and of the
+                // auto depth target created beside it.
+                backBufferWidth: 0,
+                backBufferHeight: 0,
+                viewport: { x: 0, y: 0, width: 1, height: 1,
+                    minZ: 0, maxZ: 1 },
                 transforms: new Map([
                     [D3DTS_VIEW, IDENTITY4x4], [D3DTS_PROJECTION, IDENTITY4x4],
                     [D3DTS_WORLD, IDENTITY4x4],
@@ -2075,6 +2400,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 [OP_SET_DEPTH_STENCIL_SURFACE]: this.onSetDepthStencilSurface,
                 [OP_STRETCH_RECT]: this.onStretchRect,
                 [OP_COLOR_FILL]: this.onColorFill,
+                [OP_GUEST_LOG]: this.onGuestLog,
                 [OP_CREATE_VERTEX_DECLARATION]: this.onCreateVertexDeclaration,
                 [OP_CREATE_VERTEX_SHADER]: this.onCreateVertexShader,
                 [OP_CREATE_PIXEL_SHADER]: this.onCreatePixelShader,
@@ -2165,8 +2491,10 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             // differ ("depth stencil attachment size does not match ...").
             this.discardFrame();
             const state = this.deviceState(handle);
-            state.viewport = { x: 0, y: 0, width, height };
+            state.viewport = { x: 0, y: 0, width, height, minZ: 0, maxZ: 1 };
             state.surface = { hwnd, x, y, width, height, visible: true, sessionKey: null };
+            state.backBufferWidth = width;
+            state.backBufferHeight = height;
             this.resizeCanvasIfNeeded(width, height);
             this.ensureDepthTarget(state, width, height, enableAutoDepth !== 0);
             this.notifySurface(state, "create");
@@ -2185,8 +2513,10 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             if (oldState) this.retireGPUObject(oldState.depthTexture);
             this.devices.delete(oldHandle);
             const state = this.deviceState(newHandle);
-            state.viewport = { x: 0, y: 0, width, height };
+            state.viewport = { x: 0, y: 0, width, height, minZ: 0, maxZ: 1 };
             state.surface = { hwnd, x, y, width, height, visible: true, sessionKey: null };
+            state.backBufferWidth = width;
+            state.backBufferHeight = height;
             this.resizeCanvasIfNeeded(width, height);
             this.ensureDepthTarget(state, width, height, enableAutoDepth !== 0);
             this.notifySurface(state, "reset");
@@ -2195,6 +2525,24 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
         resizeCanvasIfNeeded(width, height) {
             if (this.canvas.width !== width) this.canvas.width = width;
             if (this.canvas.height !== height) this.canvas.height = height;
+        }
+
+        // The swap-chain colour attachment is context.getCurrentTexture(), which
+        // is the canvas, which resizeCanvasIfNeeded sized to the back buffer.
+        // Reading state.surface here instead was a real defect: Present rewrites
+        // state.surface with the window's client rect every frame, so a windowed
+        // game reported a back buffer 13 rows shorter than the auto depth target
+        // created with it (Kart Rider: 800x587 against 800x600). The pass then
+        // looked mismatched and dropped depth, which turns off depth testing for
+        // the entire game rather than for anything the app actually did.
+        backBufferWidthOf(state) {
+            return state.backBufferWidth || this.canvas.width ||
+                state.surface.width || 1;
+        }
+
+        backBufferHeightOf(state) {
+            return state.backBufferHeight || this.canvas.height ||
+                state.surface.height || 1;
         }
 
         // Creates (or drops) the device's auto depth-stencil target. D3D9
@@ -2540,7 +2888,6 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 // WebGPU expresses a clear only as a pass's loadOp.
                 let pass = null;
                 let openKey = null;
-                let scissorActive = false;
                 const beginPass = (targets, clearColor, clearDepthStencil) => {
                     const descriptor = {
                         colorAttachments: targets.colors.map(color => ({
@@ -2594,7 +2941,6 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 for (const op of frame.ops) {
                     if (op.kind === "copy") {
                         if (pass) { pass.end(); pass = null; openKey = null; }
-                        scissorActive = false;
                         encoder.copyTextureToTexture(op.source, op.destination,
                             op.size);
                         continue;
@@ -2602,14 +2948,12 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                     if (op.kind === "blit") {
                         // A blit is its own pass against its own attachment.
                         if (pass) { pass.end(); pass = null; openKey = null; }
-                        scissorActive = false;
                         const transient = this.replayBlit(encoder, op, swapView);
                         if (transient) frame.transientBuffers.push(transient);
                         continue;
                     }
                     if (op.kind === "rect-clear") {
                         if (pass) { pass.end(); pass = null; openKey = null; }
-                        scissorActive = false;
                         const transient = this.replayRectClear(encoder, op,
                             swapView, swapSrgbView);
                         if (transient) frame.transientBuffers.push(transient);
@@ -2617,7 +2961,6 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                     }
                     if (op.kind === "color-fill") {
                         if (pass) { pass.end(); pass = null; openKey = null; }
-                        scissorActive = false;
                         const transient = this.replayColorFill(encoder, op);
                         if (transient) frame.transientBuffers.push(transient);
                         continue;
@@ -2634,33 +2977,31 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                                 ...(op.clearsStencil ? { stencil: op.stencil } : {}),
                             } : null);
                         openKey = op.targets.key;
-                        scissorActive = false;
                         continue;
                     }
                     if (!pass || openKey !== op.targets.key) {
                         if (pass) pass.end();
                         pass = beginPass(op.targets, null, null);
                         openKey = op.targets.key;
-                        scissorActive = false;
                     }
                     pass.setPipeline(op.pipeline);
                     pass.setBindGroup(0, op.bindGroup, op.dynamicOffsets || []);
                     pass.setBlendConstant(op.blendConstant);
                     pass.setStencilReference(op.stencilReference);
                     pass.setViewport(op.viewport.x, op.viewport.y,
-                            op.viewport.width, op.viewport.height, 0, 1);
-                    if (op.scissor) {
-                        pass.setScissorRect(op.scissor.x, op.scissor.y,
-                                op.scissor.width, op.scissor.height);
-                        scissorActive = true;
-                    } else if (scissorActive) {
-                        // Scissor is dynamic pass state. If the previous draw
-                        // enabled it, omitting this call would leak that old rect
-                        // into a draw for which D3DRS_SCISSORTESTENABLE is off.
-                        pass.setScissorRect(0, 0, op.targets.width,
-                                op.targets.height);
-                        scissorActive = false;
-                    }
+                            op.viewport.width, op.viewport.height,
+                            op.viewport.minZ, op.viewport.maxZ);
+                    // A D3D9 viewport clips; a WebGPU one only maps NDC to
+                    // pixels. Without a matching scissor, geometry an app
+                    // expected the viewport to cut off is drawn across the whole
+                    // target instead -- which is why the clip rect is the
+                    // viewport intersected with D3DRS_SCISSORTESTENABLE's rect
+                    // (D3D9 applies both), not just the latter. Scissor is
+                    // dynamic pass state, so it is re-issued for every draw:
+                    // omitting it would leak the previous draw's rect.
+                    const clip = intersectRects(op.viewport, op.scissor,
+                            op.targets.width, op.targets.height);
+                    pass.setScissorRect(clip.x, clip.y, clip.width, clip.height);
                     for (let slot = 0; slot < op.vertexBuffers.length; ++slot) {
                         const binding = op.vertexBuffers[slot];
                         pass.setVertexBuffer(slot, binding.buffer, binding.offset);
@@ -3064,6 +3405,15 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 console.warn("[d3d9-webgpu] unsupported texture format", format);
                 return;
             }
+            if (isTarget && !isDepth && !isRenderableGPUFormat(gpuFormat)) {
+                ++this.stats.texturesRejected;
+                this.warnOnce("non-renderable-d3d9-target-" + format,
+                    "a texture was marked as a D3D9 render target but its " +
+                    "WebGPU storage format cannot be a render attachment; " +
+                    "the resource is rejected instead of creating an invalid " +
+                    "GPU descriptor", { format, gpuFormat });
+                return;
+            }
             const srgbFormat = isDepth ? null : srgbSiblingOf(gpuFormat);
             const textureDescriptor = {
                 label: isDepth ? "D3D9 depth surface"
@@ -3080,7 +3430,8 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                     // be a StretchRect destination needs the attachment usage.
                     // BCn cannot be an attachment at all, which is also why a
                     // StretchRect into a compressed texture stays unsupported.
-                    ((isTarget || (!isDepth && !isCompressedFormat(format)))
+                    ((!isDepth && isRenderableGPUFormat(gpuFormat) &&
+                        (isTarget || !isCompressedFormat(format)))
                         ? TEXTURE_USAGE_RENDER_ATTACHMENT : 0),
             };
             const gpuTexture = this.createTextureOrNull(textureDescriptor, format);
@@ -3094,6 +3445,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             this.resources.set(handle, {
                 kind: RESOURCE_TEXTURE_2D, textureType: "2d",
                 gpuTexture, gpuFormat, srgbFormat, format, usage, width, height,
+                gpuBytesPerTexel: gpuBytesPerTexel(format),
                 textureDescriptor,
                 levelCount: Math.max(1, levelCount),
                 // A mip level the guest never uploads has undefined contents.
@@ -3126,7 +3478,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 bytesPerRow = Math.ceil(width / 4) * blockBytes;
                 rowsPerImage = Math.ceil(height / 4);
             } else {
-                bytesPerRow = width * 4;
+                bytesPerRow = width * resource.gpuBytesPerTexel;
                 rowsPerImage = height;
             }
             shadow = { level, layer, width, height, bytesPerRow, rowsPerImage,
@@ -3140,11 +3492,13 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             const shadow = this.textureShadowFor(resource, level, layer,
                 compressed);
             const blockBytes = compressed
-                ? (resource.format === D3DFMT_DXT1 ? 8 : 16) : 4;
+                ? (resource.format === D3DFMT_DXT1 ? 8 : 16)
+                : resource.gpuBytesPerTexel;
             const destinationX = compressed ? Math.floor(x / 4) : x;
             const destinationY = compressed ? Math.floor(y / 4) : y;
             const rowBytes = compressed
-                ? Math.ceil(width / 4) * blockBytes : width * 4;
+                ? Math.ceil(width / 4) * blockBytes
+                : width * resource.gpuBytesPerTexel;
             const rowCount = compressed ? Math.ceil(height / 4) : height;
             for (let row = 0; row < rowCount; ++row) {
                 const destinationOffset =
@@ -3187,7 +3541,10 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                         origin: { x: 0, y: 0, z: shadow.layer } }, shadow.data,
                         { bytesPerRow: shadow.bytesPerRow,
                             rowsPerImage: shadow.rowsPerImage },
-                        { width: shadow.width, height: shadow.height,
+                        { width: blockAlignedCopyExtent(shadow.width,
+                                shadow.compressed),
+                            height: blockAlignedCopyExtent(shadow.height,
+                                shadow.compressed),
                             depthOrArrayLayers: 1 });
                     this.stats.textureFullCopyRenameBytes += shadow.data.length;
                 }
@@ -3222,8 +3579,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             const resource = this.resources.get(handle);
             if (!resource || !resource.gpuTexture) return;
             const source = new Uint8Array(bytes.buffer, bytes.byteOffset + dataOffset, dataBytes);
-            const compressed = resource.format === D3DFMT_DXT1 ||
-                resource.format === D3DFMT_DXT3 || resource.format === D3DFMT_DXT5;
+            const compressed = isCompressedFormat(resource.format);
             // Bind groups are built eagerly and retain the old view. Renaming
             // here therefore preserves pixels for draws already recorded in
             // this frame while later draws bind the replacement texture.
@@ -3234,15 +3590,17 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             let payload = source;
             let bytesPerRow = rowPitch;
             if (!compressed) {
-                // Expand to tightly-packed RGBA8 (see formatToGPU()).
-                const expanded = new Uint8Array(width * height * 4);
-                const srcBytesPerTexel = rowPitch / width;
+                const gpuBpp = resource.gpuBytesPerTexel;
+                // Expand to the tightly packed WebGPU representation chosen
+                // by formatToGPU(): RGBA8 UNORM/SNORM or RGBA16F.
+                const expanded = new Uint8Array(width * height * gpuBpp);
                 for (let row = 0; row < height; ++row) {
-                    expandRowToRGBA8(resource.format, source,
-                        row * rowPitch, width, expanded, row * width * 4);
+                    expandRowToGPU(resource.format, source,
+                        row * rowPitch, width, expanded,
+                        row * width * gpuBpp);
                 }
                 payload = expanded;
-                bytesPerRow = width * 4;
+                bytesPerRow = width * gpuBpp;
             }
             this.updateTextureShadow(resource, level, z, x, y, width, height,
                 payload, bytesPerRow, compressed);
@@ -3263,7 +3621,8 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             // usually live in a larger atlas, so the one texture worth looking
             // at was the one never captured. 256x256 covers those at a bounded
             // total cost (previewBudget below).
-            if (!compressed && level === 0 && z === 0 && width <= 256 &&
+            if (!compressed && resource.gpuFormat === "rgba8unorm" &&
+                    level === 0 && z === 0 && width <= 256 &&
                     height <= 256 && x === 0 && y === 0) {
                 const previewBytes = width * height * 4;
                 if (!resource.preview) {
@@ -3294,7 +3653,9 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 { texture: resource.gpuTexture, mipLevel: level, origin: { x, y, z } },
                 payload,
                 { bytesPerRow, rowsPerImage: compressed ? Math.ceil(height / 4) : height },
-                { width, height, depthOrArrayLayers: 1 });
+                { width: blockAlignedCopyExtent(width, compressed),
+                    height: blockAlignedCopyExtent(height, compressed),
+                    depthOrArrayLayers: 1 });
         }
 
         // ---- render targets, cube textures and blits (M3/M4) ----
@@ -3331,6 +3692,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 kind: RESOURCE_TEXTURE_CUBE, textureType: "cube",
                 gpuTexture, gpuFormat, srgbFormat,
                 format, usage, width: edge, height: edge, layerCount: 6,
+                gpuBytesPerTexel: gpuBytesPerTexel(format),
                 textureDescriptor,
                 levelCount,
                 // Keyed by level*6+face, so the incomplete-mip warning counts a
@@ -3409,8 +3771,8 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             const colors = [];
             const wantsSRGB = (state.renderStates.get(D3DRS_SRGBWRITEENABLE) || 0)
                 !== 0;
-            let width = state.viewport.width || state.surface.width || 1;
-            let height = state.viewport.height || state.surface.height || 1;
+            let width = state.viewport.width || this.backBufferWidthOf(state);
+            let height = state.viewport.height || this.backBufferHeightOf(state);
             let key = "";
             for (let index = 0; index < MAX_RENDER_TARGETS; ++index) {
                 const handle = state.renderTargets[index];
@@ -3420,8 +3782,8 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                             ? this.swapchainSrgbFormat : this.format;
                         colors.push({ view: null, format,
                             swapchain: true });
-                        width = state.surface.width || width;
-                        height = state.surface.height || height;
+                        width = this.backBufferWidthOf(state);
+                        height = this.backBufferHeightOf(state);
                         key += "bb" + (format === this.format ? "" : "s") + ";";
                     }
                     continue;
@@ -3438,14 +3800,26 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                     if (index === 0) return null;
                     continue;
                 }
+                const resourceFormat = resource.gpuFormat ||
+                    formatToGPU(resource.format);
+                if (!isRenderableGPUFormat(resourceFormat)) {
+                    this.warnOnce("rt-non-renderable-" + index,
+                        "a render target slot names a texture whose WebGPU " +
+                        "format cannot be a render attachment; draws into it " +
+                        "are dropped rather than submitting an invalid pass",
+                        { index, handle, format: resource.format,
+                            gpuFormat: resourceFormat });
+                    if (index === 0) return null;
+                    continue;
+                }
                 const level = state.renderTargetLevels[index] || 0;
                 const srgb = wantsSRGB && !!resource.srgbFormat;
                 if (wantsSRGB && !resource.srgbFormat)
                     ++this.stats.srgbWriteUnavailable;
                 const targetView = this.targetViewFor(resource, level, srgb);
                 colors.push({ view: targetView,
-                    format: srgb ? resource.srgbFormat : (resource.gpuFormat ||
-                        formatToGPU(resource.format)), swapchain: false,
+                    format: srgb ? resource.srgbFormat : resourceFormat,
+                    swapchain: false,
                     resource });
                 if (index === 0) {
                     width = Math.max(1, resource.width >> level);
@@ -3597,16 +3971,26 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 ++this.stats.blits;
                 return;
             }
+            if (destination && !isRenderableGPUFormat(destinationFormat)) {
+                ++this.stats.blitsSkipped;
+                this.warnOnce("stretchrect-non-renderable-destination",
+                    "a scaled or format-converting StretchRect targets a " +
+                    "texture whose WebGPU format cannot be a render " +
+                    "attachment; only a same-size same-format GPU copy is " +
+                    "supported", { destinationHandle,
+                        format: destination.format, destinationFormat });
+                return;
+            }
 
             // Source UVs are normalised against the *level* being read, not the
             // base level, or a StretchRect from mip 2 samples a quarter of the
             // image it asked for.
             const sourceWidth = source
                 ? Math.max(1, source.width >> sourceLevel)
-                : (state.surface.width || this.canvas.width || 1);
+                : this.backBufferWidthOf(state);
             const sourceHeight = source
                 ? Math.max(1, source.height >> sourceLevel)
-                : (state.surface.height || this.canvas.height || 1);
+                : this.backBufferHeightOf(state);
             const op = {
                 kind: "blit",
                 sourceView: source
@@ -3940,6 +4324,37 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
 
         // A full ColorFill is a clear pass; a partial one is a viewport-limited
         // draw. This keeps the pixels outside the requested RECT intact.
+        // A refusal or failure the guest DLL is reporting. This is the only
+        // guest-to-host traffic in the protocol that is not a command, and it
+        // exists because everything the guest turns down used to be invisible
+        // from the page: the browser console sees a clean stream of valid
+        // commands, and the guest's own trace file is inside a VM whose
+        // filesystem is not reachable from here. The guest deduplicates by
+        // exact text, so each distinct message arrives once no matter how many
+        // frames it repeats on.
+        onGuestLog(bytes, view, offset, length) {
+            const severity = view.getUint32(offset, true);
+            const textBytes = view.getUint32(offset + 4, true);
+            if (8 + textBytes > length) {
+                ++this.stats.malformedBatches;
+                throw new Error("D9WG guest log text overruns the command");
+            }
+            let text = "";
+            for (let index = 0; index < textBytes; ++index)
+                text += String.fromCharCode(bytes[offset + 8 + index]);
+            ++this.stats.guestReports;
+            (this.guestReports || (this.guestReports = [])).push(text);
+            // Severity picks the console channel only. The identification
+            // line the guest sends at startup is info: its job is to make a
+            // later silence mean "nothing was refused" rather than "the DLL in
+            // the disk image is too old to say anything".
+            const report = severity === GUEST_LOG_SEVERITY_FAILED
+                ? console.error
+                : (severity === GUEST_LOG_SEVERITY_INFO
+                    ? console.log : console.warn);
+            report.call(console, "[d3d9-guest] " + text);
+        }
+
         onColorFill(bytes, view, offset) {
             const resource = this.resources.get(view.getUint32(offset + 4, true));
             const level = view.getUint32(offset + 8, true);
@@ -4017,8 +4432,12 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             let color1IsBGRA = false;
             let hasNormal = false;
             let hasPointSize = false;
+            let blendElements = 0;
             const texCoordSets = [];
             for (const element of elements) {
+                if (element.usage === DECLUSAGE_BLENDWEIGHT ||
+                        element.usage === DECLUSAGE_BLENDINDICES)
+                    ++blendElements;
                 if (element.usage === DECLUSAGE_POSITION && element.usageIndex === 0)
                     positionType = "world";
                 else if (element.usage === DECLUSAGE_POSITIONT && element.usageIndex === 0)
@@ -4042,6 +4461,23 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                     texCoordSets.push(element.usageIndex);
             }
             if (!positionType) return null;
+            // D3D9's fixed-function vertex blending (D3DRS_VERTEXBLEND with
+            // D3DTS_WORLDMATRIX(1..3)) is not implemented: only D3DTS_WORLD is
+            // ever consumed. A declaration carrying BLENDWEIGHT/BLENDINDICES is
+            // therefore drawn with every vertex on world matrix 0, which
+            // collapses or contorts a skinned mesh instead of posing it -- and
+            // silently, since nothing else in the pipeline can tell. Say so:
+            // "the character is missing but its shadow is there" is otherwise
+            // indistinguishable from a dozen other causes.
+            if (blendElements) {
+                ++this.stats.drawsWithUnappliedVertexBlend;
+                this.warnOnce("ff-vertex-blend",
+                    "a fixed-function draw carries blend weights/indices, but " +
+                    "fixed-function vertex blending is not implemented, so " +
+                    "every vertex is transformed by world matrix 0 alone; a " +
+                    "skinned mesh drawn this way collapses rather than posing",
+                    { blendElements, positionType });
+            }
             texCoordSets.sort((a, b) => a - b);
             return { positionType, hasColor, colorIsBGRA, hasColor1,
                 color1IsBGRA, hasNormal, hasPointSize, texCoordSets,
@@ -4435,11 +4871,24 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
         onSetViewport(bytes, view, offset) {
             const deviceHandle = view.getUint32(offset, true);
             const state = this.deviceState(deviceHandle);
+            // MinZ/MaxZ have been on the wire since M1 (D9WGSetViewport) and
+            // used to be dropped here, with recordDraw hardcoding 0..1 into
+            // setViewport. D3D9's viewport depth range is not decoration: an app
+            // that composites a 3D object into a 2D panel routinely restricts it
+            // so the object cannot collide in depth with the interface around
+            // it, and discarding that puts the object at its natural depth --
+            // where whatever the app expected to be in front of it no longer is.
+            const minZ = view.getFloat32(offset + 20, true);
+            const maxZ = view.getFloat32(offset + 24, true);
             state.viewport = {
                 x: view.getUint32(offset + 4, true),
                 y: view.getUint32(offset + 8, true),
                 width: view.getUint32(offset + 12, true),
                 height: view.getUint32(offset + 16, true),
+                // A device that never calls SetViewport, and any guest that
+                // sends zeros, still has to mean the D3D9 default range.
+                minZ: Number.isFinite(minZ) ? minZ : 0,
+                maxZ: Number.isFinite(maxZ) && maxZ !== 0 ? maxZ : 1,
             };
         }
 
@@ -4658,7 +5107,7 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 bytes.byteOffset + dataOffset, dataBytes);
             const rgba = new Uint8Array(width * height * 4);
             for (let row = 0; row < height; ++row)
-                expandRowToRGBA8(D3DFMT_A8R8G8B8, source, row * width * 4,
+                expandRowToGPU(D3DFMT_A8R8G8B8, source, row * width * 4,
                     width, rgba, row * width * 4);
             this.device.queue.writeTexture({ texture: this.cursor.texture },
                 rgba, { bytesPerRow: width * 4, rowsPerImage: height },
@@ -5651,6 +6100,11 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             const viewport = at("viewport");
             floats[viewport] = state.viewport.width || 1;
             floats[viewport + 1] = state.viewport.height || 1;
+            // zw carry the viewport's origin, which the XYZRHW path subtracts:
+            // D3D9 pre-transformed coordinates are absolute render-target
+            // pixels, not viewport-relative ones.
+            floats[viewport + 2] = state.viewport.x || 0;
+            floats[viewport + 3] = state.viewport.y || 0;
 
             if (layout.byName.has("world_view")) {
                 floats.set(worldView, at("world_view"));
@@ -5816,6 +6270,16 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             for (const item of reflection.boolDefaults) {
                 if (item.register >= bools.length) continue;
                 bools[item.register] = item.value ? 1 : 0;
+            }
+            // Every translated vertex shader reads this for the D3D9 half-pixel
+            // offset (see the o_position fixup in d3d9_shader_pipeline.js). The
+            // viewport is what maps clip space to pixels, so it -- not the
+            // render target extent -- is what a half pixel is measured against.
+            if (reflection.viewportOffset >= 0 && state) {
+                const values = new Float32Array(backing, byteOffset);
+                const slot = reflection.viewportOffset / 4;
+                values[slot] = Math.max(1, state.viewport.width || 1);
+                values[slot + 1] = Math.max(1, state.viewport.height || 1);
             }
             if (reflection.pointExpansion && state) {
                 const values = new Float32Array(backing, byteOffset);

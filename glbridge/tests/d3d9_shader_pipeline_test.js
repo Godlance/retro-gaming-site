@@ -224,7 +224,13 @@ test("vs_1_1 transform: parses, emits a vertex entry point and a WVP uniform", (
     ]);
     assert.ok(wgsl.includes("@location(0) in0: vec4<f32>"), "v0 not bound to location 0");
     assert.ok(wgsl.includes("@location(1) in1: vec4<f32>"), "v1 not bound to location 1");
-    assert.ok(wgsl.includes("result.position = o_position;"), "oPos not routed to @builtin(position)");
+    // oPos reaches @builtin(position) through the D3D9 half-pixel offset: D3D9
+    // samples a pixel at its integer corner, WebGPU at its centre, and a title
+    // that pixel-aligns its output has already subtracted that half pixel.
+    assert.ok(wgsl.includes("o_position.x + o_position.w / d9c.viewport.x"),
+        "oPos not routed to @builtin(position) with the half-pixel offset");
+    assert.ok(wgsl.includes("o_position.y - o_position.w / d9c.viewport.y"),
+        "the half-pixel offset must negate y: screen y grows downward");
     // oT0 is TEXCOORD0, which the fixed varying table puts at location 2.
     assert.ok(wgsl.includes("o_varying2 = "), "oT0 did not land in the TEXCOORD0 varying");
     assert.strictEqual(reflection.samplers.length, 0);
@@ -620,9 +626,36 @@ test("uniform sizing: the reflection describes the exact packed layout", () => {
     assert.strictEqual(reflection.floatRegionBytes, 256 * 16);
     assert.strictEqual(reflection.intRegionBytes, 16);
     assert.strictEqual(reflection.boolRegionBytes, 16);
+    const registerBytes = reflection.floatRegionBytes +
+        reflection.intRegionBytes + reflection.boolRegionBytes;
+    // A vertex shader carries one extra vec4 past the register file: the
+    // viewport the half-pixel offset is measured against.
+    assert.strictEqual(reflection.viewportOffset, registerBytes);
+    assert.strictEqual(reflection.uniformBytes, registerBytes + 16);
+});
+
+test("a pixel shader carries no viewport uniform", () => {
+    const { reflection } = compileOk(PS_2_0_TEXTURED, "ps_2_0 textured");
+    assert.strictEqual(reflection.viewportOffset, -1,
+        "the half-pixel offset is a vertex-stage concern only");
     assert.strictEqual(reflection.uniformBytes,
         reflection.floatRegionBytes + reflection.intRegionBytes +
         reflection.boolRegionBytes);
+});
+
+// Point-sprite expansion appends its own fields, which have to start after the
+// viewport rather than on top of it.
+test("point-sprite uniforms sit past the viewport, not on it", () => {
+    const result = pipeline.compileShader(tokens(VS_1_1_TRANSFORM),
+        { pointExpansion: true });
+    assert.ok(result.ok, result.error);
+    const reflection = result.reflection;
+    const registerBytes = reflection.floatRegionBytes +
+        reflection.intRegionBytes + reflection.boolRegionBytes;
+    assert.strictEqual(reflection.viewportOffset, registerBytes);
+    assert.strictEqual(reflection.pointViewportOffset, registerBytes + 16);
+    assert.strictEqual(reflection.pointParamsOffset, registerBytes + 32);
+    assert.strictEqual(reflection.uniformBytes, registerBytes + 48);
 });
 
 test("M5 compact skinning inputs are converted to D3D9 float4 registers", () => {

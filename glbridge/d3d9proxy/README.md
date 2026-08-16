@@ -133,6 +133,128 @@ implementation. Implemented:
   fallback is now enabled by default because the browser cursor is hidden; set
   `D9WG_GDI_CURSOR=0` only for a title that intentionally draws its own cursor
   geometry.
+- **Kart Rider texture-surface lifetime fix:** a surface from
+  `IDirect3DTexture9::GetSurfaceLevel` is a sub-object of its texture, not a
+  free-standing COM object. The texture now owns one surface per level
+  (`D9TextureLevel::level_surface`), returns that same pointer from every
+  `GetSurfaceLevel` for the level, forwards the surface's `AddRef`/`Release` to
+  the texture's refcount, and frees the surface only in `texture_release`.
+  Allocating a self-owning surface per call instead was a crash rather than a
+  leak: Kart Rider uploads with `GetSurfaceLevel`, `LockRect`, `Release`,
+  `UnlockRect`, dropping its surface reference while it still holds the texture
+  and then using the pointer it kept — which is legal, and which the old code
+  answered by freeing the object, so `UnlockRect` read a zeroed vtable and
+  called through a null pointer during the loading screen.
+  `../sample/d3d9_surface_lifetime_test.c` covers the sequence, plus the
+  pointer identity that apps rely on to tell two level surfaces apart.
+  `../d3d8proxy/d3d8_proxy.c`'s `texture_get_surface_level` still has the
+  original per-call behaviour.
+- **Kart Rider BCn mip-tail fix (host side):** `writeTexture` now rounds a
+  block-compressed copy extent up to the 4x4 block grid. WebGPU measures such a
+  copy in whole blocks and a mip level's physical extent is its logical size
+  rounded up, so the 2x2 and 1x1 tail of a DXT chain has to be written as a full
+  block. Passing the logical size failed validation as an *uncaptured device
+  error* rather than an exception, so the only symptom was the smallest mips
+  sampling as garbage behind several hundred console errors.
+- **Kart Rider back-buffer size fix (host side):** the swap-chain colour
+  attachment is sized from what the guest asked for at `CreateDevice`/`Reset`
+  (`deviceState.backBufferWidth/Height`), not from `deviceState.surface`.
+  `emit_present_and_flush` fills the `PRESENT` width/height from
+  `GetClientRect` so the page can place the overlay canvas; a windowed game's
+  client area is shorter than its back buffer (800x587 against 800x600 here).
+  Reading it as the render size made every back-buffer pass look like it
+  disagreed with the auto depth target, and the mismatch path then dropped
+  depth — depth testing off for the whole game, caused by a window title bar.
+- **Kart Rider half-pixel fix (host side):** every vertex stage now applies the
+  D3D9 half-pixel offset — `pos.x += pos.w / viewport.x`,
+  `pos.y -= pos.w / viewport.y` — in both the fixed-function generator
+  (`HALF_PIXEL_OFFSET_BODY`) and the DXSO translator's `o_position` fixup, the
+  latter reading a `viewport` uniform now present in every translated vertex
+  shader. D3D9 samples a pixel at its integer corner; WebGPU, like D3D10 and
+  everything after it, samples at the centre. A title that blits UI 1:1 has
+  already subtracted that half pixel itself (the "Directly Mapping Texels to
+  Pixels" adjustment), so replaying its geometry unchanged lands every sample
+  exactly on a texel boundary and bilinear filtering returns the mean of two
+  texels. 3D art does not care — none of it is pixel-aligned — but 12px CJK
+  glyphs turn to mush, which is the split Kart Rider showed: a clean track and
+  an unreadable shop. Same fix as wined3d's `posFixup` and DXVK's half-pixel
+  offset.
+
+- **Kart Rider viewport fix (host side):** a D3D9 viewport *clips*; WebGPU's
+  `setViewport` only maps NDC to pixels. Nothing else cut a draw off at the
+  viewport edge, so geometry an app restricted to a small panel with
+  `SetViewport` alone was drawn across the whole target. Every draw now sets a
+  clip rect (`intersectRects`) — the viewport intersected with
+  `D3DRS_SCISSORTESTENABLE`'s rect, since D3D9 applies both — clamped into the
+  attachment. The same call also stopped discarding the viewport's `MinZ`/`MaxZ`,
+  which `D9WGSetViewport` had carried since M1 while `recordDraw` hardcoded
+  `0, 1`: an app compositing a 3D object into a 2D panel routinely restricts the
+  depth range so the object cannot collide in depth with the interface around
+  it, and ignoring that puts the object at its natural depth instead.
+
+- **Kart Rider shop-panel fix (host side):** XYZRHW ("pre-transformed")
+  coordinates are absolute render-target pixels, not viewport-relative ones, so
+  the fixed-function screen path subtracts the viewport origin before
+  normalising — `setViewport` puts that origin back when it maps NDC into the
+  viewport rect, and doing both is what makes the round trip an identity. The
+  two cancelled out only for a viewport at 0,0, which is every full-screen UI
+  pass, so this stayed invisible until a title drew pre-transformed geometry
+  through a small offset viewport: Kart Rider renders each shop item preview
+  through a 110x109 viewport at x=368..636, and its pre-transformed geometry
+  landed several viewport-widths outside the box and was clipped away. The
+  panels whose contents were entirely pre-transformed came out empty, while the
+  one item built from world-space geometry rendered perfectly. That split is
+  what identified it, and it was only visible by counting pre-transformed draws
+  per viewport for one frame — a temporary probe, removed before release
+  because it walked every draw op and built strings on every present. If a
+  comparable symptom returns (geometry missing or mis-scaled only inside a
+  sub-viewport), re-adding that count in `finishFrame` is the shortest path.
+  Same correction as wined3d's transformed-position projection matrix, which
+  carries a `-2x/w` term for this reason.
+
+**Guest refusals now reach the browser console.** `D9WG_OP_GUEST_LOG` (opcode
+11) carries a short ASCII string from the guest DLL to the executor, which
+prints it as `[d3d9-guest] …`. The protocol only ever ran one way, so a call the
+guest turned down was invisible everywhere a developer can look: the console
+sees a clean stream of valid commands, and the guest's own trace file lives
+inside a VM whose filesystem the page cannot reach — the exact reason several
+"the picture is wrong" investigations here ran on guesswork. `host_log()` is
+compiled into the *ordinary* DLL, not just the diagnostic one (needing a special
+build to learn that a call was refused is most of the problem), and deduplicates
+by exact text so a failure inside a per-frame path costs one message rather than
+one per frame, capped at 48 distinct messages. It is deliberately not a general
+logging channel: only refusals and failures are sent — every `UNSUPPORTED()`
+site, `SetViewport` rejection, `CreateOffscreenPlainSurface`'s format
+restriction, and the `CreateTexture`/`CreateVertexBuffer`/`CreateIndexBuffer`
+failure paths. An executor too old to know the opcode counts it in
+`unsupportedCommands` and skips it, so a new DLL against a stale page degrades
+quietly instead of breaking.
+
+Every unimplemented entry point now traces `STUB <Method> -> D3DERR_INVALIDCALL`
+(see `UNSUPPORTED()`), including the ones that used to refuse in complete
+silence: `UpdateSurface`, `ProcessVertices`, `MultiplyTransform`,
+`CreateVolumeTexture`, `GetFrontBufferData`, `SetStreamSourceFreq`,
+`Surface::GetDC`/`ReleaseDC`, `GetCubeMapSurface`, clip planes, palettes and
+patches, plus `CreateOffscreenPlainSurface`'s deliberate cursor-format
+restriction. A silent `D3DERR_INVALIDCALL` is indistinguishable from "the app
+never called it" — from the host console, from the trace, from everywhere — and
+that blind spot is what left Kart Rider's missing shop art with no evidence at
+all to reason from: a picture that was wrong, an executor reporting clean frames
+and zero dropped draws, and nothing anywhere recording that the guest had been
+turned down. The D9WG protocol has no guest-to-host log channel, so these land
+in the diagnostic DLL's trace; `grep STUB` over a trace taken while reproducing
+names the APIs a title actually wanted in one step.
+
+Known gap worth naming because it renders wrong rather than failing:
+**fixed-function vertex blending** (`D3DRS_VERTEXBLEND` with
+`D3DTS_WORLDMATRIX(1..3)`) is unimplemented — only `D3DTS_WORLD` is consumed.
+A fixed-function declaration carrying `BLENDWEIGHT`/`BLENDINDICES` therefore has
+every vertex posed by world matrix 0, which collapses a skinned mesh instead of
+animating it. `fixedFunctionVertexSignature` now counts this as
+`drawsWithUnappliedVertexBlend` and warns once, so "the model is missing but its
+shadow is there" is attributable instead of being one of a dozen possible
+causes. The translated-shader skinning path (M5 `UBYTE4`/`SHORT2`/`SHORT4`/
+`UDEC3`/`DEC3N` inputs) is unaffected.
 
 Still unimplemented, each returning `D3DERR_INVALIDCALL` (or the closest
 matching real error) rather than pretending: volume textures

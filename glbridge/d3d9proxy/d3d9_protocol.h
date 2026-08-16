@@ -54,6 +54,21 @@ enum D9WGOpcode {
     D9WG_OP_STRETCH_RECT = 8,        /* M3 */
     D9WG_OP_COLOR_FILL = 9,          /* M3 */
     D9WG_OP_UPDATE_SURFACE = 10,     /* not before M2 */
+    /*
+     * Guest -> host diagnostics. The only direction this protocol ever carried
+     * was commands, so a call the guest DLL refused was invisible everywhere
+     * the developer can actually look: the browser console sees a clean stream
+     * of valid commands, and the guest's own trace file lives inside a VM whose
+     * filesystem is not reachable from the page. That gap repeatedly turned
+     * "the picture is wrong" into guesswork, because the one fact that would
+     * have ended it -- the app asked for something and was told no -- was
+     * written nowhere the developer could read.
+     *
+     * Deliberately not a general logging channel: only refusals and failures
+     * are sent, deduplicated in the guest so a per-frame failure costs one
+     * message rather than one per frame.
+     */
+    D9WG_OP_GUEST_LOG = 11,
 
     D9WG_OP_CREATE_BUFFER = 0x100,
     D9WG_OP_UPDATE_BUFFER = 0x101,
@@ -604,6 +619,22 @@ typedef struct D9WGColorFill {
     int32_t  right;
     int32_t  bottom;
 } D9WGColorFill;
+
+/*
+ * D9WG_OP_GUEST_LOG. `text_bytes` ASCII characters follow the header, not
+ * NUL-terminated. Severity is advisory: the host picks console.warn or
+ * console.error from it, nothing is gated on it.
+ */
+#define D9WG_LOG_SEVERITY_INFO    0u  /* identification, not a problem */
+#define D9WG_LOG_SEVERITY_REFUSED 1u  /* a call the guest DLL turned down */
+#define D9WG_LOG_SEVERITY_FAILED  2u  /* a call that should have worked but did not */
+#define D9WG_LOG_MAX_TEXT 240u
+
+typedef struct D9WGGuestLog {
+    uint32_t severity;
+    uint32_t text_bytes;
+    /* text_bytes of ASCII follow immediately. */
+} D9WGGuestLog;
 
 typedef struct D9WGDrawPrimitive {
     uint32_t device_handle;

@@ -1219,6 +1219,11 @@
             out.push("    f: array<vec4<f32>, " + floatCount + ">,");
             out.push("    i: array<vec4<i32>, " + intCount + ">,");
             out.push("    b: array<vec4<u32>, " + boolVectors + ">,");
+            if (kind === "vertex") {
+                // xy = render target size in pixels, for the D3D9 half-pixel
+                // offset applied to o_position below.
+                out.push("    viewport: vec4<f32>,");
+            }
             if (kind === "vertex" && this.options.pointExpansion) {
                 out.push("    point_viewport: vec4<f32>,");
                 out.push("    point_params: vec4<f32>,");
@@ -1395,7 +1400,18 @@
             // D3D9 clip space is z in [0, w]; WebGPU's is identical, so the
             // position needs no depth-range remap (unlike an OpenGL target,
             // which would need z = 2z - w here).
-            out.push("    result.position = o_position;");
+            //
+            // XY does need fixing up: D3D9 samples a pixel at its integer
+            // corner and WebGPU at its centre, half a pixel apart, and a title
+            // that aligns output to pixels has already subtracted that half
+            // pixel itself. Put it back, scaled by w so it stays half a pixel
+            // at any depth, with y negated because screen y grows downward
+            // while NDC y grows upward. Same fix as the fixed-function path's
+            // HALF_PIXEL_OFFSET_BODY, and as wined3d's posFixup.
+            out.push("    result.position = vec4<f32>(");
+            out.push("        o_position.x + o_position.w / d9c.viewport.x,");
+            out.push("        o_position.y - o_position.w / d9c.viewport.y,");
+            out.push("        o_position.zw);");
             for (let slot = 0; slot < VARYING_COUNT; ++slot)
                 out.push("    result.varying" + slot + " = o_varying" + slot + ";");
             if (this.options.pointExpansion) {
@@ -1531,6 +1547,12 @@
                 boolVectors * 16;
             const pointExpansion = this.kind === "vertex" &&
                 !!this.options.pointExpansion;
+            // Every vertex shader carries the render target size for the
+            // half-pixel offset, so it sits between the register region and the
+            // optional point-sprite fields.
+            const isVertex = this.kind === "vertex";
+            const viewportOffset = isVertex ? registerUniformBytes : -1;
+            const trailingOffset = registerUniformBytes + (isVertex ? 16 : 0);
             return {
                 kind: this.kind,
                 version: { major: this.major, minor: this.minor },
@@ -1549,14 +1571,15 @@
                 floatDefaults, intDefaults, boolDefaults,
                 levelZeroSamples: this.levelZeroSamples,
                 warnings: this.warnings.slice(),
-                uniformBytes: registerUniformBytes + (pointExpansion ? 32 : 0),
+                uniformBytes: trailingOffset + (pointExpansion ? 32 : 0),
                 floatRegionBytes: floatCount * 16,
                 intRegionBytes: intCount * 16,
                 boolRegionBytes: boolVectors * 16,
+                viewportOffset,
                 pointExpansion,
                 pointSprite: pointExpansion && !!this.options.pointSprite,
-                pointViewportOffset: pointExpansion ? registerUniformBytes : -1,
-                pointParamsOffset: pointExpansion ? registerUniformBytes + 16 : -1,
+                pointViewportOffset: pointExpansion ? trailingOffset : -1,
+                pointParamsOffset: pointExpansion ? trailingOffset + 16 : -1,
             };
         }
     }

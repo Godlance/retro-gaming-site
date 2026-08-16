@@ -5196,10 +5196,28 @@
             if (!other || !other.context) return;
             if (this.sharedD3DCanvasConflictReported) return;
             this.sharedD3DCanvasConflictReported = true;
+            // Both batch counts, because the two cases need opposite fixes and
+            // look identical without them: a handful of batches against tens of
+            // thousands is a stray DLL some launcher or probe loaded once, while
+            // two live streams mean the title really is driving both and sharing
+            // one canvas is the wrong architecture for it. Either way every
+            // frame from the losing executor is being dropped silently, so any
+            // rendering diagnosis made in this state is untrustworthy.
+            const batchesOf = executor => {
+                const stats = executor && typeof executor.getStats === "function"
+                    ? executor.getStats() : null;
+                return stats ? stats.batches : null;
+            };
             console.error("[v86gl] both the D3D8 and D3D9 executors are live on " +
                 "the same overlay canvas; they own separate GPUDevices and " +
-                "cannot share one canvas context. A game directory must " +
-                "contain only one of d3d8.dll/d3d9.dll (see plan section 4.6).");
+                "cannot share one canvas context, so whichever configured it " +
+                "last wins and the other's frames stop appearing. A game " +
+                "directory must contain only one of d3d8.dll/d3d9.dll (see plan " +
+                "section 4.6).", {
+                    drivingThisBatch: active,
+                    d3d8Batches: batchesOf(this.d3d8Executor),
+                    d3d9Batches: batchesOf(this.d3d9Executor),
+                });
         }
 
         isD3D8BatchStream(bytes) {

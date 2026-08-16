@@ -20,7 +20,7 @@ const shaderPipeline = require("../d3d9-webgpu/d3d9_shader_pipeline.js");
 
 const OP = {
     HELLO: 1, CREATE_DEVICE: 2, RESET: 3, PRESENT: 4, CLEAR: 5, COLOR_FILL: 9,
-    BEGIN_SCENE: 6, END_SCENE: 7,
+    BEGIN_SCENE: 6, END_SCENE: 7, GUEST_LOG: 11,
     CREATE_BUFFER: 0x100, UPDATE_BUFFER: 0x101, DESTROY_RESOURCE: 0x103,
     CREATE_TEXTURE_2D: 0x110, UPDATE_TEXTURE: 0x113,
     CREATE_VERTEX_DECLARATION: 0x120,
@@ -1946,6 +1946,181 @@ await test("a cube texture binds as a cube view and uploads per face",
         "the cascade must declare a cube sampler:\n" + wgsl);
 });
 
+await test("legacy D3D9 texture formats preserve colour and signed bump values",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const halfMinusOne = [0x00, 0xbc];
+    const halfZero = [0x00, 0x00];
+    const halfHalf = [0x00, 0x38];
+    const halfOne = [0x00, 0x3c];
+    const cases = [
+        { format: 20, gpu: "rgba8unorm", source: [0x33, 0x22, 0x11],
+          expected: [0x11, 0x22, 0x33, 0xff] }, // R8G8B8: B,G,R
+        { format: 27, gpu: "rgba8unorm", source: [0xe3],
+          expected: [0xff, 0x00, 0xff, 0xff] },
+        { format: 29, gpu: "rgba8unorm", source: [0xe3, 0x80],
+          expected: [0xff, 0x00, 0xff, 0x80] },
+        { format: 30, gpu: "rgba8unorm", source: [0x23, 0xf1],
+          expected: [0x11, 0x22, 0x33, 0xff] },
+        { format: 32, gpu: "rgba8unorm", source: [0x11, 0x22, 0x33, 0x44],
+          expected: [0x11, 0x22, 0x33, 0x44] },
+        { format: 33, gpu: "rgba8unorm", source: [0x11, 0x22, 0x33, 0x44],
+          expected: [0x11, 0x22, 0x33, 0xff] },
+        { format: 28, gpu: "rgba8unorm", source: [0x40],
+          expected: [0x00, 0x00, 0x00, 0x40] }, // A8 missing RGB is zero
+        { format: 51, gpu: "rgba8unorm", source: [0x40, 0x80],
+          expected: [0x40, 0x40, 0x40, 0x80] },
+        { format: 52, gpu: "rgba8unorm", source: [0xa5],
+          expected: [0x55, 0x55, 0x55, 0xaa] },
+        { format: 81, gpu: "rgba16float", source: [0x00, 0x80],
+          expected: [...halfHalf, ...halfHalf, ...halfHalf, ...halfOne] },
+        { format: 60, gpu: "rgba8snorm", source: [0x80, 0x7f],
+          expected: [0x80, 0x7f, 0x7f, 0x7f] },
+        { format: 63, gpu: "rgba8snorm", source: [0x80, 0xc0, 0x40, 0x7f],
+          expected: [0x80, 0xc0, 0x40, 0x7f] },
+        { format: 61, gpu: "rgba16float", source: [0xf0, 0xfd],
+          expected: [...halfMinusOne, ...halfOne, ...halfOne, ...halfOne] },
+        { format: 62, gpu: "rgba16float", source: [0x80, 0x7f, 0xff, 0],
+          expected: [...halfMinusOne, ...halfOne, ...halfOne, ...halfOne] },
+        { format: 64, gpu: "rgba16float", source: [0x00, 0x80, 0xff, 0x7f],
+          expected: [...halfMinusOne, ...halfOne, ...halfOne, ...halfOne] },
+        { format: 67, gpu: "rgba16float", source: [0x00, 0xfe, 0x07, 0xc0],
+          expected: [...halfMinusOne, ...halfOne, ...halfZero, ...halfOne] },
+        { format: 117, gpu: "rgba16float", source: [0x80, 0x00],
+          expected: [...halfMinusOne, ...halfZero, ...halfZero, ...halfOne] },
+    ];
+    const commands = [command(OP.CREATE_DEVICE, createDevicePayload(640, 480))];
+    cases.forEach((item, index) => {
+        const handle = 0x700 + index;
+        const source = Buffer.from(item.source);
+        const update = Buffer.alloc(48);
+        update.writeUInt32LE(handle, 0);
+        update.writeUInt32LE(1, 20); // width
+        update.writeUInt32LE(1, 24); // height
+        update.writeUInt32LE(1, 28); // depth
+        update.writeUInt32LE(source.length, 32); // source row pitch
+        update.writeUInt32LE(source.length, 40);
+        commands.push(command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, handle, 1, 1, 1, item.format, 0, 1)));
+        commands.push(command(OP.UPDATE_TEXTURE, update, source, 44));
+    });
+    await executor.submit(buildBatch(commands));
+    await executor.idle();
+    assert.equal(executor.stats.texturesRejected, 0);
+    const descriptors = find("createTexture").slice(-cases.length)
+        .map(call => call[1]);
+    const writes = find("writeTexture").slice(-cases.length);
+    cases.forEach((item, index) => {
+        assert.equal(descriptors[index].format, item.gpu,
+            "wrong GPU format for D3DFMT " + item.format);
+        if (item.gpu === "rgba8snorm")
+            assert.equal(descriptors[index].usage & 0x10, 0,
+                "SNORM textures must not request RENDER_ATTACHMENT");
+        assert.deepEqual(Array.from(writes[index][2]), item.expected,
+            "wrong texel conversion for D3DFMT " + item.format);
+        assert.equal(writes[index][3].bytesPerRow, item.expected.length);
+    });
+});
+
+await test("signed textures reject render-target use but keep direct copies",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const stretch = (destinationSize) => {
+        const payload = Buffer.alloc(56);
+        payload.writeUInt32LE(DEVICE, 0);
+        payload.writeUInt32LE(0x771, 4);
+        payload.writeUInt32LE(0, 8);
+        [0, 0, 4, 4].forEach((value, index) =>
+            payload.writeInt32LE(value, 12 + index * 4));
+        payload.writeUInt32LE(0x772, 28);
+        payload.writeUInt32LE(0, 32);
+        [0, 0, destinationSize, destinationSize].forEach((value, index) =>
+            payload.writeInt32LE(value, 36 + index * 4));
+        return payload;
+    };
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        // A stale or malformed guest must not make the host create an illegal
+        // rgba8snorm RENDER_ATTACHMENT descriptor.
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x770, 4, 4, 1, 60, 1, 0)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x771, 4, 4, 1, 60, 0, 1)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x772, 4, 4, 1, 60, 0, 1)),
+        command(0x8, stretch(4)),
+        command(0x8, stretch(2)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.texturesRejected, 1);
+    assert.equal(executor.stats.blits, 1,
+        "same-size same-format signed textures can use a GPU copy");
+    assert.equal(executor.stats.blitsSkipped, 1,
+        "scaling cannot render into an rgba8snorm texture");
+    assert.equal(find("copyTextureToTexture").length, 1);
+    assert.ok(!find("createTexture").some(call =>
+        call[1].format === "rgba8snorm" && (call[1].usage & 0x10)),
+        "rgba8snorm must never request RENDER_ATTACHMENT");
+});
+
+await test("R8G8B8 upload honours a padded source pitch", async () => {
+    const { executor, find } = makeExecutor();
+    const source = Buffer.from([
+        0x30, 0x20, 0x10, 0xee,
+        0x60, 0x50, 0x40, 0xee,
+    ]);
+    const update = Buffer.alloc(48);
+    update.writeUInt32LE(0x750, 0);
+    update.writeUInt32LE(1, 20);
+    update.writeUInt32LE(2, 24);
+    update.writeUInt32LE(1, 28);
+    update.writeUInt32LE(4, 32);
+    update.writeUInt32LE(source.length, 40);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x750, 1, 2, 1, 20, 0, 1)),
+        command(OP.UPDATE_TEXTURE, update, source, 44),
+    ]));
+    await executor.idle();
+    const write = find("writeTexture").pop();
+    assert.deepEqual(Array.from(write[2]), [
+        0x10, 0x20, 0x30, 0xff,
+        0x40, 0x50, 0x60, 0xff,
+    ]);
+    assert.equal(write[3].bytesPerRow, 4);
+    assert.equal(write[3].rowsPerImage, 2);
+});
+
+await test("DXT2 and DXT4 reuse BC2 and BC3 block storage", async () => {
+    const { executor, find } = makeExecutor();
+    const commands = [command(OP.CREATE_DEVICE, createDevicePayload(640, 480))];
+    [
+        { handle: 0x760, format: 0x32545844, gpu: "bc2-rgba-unorm" },
+        { handle: 0x761, format: 0x34545844, gpu: "bc3-rgba-unorm" },
+    ].forEach(item => {
+        const update = Buffer.alloc(48);
+        update.writeUInt32LE(item.handle, 0);
+        update.writeUInt32LE(4, 20);
+        update.writeUInt32LE(4, 24);
+        update.writeUInt32LE(1, 28);
+        update.writeUInt32LE(16, 32);
+        update.writeUInt32LE(16, 40);
+        commands.push(command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, item.handle, 4, 4, 1, item.format, 0, 1)));
+        commands.push(command(OP.UPDATE_TEXTURE, update,
+            Buffer.alloc(16, item.handle & 0xff), 44));
+    });
+    await executor.submit(buildBatch(commands));
+    await executor.idle();
+    assert.deepEqual(find("createTexture").slice(-2).map(call => call[1].format),
+        ["bc2-rgba-unorm", "bc3-rgba-unorm"]);
+    assert.deepEqual(find("writeTexture").slice(-2).map(call => call[3]), [
+        { bytesPerRow: 16, rowsPerImage: 1 },
+        { bytesPerRow: 16, rowsPerImage: 1 },
+    ]);
+});
+
 await test("exhausting the debug preview budget never drops a game texture upload",
         async () => {
     const { executor, find } = makeExecutor();
@@ -2049,9 +2224,49 @@ await test("D3DRS_SCISSORTESTENABLE gates the scissor rect", async () => {
     assert.equal(executor.stats.droppedDraws, 0);
     assert.equal(executor.stats.drawsWithScissor, 1,
         "only the draw with the test enabled is scissored");
+    // Every draw carries a clip rect, because a D3D9 viewport clips and a
+    // WebGPU one does not. With the test off that rect is the full viewport;
+    // with it on it is the viewport intersected with the app's rect, which D3D9
+    // also applies on top of the viewport rather than instead of it.
     const calls = find("setScissorRect");
-    assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0].slice(1), [10, 20, 100, 200]);
+    assert.equal(calls.length, 2, "each draw sets its own clip rect");
+    assert.deepEqual(calls[0].slice(1), [0, 0, 640, 480],
+        "with the test disabled the clip rect is the whole viewport");
+    assert.deepEqual(calls[1].slice(1), [10, 20, 100, 200]);
+});
+
+// A D3D9 viewport clips geometry; WebGPU's setViewport only maps NDC to pixels.
+// Nothing else would cut a draw off at the viewport edge, so a game that
+// restricts a small panel with SetViewport alone had its geometry drawn across
+// the whole target instead.
+await test("a viewport clips, and carries its D3D9 depth range", async () => {
+    const { executor, find } = makeExecutor();
+    const viewport = Buffer.alloc(32);
+    viewport.writeUInt32LE(DEVICE, 0);
+    viewport.writeUInt32LE(64, 4);    // x
+    viewport.writeUInt32LE(48, 8);    // y
+    viewport.writeUInt32LE(128, 12);  // width
+    viewport.writeUInt32LE(96, 16);   // height
+    viewport.writeFloatLE(0.25, 20);  // MinZ
+    viewport.writeFloatLE(0.5, 24);   // MaxZ
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_VIEWPORT, viewport),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.deepEqual(find("setScissorRect").pop().slice(1), [64, 48, 128, 96],
+        "the clip rect has to follow the viewport with no app scissor set");
+    // MinZ/MaxZ have always been on the wire; they used to be dropped here.
+    const pass = find("beginRenderPass").pop()[2];
+    assert.deepEqual(pass.ops.find(op => op[0] === "viewport").slice(1),
+        [64, 48, 128, 96, 0.25, 0.5]);
 });
 
 await test("a new guest session releases the previous process's resources",
@@ -2516,6 +2731,308 @@ await test("M4 Clear honours its rectangle list", async () => {
     assert.deepEqual(pass.ops.find(op => op[0] === "viewport").slice(1, 5),
         [8, 10, 20, 24]);
     assert.deepEqual(pass.ops.find(op => op[0] === "draw"), ["draw", 3]);
+});
+
+// WebGPU counts a block-compressed copy in whole 4x4 blocks, and a mip level's
+// physical extent is its logical size rounded up to that grid. The tail of a
+// DXT mip chain is logically 2x2 and 1x1, so passing the logical size makes
+// writeTexture fail validation. That failure arrives as an uncaptured device
+// error rather than an exception, so the only symptom is that the smallest mips
+// keep whatever the texture was created with -- which is how Kart Rider's UI
+// atlases sampled as garbage while the console filled with "copySize.width (1)
+// is not a multiple of compressed texture format block width (4)".
+await test("a DXT mip chain's sub-block levels upload as whole 4x4 blocks",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const DXT1 = 0x31545844;
+    // 8x8 DXT1 with a full chain: 8x8, 4x4, 2x2, 1x1. Every level occupies at
+    // least one 8-byte block, and the last two are smaller than one block.
+    const level = (index, size) => {
+        const blockRow = Math.ceil(size / 4) * 8;
+        const bytes = blockRow * Math.ceil(size / 4);
+        const payload = Buffer.alloc(48);
+        payload.writeUInt32LE(0x401, 0);
+        payload.writeUInt32LE(index, 4);
+        payload.writeUInt32LE(0, 8);       // x
+        payload.writeUInt32LE(0, 12);      // y
+        payload.writeUInt32LE(0, 16);      // z
+        payload.writeUInt32LE(size, 20);   // logical width
+        payload.writeUInt32LE(size, 24);   // logical height
+        payload.writeUInt32LE(1, 28);      // depth
+        payload.writeUInt32LE(blockRow, 32); // row pitch, in bytes per block row
+        payload.writeUInt32LE(0, 36);
+        payload.writeUInt32LE(bytes, 40);
+        return { payload, blob: Buffer.alloc(bytes, index + 1), field: 44 };
+    };
+    const uploads = [[0, 8], [1, 4], [2, 2], [3, 1]]
+        .map(([index, size]) => level(index, size));
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 8, 8, 4, DXT1, 0, 1)),
+        ...uploads.map(upload =>
+            command(OP.UPDATE_TEXTURE, upload.payload, upload.blob, upload.field)),
+    ]));
+    await executor.idle();
+
+    // The executor also writes its 1x1 fallback texture, which carries no
+    // mipLevel; only the mip uploads are of interest here.
+    const writes = find("writeTexture")
+        .filter(call => call[1].mipLevel !== undefined);
+    assert.equal(writes.length, 4, "every level has to be written");
+    for (const write of writes) {
+        const mipLevel = write[1].mipLevel;
+        const size = write[4];
+        assert.equal(size.width % 4, 0,
+            "level " + mipLevel + " copy width " + size.width +
+            " is not a whole number of 4x4 blocks");
+        assert.equal(size.height % 4, 0,
+            "level " + mipLevel + " copy height " + size.height +
+            " is not a whole number of 4x4 blocks");
+        // Rounding up must not overshoot the level's physical extent either.
+        const physical = Math.max(4, Math.ceil((8 >> mipLevel) / 4) * 4);
+        assert.equal(size.width, physical);
+        assert.equal(size.height, physical);
+    }
+});
+
+// PRESENT carries the window's *client rect* so the page can place the overlay
+// canvas; emit_present_and_flush fills it from GetClientRect. It is not the back
+// buffer's size, and a windowed game's client area is shorter than the back
+// buffer it hosts. Treating it as the render size made the swap-chain colour
+// attachment look like it disagreed with the auto depth target created beside
+// it, and the mismatch path then dropped depth for every pass -- depth testing
+// off for the whole game, from a window border.
+await test("a client rect smaller than the back buffer keeps depth attached",
+        async () => {
+    const { executor, find } = makeExecutor();
+    // 640x467 client rect for a 640x480 back buffer: the window has a title bar.
+    const clientRect = u32(DEVICE, 0x1234, 0, 0, 640, 467);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.PRESENT, clientRect),
+    ], { present: true }));
+    await executor.idle();
+
+    await executor.submit(buildBatch([
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
+        command(OP.SET_FVF, fvfPayload(0x104, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, clientRect),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(executor.stats.depthTargetSizeMismatches, 0,
+        "the client rect must not be mistaken for the back buffer's size");
+    const pass = find("beginRenderPass").pop()[1];
+    assert.ok(pass.depthStencilAttachment,
+        "the back-buffer pass keeps its auto depth-stencil");
+});
+
+// D3D9 rasterises with the sample point at a pixel's integer corner; WebGPU
+// samples at the pixel centre. A title that blits UI 1:1 has already subtracted
+// that half pixel itself, so replaying its geometry unchanged lands every
+// sample on a texel boundary and bilinear filtering returns the mean of two
+// texels -- invisible on 3D art, ruinous on small text. XYZRHW UI is the case
+// that shows it, but the offset belongs on every fixed-function draw.
+await test("fixed-function draws carry the D3D9 half-pixel offset", async () => {
+    const { executor, find } = makeExecutor();
+    const drawWith = position => buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
+        command(OP.SET_FVF, fvfPayload(0x104, [
+            element(0, 0, DECLTYPE.FLOAT4, position),
+            element(0, 16, DECLTYPE.D3DCOLOR, DECLUSAGE.COLOR)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+    ]);
+
+    // POSITIONT: pre-transformed UI, the path the shop text goes through.
+    await executor.submit(drawWith(DECLUSAGE.POSITIONT));
+    await executor.idle();
+    // POSITION: ordinary world-space geometry, through world_view_projection.
+    await executor.submit(drawWith(DECLUSAGE.POSITION));
+    await executor.idle();
+
+    const vertexShaders = find("createShaderModule")
+        .map(call => call[1].code)
+        .filter(code => code.includes("d9_vs_main"));
+    assert.ok(vertexShaders.length >= 2,
+        "both a screen-space and a world-space vertex shader were built");
+    for (const code of vertexShaders) {
+        assert.ok(code.includes(
+            "result.position.x + result.position.w / uniforms.viewport.x"),
+            "a fixed-function vertex shader is missing the half-pixel offset");
+        // Screen y grows downward, NDC y grows upward: the y term is negated.
+        assert.ok(code.includes(
+            "result.position.y - result.position.w / uniforms.viewport.y"),
+            "the half-pixel offset must negate y");
+    }
+});
+
+// The proxy sends BLENDWEIGHT/BLENDINDICES through, but only D3DTS_WORLD is
+// ever consumed, so a fixed-function skinned mesh is posed by world matrix 0
+// alone. That renders as a collapsed or contorted model with no other trace,
+// so it has to be reported rather than drawn silently wrong.
+await test("a fixed-function skinned declaration is reported, not drawn silently",
+        async () => {
+    const { executor } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
+        command(OP.SET_FVF, fvfPayload(0x104, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+            element(0, 12, DECLTYPE.FLOAT4, DECLUSAGE.BLENDWEIGHT),
+            element(0, 28, DECLTYPE.UBYTE4, DECLUSAGE.BLENDINDICES),
+            element(0, 32, DECLTYPE.FLOAT3, DECLUSAGE.NORMAL)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 44)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+    ]));
+    await executor.idle();
+    assert.equal(executor.stats.drawsWithUnappliedVertexBlend, 1,
+        "a declaration carrying blend weights has to be counted");
+});
+
+// XYZRHW coordinates are absolute render-target pixels. setViewport already
+// puts the viewport's origin back when it maps NDC into the viewport rect, so
+// the shader has to take that origin off first. Getting this wrong cancels out
+// exactly when the viewport sits at 0,0 -- which is every full-screen UI pass,
+// and is why it stayed invisible until a game drew pre-transformed geometry
+// through a small offset viewport (Kart Rider's shop item panels) and the
+// geometry landed several viewport-widths outside the box.
+await test("pre-transformed geometry subtracts the viewport origin",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const viewport = Buffer.alloc(32);
+    viewport.writeUInt32LE(DEVICE, 0);
+    viewport.writeUInt32LE(368, 4);   // x
+    viewport.writeUInt32LE(104, 8);   // y
+    viewport.writeUInt32LE(110, 12);  // width
+    viewport.writeUInt32LE(109, 16);  // height
+    viewport.writeFloatLE(0, 20);
+    viewport.writeFloatLE(1, 24);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(800, 600)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
+        command(OP.SET_VIEWPORT, viewport),
+        command(OP.SET_FVF, fvfPayload(0x104, [
+            element(0, 0, DECLTYPE.FLOAT4, DECLUSAGE.POSITIONT),
+            element(0, 16, DECLTYPE.D3DCOLOR, DECLUSAGE.COLOR)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+    ]));
+    await executor.idle();
+
+    const vertexShader = find("createShaderModule").map(call => call[1].code)
+        .filter(code => code.includes("d9_vs_main")).pop();
+    assert.ok(vertexShader, "a screen-space vertex shader was built");
+    assert.ok(vertexShader.includes("- viewport.z") &&
+        vertexShader.includes("- viewport.w"),
+        "the XYZRHW path must subtract the viewport origin:\n" + vertexShader);
+
+    // The origin has to actually reach the uniform, not just the WGSL.
+    const writes = find("writeBuffer");
+    assert.ok(writes.length > 0, "constants were uploaded");
+    const carriesOrigin = writes.some(call => {
+        const data = call[3];
+        if (!data) return false;
+        const floats = new Float32Array(data.buffer || data, data.byteOffset || 0,
+            Math.floor((data.byteLength || data.length || 0) / 4));
+        for (let i = 0; i + 3 < floats.length; ++i) {
+            if (floats[i] === 110 && floats[i + 1] === 109 &&
+                    floats[i + 2] === 368 && floats[i + 3] === 104)
+                return true;
+        }
+        return false;
+    });
+    assert.ok(carriesOrigin,
+        "the viewport uniform must carry size in xy and origin in zw");
+});
+
+// Guest-to-host diagnostics. Everything the guest DLL refuses used to be
+// invisible from the page -- the console sees only valid commands, and the
+// guest's trace file is inside a VM whose filesystem the developer cannot
+// reach -- which repeatedly turned "the picture is wrong" into guesswork.
+await test("a guest log command reaches the console with its text intact",
+        async () => {
+    const { executor } = makeExecutor();
+    const text = "CreateVertexBuffer refused: length=0 usage=00000008";
+    const payload = Buffer.alloc(8 + text.length);
+    payload.writeUInt32LE(2, 0);            // severity: failed
+    payload.writeUInt32LE(text.length, 4);
+    payload.write(text, 8, "ascii");
+
+    const errors = [];
+    const realError = console.error;
+    console.error = (...args) => errors.push(args.join(" "));
+    try {
+        await executor.submit(buildBatch([
+            command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+            command(OP.GUEST_LOG, payload),
+        ]));
+        await executor.idle();
+    } finally {
+        console.error = realError;
+    }
+    assert.equal(executor.stats.guestReports, 1);
+    assert.equal(executor.stats.unsupportedCommands, 0,
+        "the opcode has to be handled, not counted as unknown");
+    assert.ok(errors.some(line => line === "[d3d9-guest] " + text),
+        "the guest's text has to arrive verbatim, got: " + errors.join(" | "));
+});
+
+// The guest identifies itself at startup so that a session with no other
+// guest messages means "nothing was refused" rather than "the DLL inside the
+// disk image predates this channel and cannot say anything". Info severity has
+// to reach the console like the rest, just not as a warning.
+await test("an info-severity guest log is reported without being a warning",
+        async () => {
+    const { executor } = makeExecutor();
+    const text = "proxy build guest-log-20260816 loaded";
+    const payload = Buffer.alloc(8 + text.length);
+    payload.writeUInt32LE(0, 0);            // severity: info
+    payload.writeUInt32LE(text.length, 4);
+    payload.write(text, 8, "ascii");
+
+    const logs = [];
+    const warnings = [];
+    const realLog = console.log;
+    const realWarn = console.warn;
+    console.log = (...args) => logs.push(args.join(" "));
+    console.warn = (...args) => warnings.push(args.join(" "));
+    try {
+        await executor.submit(buildBatch([
+            command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+            command(OP.GUEST_LOG, payload),
+        ]));
+        await executor.idle();
+    } finally {
+        console.log = realLog;
+        console.warn = realWarn;
+    }
+    assert.equal(executor.stats.guestReports, 1);
+    assert.ok(logs.some(line => line === "[d3d9-guest] " + text),
+        "the identification line has to reach the console");
+    assert.ok(!warnings.some(line => line.includes(text)),
+        "identification is not a warning");
+});
+
+// A truncated length field must not read past the command into whatever
+// follows it in the batch.
+await test("a guest log claiming more text than it carries is rejected",
+        async () => {
+    const { executor } = makeExecutor();
+    const payload = Buffer.alloc(12);
+    payload.writeUInt32LE(1, 0);
+    payload.writeUInt32LE(0xffff, 4); // far more than the 4 bytes present
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.GUEST_LOG, payload),
+    ]));
+    await executor.idle();
+    assert.equal(executor.stats.malformedBatches, 1);
+    assert.equal(executor.stats.guestReports, 0);
 });
 
 // ---- report ----
