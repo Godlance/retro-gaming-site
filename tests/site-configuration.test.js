@@ -45,3 +45,20 @@ test("Diablo II library links enable V8FT without the old save-tools hook", func
     assert.doesNotMatch(app, /D2 save tools|retro:game-action|save-files/);
     assert.doesNotMatch(page, /custom_controls/);
 });
+
+test("KartRider replaces Icewind Dale 1 and enables V8FT", function() {
+    const app = read("app.js");
+    const library = read("library.js");
+    const assets = read("game-assets.js");
+
+    assert.doesNotMatch(app, /icewind_dale_1|Icewind Dale 1/);
+    assert.doesNotMatch(library, /icewind_dale_1|Icewind Dale 1/);
+    assert.doesNotMatch(assets, /icewind_dale_1/);
+    assert.equal(fs.existsSync(path.join(ROOT, "images/icewindale1.jpeg")), true);
+
+    assert.match(app, /'kartrider'\s*:\s*\{/);
+    assert.match(library, /kartrider:\s*\["KartRider",\s*"2004",\s*"Racing",\s*"Windows XP"\]/);
+    assert.match(library, /gameId === "diablo_2" \|\| gameId === "kartrider"/);
+    assert.match(assets, /kartrider:\s*"images\/kartrider\.jpeg"/);
+    assert.equal(fs.existsSync(path.join(ROOT, "images/kartrider.jpeg")), true);
+});

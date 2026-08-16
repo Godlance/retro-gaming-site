@@ -7,7 +7,7 @@ A browser-based retro gaming site built on v86, with a direct D3D8-to-WebGPU pat
 - `index.html` + `library.js`: responsive game library. Cards are sorted by the current visitor's play count stored in `localStorage`.
 - `game.html?id=<game-id>` + `app.js`: shared game detail/emulator page. Every game has its own stable URL without duplicating the v86 UI.
 - Common emulator controls: save state, load state, insert CD, eject CD, and full screen.
-- Diablo II links from the game library enable the COM file-transfer UI automatically with `v8ft=1`.
+- Diablo II and KartRider links from the game library enable the COM file-transfer UI automatically with `v8ft=1`.
 - MapleStory uses `game/maplestory.img` as its secondary disk and exposes an account-registration link below the emulator.
 
 For site-wide popularity across all visitors, replace the local play-count storage with a backend analytics endpoint while keeping the same sorting interface.

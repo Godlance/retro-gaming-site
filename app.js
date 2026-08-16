@@ -183,15 +183,6 @@ const GAMES = {
         size: 1572864000,
         stateurl: R2_URL_2 + '/windows98/states/windows98_audio_vga_2d_multidisk_simcity3000.bin.zst',
     },
-    'icewind_dale_1': {
-        name: 'Icewind Dale 1',
-        memorySize: 256 * 1024 * 1024,
-        systemDisk: '/windowsxp/windowsxpmultidisk/windowsxp_multidisk_C_2G.img.zst',
-        systemDiskSize: 2147483648,
-        disk: R2_URL_2 + '/game/icewinddale1/icewinddale1.img.zst',
-        size: 2621440000,
-        stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_icewinddale1.bin.zst',
-    },
     'need_for_speed_3': {
         name: 'Need for Speed 3',
         memorySize: 256 * 1024 * 1024,
@@ -236,6 +227,15 @@ const GAMES = {
         disk: R2_URL_2 + '/game/warcraft3/warcraft3.img.zst',
         size: 2634022912,
         stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_warcraft3.bin.zst',
+    },
+    'kartrider': {
+        name: 'KartRider',
+        memorySize: 1024 * 1024 * 1024,
+        systemDisk: '/windowsxp/windowsxpmultidisk/windowsxp_multidisk_C_2G.img.zst',
+        systemDiskSize: 2147483648,
+        disk: R2_URL_2 + '/game/kartrider/kartrider.img.zst',
+        size: 838860800,
+        stateurl: R2_URL_2 + '/windowsxp/states/windowsxp_audio_vga_2d_multidisk_kartrider.bin.zst',
     }
 };
 
@@ -250,9 +250,9 @@ const GAME_PAGE_META = {
     starcraft: ["1998", "Strategy"], commandos_1: ["1998", "Tactics"], Diablo_1: ["1997", "Action RPG"],
     richman_4: ["1998", "Board game"], rollercoaster_tycoon_2: ["2002", "Simulation"], fallout_2: ["1998", "RPG"],
     age_of_empires_2: ["1999", "Strategy"], civilization_2: ["1996", "Strategy"], planescape_torment: ["1999", "RPG"],
-    simcity_3000: ["1999", "Simulation"], icewind_dale_1: ["2000", "RPG"],
+    simcity_3000: ["1999", "Simulation"],
     need_for_speed_3: ["1998", "Racing"], dino_crisis: ["2000", "Survival"], resident_evil_2: ["1999", "Survival"],
-    maplestory: ["2003", "MMORPG"], warcraft3: ["2002", "Strategy"]
+    maplestory: ["2003", "MMORPG"], warcraft3: ["2002", "Strategy"], kartrider: ["2004", "Racing"]
 };
 const COVER_PALETTES = [
     ["#2c351b", "#a4cf54"], ["#321c1b", "#d3614f"], ["#172f35", "#55abc2"], ["#312541", "#9c70d2"],

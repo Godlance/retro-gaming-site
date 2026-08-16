@@ -733,7 +733,7 @@ restore 的完整时序必须固定为（对应现有 handler 中 `restore_state
 
 ## 8. 用户界面与流程
 
-通用 `File transfer` 入口直接由 Phase 5 UI 管理，不再经过游戏专属事件。当前游戏库只为 `diablo_2` 链接添加 `v8ft=1`；其他游戏保持原 URL，后续应在对应 state 已安装 agent 后再按游戏开启。
+通用 `File transfer` 入口直接由 Phase 5 UI 管理，不再经过游戏专属事件。当前游戏库为 `diablo_2` 和 `kartrider` 链接添加 `v8ft=1`；其他游戏保持原 URL，后续应在对应 state 已安装 agent 后再按游戏开启。
 
 面板分三个区域：左侧 share 列表，中间当前目录的条目表，底部传输队列与进度。
 
@@ -1059,7 +1059,7 @@ replacement 与 D3D/WebGPU 满载回归；产品于 2026-08-12 接受这两项�
 UTF-8、stored method ZIP，不依赖网络库。成功上传后始终显示 state 持久性提示。
 桌面 1600×1100 与窄屏 700×900 的无头浏览器视觉检查均无横向溢出；Phase 5
 UI/ZIP/多文件行为测试为 7/7 通过。游戏专属快捷方式是可选增强；旧的 Diablo II
-专用按钮和事件 hook 已移除，游戏库为 Diablo II 自动添加 `v8ft=1`。虚拟滚动
+专用按钮和事件 hook 已移除，游戏库为 Diablo II 和 KartRider 自动添加 `v8ft=1`。虚拟滚动
 暂未加入，目录继续使用显式分页加载。
 
 任务：

@@ -19,12 +19,12 @@ const GAMES_LIBRARY = {
     civilization_2: ["Civilization 2", "1996", "Strategy", "Windows XP"],
     planescape_torment: ["Planescape: Torment", "1999", "RPG", "Windows XP"],
     simcity_3000: ["SimCity 3000", "1999", "Simulation", "Windows 98"],
-    icewind_dale_1: ["Icewind Dale 1", "2000", "RPG", "Windows XP"],
     need_for_speed_3: ["Need for Speed 3", "1998", "Racing", "Windows 98"],
     dino_crisis: ["Dino Crisis", "2000", "Survival", "Windows 98"],
     resident_evil_2: ["Resident Evil 2", "1999", "Survival", "Windows 98"],
     maplestory: ["MapleStory v83", "2003", "MMORPG", "Windows XP"],
-    warcraft3: ["Warcraft III", "2002", "Strategy", "Windows XP"]
+    warcraft3: ["Warcraft III", "2002", "Strategy", "Windows XP"],
+    kartrider: ["KartRider", "2004", "Racing", "Windows XP"]
 };
 
 const COVER_PALETTES = [
@@ -63,7 +63,7 @@ function createGameCard(gameId, data, count) {
     const link = document.createElement("a");
     link.className = "game-card-link";
     const query = new URLSearchParams({ id: gameId });
-    if (gameId === "diablo_2") query.set("v8ft", "1");
+    if (gameId === "diablo_2" || gameId === "kartrider") query.set("v8ft", "1");
     link.href = `game.html?${query.toString()}`;
     link.setAttribute("aria-label", `Play ${name}`);
     link.innerHTML = `
