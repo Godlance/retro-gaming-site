@@ -106,7 +106,10 @@ static HRESULT create_device(HWND hwnd)
     present.SwapEffect = D3DSWAPEFFECT_DISCARD;
     present.hDeviceWindow = hwnd;
     present.Windowed = TRUE;
-    present.EnableAutoDepthStencil = FALSE;
+    /* Enabled so the device actually has an auto depth-stencil for
+     * verify_implicit_surfaces() to ask for. */
+    present.EnableAutoDepthStencil = TRUE;
+    present.AutoDepthStencilFormat = D3DFMT_D24S8;
     present.PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
 
     g_stage = "CreateDevice";
@@ -115,6 +118,147 @@ static HRESULT create_device(HWND hwnd)
             &present, &g_device);
     if (FAILED(hr) || !g_device)
         return fail(g_stage, FAILED(hr) ? hr : E_FAIL);
+    return D3D_OK;
+}
+
+/*
+ * The implicit back buffer and the auto depth-stencil are sub-objects of the
+ * device in the same way a texture level surface is a sub-object of its
+ * texture: every GetBackBuffer / GetDepthStencilSurface call hands back the
+ * same object, and dropping the last public reference does not destroy it.
+ *
+ * GTA San Andreas depends on both. RenderWare takes each surface once during
+ * device setup, releases it immediately, and binds the saved pointers for the
+ * rest of the run. Against a proxy that allocates a fresh self-owning surface
+ * per call, that release frees the object -- and the heap then hands the same
+ * block out as the next resource the game creates, which is a vertex buffer.
+ */
+static HRESULT verify_implicit_surfaces(void)
+{
+    IDirect3DSurface9 *back = NULL;
+    IDirect3DSurface9 *back_again = NULL;
+    IDirect3DSurface9 *depth = NULL;
+    IDirect3DSurface9 *depth_again = NULL;
+    IDirect3DVertexBuffer9 *churn = NULL;
+    IDirect3DSurface9 *borrowed_back;
+    IDirect3DSurface9 *borrowed_depth;
+    D3DSURFACE_DESC back_desc;
+    D3DSURFACE_DESC depth_desc;
+    D3DSURFACE_DESC desc;
+    HRESULT hr;
+
+    g_stage = "GetBackBuffer(0)";
+    hr = IDirect3DDevice9_GetBackBuffer(g_device, 0, 0,
+            D3DBACKBUFFER_TYPE_MONO, &back);
+    if (FAILED(hr) || !back)
+        return fail(g_stage, FAILED(hr) ? hr : E_FAIL);
+
+    g_stage = "GetBackBuffer(0, second call returns same object)";
+    hr = IDirect3DDevice9_GetBackBuffer(g_device, 0, 0,
+            D3DBACKBUFFER_TYPE_MONO, &back_again);
+    if (FAILED(hr) || back_again != back)
+    {
+        hr = FAILED(hr) ? hr : E_FAIL;
+        goto done;
+    }
+
+    g_stage = "GetDepthStencilSurface";
+    hr = IDirect3DDevice9_GetDepthStencilSurface(g_device, &depth);
+    if (FAILED(hr) || !depth)
+    {
+        hr = FAILED(hr) ? hr : E_FAIL;
+        goto done;
+    }
+
+    g_stage = "GetDepthStencilSurface(second call returns same object)";
+    hr = IDirect3DDevice9_GetDepthStencilSurface(g_device, &depth_again);
+    if (FAILED(hr) || depth_again != depth)
+    {
+        hr = FAILED(hr) ? hr : E_FAIL;
+        goto done;
+    }
+
+    /* Recorded while the references are still held, so the checks after the
+     * release compare against what the surfaces themselves reported. */
+    ZeroMemory(&back_desc, sizeof(back_desc));
+    ZeroMemory(&depth_desc, sizeof(depth_desc));
+    g_stage = "GetDesc(while referenced)";
+    hr = IDirect3DSurface9_GetDesc(back, &back_desc);
+    if (SUCCEEDED(hr))
+        hr = IDirect3DSurface9_GetDesc(depth, &depth_desc);
+    if (FAILED(hr))
+        goto done;
+
+    /* Drop every public reference, exactly as RenderWare does during setup. */
+    borrowed_back = back;
+    borrowed_depth = depth;
+    IDirect3DSurface9_Release(back_again);
+    IDirect3DSurface9_Release(back);
+    IDirect3DSurface9_Release(depth_again);
+    IDirect3DSurface9_Release(depth);
+    back = back_again = depth = depth_again = NULL;
+
+    /* Allocated after that release on purpose: if either surface was freed,
+     * this is what the heap reuses the block for. The pointer-identity checks
+     * below are the deterministic part -- this only decides whether a surviving
+     * bug shows up as wrong data or as a crash. */
+    g_stage = "CreateVertexBuffer(churns the heap)";
+    hr = IDirect3DDevice9_CreateVertexBuffer(g_device, 1024, 0, D3DFVF_XYZ,
+            D3DPOOL_MANAGED, &churn, NULL);
+    if (FAILED(hr) || !churn)
+    {
+        hr = FAILED(hr) ? hr : E_FAIL;
+        goto done;
+    }
+
+    ZeroMemory(&desc, sizeof(desc));
+    g_stage = "BackBuffer::GetDesc(through borrowed pointer)";
+    hr = IDirect3DSurface9_GetDesc(borrowed_back, &desc);
+    if (FAILED(hr) || desc.Width != back_desc.Width
+            || desc.Height != back_desc.Height
+            || desc.Format != back_desc.Format)
+    {
+        hr = FAILED(hr) ? hr : E_FAIL;
+        goto done;
+    }
+
+    ZeroMemory(&desc, sizeof(desc));
+    g_stage = "DepthSurface::GetDesc(through borrowed pointer)";
+    hr = IDirect3DSurface9_GetDesc(borrowed_depth, &desc);
+    if (FAILED(hr) || desc.Width != depth_desc.Width
+            || desc.Height != depth_desc.Height
+            || desc.Format != depth_desc.Format)
+    {
+        hr = FAILED(hr) ? hr : E_FAIL;
+        goto done;
+    }
+
+    /* The saved pointer still binds, which is all the game ever does with it. */
+    g_stage = "SetDepthStencilSurface(through borrowed pointer)";
+    hr = IDirect3DDevice9_SetDepthStencilSurface(g_device, borrowed_depth);
+    if (FAILED(hr))
+        goto done;
+
+    g_stage = "GetBackBuffer(after every reference was dropped)";
+    hr = IDirect3DDevice9_GetBackBuffer(g_device, 0, 0,
+            D3DBACKBUFFER_TYPE_MONO, &back);
+    if (FAILED(hr) || back != borrowed_back)
+        hr = FAILED(hr) ? hr : E_FAIL;
+
+done:
+    if (churn)
+        IDirect3DVertexBuffer9_Release(churn);
+    if (back_again)
+        IDirect3DSurface9_Release(back_again);
+    if (back)
+        IDirect3DSurface9_Release(back);
+    if (depth_again)
+        IDirect3DSurface9_Release(depth_again);
+    if (depth)
+        IDirect3DSurface9_Release(depth);
+    if (FAILED(hr))
+        return fail(g_stage, hr);
+    trace_text("PASS implicit back-buffer and auto depth-stencil lifetime");
     return D3D_OK;
 }
 
@@ -370,6 +514,11 @@ static HRESULT run_surface_tests(HWND hwnd)
     HRESULT hr;
 
     hr = create_device(hwnd);
+    if (FAILED(hr))
+        return hr;
+    /* Ahead of verify_depth_surface_alias(), which finishes by unbinding depth
+     * altogether and so leaves the device with no auto depth-stencil to get. */
+    hr = verify_implicit_surfaces();
     if (FAILED(hr))
         return hr;
     hr = verify_render_target_alias();

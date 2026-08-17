@@ -149,6 +149,30 @@ implementation. Implemented:
   pointer identity that apps rely on to tell two level surfaces apart.
   `../d3d8proxy/d3d8_proxy.c`'s `texture_get_surface_level` still has the
   original per-call behaviour.
+- **GTA San Andreas SDK-version fix:** `Direct3DCreate9` accepts both 31
+  (`D3D9b_SDK_VERSION`, the DirectX 9.0b SDK) and 32 (`D3D_SDK_VERSION`, 9.0c),
+  and masks off the `0x80000000` bit an app compiled with `D3D_DEBUG_INFO` sets
+  to ask for the debug runtime. The real d3d9.dll does not police this. Checking
+  the argument against the single value in mingw's header made the very first
+  call return NULL for any 9.0b title, and San Andreas — which passes 31 — can
+  only report that as a generic "unable to initialise DirectX". `../d3d8proxy`
+  had already learned the identical lesson for 120 (8.0) vs 220 (8.1).
+- **GTA San Andreas implicit-surface lifetime fix:** the back buffer and the
+  auto depth-stencil are sub-objects of the *device*, exactly as a texture level
+  surface is a sub-object of its texture. Each is now created once, cached on
+  `D9Device` (`implicit_back_buffer`/`implicit_depth_stencil`), handed back by
+  the same pointer from every `GetBackBuffer`/`GetDepthStencilSurface`, has its
+  `AddRef`/`Release` forwarded to the device, and is freed only in device
+  teardown. Allocating a self-owning surface per call meant the app's release
+  destroyed it, and the trace showed the heap handing that freed block straight
+  back out as the next index buffer while RenderWare still held the pointer it
+  had cached during device setup — the same failure shape as the Kart Rider
+  entry above, one level up. `surface_is_implicit()` identifies both from fields
+  that already existed (`swap_chain`, `auto_depth_stencil`), each written by
+  exactly one place. `../sample/d3d9_surface_lifetime_test.c`'s
+  `verify_implicit_surfaces` covers the pointer identity and the
+  survives-past-zero-references property; the test device needed
+  `EnableAutoDepthStencil` before it had an auto depth-stencil to ask for.
 - **Kart Rider BCn mip-tail fix (host side):** `writeTexture` now rounds a
   block-compressed copy extent up to the 4x4 block grid. WebGPU measures such a
   copy in whole blocks and a mip level's physical extent is its logical size
@@ -244,6 +268,50 @@ and zero dropped draws, and nothing anywhere recording that the guest had been
 turned down. The D9WG protocol has no guest-to-host log channel, so these land
 in the diagnostic DLL's trace; `grep STUB` over a trace taken while reproducing
 names the APIs a title actually wanted in one step.
+
+**The diagnostic DLL now traces the paths a title can quietly give up in.**
+Chasing GTA San Andreas's silent exit turned up three blind spots, each able to
+swallow a whole call. The whole `IDirect3D9` enumeration and caps family was
+completely dark and now logs arguments and results, including three `CAPS` lines
+carrying the fields titles actually gate on. `create_shader` rejected bytecode
+*before* emitting anything, so a refused `CreateVertexShader` left no `OK` and no
+`FAIL` — only a gap; both paths now trace, with the version token. And
+`PROCESS_DETACH` dumps `LAST` (the last marked method entered and left,
+previously printed only from the exception handler) alongside `WINDOW` (whether
+the device window outlived the process).
+
+The third was the ~100 device methods with no trace of their own —
+`SetRenderState`, `SetTextureStageState`, `SetTransform` and the rest. One
+`TRACE` at `reserve_command_locked`, the single chokepoint every host-bound
+command passes through, covers all of them in one line and is what identified
+where San Andreas stopped. It is left commented in that function rather than
+compiled in, because it costs one `WriteFile` per command: invaluable up to the
+first frame, unusable once a title is drawing. `Device.TestCooperativeLevel` is
+untraced for the same reason. Both are two-line changes when a startup
+investigation needs them.
+
+For an exit D3D9 cannot explain at all, the diagnostic build installs
+thread-local `WH_CALLWNDPROC` and `WH_GETMESSAGE` hooks and logs the window
+messages that end a program, as `MSG sent` / `MSG posted`. `WM_QUIT` only ever
+travels through the message pump, so `WH_GETMESSAGE` is the one place it is
+visible. The ordinary DLL installs nothing.
+
+That combination is what settled San Andreas, and the answer was *not* D3D9.
+With both fixes above in place the title runs RenderWare's complete device setup
+— device, six buffers, three vertex declarations, six `ps_1_1` pixel shaders,
+`DXT1` and `D24S8` format checks — and every single D3D9 call succeeds: no
+`FAIL`, no `STUB`, no `EXCEPTION`. Then, in the ~10ms after the last query and
+with no D3D9 activity in between, it tears down its three windows in exactly the
+order `DestroyWindow` on a foreground window produces (`WM_WINDOWPOSCHANGED`,
+`WM_ACTIVATEAPP` wparam=0, `WM_KILLFOCUS`, `WM_DESTROY`, `WM_NCDESTROY`) with no
+`WM_CLOSE` and no `WM_QUIT`, and exits without ever releasing the device — the
+deactivation is a consequence of the teardown, not a cause of it. That is a
+title running its own early-exit path for a reason invisible from here. The
+stage after `rsRWINITIALIZE` is input and audio initialisation, and a failure
+there sends GTA San Andreas's `WinMain` straight to destroy-window-and-return
+without RenderWare teardown, which is the shape observed. The same proxy
+technique used here, in `../d3d8proxy` and in `../winproxy` applies directly to
+`dinput8.dll`/`dsound.dll` if that thread is picked up.
 
 Known gap worth naming because it renders wrong rather than failing:
 **fixed-function vertex blending** (`D3DRS_VERTEXBLEND` with
