@@ -5,7 +5,10 @@
 
 "use strict";
 
-importScripts("d3d9_shader_pipeline.js");
+// The executor passes its cache-buster through to this worker. Mirroring it on
+// the translator import keeps worker-generated WGSL in lockstep with the
+// page's D3D9ShaderPipeline instead of silently reviving an older script.
+importScripts("d3d9_shader_pipeline.js" + self.location.search);
 
 self.onmessage = event => {
     const message = event.data || {};

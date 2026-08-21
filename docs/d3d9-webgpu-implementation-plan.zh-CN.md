@@ -1411,12 +1411,11 @@ M3 的主体工作就是把它们变成真的。
   **每个启用光源的类型烘进 shader 变体**，所以生成的 WGSL 是直线展开的，
   没有分支也没有动态光源数量。灯光位置/方向由 JS 侧在打包 uniform 时乘上
   view 矩阵，而不是把第二个矩阵搬进 shader 逐顶点重算。
-- **一个关键判断：声明里没有 NORMAL 时不做光照**。`D3DRS_LIGHTING` 的默认
-  值是 TRUE，所以大量"顶点自带颜色、不打算被照亮"的绘制其实都是带着
-  lighting=on 到达的；对零法线跑一遍光照公式的结果是只剩 ambient+emissive，
-  而 `D3DRS_AMBIENT` 默认为 0——**画面会全黑**。改为跳过光照、让顶点色原样
-  通过，这也是 WineD3D 固定管线的做法（它的 `ffp_vs_settings` 在声明无法线
-  时清掉 `lighting` 位）。计数器 `drawsWithUnappliedLighting` 暴露频率。
+- **声明里没有 NORMAL 时使用零法线，而不是跳过整条光照路径**。D3D9 对这类
+  顶点的光照点积使用 0，所以各光源的 diffuse/specular 项消失，但
+  `D3DRS_AMBIENT * material.ambient` 与 material emissive 仍然有效。旧实现直接
+  让顶点色通过，会把 GTA San Andreas 中 `COLOR0` 为黑、依靠环境光显示的角色
+  批次画成纯黑剪影。计数器 `drawsWithZeroNormalLighting` 暴露这类绘制频率。
 - **完整的 texture stage 级联**（`textureCascadeSignature` /
   `buildFixedFunctionPixelShader`）：stage 0..N-1（N 止于第一个
   `D3DTOP_DISABLE`），每级独立的颜色/alpha 运算，参数取自 diffuse、级联
@@ -1556,7 +1555,7 @@ pipeline key 与 layout，并为每种维度准备一张 1x1 白色兜底纹理�
   之后）。
 
 **验收待办**：与 M2 一样需要在真实 v86 XP 客户机里人工执行。War3 进战役
-观察 `getStats()` 的 `drawsWithUnappliedLighting`/
+观察 `getStats()` 的 `drawsWithZeroNormalLighting`/
 `drawsWithUnsupportedTextureOp`/`drawsWithTexCoordIndex`/
 `drawsWithTextureTransform`/`droppedDraws`；极品飞车 9 额外观察
 `renderTargetsCreated`/`renderTargetBinds`/`renderPasses`/

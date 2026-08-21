@@ -236,6 +236,15 @@ test("vs_1_1 transform: parses, emits a vertex entry point and a WVP uniform", (
     assert.strictEqual(reflection.samplers.length, 0);
 });
 
+test("an unwritten oFog defaults to an unfogged factor", () => {
+    const { wgsl, reflection } = compileOk(VS_1_1_TRANSFORM, "vs_1_1");
+    assert.ok(!reflection.writtenVaryings.includes(pipeline.VARYING_FOG),
+        "the fixture must leave oFog unwritten");
+    assert.ok(wgsl.includes("var<private> o_varying10: vec4<f32> = " +
+        "vec4<f32>(1.0, 0.0, 0.0, 0.0);"),
+    "an unwritten oFog must default to factor one, not full fog:\n" + wgsl);
+});
+
 test("vs_1_1 m4x4 expands to four dot products against consecutive registers", () => {
     const { wgsl } = compileOk(VS_1_1_TRANSFORM, "vs_1_1");
     for (const register of [0, 1, 2, 3])
@@ -543,6 +552,23 @@ test("shader cache reports compile latency/size and survives persistence", () =>
     assert.equal(restored.stats.compiles, before,
         "a restored shader should be a cache hit, not a retranslation");
     assert.equal(restored.snapshot().restored, 1);
+
+    // A payload carrying another build's translations must be refused rather
+    // than restored. Accepting it means this session runs WGSL and reflection
+    // this file no longer produces -- which is invisible, survives a reload,
+    // and makes a translator fix appear to do nothing for exactly the shaders
+    // that have been seen before. The storage `version` cannot catch it: that
+    // describes the envelope, and the envelope did not change.
+    const stale = cache.exportEntries();
+    assert.equal(stale.revision, pipeline.TRANSLATOR_REVISION,
+        "an exported payload has to record which translator wrote it");
+    stale.revision = stale.revision + "-other-build";
+    assert.equal(new pipeline.D3D9ShaderCache().importEntries(stale), 0,
+        "entries from a different translator build must not be restored");
+    const missing = cache.exportEntries();
+    delete missing.revision;
+    assert.equal(new pipeline.D3D9ShaderCache().importEntries(missing), 0,
+        "a payload predating the revision field is from an older build too");
 });
 
 test("arithmetic opcodes translate to their WGSL equivalents", () => {

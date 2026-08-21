@@ -207,6 +207,19 @@ const VS_BYTECODE = [
     END,
 ];
 
+// vs_2_0: dcl_position v0 / dcl_texcoord v5 / m4x4 oPos, v0, c0 /
+// mov oT0, v5. This is the fixed-function-pixel-stage boundary GTA SA's
+// character vertex shaders use: once a vertex shader is bound, stage 0 must
+// consume oT0 even if stale fixed-function TEXCOORDINDEX state says otherwise.
+const VS_TEXCOORD0_BYTECODE = [
+    VS(2, 0),
+    instr(SIO.DCL, 2), dcl(DECLUSAGE.POSITION), dst(REG.INPUT, 0),
+    instr(SIO.DCL, 2), dcl(DECLUSAGE.TEXCOORD), dst(REG.INPUT, 5),
+    instr(SIO.M4x4, 3), dst(REG.RASTOUT, 0), src(REG.INPUT, 0), src(REG.CONST, 0),
+    instr(SIO.MOV, 2), dst(REG.OUTPUT, 0), src(REG.INPUT, 5),
+    END,
+];
+
 // M5 skeletal-layout fixture. The maths is intentionally small; the important
 // contract here is that BLENDWEIGHT/BLENDINDICES and the compact auxiliary
 // semantics all reach v# with D3D9 float4 values, ready for a real matrix
@@ -627,6 +640,47 @@ await test("programmable vs+ps: modules, bindings and constants all line up", as
     const pixelBase = entries.get(1).resource.offset;
     assert.equal(data.getFloat32(pixelBase + 16, true), 0.25, "ps c1.x");
     assert.equal(data.getFloat32(pixelBase + 28, true), 1, "ps c1.w");
+});
+
+await test("a programmable VS routes fixed-function stage n through oTn", async () => {
+    const { executor, find } = makeExecutor();
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD),
+    ];
+    const vs = shaderCreatePayload(0x40000004, VS_TEXCOORD0_BYTECODE);
+    const tss = (stage, state, value) =>
+        command(0x202, u32(DEVICE, stage, state, value));
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 4, 4, 1, 21, 0, 1)),
+        command(OP.CREATE_VERTEX_DECLARATION, declarationPayload(0x301, elements)),
+        command(OP.CREATE_VERTEX_SHADER, vs.payload, vs.blob, vs.blobOffsetField),
+        command(OP.SET_VERTEX_DECLARATION, u32(DEVICE, 0x301)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_VERTEX_SHADER, u32(DEVICE, 0x40000004)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        // This may be stale vertex-state from a preceding fixed-function pass.
+        // D3D9 still routes stage 0 to oT0 while a vertex shader is bound.
+        tss(0, 11 /* D3DTSS_TEXCOORDINDEX */, 1),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.drawsWithUnwrittenCoordVarying, 0,
+        "stage 0 must not follow stale TEXCOORDINDEX while a VS is bound");
+    const pipeline = find("createRenderPipeline").pop()[1];
+    assert.ok(executor.resources.get(0x40000004).translated.reflection
+        .writtenVaryings.includes(2),
+    "the translated vertex shader must write oT0 into varying2");
+    assert.ok(pipeline.fragment.module.code.includes("stage_in.varying2.xy"),
+        "fixed-function stage 0 must sample the translated oT0 varying:\n" +
+        pipeline.fragment.module.code);
+    assert.ok(!pipeline.fragment.module.code.includes("stage_in.varying3.xy"),
+        "stale TEXCOORDINDEX must not redirect stage 0 to oT1");
 });
 
 await test("persistent WGSL cache is restored before CREATE_SHADER executes", async () => {
@@ -1429,6 +1483,9 @@ await test("the stage-0 texture matrix transforms fixed-function texcoords", asy
         command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
         command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
         command(OP.SET_TRANSFORM, transform),
+        // This test isolates texture transforms; keep the vertex uniform layout
+        // independent of D3D9's default-enabled fixed-function lighting.
+        command(OP.SET_RENDER_STATE, u32(DEVICE, 137 /* D3DRS_LIGHTING */, 0, 0)),
         command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
         command(0x202, u32(DEVICE, 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2)),
         command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
@@ -1473,6 +1530,8 @@ await test("fixed-function fog tints the fragment towards D3DRS_FOGCOLOR", async
         command(OP.SET_FVF, fvfPayload(0x2,
             [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
         command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        // This test isolates fog and asserts exact uniform offsets.
+        command(OP.SET_RENDER_STATE, u32(DEVICE, 137 /* D3DRS_LIGHTING */, 0, 0)),
         command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
         command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_FOGENABLE, 1, 0)),
         command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_FOGTABLEMODE, D3DFOG_LINEAR, 0)),
@@ -1489,14 +1548,17 @@ await test("fixed-function fog tints the fragment towards D3DRS_FOGCOLOR", async
     assert.equal(pipelines.length, 2, "fog must not reuse the unfogged pipeline");
     assert.ok(!pipelines[0].fragment.module.code.includes("mix(uniforms.fog_color"),
         "the pre-fog draw must not blend");
-    assert.ok(pipelines[1].vertex.module.code.includes("fog_distance"),
-        "the fog factor is computed in the vertex stage:\n" +
-        pipelines[1].vertex.module.code);
+    assert.ok(!pipelines[1].vertex.module.code.includes("fog_distance"),
+        "table fog must not be reduced to a per-vertex factor");
+    assert.ok(pipelines[1].fragment.module.code.includes(
+        "fog_distance = 1.0 / max(abs(stage_in.position.w), 1e-6)"),
+        "W table fog must recover clip W and evaluate per fragment:\n" +
+        pipelines[1].fragment.module.code);
     assert.ok(pipelines[1].fragment.module.code.includes("mix(uniforms.fog_color"),
         "the pixel stage must blend towards the fog colour");
 
-    // The fixed-function pixel stage has no register file, so binding 1 exists
-    // only to carry the fog colour -- and it has to be declared and supplied.
+    // The fixed-function pixel stage has no register file, so binding 1 carries
+    // the fog colour and, for table fog, its distance parameters.
     const layout = find("createBindGroupLayout").pop()[1];
     assert.ok(layout.entries.some(entry => entry.binding === 1),
         "the fog colour needs its own pixel-stage uniform binding");
@@ -1512,13 +1574,129 @@ await test("fixed-function fog tints the fragment towards D3DRS_FOGCOLOR", async
         "D3DRS_FOGCOLOR is 0x00RRGGBB and must reach the shader as RGB");
 
     // FOGSTART/FOGEND are float bits inside a DWORD, not integers.
-    const vertexData = new Float32Array(
-        find("writeBuffer").filter(c => c[1] === bindGroup.entries[0].resource.buffer)
-            .pop()[6].buffer);
-    // The vertex block's shape follows the signature (M3), so with no lighting
-    // and no texture transform fog_params sits right after the WVP and viewport.
-    assert.equal(vertexData[20], 10, "FOGSTART decoded as float bits");
-    assert.equal(vertexData[21], 200, "FOGEND decoded as float bits");
+    // Table fog evaluates in the fragment stage, so the parameters immediately
+    // follow fog_color in the fixed pixel block.
+    const pixelBase = pixelEntry.resource.offset / 4;
+    assert.equal(data[pixelBase + 4], 10, "FOGSTART decoded as float bits");
+    assert.equal(data[pixelBase + 5], 200, "FOGEND decoded as float bits");
+});
+
+await test("table fog with a translated VS uses fragment W instead of oFog",
+        async () => {
+    const D3DRS_FOGENABLE = 28, D3DRS_FOGTABLEMODE = 35;
+    const D3DFOG_LINEAR = 3;
+    const { executor, find } = makeExecutor();
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD),
+    ];
+    const vs = shaderCreatePayload(0x40000016, VS_TEXCOORD0_BYTECODE);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 4, 4, 1, 21, 0, 1)),
+        command(OP.CREATE_VERTEX_DECLARATION, declarationPayload(0x301, elements)),
+        command(OP.CREATE_VERTEX_SHADER, vs.payload, vs.blob, vs.blobOffsetField),
+        command(OP.SET_VERTEX_DECLARATION, u32(DEVICE, 0x301)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_VERTEX_SHADER, u32(DEVICE, 0x40000016)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_FOGENABLE, 1, 0)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_FOGTABLEMODE,
+            D3DFOG_LINEAR, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(executor.stats.droppedDraws, 0);
+    const pipeline = find("createRenderPipeline").pop()[1];
+    assert.ok(pipeline.fragment.module.code.includes("mix(uniforms.fog_color"),
+        "fixed-function fog remains enabled for the mixed VS/FF pixel path");
+    assert.ok(pipeline.fragment.module.code.includes(
+        "fog_distance = 1.0 / max(abs(stage_in.position.w), 1e-6)"),
+        "table fog must be evaluated from per-fragment W");
+    assert.ok(!pipeline.fragment.module.code.includes(
+        "clamp(stage_in.varying10.x"),
+        "table fog must ignore a programmable VS oFog output");
+});
+
+await test("vertex fog with a translated VS still consumes oFog", async () => {
+    const D3DRS_FOGENABLE = 28, D3DRS_FOGVERTEXMODE = 140;
+    const D3DFOG_LINEAR = 3;
+    const { executor, find } = makeExecutor();
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD),
+    ];
+    const vs = shaderCreatePayload(0x40000017, VS_TEXCOORD0_BYTECODE);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 4, 4, 1, 21, 0, 1)),
+        command(OP.CREATE_VERTEX_DECLARATION, declarationPayload(0x301, elements)),
+        command(OP.CREATE_VERTEX_SHADER, vs.payload, vs.blob, vs.blobOffsetField),
+        command(OP.SET_VERTEX_DECLARATION, u32(DEVICE, 0x301)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_VERTEX_SHADER, u32(DEVICE, 0x40000017)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_FOGENABLE, 1, 0)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_FOGVERTEXMODE,
+            D3DFOG_LINEAR, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(executor.stats.droppedDraws, 0);
+    const pipeline = find("createRenderPipeline").pop()[1];
+    assert.ok(pipeline.fragment.module.code.includes(
+        "clamp(stage_in.varying10.x"),
+        "vertex fog must consume the VS oFog varying");
+    assert.ok(!pipeline.fragment.module.code.includes("let fog_distance"),
+        "vertex fog must not be replaced by table fog");
+    assert.ok(pipeline.vertex.module.code.includes(
+        "o_varying10: vec4<f32> = vec4<f32>(1.0, 0.0, 0.0, 0.0);"),
+        "an unwritten oFog defaults to factor one for vertex fog");
+});
+
+await test("table and vertex fog do not collide in the shader cache", async () => {
+    const D3DRS_FOGENABLE = 28, D3DRS_FOGTABLEMODE = 35;
+    const D3DRS_FOGVERTEXMODE = 140, D3DRS_LIGHTING = 137;
+    const D3DFOG_NONE = 0, D3DFOG_LINEAR = 3;
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_LIGHTING, 0, 0)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_FOGENABLE, 1, 0)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_FOGTABLEMODE,
+            D3DFOG_LINEAR, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_FOGTABLEMODE,
+            D3DFOG_NONE, 0)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_FOGVERTEXMODE,
+            D3DFOG_LINEAR, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(executor.stats.droppedDraws, 0);
+    const pipelines = find("createRenderPipeline").map(call => call[1]);
+    assert.equal(pipelines.length, 2);
+    assert.ok(pipelines[0].fragment.module.code.includes("let fog_distance"),
+        "the table-fog fragment module must use fragment W");
+    assert.ok(!pipelines[0].vertex.module.code.includes("let fog_distance"),
+        "table fog must not run in the vertex shader");
+    assert.ok(pipelines[1].fragment.module.code.includes(
+        "clamp(stage_in.varying10.x"),
+        "the vertex-fog fragment module must consume oFog");
+    assert.ok(pipelines[1].vertex.module.code.includes("let fog_distance"),
+        "fixed-function vertex fog must be computed in the vertex shader");
 });
 
 await test("a malformed batch is rejected rather than half-executed", async () => {
@@ -1553,8 +1731,11 @@ await test("shader bytecode that overruns the batch is rejected", async () => {
 const D3DRS = {
     LIGHTING: 137, AMBIENT: 139, SPECULARENABLE: 29, COLORVERTEX: 141,
     NORMALIZENORMALS: 143, TEXTUREFACTOR: 60, SCISSORTESTENABLE: 174,
-    DIFFUSEMATERIALSOURCE: 145,
+    DIFFUSEMATERIALSOURCE: 145, VERTEXBLEND: 151,
+    INDEXEDVERTEXBLENDENABLE: 167,
 };
+const D3DVBF = { DISABLE: 0, ONE: 1, TWO: 2, THREE: 3, TWEENING: 255,
+    ZERO: 256 };
 const D3DTSS = {
     COLOROP: 1, COLORARG1: 2, COLORARG2: 3, ALPHAOP: 4, ALPHAARG1: 5,
     ALPHAARG2: 6, TEXCOORDINDEX: 11, TEXTURETRANSFORMFLAGS: 24,
@@ -1607,6 +1788,276 @@ function transformPayload(state, matrix) {
     matrix.forEach((value, index) => payload.writeFloatLE(value, 8 + index * 4));
     return payload;
 }
+
+// ---- fixed-function vertex blending (D3DRS_VERTEXBLEND) ----
+//
+// The bug these cover: a skinned mesh whose every vertex was posed by world
+// matrix 0 renders in bind pose -- rigid, in the right place, fully lit. It
+// looks like a working draw, which is why it survived so long, and why these
+// assert on the *matrices reaching the block* and not merely on the draw
+// succeeding.
+
+// Two world matrices whose translations differ in every component, so a vertex
+// posed by the wrong one, or by their unweighted average, lands somewhere no
+// other mistake would put it.
+const WORLD0 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 2, 3, 1];
+const WORLD1 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 40, 50, 60, 1];
+const WORLD2 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 700, 800, 900, 1];
+
+function blendedVertexUniforms(find) {
+    const bindGroup = find("createBindGroup").pop()[1];
+    const write = find("writeBuffer")
+        .filter(call => call[1] === bindGroup.entries[0].resource.buffer).pop();
+    return new Float32Array(write[6].buffer, write[6].byteOffset);
+}
+
+await test("D3DRS_VERTEXBLEND poses a vertex by several world matrices",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT1, DECLUSAGE.BLENDWEIGHT),
+    ];
+    const projection = [2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1];
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 160)),
+        command(OP.SET_FVF, fvfPayload(0, elements)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 16)),
+        command(OP.SET_TRANSFORM, transformPayload(256, WORLD0)),
+        command(OP.SET_TRANSFORM, transformPayload(257, WORLD1)),
+        command(OP.SET_TRANSFORM, transformPayload(3, projection)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.VERTEXBLEND, D3DVBF.ONE, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.blendedDraws, 1, "the draw must be blended");
+    assert.equal(executor.stats.drawsWithUnappliedVertexBlend, 0);
+
+    const pipeline = find("createRenderPipeline").pop()[1];
+    const wgsl = pipeline.vertex.module.code;
+    assert.ok(wgsl.includes("blend_worlds: array<mat4x4<f32>, 2>"),
+        "D3DVBF_1WEIGHTS names one weight and therefore two matrices:\n" + wgsl);
+    assert.ok(wgsl.includes("uniforms.blend_worlds[0u]") &&
+        wgsl.includes("uniforms.blend_worlds[1u]"),
+        "an unindexed blend takes its matrices in order");
+    // The last weight is D3D9's leftover, not a second attribute component.
+    assert.ok(wgsl.includes("let d9_blend_last = 1.0 - (in13.x);"),
+        "the final matrix takes 1 - sum(the supplied weights)");
+    assert.ok(wgsl.includes("uniforms.view_projection * d9_blend_position"),
+        "a blended draw may not pre-multiply the world matrix");
+    assert.ok(!wgsl.includes("world_view_projection"),
+        "world_view_projection would silently re-apply world matrix 0");
+    // BLENDWEIGHT has to actually be fetched, or the shader reads garbage.
+    const byLocation = new Map(pipeline.vertex.buffers[0].attributes
+        .map(a => [a.shaderLocation, a]));
+    assert.equal(byLocation.get(13).offset, 12, "BLENDWEIGHT belongs at 13");
+    assert.equal(byLocation.get(13).format, "float32");
+
+    // view_projection(16) viewport(4) blend_worlds(2 * 16)
+    const data = blendedVertexUniforms(find);
+    assert.deepEqual([...data.slice(0, 16)], projection,
+        "with an identity view, view_projection is the projection alone");
+    assert.deepEqual([...data.slice(20, 36)], WORLD0);
+    assert.deepEqual([...data.slice(36, 52)], WORLD1);
+});
+
+await test("indexed vertex blending reads BLENDINDICES as an integer attribute",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT3, DECLUSAGE.NORMAL),
+        element(0, 24, DECLTYPE.FLOAT2, DECLUSAGE.BLENDWEIGHT),
+        element(0, 32, DECLTYPE.UBYTE4, DECLUSAGE.BLENDINDICES),
+    ];
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 216)),
+        command(OP.SET_FVF, fvfPayload(0, elements)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 36)),
+        command(OP.SET_TRANSFORM, transformPayload(256, WORLD0)),
+        command(OP.SET_TRANSFORM, transformPayload(257, WORLD1)),
+        command(OP.SET_TRANSFORM, transformPayload(258, WORLD2)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.VERTEXBLEND, D3DVBF.TWO, 0)),
+        command(OP.SET_RENDER_STATE,
+            u32(DEVICE, D3DRS.INDEXEDVERTEXBLENDENABLE, 1, 0)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.LIGHTING, 1, 0)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.NORMALIZENORMALS, 1, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.blendedDraws, 1);
+
+    const pipeline = find("createRenderPipeline").pop()[1];
+    const wgsl = pipeline.vertex.module.code;
+    // UBYTE4 is uint8x4, an integer format: WebGPU rejects a pipeline whose
+    // WGSL declares that location as f32, so the base type has to follow the
+    // declaration's D3DDECLTYPE rather than the vec4<f32> everything else uses.
+    assert.ok(wgsl.includes("@location(14) in14: vec4<u32>"),
+        "BLENDINDICES must be declared with its format's base type:\n" + wgsl);
+    assert.ok(wgsl.includes("uniforms.blend_worlds[d9_blend_index.x]") &&
+        wgsl.includes("uniforms.blend_worlds[d9_blend_index.z]"),
+        "an indexed blend selects each slot's matrix per vertex");
+    assert.ok(/min\(in14,\s*vec4<u32>\(\d+u\)\)/.test(wgsl),
+        "an out-of-range index has no defined uniform read, so clamp it");
+    // The palette is sized from the highest matrix the guest has set (2), then
+    // rounded up to a bucket so adding a bone does not mint a new pipeline.
+    assert.ok(wgsl.includes("blend_worlds: array<mat4x4<f32>, 4>"),
+        "three world matrices set must round up to the 4-entry bucket");
+    // The blended normal must go through the blend, and then through the view
+    // half only -- normal_matrix no longer carries the world half.
+    assert.ok(wgsl.includes("vec4<f32>(d9_blend_normal, 0.0)"),
+        "the normal has to ride the same blend as the position");
+
+    const byLocation = new Map(pipeline.vertex.buffers[0].attributes
+        .map(a => [a.shaderLocation, a]));
+    assert.equal(byLocation.get(14).format, "uint8x4");
+    assert.equal(byLocation.get(14).offset, 32);
+
+    // view_projection(16) viewport(4) blend_worlds(4 * 16) view_matrix(16)
+    const data = blendedVertexUniforms(find);
+    assert.deepEqual([...data.slice(20, 36)], WORLD0);
+    assert.deepEqual([...data.slice(36, 52)], WORLD1);
+    assert.deepEqual([...data.slice(52, 68)], WORLD2);
+    // The unset fourth palette entry is identity, not leftover memory.
+    assert.deepEqual([...data.slice(68, 84)],
+        [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+});
+
+await test("D3DCOLOR blend indices are scaled back from unorm", async () => {
+    // D3DFVF_LASTBETA_D3DCOLOR is the FVF spelling of "the last beta DWORD
+    // holds matrix indices", and D3DCOLOR maps to unorm8x4 -- so the shader
+    // receives index 2 as 2/255, not as 2. Truncating that selects bone 0 for
+    // every vertex, which is bind pose again, arrived at by a different route.
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 144)),
+        command(OP.SET_FVF, fvfPayload(0, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+            element(0, 12, DECLTYPE.FLOAT1, DECLUSAGE.BLENDWEIGHT),
+            element(0, 16, DECLTYPE.D3DCOLOR, DECLUSAGE.BLENDINDICES)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TRANSFORM, transformPayload(256, WORLD0)),
+        command(OP.SET_TRANSFORM, transformPayload(257, WORLD1)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.VERTEXBLEND, D3DVBF.ONE, 0)),
+        command(OP.SET_RENDER_STATE,
+            u32(DEVICE, D3DRS.INDEXEDVERTEXBLENDENABLE, 1, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.blendedDraws, 1);
+    const pipeline = find("createRenderPipeline").pop()[1];
+    const wgsl = pipeline.vertex.module.code;
+    assert.ok(wgsl.includes("@location(14) in14: vec4<f32>"),
+        "unorm8x4 is a float format:\n" + wgsl);
+    assert.ok(wgsl.includes("round(in14 * 255.0)"),
+        "the index bytes have to be scaled back, and rounded not truncated");
+    // No .bgra here: the swizzle a D3DCOLOR *colour* needs would reverse the
+    // index order, since these bytes are indices in memory order, not channels.
+    assert.ok(!wgsl.includes("in14.bgra"),
+        "blend indices are bytes in order, not colour channels");
+    const byLocation = new Map(pipeline.vertex.buffers[0].attributes
+        .map(a => [a.shaderLocation, a]));
+    assert.equal(byLocation.get(14).format, "unorm8x4");
+});
+
+await test("blend data with D3DRS_VERTEXBLEND disabled is ignored, as D3D9 does",
+        async () => {
+    // Engines share one declaration between their skinned and unskinned passes,
+    // so blend elements are present far more often than blending is on. D3D9
+    // poses those draws by D3DTS_WORLD alone; so must this. The counter is what
+    // keeps the case visible without a warning that would fire every frame.
+    const { executor, find } = makeExecutor();
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT1, DECLUSAGE.BLENDWEIGHT),
+        element(0, 16, DECLTYPE.UBYTE4, DECLUSAGE.BLENDINDICES),
+    ];
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 120)),
+        command(OP.SET_FVF, fvfPayload(0, elements)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TRANSFORM, transformPayload(256, WORLD0)),
+        command(OP.SET_TRANSFORM, transformPayload(257, WORLD1)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.blendedDraws, 0);
+    assert.equal(executor.stats.drawsWithUnappliedVertexBlend, 1,
+        "ignored-but-present skinning data stays countable");
+
+    const pipeline = find("createRenderPipeline").pop()[1];
+    const wgsl = pipeline.vertex.module.code;
+    assert.ok(wgsl.includes("uniforms.world_view_projection * in0"),
+        "an unblended draw keeps the folded matrix chain:\n" + wgsl);
+    assert.ok(!wgsl.includes("blend_worlds"), "no palette is uploaded");
+    // A vertex attribute the shader never declares is a pipeline the driver
+    // may reject, so the layout has to drop them too.
+    const locations = pipeline.vertex.buffers[0].attributes
+        .map(a => a.shaderLocation);
+    assert.deepEqual(locations, [0],
+        "unread skinning attributes must stay out of the vertex layout");
+});
+
+await test("vertex blending falls back when the declaration cannot supply it",
+        async () => {
+    // D3DRS_VERTEXBLEND on, but nothing to blend with: D3D9's result is
+    // undefined, so posing by world matrix 0 and saying so beats inventing one.
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 72)),
+        command(OP.SET_FVF, fvfPayload(0x2, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_TRANSFORM, transformPayload(256, WORLD0)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.VERTEXBLEND, D3DVBF.TWO, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0, "the draw still renders");
+    assert.equal(executor.stats.blendedDraws, 0);
+    const wgsl = find("createRenderPipeline").pop()[1].vertex.module.code;
+    assert.ok(!wgsl.includes("blend_worlds"),
+        "a blend with no weights must not be attempted:\n" + wgsl);
+});
+
+await test("pre-transformed vertices are never blended", async () => {
+    // XYZRHW geometry has already been through the whole transform pipeline, so
+    // there is nothing for a world matrix to pose -- D3D9 ignores VERTEXBLEND
+    // for it, and a blend applied here would move UI off screen.
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 120)),
+        command(OP.SET_FVF, fvfPayload(0x4, [
+            element(0, 0, DECLTYPE.FLOAT4, DECLUSAGE.POSITIONT),
+            element(0, 16, DECLTYPE.FLOAT1, DECLUSAGE.BLENDWEIGHT)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TRANSFORM, transformPayload(256, WORLD0)),
+        command(OP.SET_TRANSFORM, transformPayload(257, WORLD1)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.VERTEXBLEND, D3DVBF.ONE, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.blendedDraws, 0);
+    const wgsl = find("createRenderPipeline").pop()[1].vertex.module.code;
+    assert.ok(!wgsl.includes("blend_worlds"),
+        "XYZRHW must keep its screen-space path:\n" + wgsl);
+    assert.ok(wgsl.includes("let ndc_x"), "and still be mapped through NDC");
+});
 
 await test("fixed-function lighting reaches the shader and the uniform block",
         async () => {
@@ -1680,33 +2131,93 @@ await test("fixed-function lighting reaches the shader and the uniform block",
         "the light position must be transformed into view space");
 });
 
-await test("D3DRS_LIGHTING with no NORMAL passes the vertex colour through",
+await test("D3DRS_LIGHTING with no NORMAL preserves ambient and emissive",
         async () => {
-    // D3DRS_LIGHTING defaults to TRUE, so most draws with a plain pre-coloured
-    // vertex format arrive with lighting nominally on. Running the maths on a
-    // zero normal would leave only ambient+emissive, and with D3DRS_AMBIENT
-    // defaulting to 0 that renders every such draw black.
+    // D3D9 supplies a zero normal when the declaration has no NORMAL. The
+    // light-direction dot products disappear, but ambient and emissive still
+    // have to be evaluated. GTA SA relies on that distinction for character
+    // batches whose pre-lit vertex colour is black.
     const { executor, find } = makeExecutor();
-    await executor.submit(buildBatch([
-        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
-        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
-        command(OP.SET_FVF, fvfPayload(0x42, [
-            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
-            element(0, 12, DECLTYPE.D3DCOLOR, DECLUSAGE.COLOR)])),
-        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 16)),
-        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.LIGHTING, 1, 0)),
-        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
-        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
-    ], { present: true }));
-    await executor.idle();
+    const defaultWarnings = [];
+    const originalConsoleWarn = console.warn;
+    console.warn = (...args) => defaultWarnings.push(args);
+    try {
+        await executor.submit(buildBatch([
+            command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+            command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+            command(OP.SET_FVF, fvfPayload(0x42, [
+                element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+                element(0, 12, DECLTYPE.D3DCOLOR, DECLUSAGE.COLOR)])),
+            command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 16)),
+            command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.LIGHTING, 1, 0)),
+            command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS.AMBIENT,
+                0x00ffffff, 0)),
+            command(OP.SET_MATERIAL, materialPayload(
+                [1, 1, 1, 1], [0.25, 0.5, 0.75, 1], [0, 0, 0, 0],
+                [0.05, 0, 0, 0], 0)),
+            command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+            command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+        ], { present: true }));
+        await executor.idle();
+    } finally {
+        console.warn = originalConsoleWarn;
+    }
+    assert.equal(defaultWarnings.filter(args =>
+        /coordinate set|lit draw with no NORMAL/.test(String(args[0]))).length, 0,
+    "valid but suspicious draw state must not warn unless diagnostics are enabled");
     assert.equal(executor.stats.droppedDraws, 0);
-    assert.equal(executor.stats.drawsWithUnappliedLighting, 1,
-        "skipping lighting for a normal-less draw has to be counted");
-    const wgsl = find("createRenderPipeline").pop()[1].vertex.module.code;
-    assert.ok(!wgsl.includes("struct D9Light"),
-        "no lighting maths should be generated:\n" + wgsl);
-    assert.ok(wgsl.includes("let out_diffuse = vertex_diffuse;"),
-        "the vertex colour must reach the rasteriser unchanged");
+    assert.equal(executor.stats.drawsWithUnappliedLighting, 0,
+        "normal-less lighting is implemented, not dropped");
+    assert.equal(executor.stats.drawsWithZeroNormalLighting, 1,
+        "normal-less lit draws remain visible in diagnostics");
+    assert.equal(executor.stats.zeroNormalDrawsWithoutTexture, 0);
+    assert.equal(executor.stats.zeroNormalDrawsWithMissingTexture, 1,
+        "the default stage-0 texture read must expose its missing binding");
+    assert.equal(executor.stats.zeroNormalDrawsWithLiveTexture, 0);
+
+    const pipeline = find("createRenderPipeline").pop()[1];
+    const wgsl = pipeline.vertex.module.code;
+    assert.ok(wgsl.includes("let normal_view = vec3<f32>(0.0);"),
+        "a missing NORMAL must become the D3D9 zero normal:\n" + wgsl);
+    assert.ok(wgsl.includes("total_ambient * material_ambient.xyz"),
+        "global ambient and material ambient must still be evaluated");
+    assert.ok(wgsl.includes("material_emissive.xyz"),
+        "material emissive must survive a missing normal");
+    assert.ok(!wgsl.includes("let out_diffuse = vertex_diffuse;"),
+        "black pre-lit COLOR0 must not bypass ambient lighting");
+
+    const bindGroup = find("createBindGroup").pop()[1];
+    const write = find("writeBuffer")
+        .filter(call => call[1] === bindGroup.entries[0].resource.buffer).pop();
+    const data = new Float32Array(write[6].buffer, write[6].byteOffset);
+    // world_view_projection(16) viewport(4) world_view(16) normal_matrix(16)
+    const materialDiffuse = 16 + 4 + 16 + 16;
+    assert.deepEqual([...data.slice(materialDiffuse + 4, materialDiffuse + 8)],
+        [0.25, 0.5, 0.75, 1], "material ambient must reach the uniform block");
+    const ambientPower = materialDiffuse + 16;
+    assert.deepEqual([...data.slice(ambientPower, ambientPower + 3)], [1, 1, 1],
+        "white D3DRS_AMBIENT must reach the uniform block");
+
+    // The same evidence remains available on demand without changing the
+    // rendering path or disabling the always-on counters above.
+    const diagnosticWarnings = [];
+    executor.debug.warnOnSuspiciousDraws = true;
+    console.warn = (...args) => diagnosticWarnings.push(args);
+    try {
+        await executor.submit(buildBatch([
+            command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+            command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+        ], { present: true }));
+        await executor.idle();
+    } finally {
+        console.warn = originalConsoleWarn;
+    }
+    assert.ok(diagnosticWarnings.some(args =>
+        String(args[0]).includes("coordinate set")),
+    "the missing-coordinate diagnostic must remain available on demand");
+    assert.ok(diagnosticWarnings.some(args =>
+        String(args[0]).includes("lit draw with no NORMAL")),
+    "the zero-normal diagnostic must remain available on demand");
 });
 
 await test("a multi-stage texture cascade generates one blend per stage",
@@ -2871,11 +3382,13 @@ await test("fixed-function draws carry the D3D9 half-pixel offset", async () => 
     }
 });
 
-// The proxy sends BLENDWEIGHT/BLENDINDICES through, but only D3DTS_WORLD is
-// ever consumed, so a fixed-function skinned mesh is posed by world matrix 0
-// alone. That renders as a collapsed or contorted model with no other trace,
-// so it has to be reported rather than drawn silently wrong.
-await test("a fixed-function skinned declaration is reported, not drawn silently",
+// The same case as "blend data with D3DRS_VERTEXBLEND disabled", reached from
+// the FVF side rather than a real declaration, and with the four-weight shape a
+// skinned mesh actually ships. D3D9 poses this by D3DTS_WORLD alone because the
+// render state never enabled blending, and so does this -- but a model stuck in
+// bind pose looks like a working draw, so the count is what makes the case
+// visible when it turns out to be the reason a character does not move.
+await test("a fixed-function skinned declaration is counted when blending is off",
         async () => {
     const { executor } = makeExecutor();
     await executor.submit(buildBatch([

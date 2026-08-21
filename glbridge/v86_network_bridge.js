@@ -3806,11 +3806,14 @@
                     document.getElementById("d3d_webgpu_canvas") : null);
             this.d3d8Canvas = this.options.d3d8Canvas || sharedD3DCanvas;
             this.d3d8Executor = null;
+            this.d3d8BatchStreamSeen = false;
             this.d3d8Surface = { hwnd: 0, x: 0, y: 0, width: 0, height: 0 };
             this.d3d8OwnerSessionKey = null;
             this.d3d8Visible = false;
             this.d3d9Canvas = this.options.d3d9Canvas || sharedD3DCanvas;
             this.d3d9Executor = null;
+            this.d3d9BatchStreamSeen = false;
+            this.sharedD3DCanvasConflictReported = false;
             this.d3d9Surface = { hwnd: 0, x: 0, y: 0, width: 0, height: 0 };
             this.d3d9OwnerSessionKey = null;
             this.d3d9Visible = false;
@@ -5185,12 +5188,17 @@
         }
 
         // Sharing one canvas between the two executors is safe only because a
-        // guest process loads exactly one of d3d8.dll/d3d9.dll. If both ever
-        // drove batches at once they would each hold their own GPUDevice and
+        // guest process loads exactly one of d3d8.dll/d3d9.dll. Merely creating
+        // both executors is harmless: the page does that up front so either API
+        // can be accepted. Only seeing valid batch streams from both APIs is a
+        // conflict, because then they each hold their own GPUDevice and
         // fight over the single canvas context -- whichever configured last
         // would win and the other's frames would silently stop appearing.
         // That would be baffling to debug, so say so plainly the first time.
         warnOnSharedD3DCanvasConflict(active) {
+            if (active === "d3d8") this.d3d8BatchStreamSeen = true;
+            if (active === "d3d9") this.d3d9BatchStreamSeen = true;
+            if (!this.d3d8BatchStreamSeen || !this.d3d9BatchStreamSeen) return;
             if (this.d3d8Canvas !== this.d3d9Canvas) return;
             const other = active === "d3d8" ? this.d3d9Executor : this.d3d8Executor;
             if (!other || !other.context) return;
@@ -5208,13 +5216,14 @@
                     ? executor.getStats() : null;
                 return stats ? stats.batches : null;
             };
-            console.error("[v86gl] both the D3D8 and D3D9 executors are live on " +
+            console.error("[v86gl] both D3D8 and D3D9 batch streams reached " +
                 "the same overlay canvas; they own separate GPUDevices and " +
                 "cannot share one canvas context, so whichever configured it " +
                 "last wins and the other's frames stop appearing. A game " +
                 "directory must contain only one of d3d8.dll/d3d9.dll (see plan " +
                 "section 4.6).", {
                     drivingThisBatch: active,
+                    observedBatchStreams: ["d3d8", "d3d9"],
                     d3d8Batches: batchesOf(this.d3d8Executor),
                     d3d9Batches: batchesOf(this.d3d9Executor),
                 });

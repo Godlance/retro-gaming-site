@@ -65,6 +65,11 @@ static volatile LONG g_trace_ib_count;
 static volatile LONG g_trace_vb_bytes;
 static volatile LONG g_trace_ib_bytes;
 static volatile LONG g_trace_last_freed_surface;
+/* Reset by trace_frame_summary() after every Present. */
+static volatile LONG g_frame_draws;
+static volatile LONG g_frame_primitives;
+static volatile LONG g_frame_rejected;
+static volatile LONG g_frame_clears;
 /* The device window, so PROCESS_DETACH can say whether it outlived the
  * process. A title that quit because its window was destroyed and the message
  * pump drained a WM_QUIT looks identical, from D3D9's side, to one that called
@@ -240,6 +245,58 @@ static void trace_memory_block(const char *label, DWORD address)
  * exception handler, where calling into USER32 risks faulting a second time --
  * on a stack overflow especially. This is only meaningful at exit anyway.
  */
+/*
+ * The guest's memory situation.
+ *
+ * This proxy keeps a full shadow copy of every managed texture and buffer in
+ * guest RAM, on top of the copy the application itself holds, so it roughly
+ * doubles a title's texture footprint. GTA San Andreas reaches its loading
+ * screen, streams a few hundred textures, and then shuts down cleanly -- which
+ * is what a title does when one of *its own* allocations fails, and is
+ * invisible from the D3D9 side because none of the proxy's own allocations
+ * failed. Sampling this makes the difference between "the guest ran out" and
+ * "something else entirely" a fact rather than a theory.
+ */
+static void trace_memory_state(const char *reason)
+{
+    MEMORYSTATUS status;
+
+    ZeroMemory(&status, sizeof(status));
+    status.dwLength = sizeof(status);
+    GlobalMemoryStatus(&status);
+    trace_write("MEM %s load=%lu%% phys=%luK/%luK page=%luK/%luK "
+            "virtual=%luK/%luK", reason, status.dwMemoryLoad,
+            (DWORD)(status.dwAvailPhys / 1024u),
+            (DWORD)(status.dwTotalPhys / 1024u),
+            (DWORD)(status.dwAvailPageFile / 1024u),
+            (DWORD)(status.dwTotalPageFile / 1024u),
+            (DWORD)(status.dwAvailVirtual / 1024u),
+            (DWORD)(status.dwTotalVirtual / 1024u));
+}
+
+/*
+ * One line per frame: what the title drew, and what was refused.
+ *
+ * `rejected` is the field to read first. It counts draws the proxy turned down
+ * before emitting anything, which is the one failure mode that looks identical
+ * to a title simply not drawing.
+ */
+static void trace_frame_summary(void)
+{
+    LONG draws = InterlockedExchange(&g_frame_draws, 0);
+    LONG primitives = InterlockedExchange(&g_frame_primitives, 0);
+    LONG rejected = InterlockedExchange(&g_frame_rejected, 0);
+    LONG clears = InterlockedExchange(&g_frame_clears, 0);
+
+    /* A frame that drew nothing and refused nothing is not worth a line --
+     * that is the loading screen presenting an already-composed image, and it
+     * would otherwise bury the frames that do have something to say. */
+    if (!draws && !rejected && !clears)
+        return;
+    trace_write("FRAME draws=%ld primitives=%ld rejected=%ld clears=%ld",
+            draws, primitives, rejected, clears);
+}
+
 static void trace_window_state(void)
 {
     HWND window = g_trace_device_window;
@@ -567,6 +624,36 @@ static void trace_close(void)
             (LONG)(uintptr_t)(surface))
 #define TRACE_REGISTER_RANGE(kind, ordinal, object, start, size) \
     trace_register_range(kind, ordinal, object, start, (DWORD)(size))
+/*
+ * Per-frame draw accounting.
+ *
+ * Tracing every draw is a firehose -- that is why the command-level trace is
+ * left commented out -- but the draw stream was the last part of a running
+ * title that no line of this log described at all. One summary per Present
+ * costs a line a frame and answers the questions that matter: is the title
+ * drawing, how much, and (the reason this exists) is any of it being thrown
+ * away. The four Draw* entry points refuse between them at nine places, each
+ * a bare D3DERR_INVALIDCALL that leaves no trace, so a title whose geometry is
+ * being dropped wholesale looks exactly like one that never drew.
+ */
+#define TRACE_FRAME_DRAW(primitives) \
+    do { \
+        InterlockedIncrement(&g_frame_draws); \
+        InterlockedExchangeAdd(&g_frame_primitives, (LONG)(primitives)); \
+    } while (0)
+#define TRACE_FRAME_REJECT() InterlockedIncrement(&g_frame_rejected)
+#define TRACE_FRAME_CLEAR() InterlockedIncrement(&g_frame_clears)
+/*
+ * Wraps a bare `return D3DERR_*` so a refusal leaves a mark. Two rounds of
+ * chasing San Andreas rested on "no call in the trace fails" -- but 249 of the
+ * 283 error returns in this file could not have appeared if they had. They are
+ * not covered by the per-frame reject counter (draw calls only), they emit no
+ * FAIL line, and UNSUPPORTED() only covers the deliberate stubs. A validation
+ * refusal in Clear, Lock, SetStreamSource or CreateTexture was simply silence.
+ */
+#define TRACE_REFUSE(hr) \
+    (trace_write("REFUSE %s:%d -> %08lX", __func__, (int)__LINE__, \
+            (DWORD)(hr)), (hr))
 #else
 #define TRACE(...) ((void)0)
 #define TRACE_FLUSH() ((void)0)
@@ -575,6 +662,10 @@ static void trace_close(void)
 #define TRACE_BUFFER_CREATED(index_buffer, length) ((void)0)
 #define TRACE_SURFACE_FREED(surface) ((void)0)
 #define TRACE_REGISTER_RANGE(kind, ordinal, object, start, size) ((void)0)
+#define TRACE_FRAME_DRAW(primitives) ((void)0)
+#define TRACE_FRAME_REJECT() ((void)0)
+#define TRACE_FRAME_CLEAR() ((void)0)
+#define TRACE_REFUSE(hr) (hr)
 #endif
 
 #define D9_MAX_RENDER_STATES 256u
@@ -776,6 +867,14 @@ struct D9Device {
     HCURSOR system_cursor;
     BOOL display_mode_changed;
     BOOL window_state_sent;
+    /* Saved across the borderless override an exclusive-fullscreen device
+     * applies to its window, so the app's own frame comes back on teardown. */
+    HWND styled_window;
+    LONG saved_window_style;
+    LONG saved_window_exstyle;
+    /* Reconstructs the vertical-retrace wait Present owes the app; see
+     * throttle_to_presentation_interval(). */
+    DWORD last_present_tick;
     /* Rate limiting for maintain_fullscreen_foreground(). */
     DWORD last_foreground_claim;
     DWORD foreground_claims;
@@ -1442,7 +1541,7 @@ static BOOL emit_command(uint16_t opcode, const void *payload,
  */
 /* Bumped whenever guest-visible behaviour changes, so the console can say
  * which DLL is actually loaded rather than leaving it to be inferred. */
-#define D9_PROXY_BUILD "guest-log-20260816"
+#define D9_PROXY_BUILD "gta-vertex-blend-20260819"
 
 #define D9_HOSTLOG_MAX_DISTINCT 128u
 
@@ -1918,6 +2017,28 @@ static BOOL primitive_element_count(D3DPRIMITIVETYPE type,
  * Buffer(..., this fvf, ...) should fail with D3DERR_INVALIDCALL", not "best
  * effort".
  */
+/* D3DFVF_XYZB1..XYZB5 are the five blended position codes, contiguous in steps
+ * of 2 between XYZB1 (0x0006) and XYZB5 (0x000e). XYZRHW (0x0004) sits below
+ * them and XYZW (0x4002) carries a bit outside this range, so both are excluded
+ * before the range test rather than by it. */
+static BOOL fvf_position_is_blended(DWORD fvf)
+{
+    DWORD position = fvf & D3DFVF_POSITION_MASK;
+    return position >= D3DFVF_XYZB1 && position <= D3DFVF_XYZB5;
+}
+
+/* Whether the last of a D3DFVF_XYZBn block's DWORDs holds matrix indices
+ * rather than another weight. Either LASTBETA flag says so outright; XYZB5 says
+ * so implicitly, because five float weights have no D3DDECLTYPE to be declared
+ * as and D3D9 has always read that last DWORD as indices. Same rule wined3d
+ * applies, and getting it wrong shifts every following element's offset. */
+static BOOL fvf_has_blend_indices(DWORD fvf)
+{
+    if (fvf & (D3DFVF_LASTBETA_UBYTE4 | D3DFVF_LASTBETA_D3DCOLOR))
+        return TRUE;
+    return (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZB5;
+}
+
 static BOOL fvf_to_declaration(DWORD fvf, D9WGVertexElement *elements,
         UINT *element_count)
 {
@@ -1946,6 +2067,62 @@ static BOOL fvf_to_declaration(DWORD fvf, D9WGVertexElement *elements,
         elements[count].usage_index = 0;
         ++count;
         offset += 16;
+    } else if ((fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZW) {
+        /* A four-component untransformed position, which only a vertex shader
+         * consumes -- unlike XYZRHW it is not pre-transformed. */
+        elements[count].stream = 0;
+        elements[count].offset = (uint16_t)offset;
+        elements[count].type = D3DDECLTYPE_FLOAT4;
+        elements[count].method = D3DDECLMETHOD_DEFAULT;
+        elements[count].usage = D3DDECLUSAGE_POSITION;
+        elements[count].usage_index = 0;
+        ++count;
+        offset += 16;
+    } else if (fvf_position_is_blended(fvf)) {
+        /* D3DFVF_XYZBn: a float3 position followed by n DWORDs of skinning
+         * data. This is the FVF spelling of the same BLENDWEIGHT/BLENDINDICES
+         * a vertex declaration states directly, and it used to be refused
+         * outright -- so SetFVF was the one entry point where the host's
+         * D3DRS_VERTEXBLEND support could not be reached. */
+        DWORD blend_dwords = 1u + (((fvf & D3DFVF_POSITION_MASK)
+                - D3DFVF_XYZB1) >> 1);
+        BOOL has_indices = fvf_has_blend_indices(fvf);
+        DWORD weight_count = blend_dwords - (has_indices ? 1u : 0u);
+
+        elements[count].stream = 0;
+        elements[count].offset = (uint16_t)offset;
+        elements[count].type = D3DDECLTYPE_FLOAT3;
+        elements[count].method = D3DDECLMETHOD_DEFAULT;
+        elements[count].usage = D3DDECLUSAGE_POSITION;
+        elements[count].usage_index = 0;
+        ++count;
+        offset += 12;
+
+        if (weight_count) {
+            /* FLOAT1..FLOAT4 are D3DDECLTYPE 0..3, so the count maps straight
+             * onto the enum. weight_count cannot exceed 4: XYZB5 always
+             * spends its last DWORD on indices (see fvf_has_blend_indices). */
+            elements[count].stream = 0;
+            elements[count].offset = (uint16_t)offset;
+            elements[count].type = (uint8_t)(D3DDECLTYPE_FLOAT1
+                    + (weight_count - 1u));
+            elements[count].method = D3DDECLMETHOD_DEFAULT;
+            elements[count].usage = D3DDECLUSAGE_BLENDWEIGHT;
+            elements[count].usage_index = 0;
+            ++count;
+            offset += weight_count * 4u;
+        }
+        if (has_indices) {
+            elements[count].stream = 0;
+            elements[count].offset = (uint16_t)offset;
+            elements[count].type = (fvf & D3DFVF_LASTBETA_D3DCOLOR)
+                    ? D3DDECLTYPE_D3DCOLOR : D3DDECLTYPE_UBYTE4;
+            elements[count].method = D3DDECLMETHOD_DEFAULT;
+            elements[count].usage = D3DDECLUSAGE_BLENDINDICES;
+            elements[count].usage_index = 0;
+            ++count;
+            offset += 4;
+        }
     } else {
         return FALSE;
     }
@@ -2075,8 +2252,19 @@ static BOOL parse_vertex_declaration(const D3DVERTEXELEMENT9 *elements,
     UINT count = 0;
     while (count < D3DMAXDECLLENGTH && elements[count].Stream != 0xFF) {
         const D3DVERTEXELEMENT9 *e = &elements[count];
-        if (!declaration_element_supported(e))
+        if (!declaration_element_supported(e)) {
+            /* Which element, not just "the declaration": one rejected usage or
+             * D3DDECLTYPE discards the whole array, and the attribute the app
+             * loses is almost never the one it would guess. Deduped by text,
+             * so a declaration rebuilt every frame costs one line. */
+            HOSTLOG_REFUSED("vertex declaration rejected at element %lu: "
+                    "stream=%lu offset=%lu type=%lu method=%lu usage=%lu "
+                    "usage_index=%lu (the whole declaration is discarded)",
+                    (DWORD)count, (DWORD)e->Stream, (DWORD)e->Offset,
+                    (DWORD)e->Type, (DWORD)e->Method, (DWORD)e->Usage,
+                    (DWORD)e->UsageIndex);
             return FALSE;
+        }
         wire[count].stream = e->Stream;
         wire[count].offset = e->Offset;
         wire[count].type = e->Type;
@@ -2500,12 +2688,135 @@ static BOOL shader_model_enabled(void)
     return cached != 0;
 }
 
+static BOOL env_flag_enabled(const char *name)
+{
+    char value[16];
+    DWORD length = GetEnvironmentVariableA(name, value, sizeof(value));
+
+    return length && length < sizeof(value) && value[0] != '0';
+}
+
+/*
+ * One cap this proxy still reports as 0 because nothing implements it, which is
+ * the right default: an app told it has user clip planes clips against planes
+ * nothing evaluates.
+ *
+ * Some titles gate startup on it rather than degrading, so an opt-in switch
+ * remains useful for caps bisection. GTA SA does gate startup on a capability,
+ * but it is SPECULARGOURAUDRGB, which the backend implements and fill_caps()
+ * now reports; user clip planes are not involved.
+ *
+ * So this is opt-in rather than on: enabling it trades correct rendering for
+ * getting past the gate, which is the right trade only while working out what a
+ * title wants. Defaults are unchanged, so titles that run today are unaffected.
+ *
+ * Vertex blending used to sit beside it here. It no longer does: the host
+ * implements D3DRS_VERTEXBLEND, indexed and not, so the number below is a
+ * promise that is kept.
+ */
+static DWORD reported_user_clip_planes(void)
+{
+    return env_flag_enabled("D9WG_CAPS_CLIP_PLANES") ? 6u : 0u;
+}
+
+/*
+ * D9WG_CAPS_PERMISSIVE=1: report the capability set of a complete D3D9
+ * implementation instead of only what this proxy backs.
+ *
+ * This exists for a recurring failure shape: a title reads D3DCAPS9, decides
+ * the device cannot run it, and exits before drawing -- with no call having
+ * failed, so nothing in a trace points at the cause. The GTA SA case was
+ * narrowed to one supported ShadeCaps bit and fixed in fill_caps();
+ * A broader caps comparison remains useful for the next title.
+ *
+ * The values below are SwiftShader 2.1's, read straight out of that probe, so
+ * this is "answer what a working implementation answered" rather than another
+ * guess about what a real card reports. Enabling it claims plenty this proxy
+ * does not implement: an app that takes one of those paths renders wrong. That
+ * is the trade -- it is a bisection tool for finding which field a title gates
+ * on, not a mode to ship in. Fields where the reference and this proxy already
+ * agree are omitted, so the list below IS the outstanding difference.
+ */
+static void apply_permissive_caps(D3DCAPS9 *caps)
+{
+    if (!env_flag_enabled("D9WG_CAPS_PERMISSIVE"))
+        return;
+
+    caps->Caps = D3DCAPS_READ_SCANLINE;
+    caps->Caps2 = D3DCAPS2_FULLSCREENGAMMA | D3DCAPS2_DYNAMICTEXTURES
+            | D3DCAPS2_CANAUTOGENMIPMAP;
+    caps->Caps3 = D3DCAPS3_ALPHA_FULLSCREEN_FLIP_OR_DISCARD
+            | D3DCAPS3_LINEAR_TO_SRGB_PRESENTATION | D3DCAPS3_COPY_TO_VIDMEM
+            | D3DCAPS3_COPY_TO_SYSTEMMEM;
+    caps->DevCaps = 0x009BBFF0u;
+    caps->PrimitiveMiscCaps = 0x001FCFF2u;
+    caps->RasterCaps = 0x07712190u;
+    caps->ShadeCaps = 0x00084208u;
+    caps->TextureCaps = 0x0001ECC5u;
+    caps->CubeTextureFilterCaps = caps->TextureFilterCaps;
+    caps->VolumeTextureFilterCaps = caps->TextureFilterCaps;
+    caps->TextureAddressCaps = 0x0000003Fu;
+    caps->VolumeTextureAddressCaps = 0x0000003Fu;
+    caps->LineCaps = 0x0000001Fu;
+    caps->MaxTextureWidth = 65536;
+    caps->MaxTextureHeight = 65536;
+    caps->MaxVolumeExtent = 65536;
+    caps->MaxTextureAspectRatio = 65536;
+    caps->MaxAnisotropy = 16;
+    caps->GuardBandLeft = -1.0e8f;
+    caps->GuardBandTop = -1.0e8f;
+    caps->GuardBandRight = 1.0e8f;
+    caps->GuardBandBottom = 1.0e8f;
+    caps->StencilCaps = 0x000001FFu;
+    caps->FVFCaps = 0x00180008u;
+    caps->TextureOpCaps = 0x03FFFFFFu;
+    caps->VertexProcessingCaps = 0x0000013Bu;
+    caps->MaxUserClipPlanes = 6;
+    caps->MaxVertexBlendMatrices = 4;
+    caps->MaxVertexBlendMatrixIndex = 255;
+    caps->MaxPointSize = 8192.0f;
+    caps->MaxPrimitiveCount = 2097152;
+    caps->MaxVertexIndex = 16777216;
+    caps->MaxStreams = 16;
+    caps->MaxStreamStride = 65536;
+    caps->DevCaps2 = D3DDEVCAPS2_STREAMOFFSET
+            | D3DDEVCAPS2_CAN_STRETCHRECT_FROM_TEXTURES
+            | D3DDEVCAPS2_VERTEXELEMENTSCANSHARESTREAMOFFSET;
+    caps->StretchRectFilterCaps = 0x03000300u;
+    caps->MaxVShaderInstructionsExecuted = 0xFFFFFFFFu;
+    caps->MaxPShaderInstructionsExecuted = 0xFFFFFFFFu;
+}
+
 static void fill_caps(D3DCAPS9 *caps)
 {
     ZeroMemory(caps, sizeof(*caps));
     caps->DeviceType = D3DDEVTYPE_HAL;
     caps->AdapterOrdinal = D3DADAPTER_DEFAULT;
-    caps->Caps2 = D3DCAPS2_CANMANAGERESOURCE;
+    /*
+     * Everything below claims only what this proxy implements -- but the
+     * fields left at their ZeroMemory value were understating it, which is the
+     * same class of bug as answering a call successfully with the wrong value.
+     * A cap reported as 0 is not "conservative" when the feature works: it
+     * tells a title the device cannot do something it can, and titles branch on
+     * that. Each addition here names the code that backs it.
+     */
+    caps->Caps2 = D3DCAPS2_CANMANAGERESOURCE
+            /* device_set_gamma_ramp(). */
+            | D3DCAPS2_FULLSCREENGAMMA
+            /* D3DUSAGE_DYNAMIC passes CheckDeviceFormat and CreateTexture, and
+             * the lock paths honour DISCARD/NOOVERWRITE. AUTOGENMIPMAP is
+             * deliberately refused, so D3DCAPS2_CANAUTOGENMIPMAP stays off. */
+            | D3DCAPS2_DYNAMICTEXTURES;
+    /* SetCursorProperties/SetCursorPosition/ShowCursor are all implemented, so
+     * reporting no hardware cursor at all was simply wrong. */
+    caps->CursorCaps = D3DCURSORCAPS_COLOR;
+    /* SetStreamSource carries OffsetInBytes to the host, and StretchRect
+     * accepts texture-level surfaces as its source. */
+    caps->DevCaps2 = D3DDEVCAPS2_STREAMOFFSET
+            | D3DDEVCAPS2_CAN_STRETCHRECT_FROM_TEXTURES;
+    /* A single-adapter device is a group of one. Zero is not a value any
+     * runtime reports, and an app that iterates the group gets nothing. */
+    caps->NumberOfAdaptersInGroup = 1;
     caps->PresentationIntervals = D3DPRESENT_INTERVAL_IMMEDIATE
             | D3DPRESENT_INTERVAL_ONE;
     caps->DevCaps = D3DDEVCAPS_HWRASTERIZATION
@@ -2514,12 +2825,33 @@ static void fill_caps(D3DCAPS9 *caps)
             | D3DDEVCAPS_EXECUTESYSTEMMEMORY
             | D3DDEVCAPS_EXECUTEVIDEOMEMORY
             | D3DDEVCAPS_TEXTURESYSTEMMEMORY
-            | D3DDEVCAPS_TEXTUREVIDEOMEMORY;
+            | D3DDEVCAPS_TEXTUREVIDEOMEMORY
+            /* Pre-transformed vertices draw from both a vertex buffer and a
+             * DrawPrimitiveUP pointer. */
+            | D3DDEVCAPS_TLVERTEXSYSTEMMEMORY
+            | D3DDEVCAPS_TLVERTEXVIDEOMEMORY
+            /* Present queues the frame and returns; nothing has to drain
+             * before the app may draw again. */
+            | D3DDEVCAPS_CANRENDERAFTERFLIP
+            /* Driver-model bits rather than features: every D3D9 device serves
+             * draws through the DrawPrimitives2 DDI.  Some engines read their
+             * absence as "this is a DX7-era driver" and take a legacy path. */
+            | D3DDEVCAPS_DRAWPRIMITIVES2
+            | D3DDEVCAPS_DRAWPRIMITIVES2EX;
     caps->PrimitiveMiscCaps = D3DPMISCCAPS_CULLNONE
             | D3DPMISCCAPS_CULLCW | D3DPMISCCAPS_CULLCCW
             | D3DPMISCCAPS_COLORWRITEENABLE | D3DPMISCCAPS_BLENDOP
             | D3DPMISCCAPS_SEPARATEALPHABLEND
             | D3DPMISCCAPS_INDEPENDENTWRITEMASKS
+            /* D3DRS_ZWRITEENABLE reaches the host and drives the depth-stencil
+             * state's depthWriteEnabled.  Reporting no MASKZ told apps to keep
+             * depth writes on for passes built around turning them off --
+             * particle and decal passes above all. */
+            | D3DPMISCCAPS_MASKZ
+            /* Pre-transformed (XYZRHW) geometry goes through the same render
+             * pass, viewport and scissor rectangle as everything else, so it is
+             * clipped rather than requiring the app to pre-clip it. */
+            | D3DPMISCCAPS_CLIPTLVERTS
             /* M3: D3DTA_TEMP as a stage argument and D3DTSS_RESULTARG
              * choosing it, both implemented by the host's cascade. */
             | D3DPMISCCAPS_TSSARGTEMP;
@@ -2528,7 +2860,11 @@ static void fill_caps(D3DCAPS9 *caps)
             | D3DPRASTERCAPS_FOGVERTEX | D3DPRASTERCAPS_FOGTABLE
             | D3DPRASTERCAPS_WFOG | D3DPRASTERCAPS_FOGRANGE
             /* M3: SetScissorRect reaches the host and its render pass. */
-            | D3DPRASTERCAPS_SCISSORTEST;
+            | D3DPRASTERCAPS_SCISSORTEST
+            /* WGSL interpolates varyings perspective-correct unless a stage is
+             * declared @interpolate(linear), and none are.  MIPMAPLODBIAS stays
+             * absent: D3DSAMP_MIPMAPLODBIAS reaches no sampler on the host. */
+            | D3DPRASTERCAPS_COLORPERSPECTIVE;
     caps->ZCmpCaps = 0xFFu;
     /* ZERO through BOTHINVSRCALPHA plus the BLENDFACTOR pair. The host maps
      * BOTH* to its resolved source/destination pair and installs WebGPU's
@@ -2539,8 +2875,19 @@ static void fill_caps(D3DCAPS9 *caps)
     caps->StencilCaps = D3DSTENCILCAPS_KEEP | D3DSTENCILCAPS_ZERO
             | D3DSTENCILCAPS_REPLACE | D3DSTENCILCAPS_INCRSAT
             | D3DSTENCILCAPS_DECRSAT | D3DSTENCILCAPS_INVERT
-            | D3DSTENCILCAPS_INCR | D3DSTENCILCAPS_DECR;
+            | D3DSTENCILCAPS_INCR | D3DSTENCILCAPS_DECR
+            /* D3DRS_TWOSIDEDSTENCILMODE and the four D3DRS_CCW_STENCIL* states
+             * are consumed by the host and become WebGPU's stencilBack face.
+             * Shadow-volume renderers pick a two-pass fallback without this. */
+            | D3DSTENCILCAPS_TWOSIDED;
     caps->ShadeCaps = D3DPSHADECAPS_COLORGOURAUDRGB
+            /* The fixed-function host computes per-vertex material/light
+             * specular when D3DRS_SPECULARENABLE is set and adds COLOR1 after
+             * the texture cascade. GTA SA's car environment-map pipeline
+             * explicitly requires this bit; omitting it makes
+             * CCarFXRenderer::Initialise fail during the legal screen and the
+             * game's frontend loader then exits cleanly. */
+            | D3DPSHADECAPS_SPECULARGOURAUDRGB
             | D3DPSHADECAPS_FOGGOURAUD | D3DPSHADECAPS_ALPHAGOURAUDBLEND;
     caps->TextureCaps = D3DPTEXTURECAPS_ALPHA | D3DPTEXTURECAPS_MIPMAP
             | D3DPTEXTURECAPS_PERSPECTIVE
@@ -2551,13 +2898,47 @@ static void fill_caps(D3DCAPS9 *caps)
              * claiming one would only make apps pad textures for nothing.
              * VOLUMEMAP is still absent -- IDirect3DVolumeTexture9 remains
              * unimplemented, see the plan's M3 status record. */
-            | D3DPTEXTURECAPS_CUBEMAP;
+            | D3DPTEXTURECAPS_CUBEMAP
+            /* CreateCubeTexture takes a level count and the host allocates the
+             * cube with that mipLevelCount, same as a 2D texture. */
+            | D3DPTEXTURECAPS_MIPCUBEMAP
+            /* D3DTTFF_PROJECTED is honoured: the host divides the texture
+             * coordinate by its last component before sampling. */
+            | D3DPTEXTURECAPS_PROJECTED;
     caps->TextureFilterCaps = D3DPTFILTERCAPS_MINFPOINT
             | D3DPTFILTERCAPS_MINFLINEAR | D3DPTFILTERCAPS_MAGFPOINT
             | D3DPTFILTERCAPS_MAGFLINEAR | D3DPTFILTERCAPS_MIPFPOINT
-            | D3DPTFILTERCAPS_MIPFLINEAR;
+            | D3DPTFILTERCAPS_MIPFLINEAR
+            /* Paired with MaxAnisotropy below: D3DTEXF_ANISOTROPIC resolves to
+             * linear filtering plus the sampler's anisotropy value.  Claiming a
+             * MaxAnisotropy of 16 while reporting no anisotropic filter type
+             * would contradict itself. */
+            | D3DPTFILTERCAPS_MINFANISOTROPIC
+            | D3DPTFILTERCAPS_MAGFANISOTROPIC;
+    /* Cube textures (M3) sample through the same filter path as 2D ones, so
+     * advertising D3DPTEXTURECAPS_CUBEMAP while reporting no cube filtering
+     * whatsoever contradicted the TextureCaps bit right above. */
+    caps->CubeTextureFilterCaps = caps->TextureFilterCaps;
     caps->TextureAddressCaps = D3DPTADDRESSCAPS_WRAP
-            | D3DPTADDRESSCAPS_MIRROR | D3DPTADDRESSCAPS_CLAMP;
+            | D3DPTADDRESSCAPS_MIRROR | D3DPTADDRESSCAPS_CLAMP
+            /* WebGPU has no border-colour sampler, so the host clamps for the
+             * physical sample and then substitutes D3DSAMP_BORDERCOLOR for every
+             * coordinate that fell outside the unit domain on a BORDER axis --
+             * a real implementation of the mode, not an approximation of it.
+             * MIRRORONCE is the opposite case and stays absent: it has no
+             * emulation at all and silently falls back to clamp. */
+            | D3DPTADDRESSCAPS_BORDER
+            /* ADDRESSU, ADDRESSV and ADDRESSW are read and applied separately
+             * per stage; nothing forces them to agree. */
+            | D3DPTADDRESSCAPS_INDEPENDENTUV;
+    /* device_stretch_rect() resolves its filter argument to point or linear. */
+    caps->StretchRectFilterCaps = D3DPTFILTERCAPS_MINFPOINT
+            | D3DPTFILTERCAPS_MAGFPOINT | D3DPTFILTERCAPS_MINFLINEAR
+            | D3DPTFILTERCAPS_MAGFLINEAR;
+    /* D3DPT_LINELIST/D3DPT_LINESTRIP reach the host's draw path, and lines
+     * there are textured, depth-tested, blended and fogged like triangles. */
+    caps->LineCaps = D3DLINECAPS_TEXTURE | D3DLINECAPS_ZTEST
+            | D3DLINECAPS_BLEND | D3DLINECAPS_ALPHACMP | D3DLINECAPS_FOG;
     caps->TextureOpCaps = D3DTEXOPCAPS_DISABLE | D3DTEXOPCAPS_SELECTARG1
             | D3DTEXOPCAPS_SELECTARG2 | D3DTEXOPCAPS_MODULATE
             | D3DTEXOPCAPS_MODULATE2X | D3DTEXOPCAPS_MODULATE4X
@@ -2568,17 +2949,28 @@ static void fill_caps(D3DCAPS9 *caps)
             | D3DTEXOPCAPS_BLENDTEXTUREALPHAPM
             | D3DTEXOPCAPS_BLENDCURRENTALPHA | D3DTEXOPCAPS_DOTPRODUCT3
             | D3DTEXOPCAPS_MULTIPLYADD | D3DTEXOPCAPS_LERP;
-    caps->MaxTextureWidth = 4096;
-    caps->MaxTextureHeight = 4096;
+    /* WebGPU guarantees maxTextureDimension2D >= 8192 on every implementation,
+     * and the host creates its device with the default limits, so 4096 was
+     * half of what actually works. */
+    caps->MaxTextureWidth = 8192;
+    caps->MaxTextureHeight = 8192;
     caps->MaxTextureRepeat = 8192;
-    caps->MaxTextureAspectRatio = 4096;
-    caps->MaxAnisotropy = 1;
+    caps->MaxTextureAspectRatio = 8192;
+    /* D3DSAMP_MAXANISOTROPY reaches the host and becomes the WebGPU sampler's
+     * maxAnisotropy (dropped only when the app's own filters are not all
+     * linear, which WebGPU forbids combining with anisotropy).  16 is WebGPU's
+     * ceiling; reporting 1 meant "no anisotropic filtering" and made apps grey
+     * out the setting. */
+    caps->MaxAnisotropy = 16;
     caps->MaxVertexW = 1.0e10f;
     caps->MaxPointSize = 256.0f;
     caps->MaxPrimitiveCount = 0xFFFFFu;
     caps->MaxVertexIndex = 0xFFFFFFu;
     caps->MaxStreams = D9_MAX_STREAMS;
-    caps->MaxStreamStride = 255;
+    /* Advisory, and nothing in the proxy or the protocol clamps a stride --
+     * SetStreamSource carries it as a uint32.  255 was the figure DX7-era parts
+     * reported and it rejects perfectly ordinary skinned vertex formats. */
+    caps->MaxStreamStride = 65535;
     /* M5 declaration formats beyond the baseline FLOATn/D3DCOLOR set. */
     caps->DeclTypes = D3DDTCAPS_UBYTE4 | D3DDTCAPS_UBYTE4N
             | D3DDTCAPS_SHORT2N | D3DDTCAPS_SHORT4N
@@ -2617,20 +3009,42 @@ static void fill_caps(D3DCAPS9 *caps)
         caps->MaxVertexShaderConst = 0;
         caps->PixelShaderVersion = (DWORD)D3DPS_VERSION(0, 0);
     }
-    caps->FVFCaps = 8u & D3DFVFCAPS_TEXCOORDCOUNTMASK;
+    /* Eight texture coordinate sets, plus per-vertex point size: a declaration
+     * carrying D3DDECLUSAGE_PSIZE (or the D3DFVF_PSIZE bit) is bound to the
+     * host's point-size input and used in place of D3DRS_POINTSIZE. */
+    caps->FVFCaps = (8u & D3DFVFCAPS_TEXCOORDCOUNTMASK) | D3DFVFCAPS_PSIZE;
     caps->MaxTextureBlendStages = D9_MAX_TEXTURE_STAGES;
     caps->MaxSimultaneousTextures = D9_MAX_TEXTURE_STAGES;
     caps->VertexProcessingCaps = D3DVTXPCAPS_TEXGEN
             | D3DVTXPCAPS_DIRECTIONALLIGHTS | D3DVTXPCAPS_POSITIONALLIGHTS
-            | D3DVTXPCAPS_LOCALVIEWER;
+            | D3DVTXPCAPS_LOCALVIEWER
+            /* All four of D3DRS_{DIFFUSE,SPECULAR,AMBIENT,EMISSIVE}MATERIALSOURCE
+             * are consumed, so a vertex colour can stand in for any material
+             * channel.  Without this bit an engine duplicates its meshes per
+             * material instead of colouring them per vertex. */
+            | D3DVTXPCAPS_MATERIALSOURCE7;
     caps->MaxActiveLights = 8;
-    /* Still 0: WGSL has no clip-distance facility, so a user clip plane has to
-     * become a fragment discard fed by a vertex-computed distance (plan 9.11),
-     * and that changes the varying contract both stages agree on. Reporting a
-     * non-zero count before that exists would make an app clip against planes
-     * nothing evaluates -- geometry that should be cut would simply appear. */
-    caps->MaxUserClipPlanes = 0;
-    caps->MaxVertexBlendMatrices = 0;
+    /* Defaults to 0 -- see reported_user_clip_planes() for why, and for the env
+     * switch that raises it when a title gates its startup on it instead of
+     * degrading. WGSL has no clip-distance facility, so a user clip plane has
+     * to become a fragment discard fed by a vertex-computed distance
+     * (plan 9.11), and that changes the varying contract both stages agree on;
+     * claiming it before it exists makes an app clip against planes nothing
+     * evaluates. */
+    caps->MaxUserClipPlanes = reported_user_clip_planes();
+    /* Fixed-function vertex blending: the host builds the weighted sum of
+     * D3DTS_WORLDMATRIX(0..3) in its generated vertex stage, so 4 -- D3D9's own
+     * maximum -- is now backed rather than claimed. Indexed blending is backed
+     * too, and BLENDINDICES can name any of D3D9's 256 world matrices; the host
+     * uploads a palette sized from the matrices the guest has actually set.
+     *
+     * D3DVTXPCAPS_TWEENING is deliberately NOT set alongside it. Tweening
+     * interpolates two vertex streams by D3DRS_TWEENFACTOR rather than blending
+     * matrices, and nothing implements that -- it is a separate feature that
+     * happens to share the D3DVERTEXBLENDFLAGS enum. */
+    caps->MaxVertexBlendMatrices = 4;
+    caps->MaxVertexBlendMatrixIndex = 255;
+    apply_permissive_caps(caps);
     /* Render targets and MRT: the host binds up to four colour attachments and
      * a translated pixel shader's oC0..oC3 reach them (M4 work brought forward
      * because a 2005-era D3D9 game renders most of its frame into textures). */
@@ -3125,9 +3539,59 @@ static HRESULT WINAPI d3d_get_adapter_identifier(IDirect3D9 *iface,
     return D3D_OK;
 }
 
+/*
+ * The adapter's mode list, enumerated from the guest display driver rather than
+ * invented. It used to be a fixed three entries (640x480, 800x600, 1024x768),
+ * and that is not a cosmetic understatement: San Andreas stores the chosen
+ * video mode in gta_sa.set as an *index into this list*, not as a resolution.
+ * Run the title once against a d3d9.dll that offers a longer list (SwiftShader
+ * reports 18 modes per format), let it save an index valid there, and the next
+ * run against a three-entry list finds that index out of range and destroys its
+ * windows during enumeration -- before CreateDevice, before drawing anything.
+ *
+ * EnumDisplaySettings is the right source because it is also the constraint on
+ * the other end: exclusive fullscreen calls ChangeDisplaySettings, so a mode
+ * this list advertises has to be one the guest can actually be switched into.
+ * Offering a mode the driver does not have would trade this failure for a
+ * failed mode change.
+ *
+ * One walk serves both entry points, so the count and the index-to-mode mapping
+ * cannot drift apart: pass out=NULL to count, or a mode to fetch index `wanted`.
+ */
+static UINT enumerate_adapter_modes(D3DFORMAT format, UINT wanted,
+        D3DDISPLAYMODE *out)
+{
+    DEVMODEA current;
+    DWORD bits_per_pixel = (format == D3DFMT_R5G6B5) ? 16u : 32u;
+    DWORD index = 0;
+    UINT matched = 0;
+
+    for (;;) {
+        ZeroMemory(&current, sizeof(current));
+        current.dmSize = sizeof(current);
+        if (!EnumDisplaySettingsA(NULL, index++, &current))
+            break;
+        if (current.dmBitsPerPel != bits_per_pixel)
+            continue;
+        if (!current.dmPelsWidth || !current.dmPelsHeight)
+            continue;
+        if (out && matched == wanted) {
+            fill_display_mode(out, current.dmPelsWidth, current.dmPelsHeight,
+                    format);
+            /* 0 and 1 are the driver's "default/unspecified" encodings. */
+            if (current.dmDisplayFrequency > 1)
+                out->RefreshRate = current.dmDisplayFrequency;
+            return matched + 1;
+        }
+        ++matched;
+    }
+    return matched;
+}
+
 static UINT WINAPI d3d_get_adapter_mode_count(IDirect3D9 *iface, UINT adapter,
         D3DFORMAT format)
 {
+    UINT count;
     (void)iface;
 
     if (adapter || (format != D3DFMT_X8R8G8B8 && format != D3DFMT_R5G6B5)) {
@@ -3137,27 +3601,24 @@ static UINT WINAPI d3d_get_adapter_mode_count(IDirect3D9 *iface, UINT adapter,
                 (DWORD)format);
         return 0;
     }
-    TRACE("OK GetAdapterModeCount adapter=%lu format=%08lX -> 3", adapter,
-            (DWORD)format);
-    return 3;
+    count = enumerate_adapter_modes(format, 0, NULL);
+    TRACE("OK GetAdapterModeCount adapter=%lu format=%08lX -> %lu", adapter,
+            (DWORD)format, count);
+    return count;
 }
 
 static HRESULT WINAPI d3d_enum_adapter_modes(IDirect3D9 *iface, UINT adapter,
         D3DFORMAT format, UINT index, D3DDISPLAYMODE *mode)
 {
-    static const struct { UINT width; UINT height; } sizes[] = {
-        { 640, 480 }, { 800, 600 }, { 1024, 768 }
-    };
     (void)iface;
 
     if (adapter || !mode || (format != D3DFMT_X8R8G8B8
             && format != D3DFMT_R5G6B5)
-            || index >= sizeof(sizes) / sizeof(sizes[0])) {
+            || !enumerate_adapter_modes(format, index, mode)) {
         TRACE("FAIL EnumAdapterModes adapter=%lu format=%08lX index=%lu -> %08lX",
                 adapter, (DWORD)format, index, (DWORD)D3DERR_INVALIDCALL);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
-    fill_display_mode(mode, sizes[index].width, sizes[index].height, format);
     TRACE("OK EnumAdapterModes format=%08lX index=%lu -> %lux%lu refresh=%lu",
             (DWORD)format, index, mode->Width, mode->Height,
             mode->RefreshRate);
@@ -3170,8 +3631,30 @@ static HRESULT WINAPI d3d_get_adapter_display_mode(IDirect3D9 *iface,
     (void)iface;
 
     if (adapter || !mode)
-        return D3DERR_INVALIDCALL;
-    fill_display_mode(mode, 1024, 768, D3DFMT_X8R8G8B8);
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
+    /*
+     * The guest's actual desktop mode, not a fixed 1024x768. This is what the
+     * question asks -- "what is the display doing right now" -- and answering
+     * it with a constant meant reporting a resolution the guest was not in:
+     * a title that sizes a windowed device to the desktop, or compares the
+     * mode against its saved settings, is then working from a number that was
+     * never true. The reference implementation reports the real mode.
+     */
+    {
+        DEVMODEA current;
+        ZeroMemory(&current, sizeof(current));
+        current.dmSize = sizeof(current);
+        if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &current)
+                && current.dmPelsWidth && current.dmPelsHeight) {
+            fill_display_mode(mode, current.dmPelsWidth, current.dmPelsHeight,
+                    current.dmBitsPerPel == 16 ? D3DFMT_R5G6B5
+                            : D3DFMT_X8R8G8B8);
+            if (current.dmDisplayFrequency > 1)
+                mode->RefreshRate = current.dmDisplayFrequency;
+        } else {
+            fill_display_mode(mode, 1024, 768, D3DFMT_X8R8G8B8);
+        }
+    }
     TRACE("OK GetAdapterDisplayMode -> %lux%lu format=%08lX refresh=%lu",
             mode->Width, mode->Height, (DWORD)mode->Format, mode->RefreshRate);
     return D3D_OK;
@@ -3344,12 +3827,15 @@ static void trace_caps(const char *source, const D3DCAPS9 *caps)
             caps->MaxPrimitiveCount);
     TRACE("CAPS %s filter=%08lX address=%08lX stencil=%08lX zcmp=%08lX "
             "shade=%08lX alpha_cmp=%08lX vtxp=%08lX fvf=%08lX decl=%08lX "
-            "max_index=%08lX vs_const=%lu texture_repeat=%lu stride=%lu",
+            "max_index=%08lX vs_const=%lu texture_repeat=%lu stride=%lu "
+            "blend_matrices=%lu clip_planes=%lu caps2=%08lX",
             source, caps->TextureFilterCaps, caps->TextureAddressCaps,
             caps->StencilCaps, caps->ZCmpCaps, caps->ShadeCaps,
             caps->AlphaCmpCaps, caps->VertexProcessingCaps, caps->FVFCaps,
             caps->DeclTypes, caps->MaxVertexIndex, caps->MaxVertexShaderConst,
-            caps->MaxTextureRepeat, caps->MaxStreamStride);
+            caps->MaxTextureRepeat, caps->MaxStreamStride,
+            caps->MaxVertexBlendMatrices, caps->MaxUserClipPlanes,
+            caps->Caps2);
 }
 
 static HRESULT WINAPI d3d_get_device_caps(IDirect3D9 *iface, UINT adapter,
@@ -3359,7 +3845,7 @@ static HRESULT WINAPI d3d_get_device_caps(IDirect3D9 *iface, UINT adapter,
     if (adapter || type != D3DDEVTYPE_HAL || !caps) {
         TRACE("FAIL Direct3D9.GetDeviceCaps adapter=%lu type=%lu -> %08lX",
                 adapter, (DWORD)type, (DWORD)D3DERR_INVALIDCALL);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     fill_caps(caps);
     trace_caps("Direct3D9.GetDeviceCaps", caps);
@@ -3395,13 +3881,13 @@ static HRESULT WINAPI d3d_create_device(IDirect3D9 *iface, UINT adapter,
     if (!device_out) {
         TRACE("FAIL CreateDevice missing output -> %08lX",
                 (DWORD)D3DERR_INVALIDCALL);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     *device_out = NULL;
     if (adapter || type != D3DDEVTYPE_HAL || !parameters) {
         TRACE("FAIL CreateDevice invalid arguments -> %08lX",
                 (DWORD)D3DERR_INVALIDCALL);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     TRACE("CreateDevice params %lux%lu fmt=%08lX count=%lu multisample=%lu "
             "quality=%lu swap=%lu windowed=%lu auto_depth=%lu "
@@ -3418,7 +3904,7 @@ static HRESULT WINAPI d3d_create_device(IDirect3D9 *iface, UINT adapter,
         TRACE("FAIL CreateDevice unsupported multisample=%lu -> %08lX",
                 (DWORD)parameters->MultiSampleType,
                 (DWORD)D3DERR_NOTAVAILABLE);
-        return D3DERR_NOTAVAILABLE;
+        return TRACE_REFUSE(D3DERR_NOTAVAILABLE);
     }
     if (parameters->EnableAutoDepthStencil
             && !supported_depth_stencil_format(
@@ -3426,26 +3912,26 @@ static HRESULT WINAPI d3d_create_device(IDirect3D9 *iface, UINT adapter,
         TRACE("FAIL CreateDevice unsupported depth_fmt=%08lX -> %08lX",
                 (DWORD)parameters->AutoDepthStencilFormat,
                 (DWORD)D3DERR_NOTAVAILABLE);
-        return D3DERR_NOTAVAILABLE;
+        return TRACE_REFUSE(D3DERR_NOTAVAILABLE);
     }
     if (parameters->BackBufferFormat != D3DFMT_UNKNOWN
             && !supported_backbuffer_format(parameters->BackBufferFormat)) {
         TRACE("FAIL CreateDevice unsupported backbuffer_fmt=%08lX -> %08lX",
                 (DWORD)parameters->BackBufferFormat,
                 (DWORD)D3DERR_NOTAVAILABLE);
-        return D3DERR_NOTAVAILABLE;
+        return TRACE_REFUSE(D3DERR_NOTAVAILABLE);
     }
     if (parameters->BackBufferWidth > 8192
             || parameters->BackBufferHeight > 8192) {
         TRACE("FAIL CreateDevice oversized backbuffer=%lux%lu -> %08lX",
                 parameters->BackBufferWidth, parameters->BackBufferHeight,
                 (DWORD)D3DERR_INVALIDCALL);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     if (parameters->BackBufferCount > 3) {
         TRACE("FAIL CreateDevice backbuffer_count=%lu -> %08lX",
                 parameters->BackBufferCount, (DWORD)D3DERR_INVALIDCALL);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
 
     device = (D9Device *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
@@ -3509,7 +3995,7 @@ static HRESULT WINAPI d3d_create_device(IDirect3D9 *iface, UINT adapter,
         HeapFree(GetProcessHeap(), 0, device);
         TRACE("FAIL CreateDevice transport -> %08lX",
                 (DWORD)D3DERR_DRIVERINTERNALERROR);
-        return D3DERR_DRIVERINTERNALERROR;
+        return TRACE_REFUSE(D3DERR_DRIVERINTERNALERROR);
     }
     claim_fullscreen_foreground(device, window);
     emit_window_state(device, window);
@@ -3642,7 +4128,7 @@ static HRESULT WINAPI device_get_direct3d(IDirect3DDevice9 *iface,
 {
     D9Device *device = device_from_iface(iface);
     if (!d3d_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *d3d_out = &device->parent->iface;
     IDirect3D9_AddRef(*d3d_out);
     return D3D_OK;
@@ -3652,7 +4138,7 @@ static HRESULT WINAPI device_get_caps(IDirect3DDevice9 *iface, D3DCAPS9 *caps)
 {
     (void)iface;
     if (!caps)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     fill_caps(caps);
     trace_caps("Device.GetDeviceCaps", caps);
     return D3D_OK;
@@ -3663,7 +4149,7 @@ static HRESULT WINAPI device_get_display_mode(IDirect3DDevice9 *iface,
 {
     D9Device *device = device_from_iface(iface);
     if (swapchain || !mode)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *mode = device->display_mode;
     TRACE("OK Device.GetDisplayMode -> %lux%lu format=%08lX refresh=%lu",
             mode->Width, mode->Height, (DWORD)mode->Format, mode->RefreshRate);
@@ -3675,7 +4161,7 @@ static HRESULT WINAPI device_get_creation_parameters(IDirect3DDevice9 *iface,
 {
     D9Device *device = device_from_iface(iface);
     if (!parameters)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *parameters = device->creation;
     TRACE("OK Device.GetCreationParameters adapter=%lu type=%lu behavior=%08lX",
             parameters->AdapterOrdinal, (DWORD)parameters->DeviceType,
@@ -3710,7 +4196,7 @@ static HRESULT WINAPI device_set_cursor_properties(IDirect3DDevice9 *iface,
     BOOL result;
 
     if (!bitmap || bitmap->lpVtbl != &g_surface_vtbl) {
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     surface = surface_from_iface(bitmap);
     if (surface->shadow) {
@@ -3724,14 +4210,14 @@ static HRESULT WINAPI device_set_cursor_properties(IDirect3DDevice9 *iface,
         row_pitch = surface->texture->levels[surface->level].row_pitch;
     } else {
 
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     if (surface->format != D3DFMT_A8R8G8B8 && surface->format != D3DFMT_X8R8G8B8) {
 
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     if (!multiply_u32(surface->width * 4u, surface->height, &byte_count))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
 
     ZeroMemory(&command, sizeof(command));
     EnterCriticalSection(&g_transport_lock);
@@ -3755,7 +4241,7 @@ static HRESULT WINAPI device_set_cursor_properties(IDirect3DDevice9 *iface,
     }
     LeaveCriticalSection(&g_transport_lock);
     if (!result)
-        return D3DERR_DRIVERINTERNALERROR;
+        return TRACE_REFUSE(D3DERR_DRIVERINTERNALERROR);
     device->cursor_ready = TRUE;
     device->app_cursor = TRUE;
 
@@ -3887,14 +4373,63 @@ static void claim_fullscreen_foreground(D9Device *device, HWND window)
         return;
     if (IsIconic(window))
         ShowWindow(window, SW_RESTORE);
-    /* Size the device window to the mode as well: testing showed War3's
-     * window reporting an empty rect to both GetClientRect and GetWindowRect,
-     * so nothing downstream can discover where the game's output belongs. */
+    /*
+     * Size the device window to the mode as well: testing showed War3's window
+     * reporting an empty rect to both GetClientRect and GetWindowRect, so
+     * nothing downstream can discover where the game's output belongs.
+     *
+     * Strip the frame first. SetWindowPos sizes the *window*, so on a window
+     * that still has a caption and border the client area comes out smaller
+     * than the mode -- an 800x600 window is a 792x573 client -- and the WM_SIZE
+     * this call sends tells the application that smaller number, from inside
+     * CreateDevice, while its engine is still starting. GTA San Andreas took
+     * exactly that WM_SIZE (792x573 at client origin 4,23) and then destroyed
+     * its window and exited. An exclusive-fullscreen window is borderless and
+     * covers the mode, which is also what makes client == back buffer true.
+     */
+    if (device->styled_window != window) {
+        LONG style = GetWindowLongA(window, GWL_STYLE);
+        LONG exstyle = GetWindowLongA(window, GWL_EXSTYLE);
+        LONG bare_style = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER
+                | WS_DLGFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU))
+                | WS_POPUP;
+        LONG bare_exstyle = exstyle & ~(WS_EX_CLIENTEDGE | WS_EX_WINDOWEDGE
+                | WS_EX_DLGMODALFRAME | WS_EX_STATICEDGE);
+
+        device->styled_window = window;
+        device->saved_window_style = style;
+        device->saved_window_exstyle = exstyle;
+        if (bare_style != style)
+            SetWindowLongA(window, GWL_STYLE, bare_style);
+        if (bare_exstyle != exstyle)
+            SetWindowLongA(window, GWL_EXSTYLE, bare_exstyle);
+    }
+    /* SWP_FRAMECHANGED so the stripped style is recalculated now rather than
+     * at some later, unrelated window event. */
     SetWindowPos(window, HWND_TOP, 0, 0, (int)device->display_mode.Width,
-            (int)device->display_mode.Height, SWP_SHOWWINDOW);
+            (int)device->display_mode.Height,
+            SWP_SHOWWINDOW | SWP_FRAMECHANGED);
     raise_window_to_foreground(window);
     device->last_foreground_claim = GetTickCount();
 
+}
+
+/* Undoes the borderless override, so a window that outlives the device (a
+ * Reset back to windowed, or a title that keeps running after releasing it)
+ * gets its own frame back rather than staying stripped. */
+static void restore_window_style(D9Device *device)
+{
+    HWND window = device->styled_window;
+
+    if (!window)
+        return;
+    device->styled_window = NULL;
+    if (!IsWindow(window))
+        return;
+    SetWindowLongA(window, GWL_STYLE, device->saved_window_style);
+    SetWindowLongA(window, GWL_EXSTYLE, device->saved_window_exstyle);
+    SetWindowPos(window, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE
+            | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }
 
 /*
@@ -3944,6 +4479,7 @@ static void maintain_fullscreen_foreground(D9Device *device, HWND window)
  * does not leave the guest desktop stuck at the game's resolution. */
 static void restore_display_mode(D9Device *device)
 {
+    restore_window_style(device);
     if (!device->display_mode_changed)
         return;
     device->display_mode_changed = FALSE;
@@ -4224,17 +4760,49 @@ static HRESULT WINAPI device_reset(IDirect3DDevice9 *iface,
     POINT origin;
     HWND window;
 
+    /* Reset was completely untraced, which left a hole exactly where one is
+     * least affordable: a title that resets to apply its saved video settings
+     * does so once, early, and everything after depends on it having worked.
+     * Its three refusal paths returned bare HRESULTs, indistinguishable in a
+     * trace from the call never happening. */
+    TRACE("CALL Reset %lux%lu fmt=%08lX count=%lu multisample=%lu windowed=%lu "
+            "auto_depth=%lu depth_fmt=%08lX interval=%08lX hwnd=%08lX",
+            parameters ? parameters->BackBufferWidth : 0,
+            parameters ? parameters->BackBufferHeight : 0,
+            parameters ? (DWORD)parameters->BackBufferFormat : 0,
+            parameters ? parameters->BackBufferCount : 0,
+            parameters ? (DWORD)parameters->MultiSampleType : 0,
+            parameters ? (DWORD)parameters->Windowed : 0,
+            parameters ? (DWORD)parameters->EnableAutoDepthStencil : 0,
+            parameters ? (DWORD)parameters->AutoDepthStencilFormat : 0,
+            parameters ? parameters->PresentationInterval : 0,
+            parameters ? (DWORD)(uintptr_t)parameters->hDeviceWindow : 0);
     if (!parameters || parameters->MultiSampleType != D3DMULTISAMPLE_NONE
             || parameters->BackBufferCount > 1
-            || device_has_reset_blockers(device))
-        return D3DERR_INVALIDCALL;
+            || device_has_reset_blockers(device)) {
+        TRACE("FAIL Reset parameters=%lu multisample=%lu count=%lu "
+                "blockers=%lu -> %08lX", (DWORD)(parameters != NULL),
+                parameters ? (DWORD)parameters->MultiSampleType : 0,
+                parameters ? parameters->BackBufferCount : 0,
+                (DWORD)device_has_reset_blockers(device),
+                (DWORD)D3DERR_INVALIDCALL);
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
+    }
     if (parameters->EnableAutoDepthStencil
             && !supported_depth_stencil_format(
-                    parameters->AutoDepthStencilFormat))
-        return D3DERR_NOTAVAILABLE;
+                    parameters->AutoDepthStencilFormat)) {
+        TRACE("FAIL Reset depth_fmt=%08lX -> %08lX",
+                (DWORD)parameters->AutoDepthStencilFormat,
+                (DWORD)D3DERR_NOTAVAILABLE);
+        return TRACE_REFUSE(D3DERR_NOTAVAILABLE);
+    }
     if (parameters->BackBufferFormat != D3DFMT_UNKNOWN
-            && !supported_backbuffer_format(parameters->BackBufferFormat))
-        return D3DERR_NOTAVAILABLE;
+            && !supported_backbuffer_format(parameters->BackBufferFormat)) {
+        TRACE("FAIL Reset backbuffer_fmt=%08lX -> %08lX",
+                (DWORD)parameters->BackBufferFormat,
+                (DWORD)D3DERR_NOTAVAILABLE);
+        return TRACE_REFUSE(D3DERR_NOTAVAILABLE);
+    }
     window = parameters->hDeviceWindow ? parameters->hDeviceWindow
             : device->creation.hFocusWindow;
     SetRect(&client, 0, 0, 640, 480);
@@ -4262,9 +4830,9 @@ static HRESULT WINAPI device_reset(IDirect3DDevice9 *iface,
     reset.enable_auto_depth_stencil = parameters->EnableAutoDepthStencil;
     reset.auto_depth_stencil_format = parameters->AutoDepthStencilFormat;
     if (reset.width > 8192 || reset.height > 8192)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (!emit_command(D9WG_OP_RESET, &reset, sizeof(reset)))
-        return D3DERR_DRIVERINTERNALERROR;
+        return TRACE_REFUSE(D3DERR_DRIVERINTERNALERROR);
     device_clear_bindings(device);
     device->handle = reset.new_device_handle;
     ++device->reset_epoch;
@@ -4291,8 +4859,14 @@ static HRESULT WINAPI device_reset(IDirect3DDevice9 *iface,
     device->viewport.Height = reset.height;
     device->viewport.MinZ = 0.0f;
     device->viewport.MaxZ = 1.0f;
-    if (!recreate_device_resources(device))
-        return D3DERR_DRIVERINTERNALERROR;
+    if (!recreate_device_resources(device)) {
+        TRACE("FAIL Reset recreate_device_resources -> %08lX",
+                (DWORD)D3DERR_DRIVERINTERNALERROR);
+        return TRACE_REFUSE(D3DERR_DRIVERINTERNALERROR);
+    }
+    TRACE("OK Reset old_handle=%08lX new_handle=%08lX %lux%lu epoch=%lu",
+            reset.old_device_handle, device->handle, reset.width, reset.height,
+            device->reset_epoch);
 
     return D3D_OK;
 }
@@ -4380,6 +4954,65 @@ static BOOL emit_present_and_flush(D9Device *device, HWND override_window)
     return result;
 }
 
+/*
+ * D3DPRESENT_INTERVAL_ONE..FOUR ask Present to block until the Nth vertical
+ * retrace.  That wait is the only back-pressure a D3D9 title has on its own
+ * frame rate: the render loop is `while (running) { render(); Present(); }` and
+ * nothing else in it sleeps.  Returning immediately -- what this proxy did
+ * until now, whatever the app requested -- lets the guest spin as fast as the
+ * emulator can retire the command stream.  San Andreas' loading screen reached
+ * roughly 1000 Present/s that way, which starves every other thread in the
+ * process of timeslices and spends the emulator's budget on frames nobody sees.
+ *
+ * There is no retrace to wait on here, so the wait is reconstructed from the
+ * clock: sleep out whatever is left of the interval since the previous Present.
+ * When the guest is already the bottleneck the elapsed time exceeds the
+ * interval and this costs nothing, so the throttle only engages on the frames
+ * that were running too fast.
+ */
+static BOOL present_throttle_disabled(void)
+{
+    static LONG cached = -1;
+
+    if (cached < 0)
+        cached = env_flag_enabled("D9WG_PRESENT_NO_THROTTLE") ? 1 : 0;
+    return cached != 0;
+}
+
+static void throttle_to_presentation_interval(D9Device *device)
+{
+    DWORD frames, refresh, interval_ms, elapsed;
+
+    if (present_throttle_disabled())
+        return;
+
+    switch (device->present.PresentationInterval) {
+    /* DEFAULT is documented as equivalent to ONE, not as "do not wait". */
+    case D3DPRESENT_INTERVAL_DEFAULT:
+    case D3DPRESENT_INTERVAL_ONE:   frames = 1; break;
+    case D3DPRESENT_INTERVAL_TWO:   frames = 2; break;
+    case D3DPRESENT_INTERVAL_THREE: frames = 3; break;
+    case D3DPRESENT_INTERVAL_FOUR:  frames = 4; break;
+    default:                        return;  /* IMMEDIATE */
+    }
+
+    refresh = device->display_mode.RefreshRate;
+    if (refresh < 20u || refresh > 240u)
+        refresh = 60u;
+    interval_ms = (1000u * frames) / refresh;
+    if (!interval_ms)
+        return;
+
+    /* Unsigned wraparound makes this correct across GetTickCount()'s 49.7-day
+     * rollover.  The very first Present subtracts a zero timestamp and so
+     * measures the time since boot, which never sleeps -- exactly what a first
+     * frame with no predecessor should do. */
+    elapsed = GetTickCount() - device->last_present_tick;
+    if (elapsed < interval_ms)
+        Sleep(interval_ms - elapsed);
+    device->last_present_tick = GetTickCount();
+}
+
 static HRESULT WINAPI device_present(IDirect3DDevice9 *iface,
         const RECT *src_rect, const RECT *dst_rect, HWND override_window,
         const RGNDATA *dirty_region)
@@ -4390,7 +5023,20 @@ static HRESULT WINAPI device_present(IDirect3DDevice9 *iface,
     TRACE("CALL Present device=%08lX override=%08lX",
             device_from_iface(iface)->handle,
             (DWORD)(uintptr_t)override_window);
+#ifdef D9WG_DIAGNOSTIC_TRACE
+    trace_frame_summary();
+    {
+        /* Every 256th frame: often enough to watch a loading screen eat memory,
+         * rare enough to stay out of the way of everything else. */
+        static DWORD frame;
+        if ((frame++ & 0xFFu) == 0)
+            trace_memory_state("present");
+    }
+#endif
     ok = emit_present_and_flush(device_from_iface(iface), override_window);
+    /* After the flush, so the frame is on its way to the host while this
+     * thread is parked rather than before it. */
+    throttle_to_presentation_interval(device_from_iface(iface));
     TRACE("%s Present device=%08lX -> %08lX", ok ? "OK" : "FAIL",
             device_from_iface(iface)->handle,
             (DWORD)(ok ? D3D_OK : D3DERR_DRIVERINTERNALERROR));
@@ -4415,7 +5061,7 @@ static HRESULT WINAPI device_begin_scene(IDirect3DDevice9 *iface)
     D9WGDeviceOnly command;
 
     if (device->in_scene)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     device->in_scene = TRUE;
     command.device_handle = device->handle;
     command.reserved = 0;
@@ -4429,7 +5075,7 @@ static HRESULT WINAPI device_end_scene(IDirect3DDevice9 *iface)
     D9WGDeviceOnly command;
 
     if (!device->in_scene)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     device->in_scene = FALSE;
     command.device_handle = device->handle;
     command.reserved = 0;
@@ -4449,11 +5095,11 @@ static HRESULT WINAPI device_clear(IDirect3DDevice9 *iface, DWORD rect_count,
     BOOL result;
 
     if (rect_count && !rects)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (!(flags & (D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (rect_count > 0xFFFFFFFFu / sizeof(*rects))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     rect_bytes = rect_count * sizeof(*rects);
     command.device_handle = device->handle;
     command.clear_flags = flags;
@@ -4471,6 +5117,9 @@ static HRESULT WINAPI device_clear(IDirect3DDevice9 *iface, DWORD rect_count,
             CopyMemory(rect_data, rects, rect_bytes);
     }
     LeaveCriticalSection(&g_transport_lock);
+    if (result) {
+        TRACE_FRAME_CLEAR();
+    }
     if (result && (flags & D3DCLEAR_TARGET)) {
         UINT target;
         for (target = 0; target < D9_MAX_RENDER_TARGETS; ++target) {
@@ -4504,7 +5153,7 @@ static HRESULT WINAPI device_set_transform(IDirect3DDevice9 *iface,
     D9Device *device = device_from_iface(iface);
     D9WGSetTransform command;
     if (!matrix || (UINT)state >= D9_MAX_TRANSFORMS)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_transform(device, (UINT)state);
     CopyMemory(device->transforms[state], matrix, sizeof(float) * 16);
     command.device_handle = device->handle;
@@ -4519,7 +5168,7 @@ static HRESULT WINAPI device_get_transform(IDirect3DDevice9 *iface,
 {
     D9Device *device = device_from_iface(iface);
     if (!matrix || (UINT)state >= D9_MAX_TRANSFORMS)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     CopyMemory(matrix, device->transforms[state], sizeof(float) * 16);
     return D3D_OK;
 }
@@ -4532,7 +5181,7 @@ static HRESULT WINAPI device_set_viewport(IDirect3DDevice9 *iface,
     if (!viewport || !viewport->Width || !viewport->Height) {
         TRACE("REJECT SetViewport empty viewport=%08lX",
                 (DWORD)(uintptr_t)viewport);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     /*
      * A rejected SetViewport is one of the worst silent failures in this
@@ -4560,7 +5209,7 @@ static HRESULT WINAPI device_set_viewport(IDirect3DDevice9 *iface,
                 "scale", viewport->Width, viewport->Height, viewport->X,
                 viewport->Y, device->display_mode.Width,
                 device->display_mode.Height);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     TRACE("OK SetViewport x=%lu y=%lu %lux%lu minz=%ld/1000 maxz=%ld/1000",
             viewport->X, viewport->Y, viewport->Width, viewport->Height,
@@ -4584,7 +5233,7 @@ static HRESULT WINAPI device_get_viewport(IDirect3DDevice9 *iface,
         D3DVIEWPORT9 *viewport)
 {
     if (!viewport)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *viewport = device_from_iface(iface)->viewport;
     return D3D_OK;
 }
@@ -4595,7 +5244,7 @@ static HRESULT WINAPI device_set_render_state(IDirect3DDevice9 *iface,
     D9Device *device = device_from_iface(iface);
     D9WGSetRenderState command;
     if ((UINT)state >= D9_MAX_RENDER_STATES)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_render_state(device, (UINT)state);
     if (device->render_states[state] == value)
         return D3D_OK;
@@ -4612,7 +5261,7 @@ static HRESULT WINAPI device_get_render_state(IDirect3DDevice9 *iface,
         D3DRENDERSTATETYPE state, DWORD *value)
 {
     if (!value || (UINT)state >= D9_MAX_RENDER_STATES)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *value = device_from_iface(iface)->render_states[state];
     return D3D_OK;
 }
@@ -4622,7 +5271,7 @@ static HRESULT WINAPI device_get_texture(IDirect3DDevice9 *iface,
 {
     D9Device *device = device_from_iface(iface);
     if (!texture_out || stage >= D9_MAX_TEXTURE_STAGES)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (device->textures[stage])
         *texture_out = (IDirect3DBaseTexture9 *)&device->textures[stage]->iface;
     else if (device->cube_bindings[stage])
@@ -4655,21 +5304,21 @@ static HRESULT WINAPI device_set_texture(IDirect3DDevice9 *iface,
     D9WGSetTexture command;
 
     if (stage >= D9_MAX_TEXTURE_STAGES)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (texture_iface) {
         const void *vtbl = ((const IDirect3DTexture9 *)texture_iface)->lpVtbl;
         if (vtbl == (const void *)&g_texture_vtbl) {
             texture = (D9Texture *)texture_iface;
             if (texture->device != device)
-                return D3DERR_INVALIDCALL;
+                return TRACE_REFUSE(D3DERR_INVALIDCALL);
             handle = texture->handle;
         } else if (vtbl == (const void *)&g_cube_vtbl) {
             cube = (D9CubeTexture *)texture_iface;
             if (cube->device != device)
-                return D3DERR_INVALIDCALL;
+                return TRACE_REFUSE(D3DERR_INVALIDCALL);
             handle = cube->handle;
         } else {
-            return D3DERR_INVALIDCALL;
+            return TRACE_REFUSE(D3DERR_INVALIDCALL);
         }
     }
     state_block_record_texture(device, stage);
@@ -4696,7 +5345,7 @@ static HRESULT WINAPI device_get_texture_stage_state(IDirect3DDevice9 *iface,
 {
     if (!value || stage >= D9_MAX_TEXTURE_STAGES
             || (UINT)state >= D9_MAX_TEXTURE_STAGE_STATES)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *value = device_from_iface(iface)->texture_stage_states[stage][state];
     return D3D_OK;
 }
@@ -4708,7 +5357,7 @@ static HRESULT WINAPI device_set_texture_stage_state(IDirect3DDevice9 *iface,
     D9WGSetTextureStageState command;
     if (stage >= D9_MAX_TEXTURE_STAGES
             || (UINT)state >= D9_MAX_TEXTURE_STAGE_STATES)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_texture_stage_state(device, stage, (UINT)state);
     if (device->texture_stage_states[stage][state] == value)
         return D3D_OK;
@@ -4726,7 +5375,7 @@ static HRESULT WINAPI device_validate_device(IDirect3DDevice9 *iface,
 {
     (void)iface;
     if (!passes)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *passes = 1;
     TRACE("OK Device.ValidateDevice passes=1");
     return D3D_OK;
@@ -4955,7 +5604,7 @@ static HRESULT WINAPI device_create_texture(IDirect3DDevice9 *iface,
     if (!texture_out) {
         TRACE("FAIL CreateTexture missing output -> %08lX",
                 (DWORD)D3DERR_INVALIDCALL);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     *texture_out = NULL;
     if (!width || !height || width > 4096 || height > 4096
@@ -4972,14 +5621,14 @@ static HRESULT WINAPI device_create_texture(IDirect3DDevice9 *iface,
         HOSTLOG_FAILED("CreateTexture refused: %lux%lu levels=%lu usage=%08lX "
                 "format=%08lX pool=%lu", width, height, levels, usage,
                 (DWORD)format, (DWORD)pool);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     full_levels = full_mip_level_count(width, height);
     if (!levels) levels = full_levels;
     if (levels > full_levels) {
         TRACE("FAIL CreateTexture levels=%lu exceeds full_levels=%lu -> %08lX",
                 levels, full_levels, (DWORD)D3DERR_INVALIDCALL);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
 
     texture = (D9Texture *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
@@ -4987,7 +5636,7 @@ static HRESULT WINAPI device_create_texture(IDirect3DDevice9 *iface,
     if (!texture) {
         TRACE("FAIL CreateTexture object allocation -> %08lX",
                 (DWORD)E_OUTOFMEMORY);
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     }
     texture->levels = (D9TextureLevel *)HeapAlloc(GetProcessHeap(),
             HEAP_ZERO_MEMORY, levels * sizeof(*texture->levels));
@@ -4995,7 +5644,7 @@ static HRESULT WINAPI device_create_texture(IDirect3DDevice9 *iface,
         HeapFree(GetProcessHeap(), 0, texture);
         TRACE("FAIL CreateTexture level allocation levels=%lu -> %08lX",
                 levels, (DWORD)E_OUTOFMEMORY);
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     }
     texture->iface.lpVtbl = &g_texture_vtbl;
     texture->refcount = 1;
@@ -5086,13 +5735,13 @@ static HRESULT WINAPI device_set_stream_source(IDirect3DDevice9 *iface,
     D9WGSetStreamSource command;
     if (stream >= D9_MAX_STREAMS) {
 
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     if (buffer && (buffer_iface->lpVtbl != &g_vb_vtbl
             || buffer->device != device))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (buffer && offset >= buffer->length)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_stream(device, stream);
     if (device->streams[stream].buffer == buffer
             && device->streams[stream].stride == stride
@@ -5121,7 +5770,7 @@ static HRESULT WINAPI device_get_stream_source(IDirect3DDevice9 *iface,
 {
     D9Device *device = device_from_iface(iface);
     if (stream >= D9_MAX_STREAMS || !buffer_out || !stride_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (offset_out) *offset_out = device->streams[stream].offset;
     *stride_out = device->streams[stream].stride;
     *buffer_out = device->streams[stream].buffer
@@ -5140,7 +5789,7 @@ static HRESULT WINAPI device_set_indices(IDirect3DDevice9 *iface,
 
     if (buffer && (buffer_iface->lpVtbl != &g_ib_vtbl
             || buffer->device != device))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_indices(device);
     if (device->index_buffer == buffer)
         return D3D_OK;
@@ -5160,7 +5809,7 @@ static HRESULT WINAPI device_get_indices(IDirect3DDevice9 *iface,
 {
     D9Device *device = device_from_iface(iface);
     if (!buffer_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *buffer_out = device->index_buffer ? &device->index_buffer->iface : NULL;
     if (*buffer_out)
         IDirect3DIndexBuffer9_AddRef(*buffer_out);
@@ -5186,6 +5835,7 @@ static HRESULT WINAPI device_draw_primitive(IDirect3DDevice9 *iface,
             || !device_has_vertex_format(device) || !primitive_count
             || !primitive_element_count(primitive_type, primitive_count,
                     &vertex_count)) {
+        TRACE_FRAME_REJECT();
         return D3DERR_INVALIDCALL;
     }
     /* Vertices addressable by this draw start after the stream's
@@ -5194,7 +5844,7 @@ static HRESULT WINAPI device_draw_primitive(IDirect3DDevice9 *iface,
             - device->streams[0].offset) / device->streams[0].stride;
     if (start_vertex > available_vertices
             || vertex_count > available_vertices - start_vertex) {
-
+        TRACE_FRAME_REJECT();
         return D3DERR_INVALIDCALL;
     }
     command.device_handle = device->handle;
@@ -5203,7 +5853,8 @@ static HRESULT WINAPI device_draw_primitive(IDirect3DDevice9 *iface,
     command.primitive_count = primitive_count;
 
     if (!emit_command(D9WG_OP_DRAW_PRIMITIVE, &command, sizeof(command)))
-        return D3DERR_DRIVERINTERNALERROR;
+        return TRACE_REFUSE(D3DERR_DRIVERINTERNALERROR);
+    TRACE_FRAME_DRAW(primitive_count);
     invalidate_render_target_mirrors(device);
     return D3D_OK;
 }
@@ -5226,14 +5877,14 @@ static HRESULT WINAPI device_draw_indexed_primitive(IDirect3DDevice9 *iface,
             || !primitive_count || !vertex_count
             || !primitive_element_count(primitive_type, primitive_count,
                     &index_count)) {
-
+        TRACE_FRAME_REJECT();
         return D3DERR_INVALIDCALL;
     }
     index_size = device->index_buffer->format == D3DFMT_INDEX16 ? 2u : 4u;
     available_indices = device->index_buffer->length / index_size;
     if (start_index > available_indices
             || index_count > available_indices - start_index) {
-
+        TRACE_FRAME_REJECT();
         return D3DERR_INVALIDCALL;
     }
     /* Vertices addressable by this draw start after the stream's
@@ -5242,7 +5893,7 @@ static HRESULT WINAPI device_draw_indexed_primitive(IDirect3DDevice9 *iface,
             - device->streams[0].offset) / device->streams[0].stride;
     if (min_vertex_index > available_vertices
             || vertex_count > available_vertices - min_vertex_index) {
-
+        TRACE_FRAME_REJECT();
         return D3DERR_INVALIDCALL;
     }
 
@@ -5255,7 +5906,8 @@ static HRESULT WINAPI device_draw_indexed_primitive(IDirect3DDevice9 *iface,
     command.primitive_count = primitive_count;
     if (!emit_command(D9WG_OP_DRAW_INDEXED_PRIMITIVE, &command,
             sizeof(command)))
-        return D3DERR_DRIVERINTERNALERROR;
+        return TRACE_REFUSE(D3DERR_DRIVERINTERNALERROR);
+    TRACE_FRAME_DRAW(primitive_count);
     invalidate_render_target_mirrors(device);
     return D3D_OK;
 }
@@ -5289,8 +5941,10 @@ static HRESULT WINAPI device_draw_primitive_up(IDirect3DDevice9 *iface,
             || !primitive_count
             || !primitive_element_count(primitive_type, primitive_count,
                     &vertex_count)
-            || !multiply_u32(vertex_count, stride, &vertex_bytes))
+            || !multiply_u32(vertex_count, stride, &vertex_bytes)) {
+        TRACE_FRAME_REJECT();
         return D3DERR_INVALIDCALL;
+    }
     ZeroMemory(&command, sizeof(command));
     command.device_handle = device->handle;
     command.primitive_type = primitive_type;
@@ -5300,6 +5954,7 @@ static HRESULT WINAPI device_draw_primitive_up(IDirect3DDevice9 *iface,
     command.vertex_bytes = vertex_bytes;
     result = emit_draw_primitive_up(&command, vertex_data);
     if (result) {
+        TRACE_FRAME_DRAW(primitive_count);
         invalidate_render_target_mirrors(device);
         clear_stream_zero_after_up(device);
     }
@@ -5323,18 +5978,24 @@ static HRESULT WINAPI device_draw_indexed_primitive_up(
             || !device_has_vertex_format(device) || !primitive_count
             || !vertex_count
             || !primitive_element_count(primitive_type, primitive_count,
-                    &index_count))
+                    &index_count)) {
+        TRACE_FRAME_REJECT();
         return D3DERR_INVALIDCALL;
+    }
     if (index_format == D3DFMT_INDEX16) index_size = 2;
     else if (index_format == D3DFMT_INDEX32) index_size = 4;
-    else return D3DERR_INVALIDCALL;
-    if (min_vertex_index > 0xFFFFFFFFu - vertex_count)
+    else { TRACE_FRAME_REJECT(); return D3DERR_INVALIDCALL; }
+    if (min_vertex_index > 0xFFFFFFFFu - vertex_count) {
+        TRACE_FRAME_REJECT();
         return D3DERR_INVALIDCALL;
+    }
     vertex_elements = min_vertex_index + vertex_count;
     ZeroMemory(&command, sizeof(command));
     if (!multiply_u32(index_count, index_size, &command.index_bytes)
-            || !multiply_u32(vertex_elements, stride, &command.vertex_bytes))
+            || !multiply_u32(vertex_elements, stride, &command.vertex_bytes)) {
+        TRACE_FRAME_REJECT();
         return D3DERR_INVALIDCALL;
+    }
     command.device_handle = device->handle;
     command.primitive_type = primitive_type;
     command.min_vertex_index = min_vertex_index;
@@ -5345,6 +6006,7 @@ static HRESULT WINAPI device_draw_indexed_primitive_up(
     command.index_count = index_count;
     result = emit_draw_indexed_primitive_up(&command, index_data, vertex_data);
     if (result) {
+        TRACE_FRAME_DRAW(primitive_count);
         invalidate_render_target_mirrors(device);
         clear_stream_zero_after_up(device);
         clear_indices_after_indexed_up(device);
@@ -5362,20 +6024,21 @@ static HRESULT WINAPI device_create_vertex_declaration(
     UINT count;
 
     if (!decl_out || !elements)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *decl_out = NULL;
     if (!parse_vertex_declaration(elements, wire, &count)) {
         /* The single most likely silent killer for a real game: one
          * unsupported D3DDECLTYPE/usage anywhere in the array rejects the
          * whole declaration, and without this the app just never draws. */
-
-        return D3DERR_INVALIDCALL;
+        HOSTLOG_FAILED("CreateVertexDeclaration refused (see the "
+                "element-level line above for which element and why)");
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
 
     decl = (D9VertexDeclaration *)HeapAlloc(GetProcessHeap(),
             HEAP_ZERO_MEMORY, sizeof(*decl));
     if (!decl)
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     decl->iface.lpVtbl = &g_decl_vtbl;
     decl->refcount = 1;
     decl->device = device;
@@ -5387,7 +6050,7 @@ static HRESULT WINAPI device_create_vertex_declaration(
     if (!emit_vertex_declaration_create(device, decl->handle, wire, count)) {
         device_child_release(device);
         HeapFree(GetProcessHeap(), 0, decl);
-        return D3DERR_DRIVERINTERNALERROR;
+        return TRACE_REFUSE(D3DERR_DRIVERINTERNALERROR);
     }
     decl->next_device_resource = device->vertex_declarations;
     device->vertex_declarations = decl;
@@ -5403,7 +6066,7 @@ static HRESULT WINAPI device_set_vertex_declaration(IDirect3DDevice9 *iface,
     D9WGSetVertexDeclaration command;
 
     if (decl && (decl_iface->lpVtbl != &g_decl_vtbl || decl->device != device))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_vertex_format(device);
     if (decl)
         IDirect3DVertexDeclaration9_AddRef(decl_iface);
@@ -5423,7 +6086,7 @@ static HRESULT WINAPI device_get_vertex_declaration(IDirect3DDevice9 *iface,
 {
     D9Device *device = device_from_iface(iface);
     if (!decl_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *decl_out = device->vertex_declaration
             ? &device->vertex_declaration->iface : NULL;
     if (*decl_out)
@@ -5438,8 +6101,15 @@ static HRESULT WINAPI device_set_fvf(IDirect3DDevice9 *iface, DWORD fvf)
     UINT count;
 
     if (!fvf_to_declaration(fvf, wire, &count)) {
-
-        return D3DERR_INVALIDCALL;
+        /* Worse than a plain refusal: nothing here clears the declaration
+         * already in force, so the app's next draw is laid out by the
+         * *previous* format. That renders -- with the wrong attributes at the
+         * wrong offsets -- rather than failing, which is the shape "the model
+         * is one flat colour" takes when a texcoord goes missing this way. */
+        HOSTLOG_FAILED("SetFVF refused: fvf=%08lX (the declaration already in "
+                "force stays bound, so following draws use a stale layout)",
+                fvf);
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     state_block_record_vertex_format(device);
     if (device->vertex_declaration) {
@@ -5455,7 +6125,7 @@ static HRESULT WINAPI device_set_fvf(IDirect3DDevice9 *iface, DWORD fvf)
 static HRESULT WINAPI device_get_fvf(IDirect3DDevice9 *iface, DWORD *fvf)
 {
     if (!fvf)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *fvf = device_from_iface(iface)->fvf;
     return D3D_OK;
 }
@@ -5496,7 +6166,7 @@ static HRESULT create_shader(D9Device *device, const DWORD *bytecode,
     if (!bytecode) {
         TRACE("FAIL CreateShader want_pixel=%lu bytecode=NULL -> %08lX",
                 (DWORD)want_pixel, (DWORD)D3DERR_INVALIDCALL);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     if (!shader_token_count(bytecode, &token_count, &is_pixel)
             || is_pixel != want_pixel) {
@@ -5507,18 +6177,18 @@ static HRESULT create_shader(D9Device *device, const DWORD *bytecode,
         TRACE("FAIL CreateShader version=%08lX want_pixel=%lu is_pixel=%lu "
                 "tokens=%lu -> %08lX", bytecode[0], (DWORD)want_pixel,
                 (DWORD)is_pixel, token_count, (DWORD)D3DERR_INVALIDCALL);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
 
     code_bytes = (uint32_t)token_count * 4u;
     shader = (D9Shader *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             sizeof(*shader));
     if (!shader)
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     shader->code = (DWORD *)HeapAlloc(GetProcessHeap(), 0, code_bytes);
     if (!shader->code) {
         HeapFree(GetProcessHeap(), 0, shader);
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     }
     CopyMemory(shader->code, bytecode, code_bytes);
     if (want_pixel)
@@ -5542,7 +6212,7 @@ static HRESULT create_shader(D9Device *device, const DWORD *bytecode,
         device_child_release(device);
         HeapFree(GetProcessHeap(), 0, shader->code);
         HeapFree(GetProcessHeap(), 0, shader);
-        return D3DERR_DRIVERINTERNALERROR;
+        return TRACE_REFUSE(D3DERR_DRIVERINTERNALERROR);
     }
 
     shader->next_device_resource = device->shaders;
@@ -5590,7 +6260,7 @@ static HRESULT WINAPI device_create_vertex_shader(IDirect3DDevice9 *iface,
     HRESULT hr;
 
     if (!shader_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *shader_out = NULL;
     hr = create_shader(device_from_iface(iface), bytecode, FALSE, &shader);
     if (FAILED(hr))
@@ -5606,7 +6276,7 @@ static HRESULT WINAPI device_create_pixel_shader(IDirect3DDevice9 *iface,
     HRESULT hr;
 
     if (!shader_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *shader_out = NULL;
     hr = create_shader(device_from_iface(iface), bytecode, TRUE, &shader);
     if (FAILED(hr))
@@ -5623,7 +6293,7 @@ static HRESULT WINAPI device_set_vertex_shader(IDirect3DDevice9 *iface,
 
     if (shader && (shader_iface->lpVtbl != &g_vertex_shader_vtbl
             || shader->device != device))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_vertex_shader(device);
     if (shader)
         IDirect3DVertexShader9_AddRef(shader_iface);
@@ -5638,7 +6308,7 @@ static HRESULT WINAPI device_get_vertex_shader(IDirect3DDevice9 *iface,
 {
     D9Device *device = device_from_iface(iface);
     if (!shader_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *shader_out = device->vertex_shader ? &device->vertex_shader->iface.vertex
             : NULL;
     if (*shader_out)
@@ -5654,7 +6324,7 @@ static HRESULT WINAPI device_set_pixel_shader(IDirect3DDevice9 *iface,
 
     if (shader && (shader_iface->lpVtbl != &g_pixel_shader_vtbl
             || shader->device != device))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_pixel_shader(device);
     if (shader)
         IDirect3DPixelShader9_AddRef(shader_iface);
@@ -5669,7 +6339,7 @@ static HRESULT WINAPI device_get_pixel_shader(IDirect3DDevice9 *iface,
 {
     D9Device *device = device_from_iface(iface);
     if (!shader_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *shader_out = device->pixel_shader ? &device->pixel_shader->iface.pixel
             : NULL;
     if (*shader_out)
@@ -5701,7 +6371,7 @@ static HRESULT set_constant_f(D9Device *device, BOOL is_pixel, UINT start,
     UINT index;
 
     if (!data || !constant_range_valid(start, count, capacity))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_constant(device, is_pixel, TRUE, FALSE, start, count);
     for (index = 0; index < count; ++index) {
         const float *source = data + index * 4;
@@ -5734,7 +6404,7 @@ static HRESULT set_constant_i(D9Device *device, BOOL is_pixel, UINT start,
     UINT index;
 
     if (!data || !constant_range_valid(start, count, D9_MAX_CONST_I))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_constant(device, is_pixel, FALSE, FALSE, start, count);
     for (index = 0; index < count; ++index) {
         const int *source = data + index * 4;
@@ -5768,7 +6438,7 @@ static HRESULT set_constant_b(D9Device *device, BOOL is_pixel, UINT start,
     UINT index;
 
     if (!data || !constant_range_valid(start, count, D9_MAX_CONST_B))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_constant(device, is_pixel, FALSE, TRUE, start, count);
     for (index = 0; index < count; ++index) {
         BOOL value = data[index] ? TRUE : FALSE;
@@ -5822,7 +6492,7 @@ static HRESULT WINAPI device_get_vertex_shader_constant_f(
 {
     D9Device *device = device_from_iface(iface);
     if (!data || !constant_range_valid(start, count, D9_MAX_VS_CONST_F))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     CopyMemory(data, device->vs_const_f[start], count * 16u);
     return D3D_OK;
 }
@@ -5832,7 +6502,7 @@ static HRESULT WINAPI device_get_pixel_shader_constant_f(
 {
     D9Device *device = device_from_iface(iface);
     if (!data || !constant_range_valid(start, count, D9_MAX_PS_CONST_F))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     CopyMemory(data, device->ps_const_f[start], count * 16u);
     return D3D_OK;
 }
@@ -5842,7 +6512,7 @@ static HRESULT WINAPI device_get_vertex_shader_constant_i(
 {
     D9Device *device = device_from_iface(iface);
     if (!data || !constant_range_valid(start, count, D9_MAX_CONST_I))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     CopyMemory(data, device->vs_const_i[start], count * 16u);
     return D3D_OK;
 }
@@ -5852,7 +6522,7 @@ static HRESULT WINAPI device_get_pixel_shader_constant_i(
 {
     D9Device *device = device_from_iface(iface);
     if (!data || !constant_range_valid(start, count, D9_MAX_CONST_I))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     CopyMemory(data, device->ps_const_i[start], count * 16u);
     return D3D_OK;
 }
@@ -5863,7 +6533,7 @@ static HRESULT WINAPI device_get_vertex_shader_constant_b(
     D9Device *device = device_from_iface(iface);
     UINT index;
     if (!data || !constant_range_valid(start, count, D9_MAX_CONST_B))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     for (index = 0; index < count; ++index)
         data[index] = device->vs_const_b[start + index];
     return D3D_OK;
@@ -5875,7 +6545,7 @@ static HRESULT WINAPI device_get_pixel_shader_constant_b(
     D9Device *device = device_from_iface(iface);
     UINT index;
     if (!data || !constant_range_valid(start, count, D9_MAX_CONST_B))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     for (index = 0; index < count; ++index)
         data[index] = device->ps_const_b[start + index];
     return D3D_OK;
@@ -5887,7 +6557,7 @@ static HRESULT WINAPI device_get_pixel_shader_constant_b(
  * pretending to succeed matches the D3D8 path's established discipline. */
 #define DEV_STUB0(name) \
     static HRESULT WINAPI device_##name(IDirect3DDevice9 *iface) \
-    { (void)iface; return D3DERR_INVALIDCALL; }
+    { (void)iface; return TRACE_REFUSE(D3DERR_INVALIDCALL); }
 #define DEV_STUB(name, ...) \
     static HRESULT WINAPI device_##name(IDirect3DDevice9 *iface, __VA_ARGS__)
 
@@ -5921,7 +6591,7 @@ DEV_STUB(create_additional_swap_chain, D3DPRESENT_PARAMETERS *params,
     (void)params;
     if (out)
         *out = NULL;
-    return D3DERR_INVALIDCALL;
+    return TRACE_REFUSE(D3DERR_INVALIDCALL);
 }
 
 static HRESULT WINAPI device_get_swap_chain(IDirect3DDevice9 *iface,
@@ -6059,7 +6729,7 @@ static HRESULT WINAPI device_update_texture(IDirect3DDevice9 *iface,
             || source->format != destination->format
             || source->width != destination->width
             || source->height != destination->height)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     /* D3D9 allows the source to carry fewer levels than the destination;
      * only the levels both actually have can be copied. */
     for (level = 0; level < source->level_count
@@ -6068,13 +6738,13 @@ static HRESULT WINAPI device_update_texture(IDirect3DDevice9 *iface,
         D9TextureLevel *to = &destination->levels[level];
         RECT full;
         if (from->locked || to->locked)
-            return D3DERR_INVALIDCALL;
+            return TRACE_REFUSE(D3DERR_INVALIDCALL);
         if (from->byte_count != to->byte_count)
-            return D3DERR_INVALIDCALL;
+            return TRACE_REFUSE(D3DERR_INVALIDCALL);
         CopyMemory(to->shadow, from->shadow, to->byte_count);
         SetRect(&full, 0, 0, (int)to->width, (int)to->height);
         if (!emit_texture_update(destination, level, &full))
-            return D3DERR_DRIVERINTERNALERROR;
+            return TRACE_REFUSE(D3DERR_DRIVERINTERNALERROR);
     }
     return D3D_OK;
 }
@@ -6092,27 +6762,27 @@ static HRESULT WINAPI device_get_render_target_data(IDirect3DDevice9 *iface,
 
     if (!rt_iface || !dst_iface || rt_iface->lpVtbl != &g_surface_vtbl
             || dst_iface->lpVtbl != &g_surface_vtbl)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     rt = surface_from_iface(rt_iface);
     dst = surface_from_iface(dst_iface);
     if (rt->device != device || dst->device != device
             || rt->width != dst->width || rt->height != dst->height
             || rt->format != dst->format || !rt->texture
             || !(rt->texture->usage & D3DUSAGE_RENDERTARGET))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     source_level = surface_texture_level(rt);
     if (!source_level || !source_level->shadow || !source_level->shadow_valid)
         /* A draw touched this target, so only an asynchronous GPU readback
          * could answer. Returning stale Clear/ColorFill pixels would violate
          * the M4 known-source-only rule. */
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (dst->shadow) {
         destination = dst->shadow;
         destination_pitch = dst->row_pitch;
     } else {
         destination_level = surface_texture_level(dst);
         if (!destination_level || !destination_level->shadow)
-            return D3DERR_INVALIDCALL;
+            return TRACE_REFUSE(D3DERR_INVALIDCALL);
         destination = destination_level->shadow;
         destination_pitch = destination_level->row_pitch;
     }
@@ -6144,7 +6814,7 @@ static HRESULT WINAPI device_create_offscreen_plain_surface(
     (void)pool;
     (void)shared;
     if (!out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *out = NULL;
     if (format != D3DFMT_A8R8G8B8 && format != D3DFMT_X8R8G8B8) {
         /* The deliberate cursor-format restriction, named for the same reason
@@ -6156,23 +6826,23 @@ static HRESULT WINAPI device_create_offscreen_plain_surface(
         HOSTLOG_REFUSED("CreateOffscreenPlainSurface %lux%lu format=%08lX "
                 "refused; only A8R8G8B8/X8R8G8B8 are supported here",
                 width, height, (DWORD)format);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     if (!width || !height)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (!multiply_u32(width, 4u, &row_pitch)
             || !multiply_u32(row_pitch, height, &byte_count))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
 
     surface = (D9Surface *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             sizeof(*surface));
     if (!surface)
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     surface->shadow = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             byte_count);
     if (!surface->shadow) {
         HeapFree(GetProcessHeap(), 0, surface);
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     }
     surface->iface.lpVtbl = &g_surface_vtbl;
     surface->refcount = 1;
@@ -6216,7 +6886,7 @@ static HRESULT WINAPI device_set_material(IDirect3DDevice9 *iface,
     D9Device *device = device_from_iface(iface);
     D9WGSetMaterial command;
     if (!material)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_material(device);
     device->material = *material;
     command.device_handle = device->handle;
@@ -6233,7 +6903,7 @@ static HRESULT WINAPI device_get_material(IDirect3DDevice9 *iface,
         D3DMATERIAL9 *material)
 {
     if (!material)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *material = device_from_iface(iface)->material;
     return D3D_OK;
 }
@@ -6244,7 +6914,7 @@ static HRESULT WINAPI device_set_light(IDirect3DDevice9 *iface, DWORD index,
     D9Device *device = device_from_iface(iface);
     D9WGSetLight command;
     if (!light || index >= D9_MAX_LIGHTS)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_light(device, index);
     device->lights[index] = *light;
     device->light_set[index] = TRUE;
@@ -6272,7 +6942,7 @@ static HRESULT WINAPI device_get_light(IDirect3DDevice9 *iface, DWORD index,
 {
     D9Device *device = device_from_iface(iface);
     if (!light || index >= D9_MAX_LIGHTS || !device->light_set[index])
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *light = device->lights[index];
     return D3D_OK;
 }
@@ -6283,7 +6953,7 @@ static HRESULT WINAPI device_light_enable(IDirect3DDevice9 *iface,
     D9Device *device = device_from_iface(iface);
     D9WGLightEnable command;
     if (index >= D9_MAX_LIGHTS)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_light_enable(device, index);
     device->light_enabled[index] = enable ? TRUE : FALSE;
     command.device_handle = device->handle;
@@ -6299,7 +6969,7 @@ static HRESULT WINAPI device_get_light_enable(IDirect3DDevice9 *iface,
 {
     D9Device *device = device_from_iface(iface);
     if (!enable || index >= D9_MAX_LIGHTS)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *enable = device->light_enabled[index];
     return D3D_OK;
 }
@@ -6310,15 +6980,15 @@ DEV_STUB(get_clip_plane, DWORD index, float *plane)
 { (void)iface; (void)index; (void)plane;
   UNSUPPORTED("Device.SetClipPlane/GetClipPlane"); return D3DERR_INVALIDCALL; }
 DEV_STUB(set_clip_status, const D3DCLIPSTATUS9 *status)
-{ (void)iface; (void)status; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)status; return TRACE_REFUSE(D3DERR_INVALIDCALL); }
 DEV_STUB(get_clip_status, D3DCLIPSTATUS9 *status)
-{ (void)iface; (void)status; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)status; return TRACE_REFUSE(D3DERR_INVALIDCALL); }
 static HRESULT WINAPI device_get_sampler_state(IDirect3DDevice9 *iface,
         DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD *value)
 {
     D9Device *device = device_from_iface(iface);
     if (!value || sampler >= D9_MAX_SAMPLERS || (UINT)type >= D9_MAX_SAMPLER_STATES)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *value = device->sampler_states[sampler][type];
     return D3D_OK;
 }
@@ -6332,7 +7002,7 @@ static HRESULT WINAPI device_set_sampler_state(IDirect3DDevice9 *iface,
     D9Device *device = device_from_iface(iface);
     D9WGSetSamplerState command;
     if (sampler >= D9_MAX_SAMPLERS || (UINT)type >= D9_MAX_SAMPLER_STATES)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_sampler_state(device, sampler, (UINT)type);
     if (device->sampler_states[sampler][type] == value)
         return D3D_OK;
@@ -6351,9 +7021,9 @@ DEV_STUB(get_palette_entries, UINT index, PALETTEENTRY *entries)
 { (void)iface; (void)index; (void)entries;
   UNSUPPORTED("Device.SetPaletteEntries/GetPaletteEntries"); return D3DERR_INVALIDCALL; }
 DEV_STUB(set_current_texture_palette, UINT index)
-{ (void)iface; (void)index; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)index; return TRACE_REFUSE(D3DERR_INVALIDCALL); }
 DEV_STUB(get_current_texture_palette, UINT *index)
-{ (void)iface; (void)index; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)index; return TRACE_REFUSE(D3DERR_INVALIDCALL); }
 DEV_STUB(process_vertices, UINT src_start, UINT dst_index, UINT count,
         IDirect3DVertexBuffer9 *dst, IDirect3DVertexDeclaration9 *decl,
         DWORD flags)
@@ -6375,7 +7045,7 @@ DEV_STUB(draw_tri_patch, UINT handle, const float *segments,
 { (void)iface; (void)handle; (void)segments; (void)info;
   UNSUPPORTED("Device.DrawRectPatch/DrawTriPatch"); return D3DERR_INVALIDCALL; }
 DEV_STUB(delete_patch, UINT handle)
-{ (void)iface; (void)handle; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)handle; return TRACE_REFUSE(D3DERR_INVALIDCALL); }
 
 /* ---- M3: render targets, cube textures, scissor rect, queries ---- */
 
@@ -6400,20 +7070,20 @@ static HRESULT create_target_texture(D9Device *device, UINT width, UINT height,
     D9Surface *surface;
 
     if (!surface_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *surface_out = NULL;
     if (!width || !height || width > 4096 || height > 4096)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
 
     texture = (D9Texture *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             sizeof(*texture));
     if (!texture)
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     texture->levels = (D9TextureLevel *)HeapAlloc(GetProcessHeap(),
             HEAP_ZERO_MEMORY, sizeof(*texture->levels));
     if (!texture->levels) {
         HeapFree(GetProcessHeap(), 0, texture);
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     }
     texture->iface.lpVtbl = &g_texture_vtbl;
     texture->refcount = 1;
@@ -6432,7 +7102,7 @@ static HRESULT create_target_texture(D9Device *device, UINT width, UINT height,
             &texture->levels[0].byte_count)) {
         HeapFree(GetProcessHeap(), 0, texture->levels);
         HeapFree(GetProcessHeap(), 0, texture);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     /* Shadow storage remains lazy. Clear/ColorFill may make its contents fully
      * known for M4 readback; a GPU draw invalidates that knowledge. */
@@ -6441,7 +7111,7 @@ static HRESULT create_target_texture(D9Device *device, UINT width, UINT height,
         device_child_release(device);
         HeapFree(GetProcessHeap(), 0, texture->levels);
         HeapFree(GetProcessHeap(), 0, texture);
-        return D3DERR_DRIVERINTERNALERROR;
+        return TRACE_REFUSE(D3DERR_DRIVERINTERNALERROR);
     }
     texture->next_device_resource = device->texture_resources;
     device->texture_resources = texture;
@@ -6450,7 +7120,7 @@ static HRESULT create_target_texture(D9Device *device, UINT width, UINT height,
             sizeof(*surface));
     if (!surface) {
         IDirect3DTexture9_Release(&texture->iface);
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     }
     surface->iface.lpVtbl = &g_surface_vtbl;
     surface->refcount = 1;
@@ -6487,10 +7157,10 @@ static HRESULT WINAPI device_create_render_target(IDirect3DDevice9 *iface,
     (void)lockable;
     if (multisample != D3DMULTISAMPLE_NONE || multisample_quality) {
 
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     if (!supported_render_target_format(format))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     return create_target_texture(device_from_iface(iface), width, height, format,
             D3DUSAGE_RENDERTARGET, surface_out);
 }
@@ -6503,9 +7173,9 @@ static HRESULT WINAPI device_create_depth_stencil_surface(
     (void)shared;
     (void)discard;
     if (multisample != D3DMULTISAMPLE_NONE || multisample_quality)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (!supported_depth_stencil_format(format))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     return create_target_texture(device_from_iface(iface), width, height, format,
             D3DUSAGE_DEPTHSTENCIL, surface_out);
 }
@@ -6537,15 +7207,15 @@ static HRESULT WINAPI device_set_render_target(IDirect3DDevice9 *iface,
     uint32_t level = 0;
 
     if (index >= D9_MAX_RENDER_TARGETS)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     /* D3D9 forbids unbinding slot 0: something always has to receive colour. */
     if (!surface_iface && index == 0)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (surface_iface && !surface_target_handle(surface, &handle, &level))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (surface_iface && surface->texture
             && !(surface->texture->usage & D3DUSAGE_RENDERTARGET))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
 
     old_surface = device->render_target_surfaces[index];
     TRACE("CALL SetRenderTarget index=%lu old=%08lX new=%08lX same=%lu "
@@ -6570,7 +7240,7 @@ static HRESULT WINAPI device_set_render_target(IDirect3DDevice9 *iface,
     command.color_texture_handle = handle;
     command.color_level = level;
     if (!emit_command(D9WG_OP_SET_RENDER_TARGET, &command, sizeof(command)))
-        return D3DERR_DRIVERINTERNALERROR;
+        return TRACE_REFUSE(D3DERR_DRIVERINTERNALERROR);
 
     /* D3D9 resets the viewport to the full new target on every successful
      * SetRenderTarget(0). Leaving the old viewport in place is a classic
@@ -6594,7 +7264,7 @@ static HRESULT WINAPI device_get_render_target(IDirect3DDevice9 *iface,
     D9Device *device = device_from_iface(iface);
 
     if (!surface_out || index >= D9_MAX_RENDER_TARGETS)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *surface_out = NULL;
     if (device->render_target_surfaces[index]) {
         *surface_out = &device->render_target_surfaces[index]->iface;
@@ -6604,7 +7274,7 @@ static HRESULT WINAPI device_get_render_target(IDirect3DDevice9 *iface,
     /* Nothing explicitly bound: slot 0 is the implicit back buffer, and the
      * other slots are genuinely empty (D3DERR_NOTFOUND, as D3D9 reports). */
     if (index != 0)
-        return D3DERR_NOTFOUND;
+        return TRACE_REFUSE(D3DERR_NOTFOUND);
     return IDirect3DDevice9_GetBackBuffer(iface, 0, 0,
             D3DBACKBUFFER_TYPE_MONO, surface_out);
 }
@@ -6624,7 +7294,7 @@ static HRESULT WINAPI device_set_depth_stencil_surface(IDirect3DDevice9 *iface,
     } else if (surface_iface) {
         if (!surface_target_handle(surface, &handle, &level) || !surface->texture
                 || !(surface->texture->usage & D3DUSAGE_DEPTHSTENCIL))
-            return D3DERR_INVALIDCALL;
+            return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     old_surface = device->depth_stencil_surface;
     TRACE("CALL SetDepthStencilSurface old=%08lX new=%08lX same=%lu "
@@ -6656,7 +7326,7 @@ static HRESULT WINAPI device_get_depth_stencil_surface(IDirect3DDevice9 *iface,
     D9Device *device = device_from_iface(iface);
 
     if (!surface_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *surface_out = NULL;
     if (device->depth_stencil_surface) {
         *surface_out = &device->depth_stencil_surface->iface;
@@ -6664,7 +7334,7 @@ static HRESULT WINAPI device_get_depth_stencil_surface(IDirect3DDevice9 *iface,
         return D3D_OK;
     }
     if (device->depth_stencil_unbound || !device->present.EnableAutoDepthStencil)
-        return D3DERR_NOTFOUND;
+        return TRACE_REFUSE(D3DERR_NOTFOUND);
     /* A handle onto the implicit auto depth-stencil. Refusing here used to look
      * harmless -- nothing reads a depth surface's pixels -- but it breaks the
      * standard render-to-texture sequence: an app that cannot *get* the current
@@ -6679,7 +7349,7 @@ static HRESULT WINAPI device_get_depth_stencil_surface(IDirect3DDevice9 *iface,
             surface = (D9Surface *)HeapAlloc(GetProcessHeap(),
                     HEAP_ZERO_MEMORY, sizeof(*surface));
             if (!surface)
-                return E_OUTOFMEMORY;
+                return TRACE_REFUSE(E_OUTOFMEMORY);
             surface->iface.lpVtbl = &g_surface_vtbl;
             surface->device = device;
             surface->auto_depth_stencil = TRUE;
@@ -6726,14 +7396,14 @@ static HRESULT WINAPI device_stretch_rect(IDirect3DDevice9 *iface,
     RECT destination_area;
 
     if (!source || !destination)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     ZeroMemory(&command, sizeof(command));
     if (!surface_target_handle(source, &command.source_texture_handle,
                 &command.source_level)
             || !surface_target_handle(destination,
                 &command.destination_texture_handle,
                 &command.destination_level))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     command.device_handle = device->handle;
     normalize_rect(source_rect, (int)source->width, (int)source->height,
             &source_area);
@@ -6750,7 +7420,7 @@ static HRESULT WINAPI device_stretch_rect(IDirect3DDevice9 *iface,
     command.filter_point = (filter == D3DTEXF_NONE || filter == D3DTEXF_POINT)
             ? 1u : 0u;
     if (!emit_command(D9WG_OP_STRETCH_RECT, &command, sizeof(command)))
-        return D3DERR_DRIVERINTERNALERROR;
+        return TRACE_REFUSE(D3DERR_DRIVERINTERNALERROR);
     mirror_target_copy(source, &source_area, destination, &destination_area);
     return D3D_OK;
 }
@@ -6764,10 +7434,10 @@ static HRESULT WINAPI device_color_fill(IDirect3DDevice9 *iface,
     RECT area;
 
     if (!surface)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     ZeroMemory(&command, sizeof(command));
     if (!surface_target_handle(surface, &command.texture_handle, &command.level))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     command.device_handle = device->handle;
     command.color = color;
     normalize_rect(rect, (int)surface->width, (int)surface->height, &area);
@@ -6776,7 +7446,7 @@ static HRESULT WINAPI device_color_fill(IDirect3DDevice9 *iface,
     command.right = area.right;
     command.bottom = area.bottom;
     if (!emit_command(D9WG_OP_COLOR_FILL, &command, sizeof(command)))
-        return D3DERR_DRIVERINTERNALERROR;
+        return TRACE_REFUSE(D3DERR_DRIVERINTERNALERROR);
     mirror_target_color_fill(surface, &area, color);
     return D3D_OK;
 }
@@ -6788,10 +7458,10 @@ static HRESULT WINAPI device_set_scissor_rect(IDirect3DDevice9 *iface,
     D9WGSetScissorRect command;
 
     if (!rect)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (rect->left < 0 || rect->top < 0 || rect->right < rect->left
             || rect->bottom < rect->top)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     state_block_record_scissor(device);
     device->scissor_rect = *rect;
     device->scissor_set = TRUE;
@@ -6810,7 +7480,7 @@ static HRESULT WINAPI device_get_scissor_rect(IDirect3DDevice9 *iface,
     D9Device *device = device_from_iface(iface);
 
     if (!rect)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (device->scissor_set) {
         *rect = device->scissor_rect;
     } else {
@@ -6895,7 +7565,7 @@ static HRESULT WINAPI query_get_device(IDirect3DQuery9 *iface,
 {
     D9Query *query = query_from_iface(iface);
     if (!device_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *device_out = &query->device->iface;
     IDirect3DDevice9_AddRef(*device_out);
     return D3D_OK;
@@ -6917,7 +7587,7 @@ static HRESULT WINAPI query_issue(IDirect3DQuery9 *iface, DWORD flags)
     D9Query *query = query_from_iface(iface);
     if (flags & D3DISSUE_BEGIN) {
         if (query->type == D3DQUERYTYPE_EVENT)
-            return D3DERR_INVALIDCALL;
+            return TRACE_REFUSE(D3DERR_INVALIDCALL);
         query->issued = FALSE;
     }
     if (flags & D3DISSUE_END)
@@ -6931,11 +7601,11 @@ static HRESULT WINAPI query_get_data(IDirect3DQuery9 *iface, void *data,
     D9Query *query = query_from_iface(iface);
     (void)flags;
     if (!query->issued)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (query->type == D3DQUERYTYPE_OCCLUSION) {
         if (data) {
             if (size < sizeof(DWORD))
-                return D3DERR_INVALIDCALL;
+                return TRACE_REFUSE(D3DERR_INVALIDCALL);
 
             *(DWORD *)data = query->device->present.BackBufferWidth
                     * query->device->present.BackBufferHeight;
@@ -6945,7 +7615,7 @@ static HRESULT WINAPI query_get_data(IDirect3DQuery9 *iface, void *data,
     /* EVENT: the batch this query was issued in has already been submitted. */
     if (data) {
         if (size < sizeof(WINBOOL))
-            return D3DERR_INVALIDCALL;
+            return TRACE_REFUSE(D3DERR_INVALIDCALL);
         *(WINBOOL *)data = TRUE;
     }
     return S_OK;
@@ -6960,7 +7630,7 @@ static HRESULT WINAPI device_create_query(IDirect3DDevice9 *iface,
     if (type != D3DQUERYTYPE_OCCLUSION && type != D3DQUERYTYPE_EVENT) {
 
         if (query_out) *query_out = NULL;
-        return D3DERR_NOTAVAILABLE;
+        return TRACE_REFUSE(D3DERR_NOTAVAILABLE);
     }
     /* A NULL out pointer is D3D9's "do you support this type?" probe. */
     if (!query_out)
@@ -6969,7 +7639,7 @@ static HRESULT WINAPI device_create_query(IDirect3DDevice9 *iface,
     query = (D9Query *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             sizeof(*query));
     if (!query)
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     query->iface.lpVtbl = &g_query_vtbl;
     query->refcount = 1;
     query->device = device;
@@ -7091,31 +7761,31 @@ static HRESULT WINAPI device_create_cube_texture(IDirect3DDevice9 *iface,
     (void)shared;
 
     if (!texture_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *texture_out = NULL;
     if (!edge || edge > 4096 || !supported_texture_format(format)
             || (usage & (D3DUSAGE_DEPTHSTENCIL | D3DUSAGE_RENDERTARGET
                     | D3DUSAGE_AUTOGENMIPMAP))
             || pool > D3DPOOL_SCRATCH) {
 
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     full_levels = full_mip_level_count(edge, edge);
     if (!levels) levels = full_levels;
     if (levels > full_levels)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (!multiply_u32(levels, 6u, &total))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
 
     texture = (D9CubeTexture *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
             sizeof(*texture));
     if (!texture)
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     texture->levels = (D9TextureLevel *)HeapAlloc(GetProcessHeap(),
             HEAP_ZERO_MEMORY, total * sizeof(*texture->levels));
     if (!texture->levels) {
         HeapFree(GetProcessHeap(), 0, texture);
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     }
     texture->iface.lpVtbl = &g_cube_vtbl;
     texture->refcount = 1;
@@ -7214,7 +7884,7 @@ static HRESULT WINAPI cube_get_device(IDirect3DCubeTexture9 *iface,
 {
     D9CubeTexture *texture = cube_from_iface(iface);
     if (!device_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *device_out = &texture->device->iface;
     IDirect3DDevice9_AddRef(*device_out);
     return D3D_OK;
@@ -7223,13 +7893,13 @@ static HRESULT WINAPI cube_get_device(IDirect3DCubeTexture9 *iface,
 static HRESULT WINAPI cube_set_private_data(IDirect3DCubeTexture9 *iface,
         REFGUID guid, const void *data, DWORD size, DWORD flags)
 { (void)iface; (void)guid; (void)data; (void)size; (void)flags;
-  return D3DERR_INVALIDCALL; }
+  return TRACE_REFUSE(D3DERR_INVALIDCALL); }
 static HRESULT WINAPI cube_get_private_data(IDirect3DCubeTexture9 *iface,
         REFGUID guid, void *data, DWORD *size)
-{ (void)iface; (void)guid; (void)data; (void)size; return D3DERR_NOTFOUND; }
+{ (void)iface; (void)guid; (void)data; (void)size; return TRACE_REFUSE(D3DERR_NOTFOUND); }
 static HRESULT WINAPI cube_free_private_data(IDirect3DCubeTexture9 *iface,
         REFGUID guid)
-{ (void)iface; (void)guid; return D3DERR_NOTFOUND; }
+{ (void)iface; (void)guid; return TRACE_REFUSE(D3DERR_NOTFOUND); }
 
 static DWORD WINAPI cube_set_priority(IDirect3DCubeTexture9 *iface,
         DWORD priority)
@@ -7260,7 +7930,7 @@ static DWORD WINAPI cube_get_level_count(IDirect3DCubeTexture9 *iface)
 { return cube_from_iface(iface)->level_count; }
 static HRESULT WINAPI cube_set_auto_gen_filter_type(
         IDirect3DCubeTexture9 *iface, D3DTEXTUREFILTERTYPE type)
-{ (void)iface; (void)type; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)type; return TRACE_REFUSE(D3DERR_INVALIDCALL); }
 static D3DTEXTUREFILTERTYPE WINAPI cube_get_auto_gen_filter_type(
         IDirect3DCubeTexture9 *iface)
 { (void)iface; return D3DTEXF_LINEAR; }
@@ -7272,7 +7942,7 @@ static HRESULT WINAPI cube_get_level_desc(IDirect3DCubeTexture9 *iface,
 {
     D9CubeTexture *texture = cube_from_iface(iface);
     if (!desc || level >= texture->level_count)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     ZeroMemory(desc, sizeof(*desc));
     desc->Format = texture->format;
     desc->Type = D3DRTYPE_SURFACE;
@@ -7308,10 +7978,10 @@ static HRESULT WINAPI cube_lock_rect(IDirect3DCubeTexture9 *iface,
     UINT block_width, block_height, block_bytes;
 
     if (!locked_rect || (UINT)face >= 6u || level >= texture->level_count)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     level_data = &texture->levels[(UINT)face * texture->level_count + level];
     if (level_data->locked)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (rect) {
         area = *rect;
     } else {
@@ -7323,7 +7993,7 @@ static HRESULT WINAPI cube_lock_rect(IDirect3DCubeTexture9 *iface,
             || (UINT)area.bottom > level_data->height
             || !texture_format_layout(texture->format, &block_width,
                     &block_height, &block_bytes))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     level_data->lock_rect = area;
     level_data->lock_flags = flags;
     level_data->locked = TRUE;
@@ -7342,10 +8012,10 @@ static HRESULT WINAPI cube_unlock_rect(IDirect3DCubeTexture9 *iface,
     BOOL result = TRUE;
 
     if ((UINT)face >= 6u || level >= texture->level_count)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     level_data = &texture->levels[(UINT)face * texture->level_count + level];
     if (!level_data->locked)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (!(level_data->lock_flags & D3DLOCK_READONLY))
         result = emit_cube_texture_update(texture, (UINT)face, level,
                 &level_data->lock_rect);
@@ -7443,11 +8113,20 @@ static const WORD g_vertex_state_render_states[] = {
 };
 
 /* The transform indices a state block tracks. D3D9's full D3DTRANSFORMSTATETYPE
- * space is 512 entries wide (mostly the 256 world matrices vertex blending
- * uses), and fill_caps() reports MaxVertexBlendMatrices = 0, so snapshotting
- * all of them would cost 32 KB per block to preserve state nothing can read. */
+ * space is 512 entries wide, mostly the 256 world matrices vertex blending
+ * uses, and snapshotting all of them would cost 32 KB per block.
+ *
+ * D3DTS_WORLDMATRIX(1..3) are here because unindexed vertex blending reads
+ * exactly those: fill_caps() reports MaxVertexBlendMatrices = 4, so a block
+ * that captured only D3DTS_WORLD would restore a skinned draw's pose from one
+ * matrix and three stale ones. Indexed blending can name any of the other 252,
+ * which a block still does not capture -- an app that records a state block
+ * around an indexed-skinned pass and expects the palette restored gets the
+ * palette as the pass left it. That is a bounded, stated limit rather than an
+ * unnoticed one; lifting it means paying the 32 KB. */
 static const WORD g_state_block_transforms[] = {
     D3DTS_VIEW, D3DTS_PROJECTION, D3DTS_WORLD,
+    D3DTS_WORLDMATRIX(1), D3DTS_WORLDMATRIX(2), D3DTS_WORLDMATRIX(3),
     D3DTS_TEXTURE0, D3DTS_TEXTURE1, D3DTS_TEXTURE2, D3DTS_TEXTURE3,
     D3DTS_TEXTURE4, D3DTS_TEXTURE5, D3DTS_TEXTURE6, D3DTS_TEXTURE7
 };
@@ -8018,7 +8697,7 @@ static HRESULT WINAPI state_block_get_device(IDirect3DStateBlock9 *iface,
 {
     struct D9StateBlock *block = state_block_from_iface(iface);
     if (!device_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *device_out = &block->device->iface;
     IDirect3DDevice9_AddRef(*device_out);
     return D3D_OK;
@@ -8034,7 +8713,7 @@ static HRESULT WINAPI state_block_apply_method(IDirect3DStateBlock9 *iface)
 {
     struct D9StateBlock *block = state_block_from_iface(iface);
     if (block->device->recording)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     return state_block_apply(block);
 }
 
@@ -8054,16 +8733,16 @@ static HRESULT WINAPI device_create_state_block(IDirect3DDevice9 *iface,
     struct D9StateBlock *block;
 
     if (!block_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *block_out = NULL;
     if (device->recording)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (type != D3DSBT_ALL && type != D3DSBT_PIXELSTATE
             && type != D3DSBT_VERTEXSTATE)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     block = state_block_alloc(device);
     if (!block)
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     if (type == D3DSBT_ALL) state_block_mark_all(block);
     else if (type == D3DSBT_PIXELSTATE) state_block_mark_pixel_states(block);
     else state_block_mark_vertex_states(block);
@@ -8079,14 +8758,14 @@ static HRESULT WINAPI device_begin_state_block(IDirect3DDevice9 *iface)
     struct D9StateBlock *result;
 
     if (device->recording)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     baseline = state_block_alloc(device);
     if (!baseline)
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     result = state_block_alloc(device);
     if (!result) {
         IDirect3DStateBlock9_Release(&baseline->iface);
-        return E_OUTOFMEMORY;
+        return TRACE_REFUSE(E_OUTOFMEMORY);
     }
     state_block_mark_all(baseline);
     state_block_capture(baseline);
@@ -8103,14 +8782,14 @@ static HRESULT WINAPI device_end_state_block(IDirect3DDevice9 *iface,
     struct D9StateBlock *block = device->recording_result;
 
     if (!baseline || !block)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (!block_out) {
         device->recording = NULL;
         device->recording_result = NULL;
         state_block_apply(baseline);
         IDirect3DStateBlock9_Release(&block->iface);
         IDirect3DStateBlock9_Release(&baseline->iface);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     *block_out = NULL;
     /* Capture only the explicitly touched mask. This preserves same-value and
@@ -8172,7 +8851,7 @@ static HRESULT WINAPI vb_get_device(IDirect3DVertexBuffer9 *iface,
 {
     D9VertexBuffer *buffer = vb_from_iface(iface);
     if (!device_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *device_out = &buffer->device->iface;
     IDirect3DDevice9_AddRef(*device_out);
     return D3D_OK;
@@ -8181,15 +8860,15 @@ static HRESULT WINAPI vb_get_device(IDirect3DVertexBuffer9 *iface,
 static HRESULT WINAPI vb_set_private_data(IDirect3DVertexBuffer9 *iface,
         REFGUID guid, const void *data, DWORD size, DWORD flags)
 { (void)iface; (void)guid; (void)data; (void)size; (void)flags;
-  return D3DERR_INVALIDCALL; }
+  return TRACE_REFUSE(D3DERR_INVALIDCALL); }
 
 static HRESULT WINAPI vb_get_private_data(IDirect3DVertexBuffer9 *iface,
         REFGUID guid, void *data, DWORD *size)
-{ (void)iface; (void)guid; (void)data; (void)size; return D3DERR_NOTFOUND; }
+{ (void)iface; (void)guid; (void)data; (void)size; return TRACE_REFUSE(D3DERR_NOTFOUND); }
 
 static HRESULT WINAPI vb_free_private_data(IDirect3DVertexBuffer9 *iface,
         REFGUID guid)
-{ (void)iface; (void)guid; return D3DERR_NOTFOUND; }
+{ (void)iface; (void)guid; return TRACE_REFUSE(D3DERR_NOTFOUND); }
 
 static DWORD WINAPI vb_set_priority(IDirect3DVertexBuffer9 *iface,
         DWORD priority)
@@ -8214,19 +8893,19 @@ static HRESULT WINAPI vb_lock(IDirect3DVertexBuffer9 *iface, UINT offset,
 {
     D9VertexBuffer *buffer = vb_from_iface(iface);
     if (!data_out || buffer->locked || offset > buffer->length)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if ((flags & D3DLOCK_DISCARD) && (flags & D3DLOCK_NOOVERWRITE))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if ((flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE))
             && !(buffer->usage & D3DUSAGE_DYNAMIC))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if ((flags & D3DLOCK_READONLY)
             && (flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE)))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (!size)
         size = buffer->length - offset;
     if (size > buffer->length - offset)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     buffer->locked = TRUE;
     buffer->lock_offset = offset;
     buffer->lock_size = size;
@@ -8242,7 +8921,7 @@ static HRESULT WINAPI vb_unlock(IDirect3DVertexBuffer9 *iface)
     D9VertexBuffer *buffer = vb_from_iface(iface);
     BOOL result;
     if (!buffer->locked)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     result = (buffer->lock_flags & D3DLOCK_READONLY)
             || emit_buffer_update(buffer->handle, buffer->lock_offset,
                     buffer->shadow + buffer->lock_offset, buffer->lock_size,
@@ -8259,7 +8938,7 @@ static HRESULT WINAPI vb_get_desc(IDirect3DVertexBuffer9 *iface,
 {
     D9VertexBuffer *buffer = vb_from_iface(iface);
     if (!desc)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     ZeroMemory(desc, sizeof(*desc));
     desc->Format = D3DFMT_VERTEXDATA;
     desc->Type = D3DRTYPE_VERTEXBUFFER;
@@ -8317,7 +8996,7 @@ static HRESULT WINAPI ib_get_device(IDirect3DIndexBuffer9 *iface,
 {
     D9IndexBuffer *buffer = ib_from_iface(iface);
     if (!device_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *device_out = &buffer->device->iface;
     IDirect3DDevice9_AddRef(*device_out);
     return D3D_OK;
@@ -8326,15 +9005,15 @@ static HRESULT WINAPI ib_get_device(IDirect3DIndexBuffer9 *iface,
 static HRESULT WINAPI ib_set_private_data(IDirect3DIndexBuffer9 *iface,
         REFGUID guid, const void *data, DWORD size, DWORD flags)
 { (void)iface; (void)guid; (void)data; (void)size; (void)flags;
-  return D3DERR_INVALIDCALL; }
+  return TRACE_REFUSE(D3DERR_INVALIDCALL); }
 
 static HRESULT WINAPI ib_get_private_data(IDirect3DIndexBuffer9 *iface,
         REFGUID guid, void *data, DWORD *size)
-{ (void)iface; (void)guid; (void)data; (void)size; return D3DERR_NOTFOUND; }
+{ (void)iface; (void)guid; (void)data; (void)size; return TRACE_REFUSE(D3DERR_NOTFOUND); }
 
 static HRESULT WINAPI ib_free_private_data(IDirect3DIndexBuffer9 *iface,
         REFGUID guid)
-{ (void)iface; (void)guid; return D3DERR_NOTFOUND; }
+{ (void)iface; (void)guid; return TRACE_REFUSE(D3DERR_NOTFOUND); }
 
 static DWORD WINAPI ib_set_priority(IDirect3DIndexBuffer9 *iface,
         DWORD priority)
@@ -8359,16 +9038,16 @@ static HRESULT WINAPI ib_lock(IDirect3DIndexBuffer9 *iface, UINT offset,
 {
     D9IndexBuffer *buffer = ib_from_iface(iface);
     if (!data_out || buffer->locked || offset > buffer->length)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if ((flags & D3DLOCK_DISCARD) && (flags & D3DLOCK_NOOVERWRITE))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if ((flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE))
             && !(buffer->usage & D3DUSAGE_DYNAMIC))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (!size)
         size = buffer->length - offset;
     if (size > buffer->length - offset)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     buffer->locked = TRUE;
     buffer->lock_offset = offset;
     buffer->lock_size = size;
@@ -8384,7 +9063,7 @@ static HRESULT WINAPI ib_unlock(IDirect3DIndexBuffer9 *iface)
     D9IndexBuffer *buffer = ib_from_iface(iface);
     BOOL result;
     if (!buffer->locked)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     result = (buffer->lock_flags & D3DLOCK_READONLY)
             || emit_buffer_update(buffer->handle, buffer->lock_offset,
                     buffer->shadow + buffer->lock_offset, buffer->lock_size,
@@ -8401,7 +9080,7 @@ static HRESULT WINAPI ib_get_desc(IDirect3DIndexBuffer9 *iface,
 {
     D9IndexBuffer *buffer = ib_from_iface(iface);
     if (!desc)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     ZeroMemory(desc, sizeof(*desc));
     desc->Format = buffer->format;
     desc->Type = D3DRTYPE_INDEXBUFFER;
@@ -8427,10 +9106,10 @@ static HRESULT texture_lock_level(D9Texture *texture, UINT level,
     if (!locked_rect || level >= texture->level_count
             || (texture->usage & (D3DUSAGE_RENDERTARGET
                 | D3DUSAGE_DEPTHSTENCIL)))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     level_data = &texture->levels[level];
     if (level_data->locked || !level_data->shadow)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (rect) {
         area = *rect;
     } else {
@@ -8442,7 +9121,7 @@ static HRESULT texture_lock_level(D9Texture *texture, UINT level,
             || (UINT)area.bottom > level_data->height
             || !texture_format_layout(texture->format, &block_width,
                     &block_height, &block_bytes))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (block_width > 1
             && (((UINT)area.left % block_width)
                 || ((UINT)area.top % block_height)
@@ -8450,7 +9129,7 @@ static HRESULT texture_lock_level(D9Texture *texture, UINT level,
                     && (UINT)area.right % block_width)
                 || ((UINT)area.bottom != level_data->height
                     && (UINT)area.bottom % block_height)))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
 
     block_x = (UINT)area.left / block_width;
     block_y = (UINT)area.top / block_height;
@@ -8469,10 +9148,10 @@ static HRESULT texture_unlock_level(D9Texture *texture, UINT level)
     BOOL result = TRUE;
 
     if (level >= texture->level_count)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     level_data = &texture->levels[level];
     if (!level_data->locked)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (!(level_data->lock_flags & D3DLOCK_READONLY))
         result = emit_texture_update(texture, level, &level_data->lock_rect);
     level_data->locked = FALSE;
@@ -8541,7 +9220,7 @@ static HRESULT WINAPI texture_get_device(IDirect3DTexture9 *iface,
 {
     D9Texture *texture = texture_from_iface(iface);
     if (!device_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *device_out = &texture->device->iface;
     IDirect3DDevice9_AddRef(*device_out);
     return D3D_OK;
@@ -8550,15 +9229,15 @@ static HRESULT WINAPI texture_get_device(IDirect3DTexture9 *iface,
 static HRESULT WINAPI texture_set_private_data(IDirect3DTexture9 *iface,
         REFGUID guid, const void *data, DWORD size, DWORD flags)
 { (void)iface; (void)guid; (void)data; (void)size; (void)flags;
-  return D3DERR_INVALIDCALL; }
+  return TRACE_REFUSE(D3DERR_INVALIDCALL); }
 
 static HRESULT WINAPI texture_get_private_data(IDirect3DTexture9 *iface,
         REFGUID guid, void *data, DWORD *size)
-{ (void)iface; (void)guid; (void)data; (void)size; return D3DERR_NOTFOUND; }
+{ (void)iface; (void)guid; (void)data; (void)size; return TRACE_REFUSE(D3DERR_NOTFOUND); }
 
 static HRESULT WINAPI texture_free_private_data(IDirect3DTexture9 *iface,
         REFGUID guid)
-{ (void)iface; (void)guid; return D3DERR_NOTFOUND; }
+{ (void)iface; (void)guid; return TRACE_REFUSE(D3DERR_NOTFOUND); }
 
 static DWORD WINAPI texture_set_priority(IDirect3DTexture9 *iface,
         DWORD priority)
@@ -8599,7 +9278,7 @@ static DWORD WINAPI texture_get_level_count(IDirect3DTexture9 *iface)
  * complete for titles that probe the capability defensively. */
 static HRESULT WINAPI texture_set_auto_gen_filter_type(
         IDirect3DTexture9 *iface, D3DTEXTUREFILTERTYPE filter)
-{ (void)iface; (void)filter; return D3DERR_INVALIDCALL; }
+{ (void)iface; (void)filter; return TRACE_REFUSE(D3DERR_INVALIDCALL); }
 
 static D3DTEXTUREFILTERTYPE WINAPI texture_get_auto_gen_filter_type(
         IDirect3DTexture9 *iface)
@@ -8614,7 +9293,7 @@ static HRESULT WINAPI texture_get_level_desc(IDirect3DTexture9 *iface,
     D9Texture *texture = texture_from_iface(iface);
     D9TextureLevel *level_data;
     if (!desc || level >= texture->level_count)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     level_data = &texture->levels[level];
     ZeroMemory(desc, sizeof(*desc));
     desc->Format = texture->format;
@@ -8735,7 +9414,7 @@ static HRESULT WINAPI texture_add_dirty_rect(IDirect3DTexture9 *iface,
             || rect->right <= rect->left || rect->bottom <= rect->top
             || (UINT)rect->right > texture->width
             || (UINT)rect->bottom > texture->height))
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     return D3D_OK;
 }
 
@@ -8784,7 +9463,7 @@ static HRESULT WINAPI decl_get_device(IDirect3DVertexDeclaration9 *iface,
 {
     D9VertexDeclaration *decl = decl_from_iface(iface);
     if (!device_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *device_out = &decl->device->iface;
     IDirect3DDevice9_AddRef(*device_out);
     return D3D_OK;
@@ -8794,21 +9473,28 @@ static HRESULT WINAPI decl_get_declaration(IDirect3DVertexDeclaration9 *iface,
         D3DVERTEXELEMENT9 *elements, UINT *count_out)
 {
     D9VertexDeclaration *decl = decl_from_iface(iface);
+    UINT count = decl->element_count + 1; /* includes D3DDECL_END */
+
     if (!count_out)
-        return D3DERR_INVALIDCALL;
-    if (!elements) {
-        *count_out = decl->element_count + 1; /* +1 for the END() sentinel */
-        return D3D_OK;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
+
+    /* pNumElements is [out], not an in/out capacity. The D3D9 contract puts
+     * responsibility for allocating MAXD3DDECLLENGTH elements on the caller;
+     * Microsoft's own sample deliberately leaves this UINT uninitialised.
+     * Reading it here made RenderWare's valid GetDeclaration call fail with
+     * D3DERR_INVALIDCALL when GTA SA began streaming the first world sector,
+     * after which the game dereferenced the declaration it expected back. */
+    if (elements) {
+        CopyMemory(elements, decl->elements,
+                decl->element_count * sizeof(D3DVERTEXELEMENT9));
+        {
+            D3DVERTEXELEMENT9 end = D3DDECL_END();
+            elements[decl->element_count] = end;
+        }
     }
-    if (*count_out < decl->element_count + 1)
-        return D3DERR_INVALIDCALL;
-    CopyMemory(elements, decl->elements,
-            decl->element_count * sizeof(D3DVERTEXELEMENT9));
-    {
-        D3DVERTEXELEMENT9 end = D3DDECL_END();
-        elements[decl->element_count] = end;
-    }
-    *count_out = decl->element_count + 1;
+    *count_out = count;
+    TRACE("OK VertexDeclaration.GetDeclaration object=%08lX elements=%08lX count=%lu",
+            (DWORD)(uintptr_t)iface, (DWORD)(uintptr_t)elements, count);
     return D3D_OK;
 }
 
@@ -8837,13 +9523,13 @@ static HRESULT shader_get_function(D9Shader *shader, void *data, UINT *size)
 {
     UINT byte_count = shader->token_count * 4u;
     if (!size)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (!data) {
         *size = byte_count;
         return D3D_OK;
     }
     if (*size < byte_count)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     CopyMemory(data, shader->code, byte_count);
     *size = byte_count;
     return D3D_OK;
@@ -8876,7 +9562,7 @@ static HRESULT WINAPI vertex_shader_get_device(IDirect3DVertexShader9 *iface,
 {
     D9Shader *shader = vertex_shader_from_iface(iface);
     if (!device_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *device_out = &shader->device->iface;
     IDirect3DDevice9_AddRef(*device_out);
     return D3D_OK;
@@ -8915,7 +9601,7 @@ static HRESULT WINAPI pixel_shader_get_device(IDirect3DPixelShader9 *iface,
 {
     D9Shader *shader = pixel_shader_from_iface(iface);
     if (!device_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *device_out = &shader->device->iface;
     IDirect3DDevice9_AddRef(*device_out);
     return D3D_OK;
@@ -9094,7 +9780,7 @@ static HRESULT WINAPI surface_get_device(IDirect3DSurface9 *iface,
 {
     D9Surface *surface = surface_from_iface(iface);
     if (!device_out)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *device_out = &surface->device->iface;
     IDirect3DDevice9_AddRef(*device_out);
     return D3D_OK;
@@ -9103,15 +9789,15 @@ static HRESULT WINAPI surface_get_device(IDirect3DSurface9 *iface,
 static HRESULT WINAPI surface_set_private_data(IDirect3DSurface9 *iface,
         REFGUID guid, const void *data, DWORD size, DWORD flags)
 { (void)iface; (void)guid; (void)data; (void)size; (void)flags;
-  return D3DERR_INVALIDCALL; }
+  return TRACE_REFUSE(D3DERR_INVALIDCALL); }
 
 static HRESULT WINAPI surface_get_private_data(IDirect3DSurface9 *iface,
         REFGUID guid, void *data, DWORD *size)
-{ (void)iface; (void)guid; (void)data; (void)size; return D3DERR_NOTFOUND; }
+{ (void)iface; (void)guid; (void)data; (void)size; return TRACE_REFUSE(D3DERR_NOTFOUND); }
 
 static HRESULT WINAPI surface_free_private_data(IDirect3DSurface9 *iface,
         REFGUID guid)
-{ (void)iface; (void)guid; return D3DERR_NOTFOUND; }
+{ (void)iface; (void)guid; return TRACE_REFUSE(D3DERR_NOTFOUND); }
 
 static DWORD WINAPI surface_set_priority(IDirect3DSurface9 *iface,
         DWORD priority)
@@ -9131,7 +9817,7 @@ static HRESULT WINAPI surface_get_container(IDirect3DSurface9 *iface,
 {
     D9Surface *surface = surface_from_iface(iface);
     if (!container)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *container = NULL;
     if (surface->swap_chain) {
         if (!riid || (!iid_is_unknown(riid)
@@ -9144,7 +9830,7 @@ static HRESULT WINAPI surface_get_container(IDirect3DSurface9 *iface,
         return D3D_OK;
     }
     if (!surface->texture)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (riid && !iid_is_unknown(riid)
             && !guid_equal(riid, &IID_IDirect3DResource9)
             && !guid_equal(riid, &IID_IDirect3DBaseTexture9)
@@ -9160,7 +9846,7 @@ static HRESULT WINAPI surface_get_desc(IDirect3DSurface9 *iface,
 {
     D9Surface *surface = surface_from_iface(iface);
     if (!desc)
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     ZeroMemory(desc, sizeof(*desc));
     desc->Format = surface->format;
     desc->Type = D3DRTYPE_SURFACE;
@@ -9462,7 +10148,7 @@ static HRESULT WINAPI swap_chain_get_present_parameters(
                 (DWORD)(uintptr_t)iface, (DWORD)D3DERR_INVALIDCALL);
         TRACE_MARK_EXIT("SwapChain.GetPresentParameters",
                 D3DERR_INVALIDCALL, NULL);
-        return D3DERR_INVALIDCALL;
+        return TRACE_REFUSE(D3DERR_INVALIDCALL);
     }
     *parameters = swap_chain->device->present;
     TRACE("OK SwapChain.GetPresentParameters object=%08lX %lux%lu fmt=%08lX count=%lu windowed=%lu",
@@ -9847,13 +10533,15 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
 #ifdef D9WG_DIAGNOSTIC_TRACE
         trace_open(instance);
         g_trace_veh = AddVectoredExceptionHandler(1, trace_vectored_exception);
-        TRACE("PROCESS_ATTACH diagnostic trace v4 surface-lifetime-20260815 "
-                "pid=%lu module=%08lX veh=%08lX",
+        TRACE("PROCESS_ATTACH diagnostic trace v5 build=%s "
+                "pid=%lu module=%08lX veh=%08lX", D9_PROXY_BUILD,
                 GetCurrentProcessId(), (DWORD)(uintptr_t)instance,
                 (DWORD)(uintptr_t)g_trace_veh);
         TRACE("MODULE exe=%08lX path=%s proxy=%08lX path=%s",
                 (DWORD)(uintptr_t)g_trace_exe_module, g_trace_exe_path,
                 (DWORD)(uintptr_t)g_trace_self_module, g_trace_self_path);
+        /* The baseline every later MEM sample is read against. */
+        trace_memory_state("process_attach");
         TRACE_FLUSH();
 #endif
         initialize_session_id(instance);
@@ -9862,6 +10550,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
         TRACE("PROCESS_DETACH reserved=%08lX pending_commands=%lu",
                 (DWORD)(uintptr_t)reserved, g_command_count);
 #ifdef D9WG_DIAGNOSTIC_TRACE
+        trace_memory_state("process_detach");
         trace_window_state();
         trace_last_call("process_detach");
 #endif

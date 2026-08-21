@@ -62,8 +62,10 @@
             if (typeof document === "undefined" || !document.currentScript ||
                     !document.currentScript.src)
                 return null;
-            return new URL("d3d9_shader_worker.js",
-                document.currentScript.src).href;
+            const executorURL = new URL(document.currentScript.src);
+            const workerURL = new URL("d3d9_shader_worker.js", executorURL);
+            workerURL.search = executorURL.search;
+            return workerURL.href;
         } catch (error) { return null; }
     })();
 
@@ -292,6 +294,23 @@
     const D3DRS_POINTSCALE_C = 160;
     const D3DRS_POINTSIZE_MAX = 166;
 
+    // Fixed-function vertex blending. D3DRS_VERTEXBLEND says how many world
+    // matrices pose each vertex; D3DRS_INDEXEDVERTEXBLENDENABLE says whether
+    // BLENDINDICES picks them out of the world-matrix palette instead of
+    // taking them in order from D3DTS_WORLDMATRIX(0).
+    const D3DRS_VERTEXBLEND = 151;
+    const D3DRS_INDEXEDVERTEXBLENDENABLE = 167;
+    // D3DVERTEXBLENDFLAGS. The 1/2/3WEIGHTS names count *weights*, and the
+    // matrix count is one higher: the last matrix's weight is whatever the
+    // others leave over, 1 - sum(the rest). 0WEIGHTS is the indexed-only case
+    // of one matrix per vertex chosen by BLENDINDICES.x with weight 1.
+    const D3DVBF_DISABLE = 0;
+    const D3DVBF_TWEENING = 255;
+    const D3DVBF_0WEIGHTS = 256;
+    // D3D9's fixed function blends at most four matrices per vertex, which is
+    // what fill_caps() reports as MaxVertexBlendMatrices.
+    const MAX_BLEND_MATRICES = 4;
+
     // D3DLIGHTTYPE
     const D3DLIGHT_POINT = 1, D3DLIGHT_SPOT = 2, D3DLIGHT_DIRECTIONAL = 3;
     // D3DMATERIALCOLORSOURCE
@@ -503,13 +522,32 @@
         D3DRS_SRGBWRITEENABLE, D3DRS_POINTSIZE, D3DRS_POINTSIZE_MIN,
         D3DRS_POINTSPRITEENABLE, D3DRS_POINTSCALEENABLE,
         D3DRS_POINTSCALE_A, D3DRS_POINTSCALE_B, D3DRS_POINTSCALE_C,
-        D3DRS_POINTSIZE_MAX,
+        D3DRS_POINTSIZE_MAX, D3DRS_VERTEXBLEND,
+        D3DRS_INDEXEDVERTEXBLENDENABLE,
     ]);
 
     const D3DTS_VIEW = 2;
     const D3DTS_PROJECTION = 3;
     const D3DTS_WORLD = 256;
+    // D3DTS_WORLDMATRIX(n) is D3DTS_WORLD + n, and indexed vertex blending can
+    // address all 256 of them. The palette actually uploaded per draw is sized
+    // from what the guest has set (see maxWorldMatrixIndex), not from this.
+    const MAX_WORLD_MATRICES = 256;
     const D3DTS_TEXTURE0 = 16;
+
+    // How many world matrices an indexed blend uploads. Sizing this to exactly
+    // the highest index the guest has set would put the count in the shader
+    // cache key and mint a fresh module and pipeline every time an engine adds
+    // a bone, so it is rounded up through a handful of buckets instead: the
+    // key changes a few times per session rather than a few times per frame.
+    // The cost of the slack is upload bandwidth on blended draws only.
+    function blendPaletteSize(highestIndexSet) {
+        const needed = Math.max(1, Math.min(MAX_WORLD_MATRICES,
+            (highestIndexSet | 0) + 1));
+        let size = 4;
+        while (size < needed) size *= 2;
+        return size;
+    }
 
     // D3DPRIMITIVETYPE -> WebGPU topology, and element-count helpers mirror
     // d3d9_proxy.c's primitive_element_count() so guest/host agree on how
@@ -1032,6 +1070,10 @@
     const FF_LOCATION_NORMAL = 3;
     const FF_LOCATION_TEXCOORD0 = 4; // .. 11 for TEXCOORD0..7
     const FF_LOCATION_PSIZE = 12;
+    // M7 added two more: fixed-function vertex blending reads the skinning
+    // usages the declaration validator has always accepted.
+    const FF_LOCATION_BLENDWEIGHT = 13;
+    const FF_LOCATION_BLENDINDICES = 14;
 
     // D3D9's alpha test has no fixed-function equivalent in WebGPU: it has to
     // become a `discard` in the fragment shader, which means the comparison
@@ -1061,7 +1103,9 @@
         return "    if (" + condition + ") { discard; }\n";
     }
 
-    function fixedFunctionLocationFor(element) {
+    // `blend` is the signature's resolved vertexBlend (null when the draw is
+    // not blended); it decides whether the skinning attributes are consumed.
+    function fixedFunctionLocationFor(element, blend) {
         if (element.usage === DECLUSAGE_POSITION ||
                 element.usage === DECLUSAGE_POSITIONT)
             return element.usageIndex === 0 ? FF_LOCATION_POSITION : -1;
@@ -1075,9 +1119,18 @@
             return FF_LOCATION_TEXCOORD0 + element.usageIndex;
         if (element.usage === DECLUSAGE_PSIZE)
             return element.usageIndex === 0 ? FF_LOCATION_PSIZE : -1;
-        // Skinning usages are accepted by the guest's declaration validator so
-        // lit or skinned vertex data does not have to be reformatted, but no
-        // fixed-function stage reads them.
+        // The skinning usages are read only while vertex blending is actually
+        // on. Reporting them unconditionally would put an attribute in the
+        // vertex layout that the generated WGSL never declares, for every
+        // declaration that carries blend data with D3DRS_VERTEXBLEND disabled
+        // -- which is most of them, since engines share one declaration
+        // between their skinned and unskinned passes.
+        if (element.usage === DECLUSAGE_BLENDWEIGHT)
+            return blend && blend.weightCount && element.usageIndex === 0
+                ? FF_LOCATION_BLENDWEIGHT : -1;
+        if (element.usage === DECLUSAGE_BLENDINDICES)
+            return blend && blend.indexed && element.usageIndex === 0
+                ? FF_LOCATION_BLENDINDICES : -1;
         return -1;
     }
 
@@ -1086,8 +1139,25 @@
     // (_, 0, 0, 1), which is exactly D3D9's rule for a FLOAT3 POSITION or a
     // FLOAT2 texcoord. One declared type per location also keeps a shader
     // module independent of which declaration is bound with it.
-    function vertexInputDeclaration(location) {
-        return "@location(" + location + ") in" + location + ": vec4<f32>";
+    // The one exception is an integer vertex format: WebGPU requires the WGSL
+    // input's base type to match the format's, so a UBYTE4 BLENDINDICES has to
+    // be declared vec4<u32>. `scalar` names that base type; it defaults to the
+    // f32 every other fixed-function attribute uses.
+    function vertexInputDeclaration(location, scalar) {
+        return "@location(" + location + ") in" + location +
+            ": vec4<" + (scalar || "f32") + ">";
+    }
+
+    // D3DDECLTYPE -> the WGSL base type its WebGPU format must be read as.
+    // Only the integer formats need an entry; everything else is f32. UDEC3
+    // (13) and DEC3N (14) arrive as a single packed uint32 rather than a
+    // four-component vector, so they have no vec4 reading at all and return
+    // null -- callers fall back rather than emit WGSL that will not compile.
+    function declTypeInputScalar(type) {
+        if (type === 13 || type === 14) return null;
+        if (type === 5) return "u32";           // UBYTE4  -> uint8x4
+        if (type === 6 || type === 7) return "i32"; // SHORT2/4 -> sint16x2/x4
+        return "f32";
     }
 
     // ---- fixed-function uniform blocks ----
@@ -1162,14 +1232,25 @@
         "        result.position.zw);";
 
     function fixedVertexUniformLayout(signature) {
+        // A blended draw cannot pre-multiply the world matrix into anything,
+        // because which world matrix applies is a per-vertex question. So the
+        // chain splits: the shader poses the vertex into world space from the
+        // matrix array, and these carry only what comes after that.
+        const blend = signature.vertexBlend;
         const fields = [
-            { name: "world_view_projection", type: "mat4x4<f32>", bytes: 64 },
+            { name: blend ? "view_projection" : "world_view_projection",
+                type: "mat4x4<f32>", bytes: 64 },
             { name: "viewport", type: "vec4<f32>", bytes: 16 },
         ];
+        if (blend)
+            fields.push({ name: "blend_worlds",
+                type: "array<mat4x4<f32>, " + blend.matrixSlots + ">",
+                bytes: 64 * blend.matrixSlots });
         if (signature.needsViewSpace) {
-            fields.push({ name: "world_view", type: "mat4x4<f32>", bytes: 64 });
-            // Inverse-transpose of world_view's upper 3x3, widened to a mat4 so
-            // it obeys the same 16-byte rule as everything else here.
+            fields.push({ name: blend ? "view_matrix" : "world_view",
+                type: "mat4x4<f32>", bytes: 64 });
+            // Inverse-transpose of the preceding matrix's upper 3x3, widened to
+            // a mat4 so it obeys the same 16-byte rule as everything else here.
             fields.push({ name: "normal_matrix", type: "mat4x4<f32>", bytes: 64 });
         }
         if (signature.fogMode)
@@ -1212,6 +1293,8 @@
         const fields = [];
         if (signature.fogMode)
             fields.push({ name: "fog_color", type: "vec4<f32>", bytes: 16 });
+        if (signature.tableFog)
+            fields.push({ name: "fog_params", type: "vec4<f32>", bytes: 16 });
         if (signature.usesTextureFactor)
             fields.push({ name: "texture_factor", type: "vec4<f32>", bytes: 16 });
         for (const stage of signature.stages) {
@@ -1220,6 +1303,17 @@
                     type: "vec4<f32>", bytes: 16, source: stage.index });
         }
         return uniformBlockLayout(fields);
+    }
+
+    function fixedFogFactorExpression(mode, distance) {
+        return {
+            [D3DFOG_LINEAR]: "clamp((uniforms.fog_params.y - " + distance + ") / " +
+                "max(uniforms.fog_params.y - uniforms.fog_params.x, 1e-6), 0.0, 1.0)",
+            [D3DFOG_EXP]: "clamp(exp(-(uniforms.fog_params.z * " + distance + ")), " +
+                "0.0, 1.0)",
+            [D3DFOG_EXP2]: "clamp(exp(-((uniforms.fog_params.z * " + distance + ") * " +
+                "(uniforms.fog_params.z * " + distance + "))), 0.0, 1.0)",
+        }[mode] || null;
     }
 
     // ---- D3DTEXTUREOP -> WGSL ----
@@ -1294,6 +1388,12 @@
             parameters.push(vertexInputDeclaration(FF_LOCATION_NORMAL));
         if (signature.hasPointSize)
             parameters.push(vertexInputDeclaration(FF_LOCATION_PSIZE));
+        const blend = signature.vertexBlend;
+        if (blend && blend.weightCount)
+            parameters.push(vertexInputDeclaration(FF_LOCATION_BLENDWEIGHT));
+        if (blend && blend.indexed)
+            parameters.push(vertexInputDeclaration(FF_LOCATION_BLENDINDICES,
+                blend.indexScalar));
         for (const set of signature.texCoordSets)
             parameters.push(vertexInputDeclaration(FF_LOCATION_TEXCOORD0 + set));
         if (signature.pointExpansion)
@@ -1302,6 +1402,74 @@
         const varyings = [];
         for (let slot = 0; slot < VARYING_COUNT; ++slot)
             varyings.push("    @location(" + slot + ") varying" + slot + ": vec4<f32>,");
+
+        // ---- fixed-function vertex blending (D3DRS_VERTEXBLEND) ----
+        //
+        // D3D9 poses a vertex as sum(w_i * (v * WORLDMATRIX(i))) and applies
+        // view and projection only to the result, so a blended draw cannot
+        // fold the world matrix into world_view_projection the way every
+        // other draw does -- which world matrix applies is a per-vertex
+        // question. BLENDWEIGHT carries one fewer weight than there are
+        // matrices because D3D9 defines the last as 1 - sum(the rest); that is
+        // what keeps the weights a partition of unity even when the exported
+        // ones do not quite sum to 1.
+        //
+        // Normals ride the same blend through the same matrices, with no
+        // per-matrix inverse transpose. That is D3D9's behaviour rather than an
+        // approximation of it: a blend of two rotations is shorter than either,
+        // which is the whole reason D3DRS_NORMALIZENORMALS exists, and it is
+        // honoured below where an unblended draw honours it.
+        const blendedPosition = blend ? "d9_blend_position" : position;
+        let blendBody = "";
+        if (blend) {
+            const slots = blend.matrixCount;
+            const weights = [];
+            for (let slot = 0; slot < slots - 1; ++slot)
+                weights.push("in" + FF_LOCATION_BLENDWEIGHT + "." + "xyzw"[slot]);
+            blendBody = "    var d9_blend_position = vec4<f32>(0.0);\n";
+            if (signature.hasNormal)
+                blendBody += "    var d9_blend_normal = vec3<f32>(0.0);\n";
+            if (weights.length)
+                blendBody += "    let d9_blend_last = 1.0 - (" +
+                    weights.join(" + ") + ");\n";
+            if (blend.indexed) {
+                // A palette index out of range is the app's bug, but WGSL gives
+                // no defined value for an out-of-bounds uniform read, so clamp:
+                // one wrong bone beats an indeterminate matrix.
+                const raw = "in" + FF_LOCATION_BLENDINDICES;
+                let unsigned;
+                if (blend.indexScalar === "u32")
+                    unsigned = raw;
+                else if (blend.indexScalar === "i32")
+                    unsigned = "vec4<u32>(max(" + raw + ", vec4<i32>(0)))";
+                else if (blend.indexNormalized)
+                    // Rounded, not truncated: 2/255 * 255 does not land exactly
+                    // on 2 in f32, and truncating it would select bone 1.
+                    unsigned = "vec4<u32>(round(" + raw + " * 255.0))";
+                else
+                    unsigned = "vec4<u32>(max(" + raw + ", vec4<f32>(0.0)))";
+                blendBody += "    let d9_blend_index = min(" + unsigned +
+                    ",\n        vec4<u32>(" + (blend.matrixSlots - 1) + "u));\n";
+            }
+            for (let slot = 0; slot < slots; ++slot) {
+                const weight = slot < slots - 1 ? weights[slot]
+                    : (weights.length ? "d9_blend_last" : "1.0");
+                const index = blend.indexed
+                    ? "d9_blend_index." + "xyzw"[slot] : slot + "u";
+                blendBody += "    {\n" +
+                    "        let d9_bone = uniforms.blend_worlds[" + index + "];\n" +
+                    "        let d9_weight = " + weight + ";\n" +
+                    "        d9_blend_position = d9_blend_position +\n" +
+                    "            (d9_bone * " + position + ") * d9_weight;\n";
+                if (signature.hasNormal)
+                    blendBody +=
+                    "        d9_blend_normal = d9_blend_normal +\n" +
+                    "            (d9_bone * vec4<f32>(in" + FF_LOCATION_NORMAL +
+                        ".xyz, 0.0)).xyz * d9_weight;\n";
+                blendBody += "    }\n";
+            }
+        }
+
 
         // XYZRHW ("screen") vertices arrive already in viewport pixel space and
         // bypass the world/view/projection chain entirely. D3D9 also treats
@@ -1318,12 +1486,14 @@
         // empty, while the one item drawn from world-space geometry rendered
         // perfectly. Same fix as wined3d's transformed-position projection
         // matrix, which carries the -2x/w term for exactly this reason.
-        const positionBody = (signature.positionType === "screen"
+        const positionBody = blendBody + (signature.positionType === "screen"
             ? `    let viewport = uniforms.viewport;
     let ndc_x = ((${position}.x - viewport.z) / viewport.x) * 2.0 - 1.0;
     let ndc_y = 1.0 - ((${position}.y - viewport.w) / viewport.y) * 2.0;
     result.position = vec4<f32>(ndc_x, ndc_y, ${position}.z, 1.0);`
-            : `    result.position = uniforms.world_view_projection * ${position};`)
+            : "    result.position = uniforms." +
+                (blend ? "view_projection" : "world_view_projection") +
+                " * " + blendedPosition + ";")
             + "\n" + HALF_PIXEL_OFFSET_BODY;
 
         // View space is where D3D9 lights live and where the camera-space
@@ -1333,11 +1503,16 @@
         // matrix in the shader.
         let viewSpaceBody = "";
         if (signature.needsViewSpace) {
-            viewSpaceBody = "    let position_view = uniforms.world_view * " +
-                position + ";\n";
+            // With blending, world_view/normal_matrix hold the view half only
+            // -- the world half already happened, per vertex, above.
+            viewSpaceBody = "    let position_view = uniforms." +
+                (blend ? "view_matrix" : "world_view") + " * " +
+                blendedPosition + ";\n";
             if (signature.hasNormal) {
+                const normalSource = blend ? "d9_blend_normal"
+                    : "in" + FF_LOCATION_NORMAL + ".xyz";
                 viewSpaceBody += "    var normal_view = (uniforms.normal_matrix" +
-                    " * vec4<f32>(in" + FF_LOCATION_NORMAL + ".xyz, 0.0)).xyz;\n";
+                    " * vec4<f32>(" + normalSource + ", 0.0)).xyz;\n";
                 // D3DRS_NORMALIZENORMALS is honoured rather than always
                 // normalising: D3D9 genuinely does not renormalise unless asked,
                 // so a scaled world matrix produces over- or under-bright
@@ -1346,8 +1521,9 @@
                 if (signature.normalizeNormals)
                     viewSpaceBody += "    normal_view = normalize(normal_view);\n";
             } else {
-                // A declaration with no normal cannot be lit; D3D9 uses (0,0,0),
-                // which zeroes every N.L term and leaves ambient + emissive.
+                // A declaration with no normal cannot receive directional
+                // diffuse/specular light; D3D9 uses (0,0,0), which zeroes every
+                // N.L term while leaving ambient + emissive.
                 viewSpaceBody += "    let normal_view = vec3<f32>(0.0);\n";
             }
         }
@@ -1471,13 +1647,8 @@
         // artefact of depth-based fog.
         const fogDistance = signature.fogRange && signature.needsViewSpace
             ? "length(position_view.xyz)" : "abs(result.position.w)";
-        const fogFactor = {
-            [D3DFOG_LINEAR]: "clamp((uniforms.fog_params.y - fog_distance) / " +
-                "max(uniforms.fog_params.y - uniforms.fog_params.x, 1e-6), 0.0, 1.0)",
-            [D3DFOG_EXP]: "clamp(exp(-(uniforms.fog_params.z * fog_distance)), 0.0, 1.0)",
-            [D3DFOG_EXP2]: "clamp(exp(-((uniforms.fog_params.z * fog_distance) * " +
-                "(uniforms.fog_params.z * fog_distance))), 0.0, 1.0)",
-        }[signature.fogMode];
+        const fogFactor = fixedFogFactorExpression(signature.fogMode,
+            "fog_distance");
         const fogBody = fogFactor
             ? "    let fog_distance = " + fogDistance + ";\n" +
               "    result.varying" + shaderPipeline.VARYING_FOG +
@@ -1618,6 +1789,8 @@ ${coordBody}${fogBody}${pointBody}    return result;
     //   "color"   vertex colour only, textures ignored
     //   "texture" stage 0's texture sample only, vertex colour ignored
     //   "uv"      stage 0's texcoords as red/green -- shows whether UVs are sane
+    //   "missing" flat magenta -- set per draw by debug.highlightMissingTexture
+    //             to mark the draws sampling a stage with no live texture
     function buildFixedFunctionPixelShader(signature, debugMode) {
         const layout = fixedPixelUniformLayout(signature);
         const diffuse = "stage_in.varying" + VARYING_COLOR0;
@@ -1764,6 +1937,8 @@ ${coordBody}${fogBody}${pointBody}    return result;
 
         let value = "current";
         if (debugMode === "solid") value = "vec4<f32>(0.0, 1.0, 0.0, 1.0)";
+        else if (debugMode === "missing") value = "vec4<f32>(1.0, 0.0, 1.0, 1.0)";
+        else if (debugMode === "orphan") value = "vec4<f32>(0.0, 1.0, 1.0, 1.0)";
         else if (debugMode === "color")
             value = "vec4<f32>(" + diffuse + ".rgb, 1.0)";
         else if (debugMode === "uv")
@@ -1783,11 +1958,26 @@ ${coordBody}${fogBody}${pointBody}    return result;
             ? "    result = vec4<f32>(clamp(result.rgb + " + specular +
               ".rgb, vec3<f32>(0.0), vec3<f32>(1.0)), result.a);\n"
             : "";
-        const fogBody = signature.fogMode
-            ? "    result = vec4<f32>(mix(uniforms.fog_color.rgb, result.rgb,\n" +
-              "        clamp(stage_in.varying" + shaderPipeline.VARYING_FOG +
-              ".x, 0.0, 1.0)), result.a);\n"
-            : "";
+        let fogBody = "";
+        if (signature.fogMode) {
+            // Table fog is pixel fog. The device advertises WFOG (and not
+            // ZFOG), while fragment position.w is reciprocal clip-space W in
+            // WGSL, so recover W here and evaluate the D3D fog equation per
+            // fragment. Vertex fog alone consumes the interpolated oFog value.
+            const tableFactor = fixedFogFactorExpression(signature.fogMode,
+                "fog_distance");
+            const factor = signature.tableFog && tableFactor
+                ? tableFactor
+                : "clamp(stage_in.varying" + shaderPipeline.VARYING_FOG +
+                  ".x, 0.0, 1.0)";
+            const tableDistance = signature.tableFog && tableFactor
+                ? "    let fog_distance = 1.0 / " +
+                  "max(abs(stage_in.position.w), 1e-6);\n"
+                : "";
+            fogBody = tableDistance +
+                "    result = vec4<f32>(mix(uniforms.fog_color.rgb, result.rgb,\n" +
+                "        " + factor + "), result.a);\n";
+        }
         const varyings = [];
         for (let slot = 0; slot < VARYING_COUNT; ++slot)
             varyings.push("    @location(" + slot + ") varying" + slot + ": vec4<f32>,");
@@ -1939,8 +2129,44 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 // this makes it correct immediately -- which is the cheapest
                 // way to confirm or rule out that cause.
                 forceMipLevel0: false,
+                // Suspicious-but-valid D3D9 state is counted in getStats()
+                // unconditionally. Detailed per-state console warnings are
+                // opt-in: real games deliberately reuse declarations and
+                // fixed-function state in ways that trip these heuristics,
+                // so they are debugging evidence rather than runtime errors.
+                warnOnSuspiciousDraws: false,
+                // Paints magenta over any fixed-function draw whose cascade
+                // samples a stage with no live texture -- the draws that get
+                // the 1x1 white fallback. A counter says how many there are;
+                // this says *which*, which is the question a flat silhouette
+                // actually poses: is the model I am looking at one of them?
+                // Everything else keeps rendering normally, so the answer is
+                // one screenshot rather than a bisection.
+                highlightMissingTexture: false,
+                // The same question for the other cause of a flat model:
+                // paints cyan over any draw whose stage reads a coordinate
+                // set its declaration does not carry. Magenta and cyan
+                // together answer "which of the two is this model" in one
+                // screenshot, which is the whole difficulty -- both render as
+                // one flat colour and neither fails.
+                highlightMissingCoordSet: false,
+                // Drops every draw that has a translated shader bound on
+                // either stage. shaderMode only rewrites the fixed-function
+                // pixel cascade, so a model rendered through the programmable
+                // path looks *identical* under every debug mode -- which reads
+                // as "the debug mode did nothing" rather than as "you are
+                // looking at the wrong pipeline". Making those draws vanish
+                // answers which path a model is on in one screenshot.
+                skipProgrammableDraws: false,
+                // Routes fixed-function texture stage n to varying TEXCOORD n
+                // (D3D9's rule when a vertex shader is bound) instead of to
+                // the varying D3DTSS_TEXCOORDINDEX names. See coordStagePlan
+                // for why the two disagree and which one D3D9 documents.
+                texcoordFromStageIndex: true,
             };
             this.debug.dumpSmallTextures = o => this.dumpSmallTextures(o);
+            this.debug.dumpShaders = o => this.dumpShaders(o);
+            this.debug.clearShaderCache = () => this.clearShaderCache();
             this.debug.dumpPipelineStates = () => this.dumpPipelineStates();
             this.stats = {
                 batches: 0, commands: 0, presents: 0, queueSubmits: 0,
@@ -2001,6 +2227,31 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 drawsWithTexCoordIndex: 0, drawsWithTextureTransform: 0,
                 drawsWithUnmappedBlend: 0, drawsWithUnappliedFog: 0,
                 drawsWithUnappliedLighting: 0,
+                drawsWithZeroNormalLighting: 0,
+                zeroNormalDrawsWithoutTexture: 0,
+                zeroNormalDrawsWithMissingTexture: 0,
+                // The two halves of "missing", which are different bugs with
+                // the same symptom: the guest bound nothing to the stage
+                // (handle 0), or it bound a handle this host has no resource
+                // for -- a texture whose creation was refused, or one already
+                // destroyed. Both end at the 1x1 white fallback, so the
+                // picture cannot tell them apart and the counters must.
+                zeroNormalDrawsWithUnboundTexture: 0,
+                zeroNormalDrawsWithUnknownTexture: 0,
+                zeroNormalDrawsWithLiveTexture: 0,
+                // Fixed-function pixel stages routed to a varying the bound
+                // translated vertex shader never assigned.
+                drawsWithUnwrittenCoordVarying: 0,
+                // The same seam one stage earlier, and entirely inside the
+                // fixed-function path: a stage whose D3DTSS_TEXCOORDINDEX names
+                // a coordinate set the *declaration* does not carry. The vertex
+                // stage substitutes a constant for it, so the model samples one
+                // texel and comes out a single flat colour.
+                drawsWithMissingCoordSet: 0,
+                // Draws posed by more than one world matrix, and draws
+                // whose declaration carries skinning data that the
+                // render state told us to ignore.
+                blendedDraws: 0,
                 drawsWithUnappliedVertexBlend: 0,
                 programmableDraws: 0, drawsSkippedForBadShader: 0,
                 drawsWithCompactVertexInputs: 0,
@@ -2321,6 +2572,11 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                     [D3DTS_VIEW, IDENTITY4x4], [D3DTS_PROJECTION, IDENTITY4x4],
                     [D3DTS_WORLD, IDENTITY4x4],
                 ]),
+                // Highest n the guest has ever passed as D3DTS_WORLDMATRIX(n).
+                // Indexed vertex blending sizes its palette from this rather
+                // than from the 256 D3D9 allows, so an app using eight bones
+                // uploads eight matrices per draw and not 256.
+                maxWorldMatrixIndex: 0,
                 renderStates: new Map(),
                 // Auto depth-stencil surface, created on CREATE_DEVICE/RESET
                 // when the guest asked for one. hasDepth drives both the
@@ -2454,13 +2710,21 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             // the lifetime of the page.
             const sessionLow = view.getUint32(offset + 8, true);
             const sessionHigh = view.getUint32(offset + 12, true);
-            const sessionKey = sessionHigh * 0x100000000 + sessionLow;
+            // Keyed as a string, not `high * 2**32 + low`: a 64-bit id does not
+            // survive a float64 above 2**53, and the low bits are exactly the
+            // ones that distinguish two processes. The old arithmetic key made
+            // the log self-contradictory (created "...576bff", replaced
+            // "...576c00" -- the same session, printed exact then rounded) and
+            // let two distinct sessions round together into one key, which
+            // would keep a dead process's handles alive against a live one.
+            const sessionKey = sessionHigh.toString(16).padStart(8, "0") +
+                sessionLow.toString(16).padStart(8, "0");
             if (this.sessionKey !== null && this.sessionKey !== sessionKey) {
                 ++this.stats.sessionChanges;
                 console.info("[d3d9-webgpu] a new guest process (session 0x" +
-                    sessionHigh.toString(16) + sessionLow.toString(16).padStart(8, "0") +
+                    sessionKey +
                     ") replaced session 0x" +
-                    this.sessionKey.toString(16) + "; the previous process's " +
+                    this.sessionKey + "; the previous process's " +
                     "devices and resources are released, because its numeric " +
                     "handles are about to be reused for different objects");
                 this.releaseSession();
@@ -3112,6 +3376,79 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
         // Every distinct pipeline state actually in use, with the raw D3D9
         // render-state values behind it. Reading the real mix beats guessing
         // which blend/depth/cull combination a scene is built from.
+        // Prints every translated shader the session has created: its
+        // reflection (which declaration semantics it reads, which varyings it
+        // writes) and, optionally, the generated WGSL. Reading the shader is
+        // the only way to settle questions the pipeline cannot answer -- a
+        // varying that is written but written with a constant looks exactly
+        // like one that is routed correctly, from the outside.
+        // Drops every translated shader, in memory and in storage, so the next
+        // draw retranslates from the guest's bytecode. The revision guard in
+        // D3D9ShaderCache makes this unnecessary going forward, but a cache
+        // written before that guard existed carries no revision to reject it
+        // by, and there is no way to age it out other than to throw it away.
+        async clearShaderCache() {
+            this.shaderCache = new shaderPipeline.D3D9ShaderCache();
+            this.moduleCache.clear();
+            this.shaderCacheDirty = false;
+            const storage = this.shaderCacheStorage;
+            if (storage && typeof storage.save === "function") {
+                try {
+                    await storage.save(this.shaderCacheStorageKey,
+                        { version: 1, revision: shaderPipeline.TRANSLATOR_REVISION,
+                          entries: [] });
+                } catch (error) {
+                    return "cleared in memory; storage write failed: " + error;
+                }
+            }
+            return "shader cache cleared -- reload to retranslate";
+        }
+
+        dumpShaders(options) {
+            options = options || {};
+            const rows = [];
+            for (const [handle, resource] of this.resources) {
+                if (resource.kind !== RESOURCE_VERTEX_SHADER &&
+                        resource.kind !== RESOURCE_PIXEL_SHADER) continue;
+                const kind = resource.kind === RESOURCE_VERTEX_SHADER
+                    ? "vertex" : "pixel";
+                const translated = resource.translated;
+                const reflection = translated && translated.reflection;
+                rows.push({
+                    handle, kind,
+                    hash: [resource.hashHigh, resource.hashLow]
+                        .map(value => (value >>> 0).toString(16)
+                            .padStart(8, "0")).join(""),
+                    ok: !!(translated && translated.ok),
+                    error: translated && translated.error,
+                    version: reflection ? reflection.version.major + "." +
+                        reflection.version.minor : null,
+                    // usage*16+usageIndex is how programFor matches a
+                    // declaration element to a shader input, so print the
+                    // semantics rather than the raw register numbers.
+                    inputs: reflection ? reflection.inputs.map(input =>
+                        "v" + input.register + "=usage" + input.usage +
+                        "[" + input.usageIndex + "]") : null,
+                    writtenVaryings: reflection ? reflection.writtenVaryings : null,
+                    samplers: reflection
+                        ? reflection.samplers.map(s => s.index) : null,
+                    warnings: reflection ? reflection.warnings : null,
+                });
+            }
+            for (const row of rows) console.log("[d3d9-shader]", row);
+            if (options.wgsl) {
+                for (const [handle, resource] of this.resources) {
+                    if (resource.kind !== RESOURCE_VERTEX_SHADER &&
+                            resource.kind !== RESOURCE_PIXEL_SHADER) continue;
+                    if (options.handle && handle !== options.handle) continue;
+                    if (!resource.translated || !resource.translated.ok) continue;
+                    console.log("[d3d9-shader] handle " + handle + " WGSL:\n" +
+                        resource.translated.wgsl);
+                }
+            }
+            return rows;
+        }
+
         dumpPipelineStates() {
             const out = [];
             for (const key of this.pipelineCache.keys()) {
@@ -4432,12 +4769,16 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             let color1IsBGRA = false;
             let hasNormal = false;
             let hasPointSize = false;
-            let blendElements = 0;
+            let blendWeightType = -1;
+            let blendIndicesType = -1;
             const texCoordSets = [];
             for (const element of elements) {
-                if (element.usage === DECLUSAGE_BLENDWEIGHT ||
-                        element.usage === DECLUSAGE_BLENDINDICES)
-                    ++blendElements;
+                if (element.usage === DECLUSAGE_BLENDWEIGHT &&
+                        element.usageIndex === 0)
+                    blendWeightType = element.type;
+                else if (element.usage === DECLUSAGE_BLENDINDICES &&
+                        element.usageIndex === 0)
+                    blendIndicesType = element.type;
                 if (element.usage === DECLUSAGE_POSITION && element.usageIndex === 0)
                     positionType = "world";
                 else if (element.usage === DECLUSAGE_POSITIONT && element.usageIndex === 0)
@@ -4461,27 +4802,114 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                     texCoordSets.push(element.usageIndex);
             }
             if (!positionType) return null;
-            // D3D9's fixed-function vertex blending (D3DRS_VERTEXBLEND with
-            // D3DTS_WORLDMATRIX(1..3)) is not implemented: only D3DTS_WORLD is
-            // ever consumed. A declaration carrying BLENDWEIGHT/BLENDINDICES is
-            // therefore drawn with every vertex on world matrix 0, which
-            // collapses or contorts a skinned mesh instead of posing it -- and
-            // silently, since nothing else in the pipeline can tell. Say so:
-            // "the character is missing but its shadow is there" is otherwise
-            // indistinguishable from a dozen other causes.
-            if (blendElements) {
-                ++this.stats.drawsWithUnappliedVertexBlend;
-                this.warnOnce("ff-vertex-blend",
-                    "a fixed-function draw carries blend weights/indices, but " +
-                    "fixed-function vertex blending is not implemented, so " +
-                    "every vertex is transformed by world matrix 0 alone; a " +
-                    "skinned mesh drawn this way collapses rather than posing",
-                    { blendElements, positionType });
-            }
             texCoordSets.sort((a, b) => a - b);
+            // The blend element *types* travel with the signature because the
+            // WGSL input for BLENDINDICES has to be declared with the base type
+            // of whatever WebGPU format the declaration's D3DDECLTYPE maps to;
+            // whether they are read at all is a render-state question that
+            // vertexBlendPlan() answers once the state is in hand.
             return { positionType, hasColor, colorIsBGRA, hasColor1,
                 color1IsBGRA, hasNormal, hasPointSize, texCoordSets,
+                blendWeightType, blendIndicesType,
                 hasTexCoord: texCoordSets.length > 0 };
+        }
+
+        // Resolves D3DRS_VERTEXBLEND plus D3DRS_INDEXEDVERTEXBLENDENABLE
+        // against what the declaration actually carries. Returns null when the
+        // draw is not blended, which is the overwhelmingly common case -- and
+        // is *correct* for a declaration that carries blend data while the
+        // render state is DISABLE, since D3D9 ignores the data too and poses
+        // every vertex by D3DTS_WORLD alone.
+        vertexBlendPlan(state, signature) {
+            const rs = state.renderStates;
+            const mode = rs.get(D3DRS_VERTEXBLEND) || D3DVBF_DISABLE;
+            if (mode === D3DVBF_DISABLE) return null;
+            // Pre-transformed vertices skip the whole transform pipeline, so
+            // there is nothing for a world matrix to pose.
+            if (signature.positionType === "screen") return null;
+            if (mode === D3DVBF_TWEENING) {
+                // Vertex tweening interpolates two *streams* by
+                // D3DRS_TWEENFACTOR rather than blending matrices; nothing here
+                // implements it, and fill_caps() does not claim
+                // D3DVTXPCAPS_TWEENING.
+                this.warnOnce("ff-vertex-tweening",
+                    "D3DVBF_TWEENING is not implemented; the draw is posed by " +
+                    "world matrix 0 alone");
+                return null;
+            }
+            const indexed = (rs.get(D3DRS_INDEXEDVERTEXBLENDENABLE) || 0) !== 0;
+            // 1/2/3WEIGHTS carry that many weights and one more matrix;
+            // 0WEIGHTS is one matrix at full weight.
+            const matrixCount = mode === D3DVBF_0WEIGHTS ? 1 : mode + 1;
+            if (matrixCount < 1 || matrixCount > MAX_BLEND_MATRICES) {
+                this.warnOnce("ff-vertex-blend-mode-" + mode,
+                    "unsupported D3DRS_VERTEXBLEND value " + mode +
+                    "; the draw is posed by world matrix 0 alone");
+                return null;
+            }
+            const weightCount = matrixCount - 1;
+            // Without weights there is nothing to distribute, and without
+            // indices an indexed blend has no palette entry to look up. Either
+            // way the declaration and the render state disagree; D3D9's result
+            // would be undefined, so fall back to the unblended path and say so
+            // rather than invent one.
+            if (weightCount && signature.blendWeightType < 0) {
+                this.warnOnce("ff-vertex-blend-no-weights",
+                    "D3DRS_VERTEXBLEND asks for " + weightCount + " weight(s) " +
+                    "but the declaration has no BLENDWEIGHT; the draw is posed " +
+                    "by world matrix 0 alone");
+                return null;
+            }
+            // Weights are read as vec4<f32>, so a BLENDWEIGHT declared with an
+            // integer or packed D3DDECLTYPE would put a format the shader
+            // cannot receive into the vertex layout -- a pipeline the driver
+            // rejects, which costs the whole draw rather than the blend.
+            if (weightCount && declTypeInputScalar(signature.blendWeightType)
+                    !== "f32") {
+                this.warnOnce("ff-blend-weight-type-" + signature.blendWeightType,
+                    "BLENDWEIGHT uses D3DDECLTYPE " + signature.blendWeightType +
+                    ", which is not a float format; the draw is posed by world " +
+                    "matrix 0 alone");
+                return null;
+            }
+            let indexScalar = "u32";
+            let indexNormalized = false;
+            if (indexed) {
+                if (signature.blendIndicesType < 0) {
+                    this.warnOnce("ff-vertex-blend-no-indices",
+                        "D3DRS_INDEXEDVERTEXBLENDENABLE is set but the " +
+                        "declaration has no BLENDINDICES; the draw is posed by " +
+                        "world matrix 0 alone");
+                    return null;
+                }
+                indexScalar = declTypeInputScalar(signature.blendIndicesType);
+                // D3DCOLOR and UBYTE4N both map to unorm8x4, so the shader
+                // receives each index byte divided by 255 rather than the byte.
+                // D3DFVF_LASTBETA_D3DCOLOR is the FVF spelling of exactly that,
+                // so this is a path real content takes, not a curiosity.
+                indexNormalized = signature.blendIndicesType === DECLTYPE_D3DCOLOR
+                    || signature.blendIndicesType === 8;
+                if (!indexScalar) {
+                    this.warnOnce("ff-blend-indices-type-" +
+                            signature.blendIndicesType,
+                        "BLENDINDICES uses D3DDECLTYPE " +
+                        signature.blendIndicesType + ", which packs into a " +
+                        "single uint32 rather than four components; the draw " +
+                        "is posed by world matrix 0 alone");
+                    return null;
+                }
+            }
+            // How many matrices the uniform block carries. A non-indexed blend
+            // reads WORLDMATRIX(0..matrixCount-1) in order, so that is all it
+            // needs. An indexed one can name any palette entry, and the palette
+            // is bucketed rather than sized exactly so that setting one more
+            // bone does not mint a new shader and a new pipeline; see
+            // blendPaletteSize.
+            const matrixSlots = indexed
+                ? blendPaletteSize(state.maxWorldMatrixIndex) : matrixCount;
+            ++this.stats.blendedDraws;
+            return { matrixCount, weightCount, indexed, indexScalar,
+                indexNormalized, matrixSlots };
         }
 
         // ---- fixed-function state signatures (M3) ----
@@ -4603,12 +5031,28 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 stages.push(stage);
             }
             // With a translated vertex shader the fixed-function coordinate
-            // generation and transform never ran, so the stage reads the
-            // varying its TEXCOORDINDEX names, untransformed.
+            // generation and transform never ran, so the stage reads a varying
+            // the shader wrote directly, untransformed.
+            //
+            // *Which* varying is the open question. This reads the one
+            // D3DTSS_TEXCOORDINDEX names, but D3D9 documents the opposite:
+            // "When rendering using vertex shaders, each texture stage's
+            // texture coordinate index must be set to its default value. The
+            // default index for each stage is equal to the stage index." --
+            // i.e. stage n takes oTn and TEXCOORDINDEX does not participate.
+            // An app that leaves a stale non-default index (from an earlier
+            // environment-mapped pass, say) therefore sends this code to a
+            // varying the shader never wrote, which reads as a constant and
+            // samples one texel across the whole model.
+            //
+            // The documented rule is the default. The diagnostic toggle can
+            // still restore the legacy TEXCOORDINDEX routing when comparing a
+            // capture against an older executor build.
             if (!options.fixedVertexStage) {
                 for (const stage of stages) {
-                    stage.coordVarying = Math.min(stage.texCoordIndex,
-                        MAX_TEXCOORD_SETS - 1);
+                    stage.coordVarying = this.debug.texcoordFromStageIndex
+                        ? Math.min(stage.index, MAX_TEXCOORD_SETS - 1)
+                        : Math.min(stage.texCoordIndex, MAX_TEXCOORD_SETS - 1);
                     if (stage.tciMode !== D3DTSS_TCI_PASSTHRU ||
                             stage.transformCount) {
                         unsupported.push("stage " + stage.index + " asks for " +
@@ -4641,30 +5085,15 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             if (get(D3DRS_LIGHTING, 1) === 0 ||
                     vertexSignature.positionType === "screen")
                 return null;
-            // No normal, no lighting. D3DRS_LIGHTING defaults to TRUE, so a
-            // large majority of draws with plain pre-coloured vertex formats
-            // arrive here with lighting nominally on; running the lighting maths
-            // on a zero normal would leave only ambient + emissive, and with
-            // D3DRS_AMBIENT defaulting to 0 that renders the geometry black.
-            //
-            // Dropping lighting instead is what WineD3D's fixed-function vertex
-            // pipeline does (its ffp_vs_settings clears `lighting` when the
-            // declaration has no normal), and it is the only choice that cannot
-            // regress content which relied on the vertex colour reaching the
-            // rasteriser. It is counted so a genuinely-lit mesh that lost its
-            // normal on the way in is still visible in the stats.
+            // D3D9 treats a missing NORMAL as the zero vector. Direct/specular
+            // light terms therefore vanish, but global ambient and material
+            // emissive still contribute. Do not drop the whole lighting path:
+            // GTA San Andreas submits some RenderWare character batches this
+            // way with a black vertex colour and a non-zero ambient material.
+            // Passing that colour through unchanged makes the character a black
+            // silhouette even though the scene's ambient state should light it.
             if (!vertexSignature.hasNormal) {
-                ++this.stats.drawsWithUnappliedLighting;
-                this.warnOnce("lighting-no-normal",
-                    "a draw has D3DRS_LIGHTING enabled but its declaration " +
-                    "carries no NORMAL, so lighting is skipped and the vertex " +
-                    "colour passes through unchanged", {
-                        materialSet: !!state.material,
-                        lightsEnabled: [...state.lightEnabled.entries()]
-                            .filter(entry => entry[1]).map(entry => entry[0]),
-                        ambient: get(D3DRS_AMBIENT, 0),
-                    });
-                return null;
+                ++this.stats.drawsWithZeroNormalLighting;
             }
             const lights = [];
             for (const [index, enabled] of state.lightEnabled) {
@@ -4752,6 +5181,10 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             const count = view.getUint32(offset + 8, true);
             const state = this.deviceState(deviceHandle);
             state.fvfElements = this.decodeVertexElements(bytes, view, offset + 16, count);
+            // Kept only so a diagnostic can say which FVF produced a
+            // declaration; nothing in the render path reads it, because the
+            // guest already expanded it into the element shape above.
+            state.fvf = view.getUint32(offset + 4, true);
             state.vertexDeclarationHandle = 0;
         }
 
@@ -4900,7 +5333,13 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             // Stored exactly as D3D sent it (row-major, row-vector
             // convention). No transpose here -- see uniformBufferFor for why
             // none is needed anywhere on this path.
-            this.deviceState(deviceHandle).transforms.set(transformState, matrix);
+            const state = this.deviceState(deviceHandle);
+            state.transforms.set(transformState, matrix);
+            if (transformState > D3DTS_WORLD &&
+                    transformState < D3DTS_WORLD + MAX_WORLD_MATRICES) {
+                state.maxWorldMatrixIndex = Math.max(state.maxWorldMatrixIndex,
+                    transformState - D3DTS_WORLD);
+            }
         }
 
         onSetStreamSource(bytes, view, offset) {
@@ -5538,6 +5977,11 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             if (psHandle && !psResource)
                 return { error: "bound pixel shader handle is unknown to the host",
                     shaderError: true };
+            if (this.debug.skipProgrammableDraws && (vsResource || psResource))
+                return { error: "debug.skipProgrammableDraws is on; this draw " +
+                    "has a translated " + (vsResource ? "vertex" : "") +
+                    (vsResource && psResource ? "/" : "") +
+                    (psResource ? "pixel" : "") + " shader bound" };
 
             // The declaration decides whether the fixed-function vertex stage
             // can run at all, and it is also what tells the pixel stage which
@@ -5555,11 +5999,13 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             // when both are set, which is what D3D9 does. Screen-space XYZRHW
             // geometry is excluded: it has no eye-space depth to fog against.
             let fogMode = 0;
+            let tableFog = false;
             if ((rs.get(D3DRS_FOGENABLE) || 0) !== 0 &&
                     (!fixedVertexSignature ||
                      fixedVertexSignature.positionType !== "screen")) {
                 const table = rs.get(D3DRS_FOGTABLEMODE) || D3DFOG_NONE;
-                fogMode = table !== D3DFOG_NONE ? table
+                tableFog = table !== D3DFOG_NONE;
+                fogMode = tableFog ? table
                     : (rs.get(D3DRS_FOGVERTEXMODE) || D3DFOG_NONE);
             }
 
@@ -5655,6 +6101,25 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 samplerIndices = cascade.stages
                     .filter(stage => stage.samplesTexture)
                     .map(stage => stage.index);
+                // Per-draw, so the highlight marks only the affected draws
+                // instead of repainting the frame the way shaderMode does.
+                const cascadeMissesTexture = cascade.stages.some(stage =>
+                    stage.samplesTexture && !stage.hasTextureBound);
+                const cascadeMissesCoordSet = !!fixedVertexSignature &&
+                    cascade.stages.some(stage =>
+                        stage.samplesTexture &&
+                        stage.tciMode === D3DTSS_TCI_PASSTHRU &&
+                        !fixedVertexSignature.texCoordSets
+                            .includes(stage.texCoordIndex));
+                // Missing texture wins the colour when a draw manages both,
+                // because it is the coarser fault: there is nothing to sample
+                // whatever the coordinates do.
+                const debugMode =
+                    (this.debug.highlightMissingTexture && cascadeMissesTexture)
+                        ? "missing"
+                        : ((this.debug.highlightMissingCoordSet &&
+                            cascadeMissesCoordSet)
+                            ? "orphan" : this.debug.shaderMode);
                 for (const stage of cascade.stages) {
                     if (stage.samplesTexture)
                         samplerDimensions[stage.index] = stage.textureType;
@@ -5662,7 +6127,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 pixelSignature = {
                     stages: cascade.stages,
                     usesTextureFactor: cascade.usesTextureFactor,
-                    fogMode, alphaTest,
+                    fogMode, tableFog, alphaTest,
                     // D3D9 adds the specular colour after the cascade whenever
                     // D3DRS_SPECULARENABLE is set, whether it came from lighting
                     // or straight off the vertex.
@@ -5680,11 +6145,11 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     ].join(".")).join("|") +
                     (pixelSignature.usesTextureFactor ? "_tf" : "") +
                     (pixelSignature.specularEnable ? "_s" : "") +
-                    alphaTestKey + (fogMode ? "_f" + fogMode : "") +
-                    (this.debug.shaderMode ? "_" + this.debug.shaderMode : "");
+                    alphaTestKey + (fogMode
+                        ? (tableFog ? "_ft" : "_fv") + fogMode : "") +
+                    (debugMode ? "_" + debugMode : "");
                 fragmentModule = this.moduleFor(
-                    buildFixedFunctionPixelShader(pixelSignature,
-                        this.debug.shaderMode),
+                    buildFixedFunctionPixelShader(pixelSignature, debugMode),
                     "d3d9 " + fragmentKey);
             }
 
@@ -5759,19 +6224,90 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 signature.pointScale = signature.pointExpansion &&
                     signature.positionType !== "screen" &&
                     (rs.get(D3DRS_POINTSCALEENABLE) || 0) !== 0;
-                signature.fogMode = fogMode;
-                signature.fogRange = (rs.get(D3DRS_RANGEFOGENABLE) || 0) !== 0;
+                // Table fog is evaluated from per-fragment W in the pixel
+                // stage. Only vertex fog belongs in the generated VS/oFog.
+                signature.fogMode = tableFog ? D3DFOG_NONE : fogMode;
+                signature.fogRange = !tableFog &&
+                    (rs.get(D3DRS_RANGEFOGENABLE) || 0) !== 0;
                 signature.normalizeNormals =
                     (rs.get(D3DRS_NORMALIZENORMALS) || 0) !== 0;
                 signature.lighting = this.lightingSignature(state, signature);
                 signature.coordStages = this.coordStagePlan(state, coordStageCount);
+                /*
+                 * buildFixedFunctionVertexShader() feeds a stage
+                 * vec4(0,0,0,1) when texCoordSets does not carry the set
+                 * D3DTSS_TEXCOORDINDEX names -- there is no coordinate to
+                 * read, and a pipeline that declared the attribute anyway
+                 * would be rejected outright. That substitution is silent, and
+                 * its result is a constant coordinate: every fragment of the
+                 * model samples the same texel and the whole thing renders as
+                 * one flat colour. By eye that is indistinguishable from a
+                 * missing texture or a lighting bug, and unlike every
+                 * neighbouring fallback on this path it had no counter, so the
+                 * one shape it produces could not be told apart from the two
+                 * others that produce it. Name it here, where the declaration
+                 * and the stage state are both in hand.
+                 */
+                const orphanCoordStages = signature.coordStages.filter(stage =>
+                    stage.tciMode === D3DTSS_TCI_PASSTHRU &&
+                    !signature.texCoordSets.includes(stage.texCoordIndex));
+                if (orphanCoordStages.length) {
+                    ++this.stats.drawsWithMissingCoordSet;
+                    if (this.debug.warnOnSuspiciousDraws)
+                        this.warnOnce("missing-coord-set-" + (elements || [])
+                            .map(e => e.usage + "." + e.usageIndex + ":" +
+                                e.type + "@" + e.byteOffset).join(","),
+                        "a fixed-function texture stage reads a coordinate set " +
+                        "the vertex declaration does not carry; its coordinates " +
+                        "are a constant, so the whole draw samples one texel", {
+                            stages: orphanCoordStages.map(stage => ({
+                                stage: stage.index,
+                                texCoordIndex: stage.texCoordIndex,
+                            })),
+                            declaredTexCoordSets: signature.texCoordSets.slice(),
+                            // The declaration verbatim, plus where it came
+                            // from. "The declaration carries no TEXCOORD" has
+                            // two very different causes -- the app really sent
+                            // one without, or the guest dropped it on the way
+                            // through SetFVF/CreateVertexDeclaration -- and
+                            // only the elements themselves tell them apart.
+                            declarationSource: state.fvfElements
+                                ? "fvf" : "declaration",
+                            fvf: state.fvfElements
+                                ? "0x" + ((state.fvf || 0) >>> 0).toString(16)
+                                : null,
+                            elements: (elements || []).map(element => ({
+                                stream: element.stream,
+                                offset: element.byteOffset,
+                                type: element.type,
+                                usage: element.usage,
+                                usageIndex: element.usageIndex,
+                            })),
+                            streamStrides: Array.from(state.streams)
+                                .map(([index, stream]) =>
+                                    index + ":" + (stream.stride || 0)),
+                        });
+                }
                 signature.clipPlaneCount = 0;
+                signature.vertexBlend = this.vertexBlendPlan(state, signature);
+                // Skinning data in the declaration that no world matrix past 0
+                // will act on. This is now usually *correct* -- D3D9 ignores it
+                // too whenever D3DRS_VERTEXBLEND is DISABLE, and engines share
+                // one declaration between their skinned and unskinned passes --
+                // so it is counted rather than warned about. It stays worth
+                // counting because "the character is stuck in bind pose" and
+                // "the character is missing" look alike from the outside, and a
+                // nonzero count next to a zero blendedDraws says which.
+                if (!signature.vertexBlend &&
+                        (signature.blendWeightType >= 0 ||
+                         signature.blendIndicesType >= 0))
+                    ++this.stats.drawsWithUnappliedVertexBlend;
                 // View space is needed for lighting, for the camera-space
                 // coordinate generation modes and for range-based fog.
                 signature.needsViewSpace = signature.positionType !== "screen" && (
                     !!signature.lighting ||
                     signature.pointScale ||
-                    (signature.fogRange && !!fogMode) ||
+                    (signature.fogRange && !!signature.fogMode) ||
                     signature.coordStages.some(stage =>
                         stage.tciMode !== D3DTSS_TCI_PASSTHRU));
                 vertexKey = "ffvs_" + signature.positionType +
@@ -5779,6 +6315,13 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     (signature.hasColor1 ? (signature.color1IsBGRA ? "_sb" : "_s") : "") +
                     (signature.hasNormal ? "_n" : "") +
                     (signature.hasPointSize ? "_ps" : "") +
+                    (signature.vertexBlend ? "_vb" +
+                        signature.vertexBlend.matrixCount +
+                        (signature.vertexBlend.indexed
+                            ? "i" + signature.vertexBlend.indexScalar +
+                              (signature.vertexBlend.indexNormalized ? "n" : "") +
+                              "." + signature.vertexBlend.matrixSlots
+                            : "") : "") +
                     "_t" + signature.texCoordSets.join(".") +
                     "_x" + signature.coordStages.map(stage =>
                         [stage.index, stage.texCoordIndex, stage.tciMode,
@@ -5794,15 +6337,145 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                             signature.lighting.ambientSource,
                             signature.lighting.specularSource,
                             signature.lighting.emissiveSource].join("") : "") +
-                    (fogMode ? "_f" + fogMode + (signature.fogRange ? "r" : "") : "") +
+                    (signature.fogMode ? "_f" + signature.fogMode +
+                        (signature.fogRange ? "r" : "") : "") +
                     (signature.pointExpansion ? "_point" +
                         (signature.pointSprite ? "s" : "") +
                         (signature.pointScale ? "a" : "") : "");
                 vertexModule = this.moduleFor(
                     buildFixedFunctionVertexShader(signature), "d3d9 " + vertexKey);
                 vertexReflection = null;
-                locationFor = fixedFunctionLocationFor;
+                locationFor = element =>
+                    fixedFunctionLocationFor(element, signature.vertexBlend);
                 fixedFunctionSignature = signature;
+            }
+
+            /*
+             * A no-NORMAL lit batch used to turn GTA SA's characters black.
+             * Keeping ambient/emissive fixed the lighting half, but a white or
+             * yellow silhouette means the pixel half is still receiving only
+             * that lit colour.  Make the three materially different causes
+             * observable here, while all the state needed to distinguish them
+             * is still together:
+             *
+             *   - the pixel program never samples a texture;
+             *   - it samples a stage whose resource handle is absent;
+             *   - it has a live texture, leaving coordinate routing/data as
+             *     the remaining suspect.
+             *
+             * drawsWithTexture only covers the fixed-function pixel cascade,
+             * so it cannot answer this for a ps_1_x batch.  samplerIndices
+             * covers both the fixed and programmable pixel paths.
+             */
+            /*
+             * The seam between a translated vertex shader and a fixed-function
+             * pixel cascade. The cascade picks a varying to read coordinates
+             * from; the shader decides which varyings exist. Nothing checks
+             * that those two agree, and when they do not the shader stage does
+             * not fail -- the varying is simply a constant, so every fragment
+             * samples the same texel and the model comes out one flat colour.
+             * That is indistinguishable by eye from a lighting bug, a missing
+             * texture or a broken UV attribute, which is exactly why it is
+             * worth naming rather than leaving to be guessed at.
+             */
+            if (vertexReflection && vertexReflection.writtenVaryings && cascade) {
+                const written = new Set(vertexReflection.writtenVaryings);
+                const orphans = cascade.stages.filter(stage =>
+                    stage.samplesTexture &&
+                    !written.has(VARYING_TEXCOORD0 + stage.coordVarying));
+                if (orphans.length) {
+                    ++this.stats.drawsWithUnwrittenCoordVarying;
+                    if (this.debug.warnOnSuspiciousDraws)
+                        this.warnOnce("unwritten-coord-varying",
+                        "a fixed-function texture stage reads its required oTn " +
+                        "varying, but the bound vertex shader never writes it; " +
+                        "its coordinates are a constant and the whole draw " +
+                        "samples one texel", {
+                            stages: orphans.map(stage => ({
+                                stage: stage.index,
+                                texCoordIndex: stage.texCoordIndex,
+                                readsVarying: VARYING_TEXCOORD0 + stage.coordVarying,
+                            })),
+                            shaderWroteVaryings: vertexReflection.writtenVaryings,
+                            texcoordFromStageIndex:
+                                this.debug.texcoordFromStageIndex,
+                        });
+                }
+            }
+
+            if (fixedFunctionSignature && fixedFunctionSignature.lighting &&
+                    !fixedFunctionSignature.hasNormal) {
+                const textureBindings = samplerIndices.map(index => {
+                    const handle = state.textures.get(index) || 0;
+                    const resource = handle ? this.resources.get(handle) : null;
+                    return {
+                        stage: index,
+                        handle,
+                        live: !!resource,
+                        kind: resource ? resource.kind : null,
+                        type: resource ? (resource.textureType || "2d") : null,
+                        format: resource ? resource.format : null,
+                        size: resource ? resource.width + "x" + resource.height : null,
+                        levels: resource ? resource.levelCount : null,
+                        uploadedLevels: resource && resource.uploadedLevels
+                            ? resource.uploadedLevels.size : null,
+                    };
+                });
+                const missingTexture = textureBindings.some(binding => !binding.live);
+                const diagnostic = {
+                    pixelPath: psResource ? "programmable" : "fixed-function",
+                    pixelShader: psResource
+                        ? [psResource.hashHigh, psResource.hashLow]
+                            .map(value => (value >>> 0).toString(16)
+                                .padStart(8, "0")).join("")
+                        : null,
+                    samplerIndices: samplerIndices.slice(),
+                    textureBindings,
+                    declaredTexCoordSets: fixedFunctionSignature.texCoordSets.slice(),
+                    coordinateStages: fixedFunctionSignature.coordStages.map(stage => ({
+                        stage: stage.index,
+                        texCoordIndex: stage.texCoordIndex,
+                        tciMode: stage.tciMode,
+                        transformCount: stage.transformCount,
+                        projected: stage.projected,
+                    })),
+                    materialAmbient: state.material
+                        ? state.material.ambient.slice() : null,
+                    globalAmbient: (rs.get(D3DRS_AMBIENT) || 0) >>> 0,
+                };
+                if (!samplerIndices.length) {
+                    ++this.stats.zeroNormalDrawsWithoutTexture;
+                    if (state.material && this.debug.warnOnSuspiciousDraws) {
+                        this.warnOnce("zero-normal-no-texture-sample",
+                            "a lit draw with no NORMAL does not sample any texture; " +
+                            "ambient/material colour therefore becomes a flat " +
+                            "silhouette", diagnostic);
+                    }
+                } else if (missingTexture) {
+                    ++this.stats.zeroNormalDrawsWithMissingTexture;
+                    if (textureBindings.some(binding =>
+                            !binding.live && !binding.handle))
+                        ++this.stats.zeroNormalDrawsWithUnboundTexture;
+                    if (textureBindings.some(binding =>
+                            !binding.live && binding.handle))
+                        ++this.stats.zeroNormalDrawsWithUnknownTexture;
+                    if (state.material && this.debug.warnOnSuspiciousDraws) {
+                        this.warnOnce("zero-normal-missing-texture",
+                            "a lit draw with no NORMAL samples an unbound or unknown " +
+                            "texture and receives the 1x1 white fallback; its " +
+                            "ambient/material colour therefore becomes a flat " +
+                            "silhouette", diagnostic);
+                    }
+                } else {
+                    ++this.stats.zeroNormalDrawsWithLiveTexture;
+                    if (state.material && this.debug.warnOnSuspiciousDraws) {
+                        this.warnOnce("zero-normal-live-texture",
+                            "a lit draw with no NORMAL has a live sampled texture; " +
+                            "if it is still a flat silhouette, inspect the reported " +
+                            "TEXCOORD routing (debug.shaderMode='uv'/'texture' can " +
+                            "separate coordinates from texture data)", diagnostic);
+                    }
+                }
             }
             if (vertexModule._d9wgBroken || fragmentModule._d9wgBroken)
                 return { error: "a stage failed WGSL compilation (see the " +
@@ -5828,7 +6501,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 pixelUniformBytes: pixelReflection ? pixelReflection.uniformBytes
                     : (pixelUniformLayout && pixelUniformLayout.entries.length
                         ? pixelUniformLayout.byteLength : 0),
-                fogMode, pointExpansion: !!drawOptions.pointExpansion,
+                fogMode, tableFog, pointExpansion: !!drawOptions.pointExpansion,
                 pointSprite: !!drawOptions.pointSprite };
         }
 
@@ -6091,12 +6764,26 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 return entry ? entry.offset / 4 : -1;
             };
             const screenSpace = signature.positionType === "screen";
-            const worldView = multiply4x4(
-                state.transforms.get(D3DTS_WORLD) || IDENTITY4x4,
-                state.transforms.get(D3DTS_VIEW) || IDENTITY4x4);
+            const blend = signature.vertexBlend;
+            const view = state.transforms.get(D3DTS_VIEW) || IDENTITY4x4;
+            // A blended draw's world half is applied per vertex from
+            // blend_worlds, so what is pre-multiplied here stops at the view.
+            const preVertex = blend ? view : multiply4x4(
+                state.transforms.get(D3DTS_WORLD) || IDENTITY4x4, view);
 
-            floats.set(screenSpace ? IDENTITY4x4 : this.wvp(state),
-                at("world_view_projection"));
+            if (blend) {
+                floats.set(multiply4x4(view,
+                    state.transforms.get(D3DTS_PROJECTION) || IDENTITY4x4),
+                    at("view_projection"));
+                const base = at("blend_worlds");
+                for (let slot = 0; slot < blend.matrixSlots; ++slot) {
+                    floats.set(state.transforms.get(D3DTS_WORLD + slot) ||
+                        IDENTITY4x4, base + slot * 16);
+                }
+            } else {
+                floats.set(screenSpace ? IDENTITY4x4 : this.wvp(state),
+                    at("world_view_projection"));
+            }
             const viewport = at("viewport");
             floats[viewport] = state.viewport.width || 1;
             floats[viewport + 1] = state.viewport.height || 1;
@@ -6106,9 +6793,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             floats[viewport + 2] = state.viewport.x || 0;
             floats[viewport + 3] = state.viewport.y || 0;
 
-            if (layout.byName.has("world_view")) {
-                floats.set(worldView, at("world_view"));
-                floats.set(inverseTranspose3x3(worldView), at("normal_matrix"));
+            const viewSpaceField = blend ? "view_matrix" : "world_view";
+            if (layout.byName.has(viewSpaceField)) {
+                floats.set(preVertex, at(viewSpaceField));
+                floats.set(inverseTranspose3x3(preVertex), at("normal_matrix"));
             }
             if (layout.byName.has("fog_params")) {
                 // FOGSTART/FOGEND/FOGDENSITY are floats carried inside a DWORD.
@@ -6178,7 +6866,6 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             // matrix: eight lights is at most a few dozen multiplies per draw,
             // against a full mat4 the vertex stage would otherwise re-apply per
             // vertex.
-            const view = state.transforms.get(D3DTS_VIEW) || IDENTITY4x4;
             let base = at("lights");
             for (const entry of signature.lighting.lights) {
                 const light = state.lights.get(entry.index);
@@ -6209,7 +6896,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             }
         }
 
-        // Fills the fixed-function pixel block: only the fog colour, texture
+        // Fills the fixed-function pixel block: only the fog inputs, texture
         // factor and per-stage constants the cascade actually reads.
         writeFixedPixelUniforms(state, program, backing, byteOffset) {
             const layout = program.pixelUniformLayout;
@@ -6227,6 +6914,19 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     // D3DRS_FOGCOLOR's alpha byte is defined as unused.
                     writeColor(entry.offset / 4,
                         state.renderStates.get(D3DRS_FOGCOLOR) || 0, 1);
+                } else if (entry.name === "fog_params") {
+                    // Table fog evaluates the equation per fragment, so its
+                    // start/end/density values belong to the pixel block.
+                    const asFloat = (id, fallback) => {
+                        const raw = state.renderStates.get(id);
+                        if (raw === undefined) return fallback;
+                        FLOAT_BITS_U32[0] = raw >>> 0;
+                        return FLOAT_BITS_F32[0];
+                    };
+                    const base = entry.offset / 4;
+                    floats[base] = asFloat(D3DRS_FOGSTART, 0);
+                    floats[base + 1] = asFloat(D3DRS_FOGEND, 1);
+                    floats[base + 2] = asFloat(D3DRS_FOGDENSITY, 1);
                 } else if (entry.name === "texture_factor") {
                     writeColor(entry.offset / 4,
                         state.renderStates.get(D3DRS_TEXTUREFACTOR) === undefined

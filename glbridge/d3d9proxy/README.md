@@ -173,6 +173,64 @@ implementation. Implemented:
   `verify_implicit_surfaces` covers the pointer identity and the
   survives-past-zero-references property; the test device needed
   `EnableAutoDepthStencil` before it had an auto depth-stencil to ask for.
+- **GTA San Andreas adapter-mode-list fix:** `GetAdapterModeCount`/
+  `EnumAdapterModes` reported a fixed three entries (640x480, 800x600,
+  1024x768). They now enumerate the guest display driver through
+  `EnumDisplaySettings`. San Andreas stores the chosen video mode in
+  `gta_sa.set` as an **index into that list**, not as a resolution, so the
+  length of the list is load-bearing: run the title once against a `d3d9.dll`
+  offering a longer one (SwiftShader reports 18 modes per format), let it save
+  an index valid there, and the next run against a three-entry list finds the
+  index out of range and destroys its windows *during enumeration* -- before
+  `CreateDevice`, before a single frame. The failure therefore depends on what
+  ran previously, which is why it presented as "sometimes it dies at the legal
+  screen, sometimes before the window appears". `EnumDisplaySettings` is the
+  right source because it is also the constraint at the other end: exclusive
+  fullscreen calls `ChangeDisplaySettings`, so every advertised mode has to be
+  one the guest can actually switch into.
+- **Presentation-interval fix:** `Present` honours
+  `D3DPRESENT_INTERVAL_ONE`..`FOUR` (and `DEFAULT`, which D3D9 documents as
+  equivalent to `ONE`) by sleeping out the remainder of the interval since the
+  previous `Present`, from `GetTickCount` against the device's reported refresh
+  rate. That wait is the *only* back-pressure a D3D9 title has on its own frame
+  rate — the render loop is `while (running) { render(); Present(); }` and
+  nothing else in it sleeps — so returning immediately let San Andreas' loading
+  screen reach roughly 1000 `Present`/s, starving every other thread in the
+  guest of timeslices. It costs nothing when the guest is already the
+  bottleneck, since the elapsed time then exceeds the interval; `IMMEDIATE` is
+  never throttled, and `D9WG_PRESENT_NO_THROTTLE=1` disables it outright.
+- **GTA San Andreas legal-screen exit fix:** GTA's frontend loader exits when
+  `CGame::InitialiseEssentialsAfterRW()` fails. The failing branch is the car
+  environment-map pipeline's caps gate: it requires
+  `D3DPSHADECAPS_SPECULARGOURAUDRGB`, but the proxy reported `ShadeCaps`
+  `0x00084008`, missing that `0x00000200` bit. The backend already computes
+  fixed-function per-vertex specular and adds it after the texture cascade, so
+  `GetDeviceCaps` now reports the implemented capability (`0x00084208`). This
+  is the one relevant difference exposed by the working SwiftShader caps, not
+  a timing race; the GTA-specific 750 ms startup pacing workaround has been
+  removed, and so has `D9WG_PRESENT_MIN_MS`, the environment override that
+  existed to test the timing hypothesis. Keeping it would have left a switch
+  whose only purpose was a question already answered -- and a misleading one,
+  since pinning the frame time is exactly what a reader would reach for next
+  time a title exits during startup. `D9WG_PRESENT_NO_THROTTLE=1` stays,
+  because "run without the interval wait" is a question about this proxy's own
+  behaviour rather than about one title's bug.
+- **GTA San Andreas New Game crash fix:**
+  `IDirect3DVertexDeclaration9::GetDeclaration` defines `pNumElements` as an
+  output value, including when the caller supplies a declaration array. The
+  proxy incorrectly treated its incoming, potentially uninitialised value as
+  that array's capacity and returned `D3DERR_INVALIDCALL`. GTA's first world
+  streaming pass makes exactly that valid call after displaying "Francis INTL
+  Airport"; its RenderWare path then used the missing result and faulted at
+  `0x007C91B1`. The proxy now always copies the declaration when an array is
+  supplied and writes the resulting count, matching the D3D9 contract.
+- **GTA San Andreas black-character fix (host side):** when lighting is enabled
+  but a declaration has no `NORMAL`, D3D9 uses a zero normal for the light dot
+  products; it does not bypass ambient and emissive lighting. The host used to
+  skip the whole lighting path and pass GTA's black pre-lit `COLOR0` through,
+  producing a black player silhouette. Zero-normal draws now retain global
+  ambient times material ambient plus material emissive, and are counted by
+  `drawsWithZeroNormalLighting`.
 - **Kart Rider BCn mip-tail fix (host side):** `writeTexture` now rounds a
   block-compressed copy extent up to the 4x4 block grid. WebGPU measures such a
   copy in whole blocks and a mip level's physical extent is its logical size
@@ -296,33 +354,84 @@ messages that end a program, as `MSG sent` / `MSG posted`. `WM_QUIT` only ever
 travels through the message pump, so `WH_GETMESSAGE` is the one place it is
 visible. The ordinary DLL installs nothing.
 
-That combination is what settled San Andreas, and the answer was *not* D3D9.
-With both fixes above in place the title runs RenderWare's complete device setup
+**A trace where nothing fails is not a trace where nothing is wrong.** That
+combination above produced, for San Andreas, a complete RenderWare device setup
 — device, six buffers, three vertex declarations, six `ps_1_1` pixel shaders,
-`DXT1` and `D24S8` format checks — and every single D3D9 call succeeds: no
-`FAIL`, no `STUB`, no `EXCEPTION`. Then, in the ~10ms after the last query and
-with no D3D9 activity in between, it tears down its three windows in exactly the
-order `DestroyWindow` on a foreground window produces (`WM_WINDOWPOSCHANGED`,
-`WM_ACTIVATEAPP` wparam=0, `WM_KILLFOCUS`, `WM_DESTROY`, `WM_NCDESTROY`) with no
-`WM_CLOSE` and no `WM_QUIT`, and exits without ever releasing the device — the
-deactivation is a consequence of the teardown, not a cause of it. That is a
-title running its own early-exit path for a reason invisible from here. The
-stage after `rsRWINITIALIZE` is input and audio initialisation, and a failure
-there sends GTA San Andreas's `WinMain` straight to destroy-window-and-return
-without RenderWare teardown, which is the shape observed. The same proxy
-technique used here, in `../d3d8proxy` and in `../winproxy` applies directly to
-`dinput8.dll`/`dsound.dll` if that thread is picked up.
+`DXT1` and `D24S8` format checks — in which *every single D3D9 call succeeded*:
+no `FAIL`, no `STUB`, no `EXCEPTION`, followed by an orderly teardown. The
+conclusion drawn from that, that the exit was not D3D9's doing and the next
+place to look was `dinput8`/`dsound`, was wrong: the same build of the game runs
+under SwiftShader on the same guest. Returning `D3D_OK` is not the same as
+returning the *right value*, and a trace of return codes cannot tell the two
+apart. The adapter identifier, the mode list and all ~67 `D3DCAPS9` fields this
+proxy reports are fabricated by `fill_caps()`, and an app that reads one and
+quietly takes a different path leaves no mark on the trace at all.
 
-Known gap worth naming because it renders wrong rather than failing:
-**fixed-function vertex blending** (`D3DRS_VERTEXBLEND` with
-`D3DTS_WORLDMATRIX(1..3)`) is unimplemented — only `D3DTS_WORLD` is consumed.
-A fixed-function declaration carrying `BLENDWEIGHT`/`BLENDINDICES` therefore has
-every vertex posed by world matrix 0, which collapses a skinned mesh instead of
-animating it. `fixedFunctionVertexSignature` now counts this as
-`drawsWithUnappliedVertexBlend` and warns once, so "the model is missing but its
-shadow is there" is attributable instead of being one of a dozen possible
-causes. The translated-shader skinning path (M5 `UBYTE4`/`SHORT2`/`SHORT4`/
-`UDEC3`/`DEC3N` inputs) is unaffected.
+That claim also has to be *earned*, and for two rounds it was not. Of the 283
+error returns in `d3d9_proxy.c`, **249 were invisible**: a bare
+`return D3DERR_INVALIDCALL` emits no `FAIL` line, is not covered by the
+per-frame `rejected=` counter (that only wraps the four draw entry points), and
+`UNSUPPORTED()` only covers the deliberate stubs. A validation refusal inside
+`Clear`, `LockRect`, `SetStreamSource` or `CreateTexture` was simply silence --
+indistinguishable, in the log, from the call never happening. The diagnostic
+build now wraps every one of them in `TRACE_REFUSE()`, which logs
+`REFUSE <function>:<line> -> <hr>`; it compiles to the identity in the shipping
+DLL, which carries no `REFUSE` string at all. Read "nothing in the trace failed"
+as evidence only for calls whose failure path is instrumented.
+
+### Fixed-function vertex blending
+
+`D3DRS_VERTEXBLEND` is implemented, indexed and not. `vertexBlendPlan()` in
+`d3d9_executor.js` resolves the render state against what the declaration
+carries, and the generated vertex stage builds `sum(w_i * (v * WORLDMATRIX(i)))`
+rather than posing every vertex by `D3DTS_WORLD`. Three details are worth
+keeping in mind, because each of them is a way to get this subtly wrong:
+
+- **The weights are one short on purpose.** `D3DVBF_1WEIGHTS` names one weight
+  and blends *two* matrices; D3D9 defines the last matrix's weight as
+  `1 - sum(the rest)`. Reading a fourth weight out of the attribute instead
+  would leave the weights failing to sum to 1 wherever the exporter rounded.
+- **`BLENDINDICES` is the one fixed-function attribute that is not `f32`.**
+  `D3DDECLTYPE_UBYTE4` maps to WebGPU's `uint8x4`, and WebGPU rejects a pipeline
+  whose WGSL declares that location as a float. `declTypeInputScalar()` picks
+  the base type from the declaration; the WGSL validation test compiles all
+  three (`u32`/`i32`/`f32`) through naga so a wrong one cannot reach a browser.
+- **A blended draw cannot fold the world matrix into the chain.** Which world
+  matrix applies is a per-vertex question, so the uniform block carries
+  `view_projection` (and `view_matrix`) instead of `world_view_projection` (and
+  `world_view`). Leaving the folded matrix in place would re-apply world matrix
+  0 on top of the blend, which looks almost right and is not.
+
+The FVF spelling works too: `fvf_to_declaration()` expands `D3DFVF_XYZB1`
+through `XYZB5` (and `D3DFVF_XYZW`), honouring `D3DFVF_LASTBETA_UBYTE4` /
+`D3DFVF_LASTBETA_D3DCOLOR` — and treating `XYZB5` as implicitly carrying
+indices, since five float weights have no `D3DDECLTYPE` to be declared as.
+Those codes used to be refused outright, which made `SetFVF` the one entry
+point from which vertex blending could not be reached at all.
+
+`fill_caps()` reports `MaxVertexBlendMatrices = 4` and
+`MaxVertexBlendMatrixIndex = 255` accordingly. It deliberately does **not** set
+`D3DVTXPCAPS_TWEENING`: tweening interpolates two vertex streams by
+`D3DRS_TWEENFACTOR` and merely shares the `D3DVERTEXBLENDFLAGS` enum with
+blending — nothing implements it, and `D3DVBF_TWEENING` falls back to world
+matrix 0 with a warning.
+
+Indexed blending uploads a palette sized from the highest `D3DTS_WORLDMATRIX(n)`
+the guest has set, rounded up through power-of-two buckets: sizing it exactly
+would put the count in the shader cache key and mint a new module and pipeline
+every time an engine adds a bone. State blocks capture world matrices 0..3 only;
+an app recording a block around an *indexed* skinned pass gets the palette back
+as that pass left it, which is a stated limit rather than an unnoticed one.
+
+`drawsWithUnappliedVertexBlend` survives, but it now means something different
+and much weaker: the declaration carried `BLENDWEIGHT`/`BLENDINDICES` while
+`D3DRS_VERTEXBLEND` was `DISABLE`, so nothing blended. That is *correct* — D3D9
+ignores the data too — and it is common, because engines share one declaration
+between their skinned and unskinned passes. It stays counted rather than warned
+about because "the character is stuck in bind pose" and "the character is
+missing" look alike from the outside, and a nonzero count next to a zero
+`blendedDraws` says which. The translated-shader skinning path (M5 `UBYTE4`/
+`SHORT2`/`SHORT4`/`UDEC3`/`DEC3N` inputs) is a separate path and is unaffected.
 
 Still unimplemented, each returning `D3DERR_INVALIDCALL` (or the closest
 matching real error) rather than pretending: volume textures
@@ -391,4 +500,4 @@ Tests:
   message. Opt-in via `D9_SHADER_CORPUS`; it is a measurement, not a gate,
   unless `D9_CORPUS_STRICT=1`;
 - `../sample/d3d9_shader_test.c` — the real DLL in the real XP guest
-  (`./build_smoke_test.sh`).
+  (`./build_smoke_test.sh`);

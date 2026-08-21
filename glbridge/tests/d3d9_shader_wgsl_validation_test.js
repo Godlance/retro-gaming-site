@@ -417,6 +417,7 @@ for (const [name, kind] of [["ubyte4", "ubyte4"], ["short2", "short2"],
         fogMode: 0, fogRange: false, normalizeNormals: false,
         needsViewSpace: false, lighting: null, clipPlaneCount: 0,
         pointExpansion: false, pointSprite: false, pointScale: false,
+        blendWeightType: -1, blendIndicesType: -1, vertexBlend: null,
     }, overrides);
     for (const positionType of ["world", "screen"]) {
         for (const hasColor of [false, true]) {
@@ -489,6 +490,46 @@ for (const [name, kind] of [["ubyte4", "ubyte4"], ["short2", "short2"],
                 }))]);
         }
     }
+    // Fixed-function vertex blending: every matrix count, both the ordered and
+    // the indexed matrix source, and both integer index formats -- BLENDINDICES
+    // is the one fixed-function attribute whose WGSL type is not f32, so a
+    // wrong base type here is a compile error the compiler has to be the one to
+    // catch. Paired with lighting because the blended normal takes a different
+    // path from the plain one.
+    for (let matrixCount = 1; matrixCount <= 4; ++matrixCount) {
+        for (const indexScalar of [null, "u32", "i32", "f32", "f32-plain"]) {
+            for (const hasNormal of [false, true]) {
+                const indexed = indexScalar !== null;
+                const scalar = indexed
+                    ? indexScalar.replace("-plain", "") : "u32";
+                fixedFunction.push(["ff vs blend " + matrixCount +
+                    (indexed ? " indexed " + indexScalar : " ordered") +
+                    (hasNormal ? " normal" : ""),
+                    executor.buildFixedFunctionVertexShader(vsBase({
+                        hasNormal, needsViewSpace: hasNormal,
+                        normalizeNormals: hasNormal,
+                        lighting: hasNormal
+                            ? { lights: [{ index: 0, type: 3 }],
+                                colorVertex: false, specularEnable: false,
+                                localViewer: false, diffuseSource: 0,
+                                ambientSource: 0, specularSource: 0,
+                                emissiveSource: 0 }
+                            : null,
+                        blendWeightType: matrixCount > 1 ? 2 : -1,
+                        blendIndicesType: indexed ? 5 : -1,
+                        vertexBlend: {
+                            matrixCount, weightCount: matrixCount - 1, indexed,
+                            indexScalar: scalar,
+                            // The unorm8x4 spelling (D3DCOLOR/UBYTE4N) reaches
+                            // the shader as bytes over 255 and needs its own
+                            // conversion, so it is its own case here.
+                            indexNormalized: indexScalar === "f32",
+                            matrixSlots: indexed ? 16 : matrixCount,
+                        },
+                    }))]);
+            }
+        }
+    }
     fixedFunction.push(["ff vs point sprite scaled",
         executor.buildFixedFunctionVertexShader(vsBase({
             hasColor: true, hasPointSize: true, needsViewSpace: true,
@@ -507,6 +548,7 @@ for (const [name, kind] of [["ubyte4", "ubyte4"], ["short2", "short2"],
     }, overrides);
     const psBase = overrides => Object.assign({
         stages: [stage()], usesTextureFactor: false, fogMode: 0,
+        tableFog: false,
         alphaTest: { enabled: false, func: 8, reference: 0 },
         specularEnable: false,
     }, overrides);
@@ -562,9 +604,14 @@ for (const [name, kind] of [["ubyte4", "ubyte4"], ["short2", "short2"],
                 borderColor: 0x80402010 })],
         }), null)]);
     for (const fogMode of [1, 2, 3]) {
-        fixedFunction.push(["ff ps fog " + fogMode,
+        fixedFunction.push(["ff ps vertex fog " + fogMode,
             executor.buildFixedFunctionPixelShader(psBase({
                 fogMode, specularEnable: true,
+                alphaTest: { enabled: true, func: 5, reference: 128 },
+            }), null)]);
+        fixedFunction.push(["ff ps table fog " + fogMode,
+            executor.buildFixedFunctionPixelShader(psBase({
+                fogMode, tableFog: true, specularEnable: true,
                 alphaTest: { enabled: true, func: 5, reference: 128 },
             }), null)]);
     }

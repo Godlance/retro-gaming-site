@@ -233,6 +233,8 @@ static HRESULT create_device(HWND hwnd)
 
 static HRESULT create_triangle_resources(void)
 {
+    D3DVERTEXELEMENT9 returned_declaration[D3DMAXDECLLENGTH];
+    UINT returned_count;
     void *destination;
     HRESULT hr;
 
@@ -242,6 +244,37 @@ static HRESULT create_triangle_resources(void)
     if (FAILED(hr))
         return failed("CreateVertexDeclaration", hr);
     trace_hresult("CreateVertexDeclaration(POSITION+COLOR)", hr);
+
+    /* pNumElements is output-only. Initialising it to zero catches proxies
+     * that incorrectly treat it as the capacity of returned_declaration; that
+     * exact bug made GTA SA crash after the first New Game loading screen. */
+    returned_count = 0;
+    ZeroMemory(returned_declaration, sizeof(returned_declaration));
+    begin_stage("VertexDeclaration::GetDeclaration array");
+    hr = IDirect3DVertexDeclaration9_GetDeclaration(g_declaration_object,
+            returned_declaration, &returned_count);
+    if (FAILED(hr))
+        return failed("VertexDeclaration::GetDeclaration array", hr);
+    if (returned_count != sizeof(g_declaration) / sizeof(g_declaration[0])
+            || returned_declaration[0].Stream != g_declaration[0].Stream
+            || returned_declaration[0].Type != g_declaration[0].Type
+            || returned_declaration[1].Offset != g_declaration[1].Offset
+            || returned_declaration[1].Usage != g_declaration[1].Usage
+            || returned_declaration[returned_count - 1].Stream != 0xFFu
+            || returned_declaration[returned_count - 1].Type
+                != D3DDECLTYPE_UNUSED)
+        return failed("VertexDeclaration::GetDeclaration contents", E_FAIL);
+    trace_hresult("VertexDeclaration::GetDeclaration array", hr);
+
+    returned_count = 0;
+    begin_stage("VertexDeclaration::GetDeclaration count");
+    hr = IDirect3DVertexDeclaration9_GetDeclaration(g_declaration_object,
+            NULL, &returned_count);
+    if (FAILED(hr)
+            || returned_count != sizeof(g_declaration) / sizeof(g_declaration[0]))
+        return failed("VertexDeclaration::GetDeclaration count",
+                FAILED(hr) ? hr : E_FAIL);
+    trace_hresult("VertexDeclaration::GetDeclaration count", hr);
 
     begin_stage("SetVertexDeclaration");
     hr = IDirect3DDevice9_SetVertexDeclaration(g_device, g_declaration_object);

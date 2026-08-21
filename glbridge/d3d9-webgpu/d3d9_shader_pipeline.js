@@ -181,6 +181,35 @@
     // vertex shader emits all of these (WebGPU allows a vertex stage to
     // produce outputs the fragment stage ignores, but not the reverse), so
     // no VS/PS combination can ever fail to link.
+    // Identifies *this build of the translator* to the persistent shader
+    // cache. The cache's own `version` field describes the storage format, so
+    // it stayed at 1 while the translator changed underneath it -- and every
+    // entry already in IndexedDB was then restored verbatim, WGSL and
+    // reflection included. The effect is a translator fix that does nothing
+    // for exactly the shaders that have been seen before, which is silent, and
+    // survives a reload: the symptom is a change that "did not work" plus a
+    // reflection field that reads undefined because the stored object predates
+    // it. Both happened here.
+    //
+    // The page already versions this file through the ?v= cache-buster it is
+    // loaded with, and that string is bumped whenever the file changes, so
+    // deriving the revision from it keeps the two in step with no extra
+    // discipline. Outside a browser (the Node test suite) one constant serves,
+    // because there the cache never outlives the process.
+    const TRANSLATOR_REVISION = (function() {
+        try {
+            const script = typeof document !== "undefined" &&
+                document.currentScript;
+            const source = script && script.src;
+            if (source) {
+                const query = source.indexOf("?v=");
+                if (query >= 0) return source.slice(query + 3);
+                return source;
+            }
+        } catch (error) { /* no document: fall through */ }
+        return "node";
+    })();
+
     const VARYING_COLOR0 = 0;
     const VARYING_COLOR1 = 1;
     const VARYING_TEXCOORD0 = 2; // .. 9 for TEXCOORD0..7
@@ -1278,9 +1307,16 @@
                 out.push("var<private> o_position: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 1.0);");
                 if (this.usesPointSize)
                     out.push("var<private> o_pointsize: vec4<f32> = vec4<f32>(1.0);");
-                for (let slot = 0; slot < VARYING_COUNT; ++slot)
+                for (let slot = 0; slot < VARYING_COUNT; ++slot) {
+                    // D3D9's oFog factor defaults to one (no fog) when a
+                    // vertex shader does not write it. Initialising it to
+                    // zero makes a fixed-function pixel fog blend replace the
+                    // entire textured draw with the fog colour.
+                    const initialValue = slot === VARYING_FOG
+                        ? "vec4<f32>(1.0, 0.0, 0.0, 0.0)" : "vec4<f32>(0.0)";
                     out.push("var<private> o_varying" + slot +
-                        ": vec4<f32> = vec4<f32>(0.0);");
+                        ": vec4<f32> = " + initialValue + ";");
+                }
                 for (const index of Array.from(this.usedInputs.keys()).sort((a, b) => a - b))
                     out.push("var<private> vin" + index + ": vec4<f32> = vec4<f32>(0.0);");
             } else {
@@ -1568,6 +1604,15 @@
                 readsFrontFacing: this.usesFrontFacing,
                 readsFragmentPosition: this.usesFragPosition,
                 colorOutputs: Array.from(this.colorOutputs).sort((a, b) => a - b),
+                // Which varying slots this shader actually assigns. A fixed-
+                // function pixel cascade paired with a translated vertex
+                // shader has to read the slots that shader wrote; reading one
+                // it never wrote yields a constant, and a constant texture
+                // coordinate samples one texel across a whole model -- a flat
+                // silhouette that looks like a lighting or texture bug rather
+                // than the stage/varying mismatch it is.
+                writtenVaryings: Array.from(this.writtenVaryings)
+                    .sort((a, b) => a - b),
                 floatDefaults, intDefaults, boolDefaults,
                 levelZeroSamples: this.levelZeroSamples,
                 warnings: this.warnings.slice(),
@@ -1727,12 +1772,16 @@
                 bytes += encoded.length * 2;
             }
             entries.reverse();
-            return { version: 1, entries };
+            return { version: 1, revision: TRANSLATOR_REVISION, entries };
         }
 
         importEntries(payload) {
             if (!payload || payload.version !== 1 || !Array.isArray(payload.entries))
                 return 0;
+            // A payload written by a different build of the translator holds
+            // that build's WGSL and reflection. Restoring it would mean this
+            // session runs code this file no longer generates.
+            if (payload.revision !== TRANSLATOR_REVISION) return 0;
             let restored = 0;
             for (const item of payload.entries) {
                 if (!item || typeof item.key !== "string" || !item.result) continue;
@@ -1753,6 +1802,7 @@
 
     const api = {
         compileShader, parseShader, hashTokens, D3D9ShaderCache,
+        TRANSLATOR_REVISION,
         VARYING_COLOR0, VARYING_COLOR1, VARYING_TEXCOORD0, VARYING_FOG,
         VARYING_COUNT, varyingForSemantic,
         OP, REGISTER: {

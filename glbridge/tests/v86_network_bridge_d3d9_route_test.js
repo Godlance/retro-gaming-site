@@ -114,4 +114,29 @@ bridge.showOverlayCanvas();
 assert.equal(d3d9Canvas.style.display, "none");
 assert.equal(canvas.style.display, "block");
 
+// The production page installs both executors on one overlay so it can accept
+// either API. Executor/context existence alone must not be diagnosed as a
+// conflict; only valid traffic from both APIs makes the shared canvas unsafe.
+const sharedCanvas = {};
+bridge.d3d8Canvas = sharedCanvas;
+bridge.d3d9Canvas = sharedCanvas;
+bridge.d3d8Executor = { context: {}, getStats() { return { batches: 0 }; } };
+bridge.d3d9Executor = { context: {}, getStats() { return { batches: 0 }; } };
+const conflictErrors = [];
+const originalConsoleError = console.error;
+console.error = (...args) => conflictErrors.push(args);
+try {
+    bridge.warnOnSharedD3DCanvasConflict("d3d9");
+    bridge.warnOnSharedD3DCanvasConflict("d3d9");
+    assert.equal(conflictErrors.length, 0,
+        "one active API must stay quiet even when both executors are installed");
+    bridge.warnOnSharedD3DCanvasConflict("d3d8");
+    assert.equal(conflictErrors.length, 1,
+        "traffic from both APIs must report the real shared-canvas conflict");
+    bridge.warnOnSharedD3DCanvasConflict("d3d9");
+    assert.equal(conflictErrors.length, 1, "the conflict is reported only once");
+} finally {
+    console.error = originalConsoleError;
+}
+
 console.log("v86_network_bridge_d3d9_route_test: ok");
