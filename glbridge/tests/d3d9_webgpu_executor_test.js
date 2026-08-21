@@ -30,6 +30,8 @@ const OP = {
     SET_MATERIAL: 0x207, SET_LIGHT: 0x208, LIGHT_ENABLE: 0x209,
     SET_STREAM_SOURCE: 0x20A, SET_INDICES: 0x20C,
     SET_VERTEX_DECLARATION: 0x20D, SET_FVF: 0x20E,
+    SET_RENDER_TARGET: 0x20F, SET_DEPTH_STENCIL_SURFACE: 0x210,
+    SET_DEPTH_STENCIL_SURFACE_LEVEL: 0x21E,
     SET_VERTEX_SHADER: 0x211, SET_PIXEL_SHADER: 0x212,
     SET_VS_CONST_F: 0x213, SET_VS_CONST_I: 0x214, SET_VS_CONST_B: 0x215,
     SET_PS_CONST_F: 0x216, SET_PS_CONST_I: 0x217, SET_PS_CONST_B: 0x218,
@@ -67,7 +69,7 @@ function buildBatch(commands, options = {}) {
     const batch = Buffer.alloc(32 + commandBytes);
     batch.writeUInt32LE(D9WG_MAGIC, 0);
     batch.writeUInt16LE(1, 4);
-    batch.writeUInt16LE(0, 6);
+    batch.writeUInt16LE(options.versionMinor ?? 1, 6);
     batch.writeUInt32LE(options.frameId || 1, 8);
     batch.writeUInt32LE(options.present ? BATCH_FLAG_PRESENT : 0, 12);
     batch.writeUInt32LE(commands.length, 16);
@@ -2363,15 +2365,17 @@ await test("a render target redirects the pass and keys its own pipeline",
             [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
         command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
         // Into the texture...
-        command(0x20F, u32(DEVICE, 0, 0x501, 0)),
-        command(0x210, u32(DEVICE, 0, 0, 0)), // no depth surface with it
+        command(OP.SET_RENDER_TARGET, u32(DEVICE, 0, 0x501, 0)),
+        command(OP.SET_DEPTH_STENCIL_SURFACE,
+            u32(DEVICE, 0, 0, 0)), // v1.0 payload: no depth surface with it
         command(OP.SET_VIEWPORT, u32(DEVICE, 0, 0, 256, 256, 0, 0x3f800000, 0)),
         command(OP.CLEAR, u32(DEVICE, 1, 0xff112233, 0, 0, 0)),
         command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
         // ...and back to the back buffer, restoring the implicit depth surface
         // (D9WG_AUTO_DEPTH_STENCIL_HANDLE) the way an app that saved it does.
-        command(0x20F, u32(DEVICE, 0, 0, 0)),
-        command(0x210, u32(DEVICE, 0xffffffff, 640, 480)),
+        command(OP.SET_RENDER_TARGET, u32(DEVICE, 0, 0, 0)),
+        command(OP.SET_DEPTH_STENCIL_SURFACE,
+            u32(DEVICE, 0xffffffff, 640, 480)),
         command(OP.SET_VIEWPORT, u32(DEVICE, 0, 0, 640, 480, 0, 0x3f800000, 0)),
         command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
         command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
@@ -2398,6 +2402,123 @@ await test("a render target redirects the pass and keys its own pipeline",
         passes[passes.length - 1].colorAttachments[0].view,
         "the texture pass must not render into the back buffer");
     assert.equal(executor.stats.renderPasses, passes.length);
+});
+
+await test("a v1.0 depth-surface command still binds texture level zero",
+        async () => {
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480, 0)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x504, 640, 480, 3, 75, 2, 0)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        // The frozen v1.0 wire payload has no level field. It always means the
+        // top level, even when the texture itself contains more mip levels.
+        command(OP.SET_DEPTH_STENCIL_SURFACE,
+            u32(DEVICE, 0x504, 640, 480)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true, versionMinor: 0 }));
+    await executor.idle();
+
+    assert.equal(executor.stats.droppedDraws, 0);
+    const pass = find("beginRenderPass").find(call =>
+        call[1].depthStencilAttachment);
+    assert.ok(pass, "the stale guest's level-zero depth surface must bind");
+    assert.deepEqual(pass[1].depthStencilAttachment.view.descriptor, {
+        baseMipLevel: 0,
+        mipLevelCount: 1,
+        dimension: "2d",
+        baseArrayLayer: 0,
+        arrayLayerCount: 1,
+    });
+});
+
+await test("a D24S8 mip is used as the explicit depth attachment",
+        async () => {
+    const D3DUSAGE_DEPTHSTENCIL = 2;
+    const D3DFMT_D24S8 = 75;
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        // Disable the automatic depth surface so the pass can only succeed by
+        // resolving the texture bound below.
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480, 0)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x502, 2560, 1920, 4, D3DFMT_D24S8,
+                D3DUSAGE_DEPTHSTENCIL, 0)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_DEPTH_STENCIL_SURFACE_LEVEL,
+            u32(DEVICE, 0x502, 2, 640, 480)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.texturesRejected, 0);
+    const creation = find("createTexture").find(call =>
+        call[1].label === "D3D9 depth surface");
+    assert.ok(creation, "CreateTexture(D24S8) must allocate a GPU depth target");
+    assert.equal(creation[1].format, "depth24plus-stencil8");
+    assert.equal(creation[1].mipLevelCount, 4);
+    assert.equal(creation[1].usage, 0x10,
+        "a depth texture is an attachment, not a sampled colour texture");
+
+    const pass = find("beginRenderPass").find(call =>
+        call[1].depthStencilAttachment);
+    assert.ok(pass, "the draw must open a pass with the explicit depth surface");
+    assert.equal(pass[1].depthStencilAttachment.view.texture, creation[2]);
+    assert.deepEqual(pass[1].depthStencilAttachment.view.descriptor, {
+        baseMipLevel: 2,
+        mipLevelCount: 1,
+        dimension: "2d",
+        baseArrayLayer: 0,
+        arrayLayerCount: 1,
+    }, "the attachment view must address exactly the selected depth mip");
+    const pipeline = find("createRenderPipeline").pop()[1];
+    assert.equal(pipeline.depthStencil.format, "depth24plus-stencil8");
+});
+
+await test("an out-of-range depth mip is rejected at binding without invalidating WebGPU",
+        async () => {
+    const warnings = [];
+    const realWarn = console.warn;
+    const { executor, find } = makeExecutor();
+    console.warn = (...args) => warnings.push(args.join(" "));
+    try {
+        await executor.submit(buildBatch([
+            command(OP.CREATE_DEVICE, createDevicePayload(640, 480, 0)),
+            command(OP.CREATE_TEXTURE_2D,
+                u32(DEVICE, 0x503, 640, 480, 2, 75, 2, 0)),
+            command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+            command(OP.SET_FVF, fvfPayload(0x2,
+                [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+            command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+            command(OP.SET_DEPTH_STENCIL_SURFACE_LEVEL,
+                u32(DEVICE, 0x503, 2, 160, 120)),
+            command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+            command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+        ], { present: true }));
+        await executor.idle();
+    } finally {
+        console.warn = realWarn;
+    }
+    assert.equal(executor.stats.texturesRejected, 0);
+    assert.ok(find("createTexture").some(call =>
+        call[1].label === "D3D9 depth surface"),
+        "a valid multi-mip depth descriptor must reach WebGPU");
+    assert.ok(warnings.some(line => line.includes("out-of-range texture level")),
+        "the invalid binding should explain why depth was omitted");
+    const pass = find("beginRenderPass").find(call =>
+        call[1].colorAttachments);
+    assert.ok(pass && !pass[1].depthStencilAttachment,
+        "an invalid mip must be dropped before render-pass validation");
 });
 
 await test("a cube texture binds as a cube view and uploads per face",

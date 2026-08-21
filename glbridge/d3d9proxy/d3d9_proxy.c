@@ -1765,6 +1765,26 @@ static BOOL supported_render_target_format(D3DFORMAT format)
     }
 }
 
+/* Depth surfaces are real WebGPU render attachments.  The guest cannot lock
+ * or read them back, so the observable distinction between these D3D9
+ * formats is their depth/stencil role rather than their physical storage;
+ * the executor maps them to depth24plus-stencil8. */
+static BOOL supported_depth_stencil_format(D3DFORMAT format)
+{
+    switch (format) {
+    case D3DFMT_D16:
+    case D3DFMT_D16_LOCKABLE:
+    case D3DFMT_D15S1:
+    case D3DFMT_D24S8:
+    case D3DFMT_D24X8:
+    case D3DFMT_D24X4S4:
+    case D3DFMT_D32:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
 static BOOL supported_backbuffer_format(D3DFORMAT format)
 {
     return format == D3DFMT_A8R8G8B8 || format == D3DFMT_X8R8G8B8
@@ -3660,33 +3680,6 @@ static HRESULT WINAPI d3d_get_adapter_display_mode(IDirect3D9 *iface,
     return D3D_OK;
 }
 
-/*
- * M1 does not implement depth testing at all (no depth attachment exists on
- * the host side yet), so this list is not a claim about what the renderer
- * honours -- it is only about which AutoDepthStencilFormat values are
- * allowed to get past CreateDevice. Restricting it to D16/D24S8 made
- * CreateDevice fail outright for the very common case of a game asking for
- * D24X8 (depth, no stencil), which is a much worse outcome than the already
- * documented "depth is ignored" boundary: the app cannot render anything at
- * all rather than rendering without depth. Widening it keeps the same
- * honesty level for every format instead of only two.
- */
-static BOOL supported_depth_stencil_format(D3DFORMAT format)
-{
-    switch (format) {
-    case D3DFMT_D16:
-    case D3DFMT_D16_LOCKABLE:
-    case D3DFMT_D15S1:
-    case D3DFMT_D24S8:
-    case D3DFMT_D24X8:
-    case D3DFMT_D24X4S4:
-    case D3DFMT_D32:
-        return TRUE;
-    default:
-        return FALSE;
-    }
-}
-
 static HRESULT WINAPI d3d_check_device_type(IDirect3D9 *iface, UINT adapter,
         D3DDEVTYPE type, D3DFORMAT display_format,
         D3DFORMAT backbuffer_format, WINBOOL windowed)
@@ -3726,8 +3719,9 @@ static HRESULT WINAPI d3d_check_device_format(IDirect3D9 *iface,
                         && supported_render_target_format(format)))
                 && supported_texture_format(format))
             ok = TRUE;
-        else if (resource_type == D3DRTYPE_SURFACE
-                && (usage & D3DUSAGE_DEPTHSTENCIL)
+        else if ((resource_type == D3DRTYPE_TEXTURE
+                    || resource_type == D3DRTYPE_SURFACE)
+                && usage == D3DUSAGE_DEPTHSTENCIL
                 && supported_depth_stencil_format(format))
             ok = TRUE;
         else if (resource_type == D3DRTYPE_SURFACE
@@ -5595,6 +5589,7 @@ static HRESULT WINAPI device_create_texture(IDirect3DDevice9 *iface,
     UINT level_width;
     UINT level_height;
     HRESULT failure = E_OUTOFMEMORY;
+    BOOL is_depth = (usage & D3DUSAGE_DEPTHSTENCIL) != 0;
     (void)shared_handle;
 
     TRACE("CALL CreateTexture %lux%lu levels=%lu usage=%08lX "
@@ -5608,9 +5603,11 @@ static HRESULT WINAPI device_create_texture(IDirect3DDevice9 *iface,
     }
     *texture_out = NULL;
     if (!width || !height || width > 4096 || height > 4096
-            || !supported_texture_format(format)
             || (usage & D3DUSAGE_AUTOGENMIPMAP)
-            || ((usage & D3DUSAGE_DEPTHSTENCIL) && pool != D3DPOOL_DEFAULT)
+            || (is_depth && (usage != D3DUSAGE_DEPTHSTENCIL
+                    || pool != D3DPOOL_DEFAULT
+                    || !supported_depth_stencil_format(format)))
+            || (!is_depth && !supported_texture_format(format))
             || ((usage & D3DUSAGE_RENDERTARGET)
                 && (pool != D3DPOOL_DEFAULT
                     || !supported_render_target_format(format)))
@@ -5664,7 +5661,7 @@ static HRESULT WINAPI device_create_texture(IDirect3DDevice9 *iface,
         D9TextureLevel *level_data = &texture->levels[level];
         level_data->width = level_width;
         level_data->height = level_height;
-        if (!texture_level_layout(format, level_width, level_height,
+        if (!is_depth && !texture_level_layout(format, level_width, level_height,
                 &level_data->row_pitch, &level_data->row_count,
                 &level_data->byte_count))
             goto allocation_failed;
@@ -7097,7 +7094,8 @@ static HRESULT create_target_texture(D9Device *device, UINT width, UINT height,
     texture->pool = D3DPOOL_DEFAULT;
     texture->levels[0].width = width;
     texture->levels[0].height = height;
-    if (!texture_level_layout(format, width, height,
+    if (!(usage & D3DUSAGE_DEPTHSTENCIL)
+            && !texture_level_layout(format, width, height,
             &texture->levels[0].row_pitch, &texture->levels[0].row_count,
             &texture->levels[0].byte_count)) {
         HeapFree(GetProcessHeap(), 0, texture->levels);
@@ -7285,7 +7283,7 @@ static HRESULT WINAPI device_set_depth_stencil_surface(IDirect3DDevice9 *iface,
     D9Device *device = device_from_iface(iface);
     D9Surface *surface = surface_iface ? surface_from_iface(surface_iface) : NULL;
     D9Surface *old_surface;
-    D9WGSetDepthStencilSurface command;
+    D9WGSetDepthStencilSurfaceLevel command;
     uint32_t handle = 0;
     uint32_t level = 0;
 
@@ -7309,14 +7307,13 @@ static HRESULT WINAPI device_set_depth_stencil_surface(IDirect3DDevice9 *iface,
     device->depth_stencil_surface = surface;
     if (old_surface)
         IDirect3DSurface9_Release(&old_surface->iface);
-    device->depth_stencil_unbound = surface_iface ? FALSE : TRUE;
-
     command.device_handle = device->handle;
     command.depth_texture_handle = handle;
+    command.depth_level = level;
     command.width = surface ? surface->width : 0u;
     command.height = surface ? surface->height : 0u;
     device->depth_stencil_unbound = surface ? FALSE : TRUE;
-    return emit_command(D9WG_OP_SET_DEPTH_STENCIL_SURFACE, &command,
+    return emit_command(D9WG_OP_SET_DEPTH_STENCIL_SURFACE_LEVEL, &command,
             sizeof(command)) ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
 }
 

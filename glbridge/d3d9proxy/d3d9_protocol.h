@@ -27,7 +27,7 @@
 
 #define D9WG_MAGIC 0x47573944u /* "D9WG" */
 #define D9WG_VERSION_MAJOR 1u
-#define D9WG_VERSION_MINOR 0u
+#define D9WG_VERSION_MINOR 1u
 
 #define D9WG_BATCH_FLAG_PRESENT (1u << 0)
 
@@ -124,6 +124,10 @@ enum D9WGOpcode {
      * entirely. Nothing about that is visible in the picture, which is why it
      * has to be reported rather than inferred. */
     D9WG_OP_WINDOW_STATE = 0x21D,
+    /* v1.1: the v1.0 SET_DEPTH_STENCIL_SURFACE payload can only name level
+     * zero. Keep that opcode frozen for archived traces and stale guest
+     * DLLs; this extension carries the GetSurfaceLevel subresource. */
+    D9WG_OP_SET_DEPTH_STENCIL_SURFACE_LEVEL = 0x21E,
 
     D9WG_OP_DRAW_PRIMITIVE = 0x300,
     D9WG_OP_DRAW_INDEXED_PRIMITIVE = 0x301,
@@ -587,6 +591,17 @@ typedef struct D9WGSetDepthStencilSurface {
     uint32_t height;
 } D9WGSetDepthStencilSurface;
 
+typedef struct D9WGSetDepthStencilSurfaceLevel {
+    uint32_t device_handle;
+    uint32_t depth_texture_handle;
+    /* The mip selected by IDirect3DTexture9::GetSurfaceLevel.  Unlike the
+     * implicit auto depth-stencil, an explicit depth texture can expose any
+     * of its levels as a surface, so the subresource is part of the binding. */
+    uint32_t depth_level;
+    uint32_t width;
+    uint32_t height;
+} D9WGSetDepthStencilSurfaceLevel;
+
 /* StretchRect between two surfaces the host owns. A zero *_texture_handle names
  * the current render target (D3D9 apps routinely stretch the back buffer into a
  * texture and back), and level selects the mip. filter_point is
@@ -745,6 +760,8 @@ typedef char D9WGAssertSetRenderTargetSize[
         sizeof(D9WGSetRenderTarget) == 16 ? 1 : -1];
 typedef char D9WGAssertSetDepthStencilSurfaceSize[
         sizeof(D9WGSetDepthStencilSurface) == 16 ? 1 : -1];
+typedef char D9WGAssertSetDepthStencilSurfaceLevelSize[
+        sizeof(D9WGSetDepthStencilSurfaceLevel) == 20 ? 1 : -1];
 typedef char D9WGAssertSetScissorRectSize[
         sizeof(D9WGSetScissorRect) == 20 ? 1 : -1];
 typedef char D9WGAssertStretchRectSize[

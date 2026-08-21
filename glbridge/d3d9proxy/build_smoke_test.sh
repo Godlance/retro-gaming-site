@@ -16,6 +16,7 @@ for test_name in \
     reset \
     shader \
     swapchain \
+    depth_texture \
     surface_lifetime
 do
     "$compiler" -mwindows -std=gnu99 -Os -s -nostdlib \

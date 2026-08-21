@@ -71,7 +71,7 @@
 
     const D9WG_MAGIC = 0x47573944; // "D9WG"
     const D9WG_VERSION_MAJOR = 1;
-    const D9WG_VERSION_MINOR = 0;
+    const D9WG_VERSION_MINOR = 1;
     const D9WG_BATCH_HEADER_BYTES = 32;
     const D9WG_COMMAND_HEADER_BYTES = 16;
     const D9WG_BATCH_FLAG_PRESENT = 1 << 0;
@@ -98,6 +98,7 @@
     const OP_SET_SCISSOR_RECT = 0x205;
     const OP_SET_RENDER_TARGET = 0x20F;
     const OP_SET_DEPTH_STENCIL_SURFACE = 0x210;
+    const OP_SET_DEPTH_STENCIL_SURFACE_LEVEL = 0x21E;
     // D9WGSetDepthStencilSurface.depth_texture_handle sentinel: the device's own
     // auto depth-stencil surface. It needs a value distinct from 0 because
     // SetDepthStencilSurface(NULL) -- which really does turn depth testing off
@@ -2617,6 +2618,7 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 // SetDepthStencilSurface(NULL), which is not the same thing --
                 // it turns depth testing off for the draws that follow.
                 depthTargetHandle: 0,
+                depthTargetLevel: 0,
                 depthUnbound: false,
                 scissorRect: null,
                 inScene: false,
@@ -2654,6 +2656,8 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
                 [OP_SET_SCISSOR_RECT]: this.onSetScissorRect,
                 [OP_SET_RENDER_TARGET]: this.onSetRenderTarget,
                 [OP_SET_DEPTH_STENCIL_SURFACE]: this.onSetDepthStencilSurface,
+                [OP_SET_DEPTH_STENCIL_SURFACE_LEVEL]:
+                    this.onSetDepthStencilSurfaceLevel,
                 [OP_STRETCH_RECT]: this.onStretchRect,
                 [OP_COLOR_FILL]: this.onColorFill,
                 [OP_GUEST_LOG]: this.onGuestLog,
@@ -4088,12 +4092,25 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
         onSetDepthStencilSurface(bytes, view, offset) {
             const state = this.deviceState(view.getUint32(offset, true));
             const handle = view.getUint32(offset + 4, true);
+            this.setDepthStencilSurface(state, handle, 0);
+        }
+
+        onSetDepthStencilSurfaceLevel(bytes, view, offset) {
+            const state = this.deviceState(view.getUint32(offset, true));
+            const handle = view.getUint32(offset + 4, true);
+            const level = view.getUint32(offset + 8, true);
+            this.setDepthStencilSurface(state, handle, level);
+        }
+
+        setDepthStencilSurface(state, handle, level) {
             if (handle === D9WG_AUTO_DEPTH_STENCIL_HANDLE) {
                 state.depthTargetHandle = 0;
+                state.depthTargetLevel = 0;
                 state.depthUnbound = false;
                 return;
             }
             state.depthTargetHandle = handle;
+            state.depthTargetLevel = level;
             state.depthUnbound = handle === 0;
         }
 
@@ -4173,12 +4190,29 @@ ${specularBody}${alphaTestDiscard(signature.alphaTest, "result.a")}${fogBody}   
             let depthHeight = 0;
             if (state.depthTargetHandle) {
                 const resource = this.resources.get(state.depthTargetHandle);
-                if (resource && resource.gpuTexture) {
-                    depthView = resource.depthView ||
-                        (resource.depthView = resource.gpuTexture.createView());
-                    depthWidth = resource.width;
-                    depthHeight = resource.height;
-                    key += "d" + state.depthTargetHandle;
+                const level = state.depthTargetLevel || 0;
+                if (resource && resource.gpuTexture &&
+                        (resource.usage & D3DUSAGE_DEPTHSTENCIL) !== 0 &&
+                        level < resource.levelCount) {
+                    // A render attachment view must select exactly one mip.
+                    // targetViewFor is deliberately shared with colour render
+                    // targets so both subresource paths have identical cache
+                    // and descriptor semantics.
+                    depthView = this.targetViewFor(resource, level, false);
+                    depthWidth = Math.max(1, resource.width >> level);
+                    depthHeight = Math.max(1, resource.height >> level);
+                    key += "d" + state.depthTargetHandle + "." + level;
+                } else {
+                    this.warnOnce("depth-target-invalid-" +
+                            state.depthTargetHandle + "-" + level,
+                        "a depth-stencil binding names an unknown, non-depth, " +
+                        "or out-of-range texture level; the pass runs without " +
+                        "a depth attachment", {
+                            handle: state.depthTargetHandle,
+                            level,
+                            levelCount: resource ? resource.levelCount : 0,
+                        });
+                    key += "dinvalid";
                 }
             } else if (!state.depthUnbound && state.depthView) {
                 depthView = state.depthView;
