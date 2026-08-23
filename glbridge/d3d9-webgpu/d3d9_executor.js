@@ -273,6 +273,16 @@
     const D3DFMT_DF16 = 0x36314644;      // 'DF16'
     const D3DFMT_DF24 = 0x34324644;      // 'DF24'
     const D3DFMT_INTZ = 0x5A544E49;      // 'INTZ'
+    // ATI's 3Dc pair, which are BC4 and BC5 under their pre-DX10 names. A
+    // normal map keeping only X and Y and reconstructing Z in the shader beats
+    // DXT5 for normals by enough that 2005-2007 titles ship art in it. WebGPU
+    // exposes exactly these two under texture-compression-bc, so this is a
+    // rename rather than a translation.
+    const D3DFMT_ATI1N = 0x31495441;     // 'ATI1'
+    const D3DFMT_ATI2N = 0x32495441;     // 'ATI2'
+    // A render target whose contents nothing ever reads, so a depth-only pass
+    // does not have to allocate a colour buffer it will not use.
+    const D3DFMT_NULL = 0x4C4C554E;      // 'NULL'
     const D3DFMT_DXT1 = 0x31545844;
     const D3DFMT_DXT2 = 0x32545844;
     const D3DFMT_DXT3 = 0x33545844;
@@ -371,6 +381,17 @@
     // D3DRS_WRAP0..7 are contiguous at 128..135; WRAP8..15 live at 198..205.
     const D3DRS_WRAP0 = 128, D3DRS_WRAP7 = 135;
     const D3DRS_MULTISAMPLEANTIALIAS = 161;
+    // Alpha-to-coverage, which every D3D9 vendor exposed by smuggling a FOURCC
+    // through a render state that meant something else -- there was no
+    // D3DRS_ALPHATOCOVERAGE to set. ATI wrote 'ATOC' into ADAPTIVETESS_Y;
+    // NVIDIA used the same slot with 'ATOC' too (its 'SSAA' spelling asked for
+    // supersampling instead, which is not this). Foliage and chain-link fences
+    // are what it exists for: alpha-tested edges that alias horribly without it.
+    //
+    // WebGPU has it natively as multisample.alphaToCoverageEnabled, so unlike
+    // most of this family it is an exact mapping rather than a hack.
+    const D3DRS_ADAPTIVETESS_Y = 181;
+    const D3DFOURCC_ATOC = 0x434F5441; // 'ATOC'
     const D3DRS_MULTISAMPLEMASK = 162;
     const D3DFILL_POINT = 1, D3DFILL_WIREFRAME = 2, D3DFILL_SOLID = 3;
     const D3DRS_SHADEMODE = 9;
@@ -770,7 +791,14 @@
     function isCompressedFormat(format) {
         return format === D3DFMT_DXT1 || format === D3DFMT_DXT2 ||
             format === D3DFMT_DXT3 || format === D3DFMT_DXT4 ||
-            format === D3DFMT_DXT5;
+            format === D3DFMT_DXT5 ||
+            format === D3DFMT_ATI1N || format === D3DFMT_ATI2N;
+    }
+
+    // Bytes per 4x4 block for the block-compressed formats. BC1 and BC4 carry
+    // one 8-byte block; everything else here carries two.
+    function compressedBlockBytes(format) {
+        return (format === D3DFMT_DXT1 || format === D3DFMT_ATI1N) ? 8 : 16;
     }
 
     // WebGPU measures a block-compressed copy in whole texel blocks: copySize
@@ -877,7 +905,11 @@
     function isRenderableGPUFormat(format) {
         return format === "rgba8unorm" || format === "rgba16float" ||
             format === "r32float" || format === "rg32float" ||
-            format === "rgba32float";
+            format === "rgba32float" ||
+            // The NULL FOURCC target's stand-in. It is renderable by
+            // definition -- being a render target nothing reads is its whole
+            // purpose -- and r8unorm is the cheapest format that can be one.
+            format === "r8unorm";
     }
 
     function isFloat32GPUFormat(format) {
@@ -954,6 +986,15 @@
         case D3DFMT_DXT4:
         case D3DFMT_DXT5:
             return "bc3-rgba-unorm";
+        case D3DFMT_ATI1N:
+            return "bc4-r-unorm";
+        case D3DFMT_ATI2N:
+            return "bc5-rg-unorm";
+        case D3DFMT_NULL:
+            // Nothing reads it, so the cheapest renderable format is the right
+            // one: the size still has to match the depth attachment the pass
+            // is really aiming at, but the per-texel cost does not.
+            return "r8unorm";
         default:
             return null;
         }
@@ -6098,7 +6139,7 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             let bytesPerRow;
             let rowsPerImage;
             if (compressed) {
-                const blockBytes = resource.format === D3DFMT_DXT1 ? 8 : 16;
+                const blockBytes = compressedBlockBytes(resource.format);
                 bytesPerRow = Math.ceil(width / 4) * blockBytes;
                 rowsPerImage = Math.ceil(height / 4);
             } else {
@@ -6118,7 +6159,7 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             const shadow = this.textureShadowFor(resource, level, layer,
                 compressed);
             const blockBytes = compressed
-                ? (resource.format === D3DFMT_DXT1 ? 8 : 16)
+                ? compressedBlockBytes(resource.format)
                 : resource.gpuBytesPerTexel;
             const destinationX = compressed ? Math.floor(x / 4) : x;
             const destinationY = compressed ? Math.floor(y / 4) : y;
@@ -9137,7 +9178,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     ? (get(D3DRS_MULTISAMPLEANTIALIAS, 1) !== 0
                         ? (get(D3DRS_MULTISAMPLEMASK, 0xffffffff) >>> 0)
                         : 1)
-                    : 0xffffffff };
+                    : 0xffffffff,
+                // Only meaningful on a multisampled target -- with one sample
+                // there is no coverage to spread an alpha value over, and
+                // WebGPU rejects the combination outright.
+                alphaToCoverage: sampleCount > 1 &&
+                    (get(D3DRS_ADAPTIVETESS_Y, 0) >>> 0) === D3DFOURCC_ATOC };
         }
 
         // ---- independent sampler state (plan 4.4/12) ----
@@ -10070,6 +10116,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 descriptor.multisample = {
                     count: pipelineState.sampleCount,
                     mask: pipelineState.sampleMask,
+                    alphaToCoverageEnabled: pipelineState.alphaToCoverage,
                 };
             }
             // The pipeline must declare a depthStencil state whenever the

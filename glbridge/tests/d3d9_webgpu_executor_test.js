@@ -1409,6 +1409,98 @@ await test("independent sampler state drives the GPUSampler, not the texture", a
     assert.equal(executor.stats.samplersCreated, 1);
 });
 
+// The vendor FOURCC formats. These are outside the D3D9 specification but not
+// outside what 9.0c-era games actually ship against, and the three below are
+// exact WebGPU mappings rather than approximations.
+await test("ATI1N and ATI2N map to BC4 and BC5", async () => {
+    // 3Dc is BC4/BC5 under its pre-DX10 name, so this is a rename. Getting the
+    // block size wrong is the failure that matters: BC4 is 8 bytes per 4x4
+    // block and BC5 is 16, and a mismatched stride corrupts every level.
+    const ATI1N = 0x31495441, ATI2N = 0x32495441;
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0xA01, 16, 16, 1, ATI1N, 0, 0)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0xA02, 16, 16, 1, ATI2N, 0, 0)),
+    ]));
+    await executor.idle();
+    const formats = find("createTexture").map(call => call[1].format);
+    assert.ok(formats.includes("bc4-r-unorm"),
+        "ATI1N is BC4: " + formats.join(", "));
+    assert.ok(formats.includes("bc5-rg-unorm"),
+        "ATI2N is BC5: " + formats.join(", "));
+});
+
+await test("a NULL render target allocates the cheapest renderable format",
+        async () => {
+    // Nothing reads it -- it exists so a depth-only pass need not allocate a
+    // colour buffer -- so the size must still match while the per-texel cost
+    // need not.
+    const D3DFMT_NULL = 0x4C4C554E;
+    const D3DUSAGE_RENDERTARGET = 1;
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0xA03, 256, 256, 1, D3DFMT_NULL,
+                D3DUSAGE_RENDERTARGET, 0)),
+    ]));
+    await executor.idle();
+    const descriptor = find("createTexture")
+        .map(call => call[1])
+        .find(entry => entry.size && entry.size.width === 256);
+    assert.ok(descriptor, "the NULL target still has to be allocated");
+    assert.equal(descriptor.format, "r8unorm");
+});
+
+await test("ATOC in D3DRS_ADAPTIVETESS_Y enables alpha-to-coverage",
+        async () => {
+    // D3D9 never grew a state for alpha-to-coverage, so every vendor smuggled
+    // a FOURCC through a state that meant something else. WebGPU has it
+    // natively, which makes this one of the few exact mappings in the family.
+    const D3DRS_ADAPTIVETESS_Y = 181, ATOC = 0x434F5441;
+    const D3DMULTISAMPLE_4_SAMPLES = 4;
+    const { executor, find } = makeExecutor();
+    const createDevice = createDevicePayload(640, 480);
+    createDevice.writeUInt32LE(D3DMULTISAMPLE_4_SAMPLES, 44);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevice),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_ADAPTIVETESS_Y, ATOC)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(
+        find("createRenderPipeline").pop()[1].multisample.alphaToCoverageEnabled,
+        true);
+});
+
+await test("ATOC on a single-sampled target stays off", async () => {
+    // WebGPU rejects alphaToCoverage without multisampling, and with one
+    // sample there is no coverage to spread an alpha value over anyway.
+    const D3DRS_ADAPTIVETESS_Y = 181, ATOC = 0x434F5441;
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_ADAPTIVETESS_Y, ATOC)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(find("createRenderPipeline").pop()[1].multisample, undefined,
+        "no multisample block at all on a single-sampled target");
+});
+
 // CreateAdditionalSwapChain targets a second guest window, so the host needs a
 // second drawing surface. The back buffer is an ordinary render-target texture
 // -- that is what keeps draws, StretchRect and readback unchanged -- and the

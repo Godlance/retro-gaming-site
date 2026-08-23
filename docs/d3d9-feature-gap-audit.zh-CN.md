@@ -280,17 +280,36 @@ caps 与调用返回值、`GetNPatchMode` 的回读、以及 B-spline 基**被�
 
 ---
 
-## P3：规范外，但 9.0c 时代游戏真的依赖
+## P3：规范外，但 9.0c 时代游戏真的依赖 —— 已完成（2026-08-23）
 
-如果目标包含"跑完所有 9.0c 游戏"而不只是"实现规范"，这些 vendor FourCC hack
-绕不过去：
+这些 vendor hack 之所以长这样，是因为 D3D9 从来没为它们长出过正式的状态或格式：
+厂商把 FOURCC 塞进本来另有含义的 render state，或者塞进 `D3DFORMAT`。
 
-- [ ] `INTZ`、`RAWZ`、`DF16` / `DF24`（深度当纹理读）
-- [ ] `NULL`（空 render target）
-- [ ] `ATI1N` / `ATI2N`（3Dc 法线压缩）
-- [ ] `RESZ`（深度 resolve）
-- [ ] `ATOC`（alpha-to-coverage；WebGPU 原生支持 `alphaToCoverageEnabled`）
-- [ ] `NVDB`（深度边界测试）
+**四个能精确映射，两个撞上真实的墙。** 后两个是**具名拒绝**而不是静默忽略 ——
+理由见各条。
+
+- [x] `INTZ` / `DF16` / `DF24`（深度当纹理读）—— 早前已实现。
+- [x] **`ATI1N` / `ATI2N`（3Dc）** —— 这两个就是 BC4 / BC5 的 DX10 之前的名字，
+      WebGPU 在 `texture-compression-bc` 下原样提供，所以这是**改名而非翻译**。
+      法线图只存 X/Y 由 shader 重建 Z，比 DXT5 好到 2005-2007 的标题会直接出这种
+      美术资源。要点是块大小：BC4 每 4x4 块 8 字节、BC5 是 16，弄错步长会毁掉每一级。
+- [x] **`NULL`（空 render target）** —— 让 depth-only pass 不必分配一块不会被读的
+      颜色缓冲。尺寸仍要匹配，逐纹素代价不必，所以映射到 `r8unorm`。
+- [x] **`ATOC`（alpha-to-coverage）** —— WebGPU 原生有
+      `multisample.alphaToCoverageEnabled`，是这一族里少见的精确映射。只在多重采样
+      目标上生效（单采样时没有 coverage 可分摊，WebGPU 也会直接拒绝这个组合）。
+- [ ] **`RAWZ`** —— 确认**无法忠实实现**。它交给 shader 的不是深度值，而是深度缓冲的
+      **字节**摊在 A/R/G 三个通道里，由 app 用一个硬编码的点积重新拼装。用真实深度
+      纹理去服务它，app 会拿到干净的深度然后把它解码成垃圾 —— 这比拒绝更糟，因为
+      画面会是错的而不是缺的。所有探测 RAWZ 的标题都会先探测 `INTZ`，而后者已实现。
+- [ ] **`RESZ`（深度 resolve）** —— 确认**无法实现**，而且是硬墙不是缺功能：host 的
+      深度附件是 `depth24plus-stencil8`，**WebGPU 根本不给这个格式任何 copy-source
+      能力**，所以没有任何操作（copy / blit / resolve）能把它读出来；WebGPU 也没有
+      多重采样深度 resolve。而这个 trick 想绕开的需求 —— 深度缓冲同时作为附件和纹理 ——
+      **已经由 INTZ 直接采样满足了**，标题在这里应该走那条路。
+- [ ] **`NVDB`（深度边界测试）** —— WebGPU 在任何层级都没有深度边界状态，也没有东西
+      能近似它。命名它尤其重要，因为它是**宽松地**失败：开了深度边界却被忽略的 app
+      会画出它本想剔除的像素，看起来像深度 bug 而不是缺失的特性。
 
 ---
 

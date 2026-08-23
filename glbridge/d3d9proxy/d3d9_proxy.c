@@ -693,6 +693,44 @@ static void trace_close(void)
 #define D9FMT_DF16 D9_FOURCC('D', 'F', '1', '6')
 #define D9FMT_DF24 D9_FOURCC('D', 'F', '2', '4')
 #define D9FMT_INTZ D9_FOURCC('I', 'N', 'T', 'Z')
+/*
+ * ATI's 3Dc compressed formats, which are BC4 and BC5 under their pre-DX10
+ * names. A normal map stored as ATI2N keeps only X and Y and the shader
+ * reconstructs Z, which is why it beats DXT5 for normals badly enough that
+ * 2005-2007 titles ship art in it.
+ *
+ * WebGPU exposes exactly these as bc4-r-unorm and bc5-rg-unorm under the
+ * texture-compression-bc feature, so this is a rename rather than a
+ * translation. ATI1/ATI2 are the FOURCCs D3D9 apps actually probe for;
+ * '3Dc\0'-style spellings never shipped.
+ */
+#define D9FMT_ATI1N D9_FOURCC('A', 'T', 'I', '1')
+#define D9FMT_ATI2N D9_FOURCC('A', 'T', 'I', '2')
+/*
+ * A render target that discards everything written to it, so a depth-only pass
+ * needs no colour buffer. Apps bind it and render shadow or depth pre-passes
+ * against a real depth-stencil surface.
+ */
+#define D9FMT_NULL D9_FOURCC('N', 'U', 'L', 'L')
+/*
+ * The two vendor hacks with no faithful mapping, named here so the refusals
+ * below can say which one was asked for.
+ *
+ * RAWZ is NVIDIA's depth-as-texture format for parts that predate INTZ. What
+ * it hands the shader is not a depth value but the depth buffer's *bytes*
+ * spread across A, R and G, which the app then reassembles with a hardcoded
+ * dot product. Serving it from a real depth texture would give the app clean
+ * depth in .r and its decode would turn that into nonsense -- worse than a
+ * refusal, because the picture would be wrong rather than absent. Every title
+ * that probes for RAWZ probes for INTZ first, which is implemented.
+ *
+ * NVDB is the depth bounds test. WebGPU has no such state at any level, and
+ * there is nothing to approximate it with: skipping it draws pixels the app
+ * meant to reject.
+ */
+#define D9FMT_RAWZ D9_FOURCC('R', 'A', 'W', 'Z')
+#define D9FOURCC_NVDB D9_FOURCC('N', 'V', 'D', 'B')
+#define D9FOURCC_ATOC D9_FOURCC('A', 'T', 'O', 'C')
 #define D9_MAX_TEXTURE_STAGE_STATES 33u
 /* D3D9's architectural maximum. The host does not bind 16 WebGPU vertex
  * buffers per draw to honour this -- vertexBufferLayoutsFor() builds one layout
@@ -1926,6 +1964,20 @@ static BOOL texture_format_layout(D3DFORMAT format, UINT *block_width,
         *block_bytes = 16;
         return TRUE;
     default:
+        /* Outside the switch because a FOURCC is not a D3DFORMAT enumerator.
+         * ATI1N is one BC4 block (8 bytes) and ATI2N two of them (16). */
+        if (format == D9FMT_ATI1N) {
+            *block_width = 4;
+            *block_height = 4;
+            *block_bytes = 8;
+            return TRUE;
+        }
+        if (format == D9FMT_ATI2N) {
+            *block_width = 4;
+            *block_height = 4;
+            *block_bytes = 16;
+            return TRUE;
+        }
         return FALSE;
     }
 }
@@ -2001,7 +2053,7 @@ static BOOL supported_texture_format(D3DFORMAT format)
     case D3DFMT_DXT5:
         return TRUE;
     default:
-        return FALSE;
+        return format == D9FMT_ATI1N || format == D9FMT_ATI2N;
     }
 }
 
@@ -2027,7 +2079,12 @@ static BOOL supported_render_target_format(D3DFORMAT format)
     case D3DFMT_A32B32G32R32F:
         return TRUE;
     default:
-        return FALSE;
+        /* The NULL render target: a colour attachment whose contents nothing
+         * ever reads, so a depth-only pass does not have to allocate one it
+         * will not use. It is a render target and nothing else -- never a
+         * sampled texture -- which is why it appears here and in no other
+         * format predicate. */
+        return format == D9FMT_NULL;
     }
 }
 
@@ -2049,6 +2106,14 @@ static BOOL supported_depth_stencil_format(D3DFORMAT format)
     default:
         /* Outside the switch because a FOURCC is not a D3DFORMAT enumerator,
          * and -Wswitch is right to say so. */
+        if (format == D9FMT_RAWZ) {
+            HOSTLOG_REFUSED("the RAWZ depth-as-texture format is not "
+                    "implemented: it hands the shader the depth buffer's bytes "
+                    "for the app to reassemble, and serving clean depth "
+                    "instead would make that decode produce nonsense. Use "
+                    "INTZ, which is implemented");
+            return FALSE;
+        }
         return format == D9FMT_DF16 || format == D9FMT_DF24
                 || format == D9FMT_INTZ;
     }
@@ -6056,6 +6121,42 @@ static HRESULT WINAPI device_set_render_state(IDirect3DDevice9 *iface,
                 "its per-edge level comes from sampling D3DDMAPSAMPLER during "
                 "tessellation, which has no equivalent here. N-patches still "
                 "tessellate at the SetNPatchMode level");
+    /*
+     * The vendor render-state hacks share the D3DRS_ADAPTIVETESS_* slots,
+     * because D3D9 never grew states of their own for them. ADAPTIVETESS_Y
+     * carrying 'ATOC' is alpha-to-coverage, which the host implements natively;
+     * ADAPTIVETESS_X carrying 'NVDB' is the depth bounds test, which nothing
+     * can. Naming the second one matters because it fails *permissively*: an
+     * app that enables depth bounds and is ignored draws pixels it meant to
+     * reject, which reads as a depth bug rather than a missing feature.
+     */
+    if (state == D3DRS_ADAPTIVETESS_X && value == D9FOURCC_NVDB)
+        HOSTLOG_REFUSED("the NVDB depth bounds test is not implemented: "
+                "WebGPU has no depth bounds state, and ignoring it draws "
+                "pixels the app meant to reject rather than fewer");
+    /*
+     * RESZ: the app writes a magic value into D3DRS_POINTSIZE to ask the driver
+     * to resolve the bound multisampled depth buffer into an INTZ texture. It
+     * cannot be served here, and the reason is a hard one rather than a missing
+     * feature: the host's depth attachment is depth24plus-stencil8, and WebGPU
+     * gives that format no copy-source capability at all, so there is no
+     * operation -- copy, blit or resolve -- that can read it out. WebGPU has no
+     * multisampled depth resolve either.
+     *
+     * What the trick exists to work around is binding the depth buffer as a
+     * texture while it is also the depth attachment. That specific need is
+     * already met: an INTZ texture can be bound to a sampler and read directly
+     * (see depthSampleModeFor in the executor), which is the path a title
+     * should take here.
+     *
+     * The magic value is a float NaN pattern, so no legitimate point size can
+     * collide with it.
+     */
+    if (state == D3DRS_POINTSIZE && value == 0x7FA05000u)
+        HOSTLOG_REFUSED("the RESZ depth-resolve trick is not implemented: the "
+                "host's depth attachment is depth24plus-stencil8, which WebGPU "
+                "gives no copy-source capability, so nothing can read it out. "
+                "Bind an INTZ texture and sample it directly instead");
     device->render_states[state] = value;
     command.device_handle = device->handle;
     command.state = state;
