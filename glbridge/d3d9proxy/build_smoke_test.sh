@@ -21,7 +21,8 @@ for test_name in \
     depth_texture \
     cube_texture \
     surface_lifetime \
-    process_vertices
+    process_vertices \
+    patch
 do
     "$compiler" -mwindows -std=gnu99 -Os -s -nostdlib \
         -Wall -Wextra -Werror \

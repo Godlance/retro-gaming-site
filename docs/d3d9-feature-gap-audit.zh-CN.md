@@ -228,24 +228,55 @@ wireframe / point 填充完全没实现。WebGPU 没有 polygon mode，必须把
 
 ---
 
-## P2：规范要求但游戏几乎不用（高阶图元）
+## P2：规范要求但游戏几乎不用（高阶图元）—— 已完成（2026-08-23）
 
-这一整块是零实现，而且 **`SetNPatchMode` 返回 `D3D_OK` 却什么都不做**
-（`d3d9_proxy.c:5913`），属于和 P1 第一条同一类的"假装成功"。
+**关键判断：WebGPU 没有细分阶段，所以全部在 guest 侧求值，结果作为普通的
+indexed triangle list 画出去 —— 协议和 host 一行都不用改。** 等东西过线的时候，
+它已经只是几何了。
 
-- [ ] `DrawRectPatch` / `DrawTriPatch` / `DeletePatch`（RT-patch，D3D8 起）
-- [ ] N-patch（`D3DUSAGE_NPATCHES`、`D3DRS_POSITIONDEGREE`/`NORMALDEGREE`）
-- [ ] **9.0 新增的自适应细分 + 位移贴图**：`D3DRS_ENABLEADAPTIVETESSELLATION`、
-      `D3DRS_ADAPTIVETESS_X/Y/Z/W`、`D3DDMAPSAMPLER`、`D3DUSAGE_DMAP`
-      —— 这几个常量在代码里一次都没出现
-- [ ] `D3DFMT_MULTI2_ARGB8` + `D3DSAMP_ELEMENTINDEX`(12) + `D3DSAMP_DMAPOFFSET`(13)
+在 CPU 上做不是"绕过缺失的阶段"，而是唯一输入齐全的地方：控制点就在这个 DLL 已经
+影子化的顶点缓冲里，细分级别是逐调用的参数而不是管线状态。
 
-WebGPU 没有 tessellation stage，只能靠 compute shader 预细分。如果目标是"规范
-完整"，这块躲不掉；如果目标是"跑游戏"，实际用户只有 ATI TruForm 演示。
 
-- [x] **`SetNPatchMode` 已改成诚实的拒绝**：`segments > 1.0` 返回
-      `D3DERR_INVALIDCALL` 并记录；关闭细分（`<= 1.0`）仍然接受，因为每个标题
-      退出时都会这么调一次。
+
+- [x] **`DrawRectPatch` / `DrawTriPatch`** —— 张量积 / 三角 Bézier 曲面在 guest
+      侧求值。限制全部**具名拒绝**而非近似：只支持 `D3DBASIS_BEZIER`（B-spline 和
+      Catmull-Rom 的控制点语义不同，拿 Bézier 顶替会画出一个光滑但位置错误的曲面）；
+      次数到 cubic 为止（这正是 `D3DDEVCAPS_RTPATCHES` 不带 `QUINTICRTPATCHES` 的
+      承诺）；每次调用一个 patch；顶点分量支持 FLOAT1..4 与 D3DCOLOR（打包色会先
+      解包成四个浮点再插值再打包 —— 把 D3DCOLOR 当浮点插值是把 patch 顶点色变成
+      噪声的经典做法）。
+      caps 新增 `D3DDEVCAPS_RTPATCHES | D3DDEVCAPS_RTPATCHHANDLEZERO`。
+- [x] **`DeletePatch`** 保持返回 `D3DERR_INVALIDCALL` —— 这里不缓存任何 patch，
+      而 caps 报的是 `RTPATCHHANDLEZERO` 而非缓存形式，所以读 caps 的 app 根本不会
+      走到这里来失望。
+- [x] **N-patch（PN triangles）已实现**：`SetNPatchMode > 1` 之后，每个三角形
+      draw 的每个三角形都会被替换成由三个顶点的位置和法线构造的三次 Bézier 三角形
+      （Vlachos 等人的构造）。**要点**：它坐在绘制热路径上，所以整件事以
+      `npatch_segments` 非零为闸门 —— 默认情况下每次 draw 只多一次浮点比较。
+      `D3DRS_POSITIONDEGREE` 与 `D3DRS_NORMALDEGREE` 都被遵守，且默认值正确
+      （三次位置 + **线性**法线 —— 悄悄把法线升成二次会改变 app 没要求改的光照）。
+      无法细分的 draw（没有法线、绑了 shader、输出顶点超出 16 位索引）会**回落到
+      平面绘制**而不是被丢弃：缺法线的网格应该照常出现，只是不圆。
+      caps 新增 `D3DDEVCAPS_NPATCHES` 与 `MaxNpatchTessellationLevel = 64`；
+      `D3DUSAGE_NPATCHES` 从"未实现"列表里移除。
+- [x] **`SetNPatchMode` 恢复接受**（此前我把它改成了诚实拒绝，现在它有了真实现）。
+- [ ] **自适应细分 + 位移贴图**：确认**无法实现**，现在会具名报告。
+      它不是"可以近似的 N-patch 级别细化"：D3D9 把它绑死在位移贴图上 —— 逐边的
+      细分级别来自在**细分过程中**采样 `D3DDMAPSAMPLER` 的纹理，而没有细分阶段的
+      管线里没有任何地方能在那个时刻采样纹理。开启
+      `D3DRS_ENABLEADAPTIVETESSELLATION` 现在会说明原因，而不是让 app 疑惑自己的
+      网格是不是坏了。`D3DUSAGE_DMAP` 仍在未实现列表里。
+- [x] **`D3DFMT_MULTI2_ARGB8` 不是缺口** —— 复核后撤回。它不在支持格式表里，
+      `CheckDeviceFormat` 和所有 Create* 都会拒绝它，而这正是**不支持它的真实硬件
+      的行为**（只有少数 GeForce 部件支持过）。`D3DSAMP_ELEMENTINDEX` 只在多元素
+      纹理上有意义，`D3DSAMP_DMAPOFFSET` 只在位移贴图上有意义 —— 两者都随各自的
+      特性一起不适用。
+
+配套新增冒烟测试 `sample/d3d9_patch_test.c`：三条路径各画一个视口，自动核对
+caps 与调用返回值、`GetNPatchMode` 的回读、以及 B-spline 基**被拒绝**而不是被
+当成 Bézier 画出来。几何本身仍需肉眼看：两张 Bézier 控制网是共面且均匀的，
+正确求值应当重现它们描述的平面四边形和三角形。
 
 ---
 

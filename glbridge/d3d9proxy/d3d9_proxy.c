@@ -701,6 +701,10 @@ static void trace_close(void)
  * the DX7-era figure and it rejects ordinary skinned formats that split
  * position, weights, normals and two UV sets across separate streams. */
 #define D9_MAX_STREAMS 16u
+/* The tessellation ceiling shared by the RT patches and N-patches. It bounds
+ * the scratch allocation each of them makes: a level of 64 already means 2145
+ * vertices per source triangle. */
+#define D9_PATCH_MAX_SEGMENTS 64u
 #define D9_MAX_TRANSFORMS 512u
 #define D9_MAX_LIGHTS 8u
 #define D9_MAX_SAMPLERS 20u /* 16 pixel + 4 D3DVERTEXTEXTURESAMPLER slots */
@@ -870,6 +874,9 @@ struct D9Device {
     /* Only meaningful on a D3DCREATE_MIXED_VERTEXPROCESSING device; the other
      * two modes are fixed at creation and answer from BehaviorFlags. */
     BOOL software_vertex_processing;
+    /* SetNPatchMode's level, or 0 when tessellation is off. Zero is the gate
+     * the draw path checks, so the default costs one comparison. */
+    float npatch_segments;
     D3DLIGHT9 lights[D9_MAX_LIGHTS];
     BOOL light_set[D9_MAX_LIGHTS];
     BOOL light_enabled[D9_MAX_LIGHTS];
@@ -2049,6 +2056,13 @@ static BOOL supported_depth_stencil_format(D3DFORMAT format)
 
 static BOOL supported_volume_texture_format(D3DFORMAT format);
 static BOOL emit_generate_mips(D9Device *device, uint32_t resource_handle);
+/* N-patch tessellation, defined with the other higher-order primitive code far
+ * below but reached from the draw path above it. Returns D3DERR_INVALIDCALL for
+ * a draw it cannot tessellate, which the callers treat as "draw it flat"
+ * rather than as a failure: a mesh without normals should still appear. */
+static HRESULT d9_draw_npatch(IDirect3DDevice9 *iface, D9Device *device,
+        D3DPRIMITIVETYPE primitive_type, UINT primitive_count,
+        const void *indices, UINT index_size, UINT base_vertex);
 /*
  * IDirect3DBaseTexture9::SetLOD. D3D9 defines it as a no-op on anything but a
  * MANAGED texture, so the three callers below apply it under the same
@@ -3308,7 +3322,23 @@ static void fill_caps(D3DCAPS9 *caps)
              * draws through the DrawPrimitives2 DDI.  Some engines read their
              * absence as "this is a DX7-era driver" and take a legacy path. */
             | D3DDEVCAPS_DRAWPRIMITIVES2
-            | D3DDEVCAPS_DRAWPRIMITIVES2EX;
+            | D3DDEVCAPS_DRAWPRIMITIVES2EX
+            /* Higher-order primitives. WebGPU has no tessellation stage, so
+             * DrawRectPatch/DrawTriPatch evaluate the surface in the guest and
+             * draw the result as an ordinary indexed triangle list -- which is
+             * why nothing about them reaches the protocol.
+             *
+             * HANDLEZERO and not the caching form: nothing here keeps a
+             * tessellated patch between calls, so every call must carry its own
+             * D3DRECTPATCH_INFO/D3DTRIPATCH_INFO. QUINTICRTPATCHES stays absent
+             * because only LINEAR/QUADRATIC/CUBIC are evaluated. */
+            | D3DDEVCAPS_RTPATCHES
+            | D3DDEVCAPS_RTPATCHHANDLEZERO
+            /* N-patches: SetNPatchMode above 1 makes every following triangle
+             * draw a PN triangle, evaluated in the guest and drawn as an
+             * ordinary indexed list. D3DRS_POSITIONDEGREE and
+             * D3DRS_NORMALDEGREE are both honoured. */
+            | D3DDEVCAPS_NPATCHES;
     caps->PrimitiveMiscCaps = D3DPMISCCAPS_CULLNONE
             | D3DPMISCCAPS_CULLCW | D3DPMISCCAPS_CULLCCW
             | D3DPMISCCAPS_COLORWRITEENABLE | D3DPMISCCAPS_BLENDOP
@@ -3553,6 +3583,10 @@ static void fill_caps(D3DCAPS9 *caps)
      * happens to share the D3DVERTEXBLENDFLAGS enum. */
     caps->MaxVertexBlendMatrices = 4;
     caps->MaxVertexBlendMatrixIndex = 255;
+    /* The tessellation ceiling d9_draw_npatch() clamps to. It bounds the
+     * scratch each draw allocates; 16-bit output indices bound it further for
+     * a large mesh, and a draw that would overflow them is left flat. */
+    caps->MaxNpatchTessellationLevel = (float)D9_PATCH_MAX_SEGMENTS;
     apply_permissive_caps(caps);
     /* Render targets and MRT: the host binds up to four colour attachments and
      * a translated pixel shader's oC0..oC3 reach them (M4 work brought forward
@@ -4282,8 +4316,13 @@ static HRESULT WINAPI d3d_check_device_format(IDirect3D9 *iface,
          * blitting each level from the one above whenever level 0 changes.
          * Volume textures are the exception, and D3D9 does not support
          * automatic generation for those either. */
+        /* D3DUSAGE_DMAP stays unimplemented: displacement mapping samples a
+         * texture *during* tessellation, and nothing here can. D3DUSAGE_
+         * NPATCHES is gone from this list -- N-patch tessellation is
+         * implemented, and a buffer created with the usage is otherwise an
+         * ordinary vertex buffer. */
         const DWORD unimplemented = D3DUSAGE_QUERY_LEGACYBUMPMAP
-                | D3DUSAGE_DMAP | D3DUSAGE_NPATCHES
+                | D3DUSAGE_DMAP
                 | ((resource_type == D3DRTYPE_VOLUMETEXTURE)
                     ? D3DUSAGE_AUTOGENMIPMAP : 0u);
         const DWORD creation_usage = usage
@@ -6002,6 +6041,21 @@ static HRESULT WINAPI device_set_render_state(IDirect3DDevice9 *iface,
     state_block_record_render_state(device, (UINT)state);
     if (device->render_states[state] == value)
         return D3D_OK;
+    /*
+     * Adaptive tessellation is the one part of the higher-order primitive
+     * family with nothing behind it. It is not a refinement of the N-patch
+     * level that could be approximated: D3D9 ties it to displacement mapping,
+     * where the per-edge level comes from sampling D3DDMAPSAMPLER's texture
+     * *during* tessellation, and nothing in a stage-less pipeline can sample a
+     * texture there. Setting it therefore changes nothing, and a title that
+     * enables it and sees no extra detail deserves to be told why rather than
+     * left to wonder whether its meshes are wrong.
+     */
+    if (state == D3DRS_ENABLEADAPTIVETESSELLATION && value)
+        HOSTLOG_REFUSED("D3DRS_ENABLEADAPTIVETESSELLATION is not implemented: "
+                "its per-edge level comes from sampling D3DDMAPSAMPLER during "
+                "tessellation, which has no equivalent here. N-patches still "
+                "tessellate at the SetNPatchMode level");
     device->render_states[state] = value;
     command.device_handle = device->handle;
     command.state = state;
@@ -6247,18 +6301,29 @@ static WINBOOL WINAPI device_get_software_vertex_processing(
  * Setting it back to 0.0 -- "no tessellation" -- is what every title does on
  * shutdown and is always honoured.
  */
+/*
+ * N-patch (PN triangle) tessellation. Every subsequent draw has each of its
+ * triangles replaced by a cubic Bezier triangle built from the three vertices'
+ * positions and normals -- Vlachos et al.'s construction, which is what
+ * D3DRS_POSITIONDEGREE/NORMALDEGREE's defaults describe.
+ *
+ * Like the RT patches, it is evaluated in the guest and drawn as an ordinary
+ * indexed triangle list, so nothing about it reaches the protocol. Unlike them
+ * it sits on the draw path, which is why the whole thing is gated on a level
+ * above 1.0: at the default it costs one float comparison per draw.
+ */
 static HRESULT WINAPI device_set_npatch_mode(IDirect3DDevice9 *iface,
         float segments)
 {
-    (void)iface;
-    if (segments <= 1.0f)
-        return D3D_OK;
-    UNSUPPORTED("Device.SetNPatchMode");
-    return TRACE_REFUSE(D3DERR_INVALIDCALL);
+    D9Device *device = device_from_iface(iface);
+    if (segments > (float)D9_PATCH_MAX_SEGMENTS)
+        segments = (float)D9_PATCH_MAX_SEGMENTS;
+    device->npatch_segments = segments > 1.0f ? segments : 0.0f;
+    return D3D_OK;
 }
 
 static float WINAPI device_get_npatch_mode(IDirect3DDevice9 *iface)
-{ (void)iface; return 0.0f; }
+{ return device_from_iface(iface)->npatch_segments; }
 
 /* ---- IDirect3DDevice9: resources, streams, draws ---- */
 
@@ -6715,6 +6780,15 @@ static HRESULT WINAPI device_draw_primitive(IDirect3DDevice9 *iface,
         TRACE_FRAME_REJECT();
         return D3DERR_INVALIDCALL;
     }
+    if (device->npatch_segments > 1.0f) {
+        HRESULT tessellated = d9_draw_npatch(iface, device, primitive_type,
+                primitive_count, NULL, 0, start_vertex);
+        if (SUCCEEDED(tessellated))
+            return tessellated;
+        /* Not tessellatable -- no normals, a shader bound, too many output
+         * vertices for 16-bit indices. Fall through and draw it flat, which is
+         * what the mesh looked like before N-patches were switched on. */
+    }
     /* Vertices addressable by this draw start after the stream's
      * OffsetInBytes, not at the start of the buffer. */
     available_vertices = (device->streams[0].buffer->length
@@ -6763,6 +6837,16 @@ static HRESULT WINAPI device_draw_indexed_primitive(IDirect3DDevice9 *iface,
             || index_count > available_indices - start_index) {
         TRACE_FRAME_REJECT();
         return D3DERR_INVALIDCALL;
+    }
+    if (device->npatch_segments > 1.0f && base_vertex_index >= 0) {
+        HRESULT tessellated = d9_draw_npatch(iface, device, primitive_type,
+                primitive_count,
+                device->index_buffer->shadow + start_index * index_size,
+                index_size, (UINT)base_vertex_index);
+        if (SUCCEEDED(tessellated))
+            return tessellated;
+        /* See the note in device_draw_primitive: falling through draws the
+         * mesh flat rather than dropping it. */
     }
     /* Vertices addressable by this draw start after the stream's
      * OffsetInBytes, not at the start of the buffer. */
@@ -9709,15 +9793,954 @@ static HRESULT WINAPI device_get_stream_source_freq(IDirect3DDevice9 *iface,
     *divider = device->streams[stream].frequency;
     return D3D_OK;
 }
-DEV_STUB(draw_rect_patch, UINT handle, const float *segments,
-        const D3DRECTPATCH_INFO *info)
-{ (void)iface; (void)handle; (void)segments; (void)info;
-  UNSUPPORTED("Device.DrawRectPatch/DrawTriPatch"); return D3DERR_INVALIDCALL; }
-DEV_STUB(draw_tri_patch, UINT handle, const float *segments,
-        const D3DTRIPATCH_INFO *info)
-{ (void)iface; (void)handle; (void)segments; (void)info;
-  UNSUPPORTED("Device.DrawRectPatch/DrawTriPatch"); return D3DERR_INVALIDCALL; }
-DEV_STUB(delete_patch, UINT handle)
+/*
+ * ---- Higher-order primitives: rectangular and triangular patches ----
+ *
+ * WebGPU has no tessellation stage, so the surface is evaluated here and the
+ * result is drawn as an ordinary indexed triangle list through
+ * DrawIndexedPrimitiveUP. That needs no protocol opcode and no host change at
+ * all: by the time anything crosses the wire it is plain geometry.
+ *
+ * Evaluating on the CPU is not a workaround for the missing stage so much as
+ * the only place the work can happen with the right inputs -- the control
+ * points live in a guest vertex buffer this DLL already shadows, and the
+ * tessellation factor is a per-call argument rather than pipeline state.
+ *
+ * Scope, with every limit refused by name rather than approximated:
+ *
+ *   - D3DBASIS_BEZIER only. B-spline and Catmull-Rom bases have different
+ *     control-point semantics; substituting Bezier for either draws a surface
+ *     that is smooth, plausible and in the wrong place.
+ *   - Degree up to cubic, which is what D3DDEVCAPS_RTPATCHES without
+ *     D3DDEVCAPS_QUINTICRTPATCHES promises.
+ *   - One patch per call: Width/Height are exactly Degree+1 control points.
+ *   - Vertex components are FLOAT1..4 and D3DCOLOR. A packed or half-float
+ *     component would be silently mis-decoded, which is geometry that is wrong
+ *     rather than missing.
+ */
+#define D9_PATCH_MAX_CONTROL_POINTS 16u
+#define D9_PATCH_MAX_COMPONENTS 64u
+
+/* Integer power. This DLL links no C runtime, so there is no powf -- and the
+ * exponents here are bounded by the patch degree, which makes a loop both
+ * exact and shorter than any series would be. */
+static float d9_powi(float base, UINT exponent)
+{
+    float result = 1.0f;
+    while (exponent--) result *= base;
+    return result;
+}
+
+/* The trinomial coefficient degree! / (i! j! k!) for a triangular Bernstein
+ * basis. Degree is at most cubic here, so the factorials are a four-entry
+ * table rather than a computation. */
+static float d9_trinomial(UINT degree, UINT i, UINT j, UINT k)
+{
+    static const float factorial[6] = { 1.0f, 1.0f, 2.0f, 6.0f, 24.0f, 120.0f };
+    if (degree > 5 || i > 5 || j > 5 || k > 5) return 0.0f;
+    return factorial[degree] / (factorial[i] * factorial[j] * factorial[k]);
+}
+
+/* Bernstein basis of the given degree at t, into out[0..degree]. */
+static void d9_bernstein(UINT degree, float t, float *out)
+{
+    float s = 1.0f - t;
+    switch (degree) {
+    case 1:
+        out[0] = s;
+        out[1] = t;
+        break;
+    case 2:
+        out[0] = s * s;
+        out[1] = 2.0f * s * t;
+        out[2] = t * t;
+        break;
+    default: /* cubic */
+        out[0] = s * s * s;
+        out[1] = 3.0f * s * s * t;
+        out[2] = 3.0f * s * t * t;
+        out[3] = t * t * t;
+        break;
+    }
+}
+
+/*
+ * A vertex decoded into plain floats, and the inverse. Interpolating a packed
+ * D3DCOLOR as if it were a float is the classic way to turn a patch's vertex
+ * colours into noise, so colours are unpacked to four floats, interpolated as
+ * colours, and repacked.
+ */
+typedef struct D9PatchFormat {
+    UINT element_count;
+    UINT stride;
+    UINT component_count;
+    /* Indices into the decoded float vector, or -1. N-patch tessellation needs
+     * both: PN triangles are built from positions and normals and from nothing
+     * else. */
+    int position_component;
+    int normal_component;
+    struct {
+        UINT offset;
+        UINT components;   /* floats this element contributes */
+        BOOL packed_color;
+    } elements[D3DMAXDECLLENGTH];
+} D9PatchFormat;
+
+static BOOL d9_patch_format(D9Device *device, D9PatchFormat *format)
+{
+    D9WGVertexElement elements[D3DMAXDECLLENGTH];
+    UINT count = 0;
+    UINT index;
+
+    ZeroMemory(format, sizeof(*format));
+    format->position_component = -1;
+    format->normal_component = -1;
+    if (device->vertex_declaration) {
+        const D9VertexDeclaration *decl = device->vertex_declaration;
+        if (decl->element_count > D3DMAXDECLLENGTH)
+            return FALSE;
+        for (index = 0; index < decl->element_count; ++index) {
+            elements[index].stream = (uint16_t)decl->elements[index].Stream;
+            elements[index].offset = (uint16_t)decl->elements[index].Offset;
+            elements[index].type = (uint8_t)decl->elements[index].Type;
+            elements[index].method = (uint8_t)decl->elements[index].Method;
+            elements[index].usage = (uint8_t)decl->elements[index].Usage;
+            elements[index].usage_index =
+                    (uint8_t)decl->elements[index].UsageIndex;
+        }
+        count = decl->element_count;
+    } else if (device->fvf) {
+        if (!fvf_to_declaration(device->fvf, elements, &count))
+            return FALSE;
+    } else {
+        return FALSE;
+    }
+
+    for (index = 0; index < count; ++index) {
+        const D9WGVertexElement *e = &elements[index];
+        UINT bytes = d9_decl_type_bytes(e->type);
+        UINT components;
+        BOOL packed_color = FALSE;
+        UINT end;
+
+        if (e->stream != 0 || !bytes || e->method != D3DDECLMETHOD_DEFAULT)
+            return FALSE;
+        if (e->type == D3DDECLTYPE_D3DCOLOR) {
+            components = 4;
+            packed_color = TRUE;
+        } else if (!d9_decl_type_float_count(e->type, &components)) {
+            return FALSE;
+        }
+        if (format->component_count + components > D9_PATCH_MAX_COMPONENTS)
+            return FALSE;
+        if (e->usage == D3DDECLUSAGE_POSITION && !e->usage_index
+                && components >= 3)
+            format->position_component = (int)format->component_count;
+        else if (e->usage == D3DDECLUSAGE_NORMAL && !e->usage_index
+                && components >= 3)
+            format->normal_component = (int)format->component_count;
+        format->elements[format->element_count].offset = e->offset;
+        format->elements[format->element_count].components = components;
+        format->elements[format->element_count].packed_color = packed_color;
+        ++format->element_count;
+        format->component_count += components;
+        end = (UINT)e->offset + bytes;
+        if (end > format->stride) format->stride = end;
+    }
+    return format->element_count > 0;
+}
+
+static void d9_patch_decode(const D9PatchFormat *format, const BYTE *vertex,
+        float *out)
+{
+    UINT index;
+    UINT cursor = 0;
+    for (index = 0; index < format->element_count; ++index) {
+        const BYTE *field = vertex + format->elements[index].offset;
+        if (format->elements[index].packed_color) {
+            DWORD color = *(const DWORD *)field;
+            out[cursor++] = ((color >> 16) & 0xffu) / 255.0f;
+            out[cursor++] = ((color >> 8) & 0xffu) / 255.0f;
+            out[cursor++] = (color & 0xffu) / 255.0f;
+            out[cursor++] = ((color >> 24) & 0xffu) / 255.0f;
+        } else {
+            UINT component;
+            for (component = 0; component < format->elements[index].components;
+                    ++component)
+                out[cursor++] = ((const float *)field)[component];
+        }
+    }
+}
+
+static void d9_patch_encode(const D9PatchFormat *format, const float *in,
+        BYTE *vertex)
+{
+    UINT index;
+    UINT cursor = 0;
+    for (index = 0; index < format->element_count; ++index) {
+        BYTE *field = vertex + format->elements[index].offset;
+        if (format->elements[index].packed_color) {
+            float rgba[4];
+            rgba[0] = in[cursor];
+            rgba[1] = in[cursor + 1];
+            rgba[2] = in[cursor + 2];
+            rgba[3] = in[cursor + 3];
+            cursor += 4;
+            *(DWORD *)field = d9_pack_color(rgba);
+        } else {
+            UINT component;
+            for (component = 0; component < format->elements[index].components;
+                    ++component)
+                ((float *)field)[component] = in[cursor++];
+        }
+    }
+}
+
+/* The uniform segment count this patch is tessellated at. D3D9 allows a
+ * different count per edge; a uniform grid at the largest of them keeps the
+ * shared edges of adjacent patches watertight, which differing counts would
+ * only achieve with a stitching step nothing here does. */
+static UINT d9_patch_segments(const float *segments, UINT count)
+{
+    UINT result = 1;
+    UINT index;
+    for (index = 0; index < count; ++index) {
+        float value = segments ? segments[index] : 1.0f;
+        UINT rounded;
+        if (!(value > 1.0f)) continue;
+        rounded = (UINT)(value + 0.5f);
+        if (rounded > result) result = rounded;
+    }
+    if (result > D9_PATCH_MAX_SEGMENTS) result = D9_PATCH_MAX_SEGMENTS;
+    return result;
+}
+
+static BOOL d9_patch_basis_supported(D3DBASISTYPE basis, D3DDEGREETYPE degree,
+        const char *what)
+{
+    if (basis != D3DBASIS_BEZIER) {
+        HOSTLOG_REFUSED("%s refused: only D3DBASIS_BEZIER is implemented; "
+                "basis %lu has different control-point semantics and "
+                "substituting Bezier would draw a plausible surface in the "
+                "wrong place", what, (DWORD)basis);
+        return FALSE;
+    }
+    if (degree != D3DDEGREE_LINEAR && degree != D3DDEGREE_QUADRATIC
+            && degree != D3DDEGREE_CUBIC) {
+        HOSTLOG_REFUSED("%s refused: degree %lu is outside LINEAR/QUADRATIC/"
+                "CUBIC, which is what D3DDEVCAPS_RTPATCHES without "
+                "QUINTICRTPATCHES promises", what, (DWORD)degree);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* The grid -> triangle list index buffer shared by both patch kinds. */
+static void d9_patch_grid_indices(UINT segments, uint16_t *indices)
+{
+    UINT row;
+    UINT column;
+    UINT cursor = 0;
+    const UINT pitch = segments + 1;
+    for (row = 0; row < segments; ++row) {
+        for (column = 0; column < segments; ++column) {
+            uint16_t a = (uint16_t)(row * pitch + column);
+            uint16_t b = (uint16_t)(a + 1);
+            uint16_t c = (uint16_t)(a + pitch);
+            uint16_t d = (uint16_t)(c + 1);
+            indices[cursor++] = a;
+            indices[cursor++] = b;
+            indices[cursor++] = c;
+            indices[cursor++] = c;
+            indices[cursor++] = b;
+            indices[cursor++] = d;
+        }
+    }
+}
+
+/*
+ * ---- N-patches (PN triangles) ----
+ *
+ * Each source triangle becomes a cubic Bezier triangle built from its three
+ * positions and normals -- Vlachos et al.'s construction, which is what
+ * D3DRS_POSITIONDEGREE and D3DRS_NORMALDEGREE select, whose defaults are a
+ * cubic position and a linear normal.
+ * The point of it is that a low-polygon mesh gains curvature without new art:
+ * the control net is derived from the normals the mesh already carries.
+ *
+ * Evaluated here and drawn as an ordinary indexed triangle list, so nothing
+ * about it reaches the protocol. It sits on the draw path, which is why every
+ * entry point gates on npatch_segments being non-zero before doing any work.
+ */
+static void d9_normalize3(float *v)
+{
+    float length = d9_sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (length < 1e-6f) return;
+    v[0] /= length;
+    v[1] /= length;
+    v[2] /= length;
+}
+
+/* Barycentric grid layout: row r holds (level + 1 - r) points. */
+static UINT d9_npatch_row_offset(UINT level, UINT row)
+{
+    /* sum over k < row of (level + 1 - k) */
+    return row * (level + 1) - (row * (row - 1)) / 2;
+}
+
+static UINT d9_npatch_point_count(UINT level)
+{
+    return (level + 1) * (level + 2) / 2;
+}
+
+/*
+ * One source triangle -> `out_vertices` grid vertices and `out_indices`
+ * triangle indices, both appended at the caller's cursor. `corners` holds the
+ * three decoded source vertices.
+ */
+static void d9_npatch_triangle(const D9PatchFormat *format, UINT level,
+        const float *corners, float *scratch, BYTE *out_vertices,
+        uint16_t *out_indices, UINT base_vertex, BOOL cubic_position,
+        BOOL quadratic_normal)
+{
+    const UINT components = format->component_count;
+    const int position = format->position_component;
+    const int normal = format->normal_component;
+    /* b300..b111: the ten cubic control points, positions only. */
+    float b[10][3];
+    float n[6][3];
+    float centre[3];
+    float edge_centre[3];
+    UINT corner;
+    UINT axis;
+    UINT row;
+    UINT column;
+    UINT cursor = 0;
+
+    for (corner = 0; corner < 3; ++corner) {
+        for (axis = 0; axis < 3; ++axis) {
+            b[corner][axis] = corners[corner * components + position + axis];
+            n[corner][axis] = corners[corner * components + normal + axis];
+        }
+        d9_normalize3(n[corner]);
+    }
+    /* Six edge control points: each is the corner pushed a third of the way
+     * along the edge and then projected back onto that corner's tangent plane,
+     * which is the whole trick -- it is what turns a flat edge into one that
+     * respects the normal. */
+    {
+        static const UINT from[6] = { 0, 1, 1, 2, 2, 0 };
+        static const UINT to[6]   = { 1, 0, 2, 1, 0, 2 };
+        UINT edge;
+        for (edge = 0; edge < 6; ++edge) {
+            const UINT i = from[edge];
+            const UINT j = to[edge];
+            float delta[3];
+            float w;
+            for (axis = 0; axis < 3; ++axis)
+                delta[axis] = b[j][axis] - b[i][axis];
+            w = delta[0] * n[i][0] + delta[1] * n[i][1] + delta[2] * n[i][2];
+            for (axis = 0; axis < 3; ++axis) {
+                b[3 + edge][axis] = (2.0f * b[i][axis] + b[j][axis]
+                        - w * n[i][axis]) / 3.0f;
+            }
+        }
+    }
+    /* The interior point: the average of the six edge points, pushed half that
+     * distance further from the corner average again. */
+    for (axis = 0; axis < 3; ++axis) {
+        UINT edge;
+        edge_centre[axis] = 0.0f;
+        for (edge = 0; edge < 6; ++edge)
+            edge_centre[axis] += b[3 + edge][axis];
+        edge_centre[axis] /= 6.0f;
+        centre[axis] = (b[0][axis] + b[1][axis] + b[2][axis]) / 3.0f;
+        b[9][axis] = edge_centre[axis]
+                + (edge_centre[axis] - centre[axis]) * 0.5f;
+    }
+    /* Quadratic normal control points, so shading follows the new surface
+     * rather than staying flat across each source triangle. */
+    {
+        static const UINT pair_i[3] = { 0, 1, 2 };
+        static const UINT pair_j[3] = { 1, 2, 0 };
+        UINT pair;
+        for (pair = 0; pair < 3; ++pair) {
+            const UINT i = pair_i[pair];
+            const UINT j = pair_j[pair];
+            float delta[3];
+            float denominator;
+            float v;
+            for (axis = 0; axis < 3; ++axis)
+                delta[axis] = b[j][axis] - b[i][axis];
+            denominator = delta[0] * delta[0] + delta[1] * delta[1]
+                    + delta[2] * delta[2];
+            v = denominator > 1e-12f
+                    ? 2.0f * ((delta[0] * (n[i][0] + n[j][0])
+                        + delta[1] * (n[i][1] + n[j][1])
+                        + delta[2] * (n[i][2] + n[j][2])) / denominator)
+                    : 0.0f;
+            for (axis = 0; axis < 3; ++axis)
+                n[3 + pair][axis] = n[i][axis] + n[j][axis] - v * delta[axis];
+            d9_normalize3(n[3 + pair]);
+        }
+    }
+
+    for (row = 0; row <= level; ++row) {
+        for (column = 0; column + row <= level; ++column) {
+            const float w = level ? (float)(level - row - column) / (float)level : 1.0f;
+            const float u = level ? (float)column / (float)level : 0.0f;
+            const float v = level ? (float)row / (float)level : 0.0f;
+            float position_out[3];
+            float normal_out[3];
+            UINT component;
+            /* Everything that is not position or normal interpolates
+             * linearly -- D3D9 does the same, and a cubic texture coordinate
+             * would slide the texture across the surface. */
+            for (component = 0; component < components; ++component) {
+                scratch[component] = w * corners[component]
+                        + u * corners[components + component]
+                        + v * corners[2 * components + component];
+            }
+            for (axis = 0; axis < 3; ++axis) {
+                position_out[axis] =
+                        b[0][axis] * w * w * w
+                        + b[1][axis] * u * u * u
+                        + b[2][axis] * v * v * v
+                        + b[3][axis] * 3.0f * w * w * u
+                        + b[4][axis] * 3.0f * w * u * u
+                        + b[5][axis] * 3.0f * u * u * v
+                        + b[6][axis] * 3.0f * u * v * v
+                        + b[7][axis] * 3.0f * v * v * w
+                        + b[8][axis] * 3.0f * v * w * w
+                        + b[9][axis] * 6.0f * w * u * v;
+                normal_out[axis] =
+                        n[0][axis] * w * w + n[1][axis] * u * u
+                        + n[2][axis] * v * v
+                        + n[3][axis] * 2.0f * w * u
+                        + n[4][axis] * 2.0f * u * v
+                        + n[5][axis] * 2.0f * v * w;
+            }
+            d9_normalize3(normal_out);
+            /* D3DRS_POSITIONDEGREE and D3DRS_NORMALDEGREE choose the basis per
+             * channel. Their defaults are cubic position and *linear* normal,
+             * so a title that never sets them gets curved geometry with the
+             * normals it already had -- which is what D3D9 gives it, and
+             * quietly upgrading the normal would change lighting the app never
+             * asked to change. The linear form is already in `scratch` from
+             * the interpolation above, so this only overwrites what was
+             * asked for. */
+            for (axis = 0; axis < 3; ++axis) {
+                if (cubic_position)
+                    scratch[position + axis] = position_out[axis];
+                if (quadratic_normal)
+                    scratch[normal + axis] = normal_out[axis];
+            }
+            d9_patch_encode(format, scratch,
+                    out_vertices + cursor * format->stride);
+            ++cursor;
+        }
+    }
+
+    cursor = 0;
+    for (row = 0; row < level; ++row) {
+        const UINT here = d9_npatch_row_offset(level, row);
+        const UINT next = d9_npatch_row_offset(level, row + 1);
+        for (column = 0; column + row < level; ++column) {
+            out_indices[cursor++] = (uint16_t)(base_vertex + here + column);
+            out_indices[cursor++] = (uint16_t)(base_vertex + here + column + 1);
+            out_indices[cursor++] = (uint16_t)(base_vertex + next + column);
+            if (column + row + 1 < level) {
+                out_indices[cursor++] =
+                        (uint16_t)(base_vertex + here + column + 1);
+                out_indices[cursor++] =
+                        (uint16_t)(base_vertex + next + column + 1);
+                out_indices[cursor++] = (uint16_t)(base_vertex + next + column);
+            }
+        }
+    }
+}
+
+/*
+ * Replace one draw's triangles with their tessellated forms.
+ *
+ * `read_index` yields the source vertex index for the n-th triangle corner,
+ * which is what lets the indexed and non-indexed paths share this. Returning
+ * D3DERR_INVALIDCALL means "this draw cannot be tessellated"; the callers then
+ * fall back to drawing it untessellated, which is the right failure: a mesh
+ * missing normals should still appear, just flat.
+ */
+static UINT d9_npatch_source_index(const void *indices, UINT index_size,
+        UINT position, UINT base_vertex)
+{
+    if (!indices) return base_vertex + position;
+    if (index_size == 2)
+        return base_vertex + ((const uint16_t *)indices)[position];
+    return base_vertex + ((const uint32_t *)indices)[position];
+}
+
+static HRESULT d9_draw_npatch(IDirect3DDevice9 *iface, D9Device *device,
+        D3DPRIMITIVETYPE primitive_type, UINT primitive_count,
+        const void *indices, UINT index_size, UINT base_vertex)
+{
+    D9PatchFormat format;
+    D9VertexBuffer *source = device->streams[0].buffer;
+    const UINT stream_stride = device->streams[0].stride;
+    UINT level;
+    UINT per_triangle_points;
+    UINT per_triangle_indices;
+    UINT total_points;
+    UINT total_indices;
+    BYTE *vertices;
+    uint16_t *out_indices;
+    float *corners;
+    float *scratch;
+    UINT triangle;
+    BOOL cubic_position;
+    BOOL quadratic_normal;
+    HRESULT result;
+
+    if (primitive_type != D3DPT_TRIANGLELIST
+            && primitive_type != D3DPT_TRIANGLESTRIP
+            && primitive_type != D3DPT_TRIANGLEFAN)
+        return D3DERR_INVALIDCALL;
+    if (!source || !stream_stride || device->vertex_shader
+            || !d9_patch_format(device, &format)
+            || format.position_component < 0 || format.normal_component < 0
+            || stream_stride < format.stride)
+        return D3DERR_INVALIDCALL;
+
+    cubic_position = (device->render_states[D3DRS_POSITIONDEGREE]
+            ? device->render_states[D3DRS_POSITIONDEGREE]
+            : (DWORD)D3DDEGREE_CUBIC) != (DWORD)D3DDEGREE_LINEAR;
+    quadratic_normal = (device->render_states[D3DRS_NORMALDEGREE]
+            ? device->render_states[D3DRS_NORMALDEGREE]
+            : (DWORD)D3DDEGREE_LINEAR) != (DWORD)D3DDEGREE_LINEAR;
+    /* Both channels linear is the identity: tessellating would multiply the
+     * triangle count for a surface identical to the flat one. */
+    if (!cubic_position && !quadratic_normal)
+        return D3DERR_INVALIDCALL;
+    level = (UINT)(device->npatch_segments + 0.5f);
+    if (level < 1) level = 1;
+    if (level > D9_PATCH_MAX_SEGMENTS) level = D9_PATCH_MAX_SEGMENTS;
+    per_triangle_points = d9_npatch_point_count(level);
+    per_triangle_indices = level * level * 3u;
+    /* uint16 indices bound the whole draw, so a mesh that would overflow them
+     * is left untessellated rather than drawn with wrapped indices. */
+    if (!multiply_u32(primitive_count, per_triangle_points, &total_points)
+            || total_points > 0xFFFFu
+            || !multiply_u32(primitive_count, per_triangle_indices,
+                    &total_indices))
+        return D3DERR_INVALIDCALL;
+
+    vertices = (BYTE *)HeapAlloc(GetProcessHeap(), 0,
+            total_points * format.stride);
+    out_indices = (uint16_t *)HeapAlloc(GetProcessHeap(), 0,
+            total_indices * sizeof(uint16_t));
+    corners = (float *)HeapAlloc(GetProcessHeap(), 0,
+            3 * format.component_count * sizeof(float));
+    scratch = (float *)HeapAlloc(GetProcessHeap(), 0,
+            format.component_count * sizeof(float));
+    if (!vertices || !out_indices || !corners || !scratch) {
+        if (vertices) HeapFree(GetProcessHeap(), 0, vertices);
+        if (out_indices) HeapFree(GetProcessHeap(), 0, out_indices);
+        if (corners) HeapFree(GetProcessHeap(), 0, corners);
+        if (scratch) HeapFree(GetProcessHeap(), 0, scratch);
+        return E_OUTOFMEMORY;
+    }
+
+    for (triangle = 0; triangle < primitive_count; ++triangle) {
+        UINT corner;
+        UINT source_index[3];
+        /* Strips alternate winding and fans pivot on vertex 0; unrolling here
+         * is what lets the tessellator only ever see independent triangles. */
+        if (primitive_type == D3DPT_TRIANGLELIST) {
+            source_index[0] = triangle * 3;
+            source_index[1] = triangle * 3 + 1;
+            source_index[2] = triangle * 3 + 2;
+        } else if (primitive_type == D3DPT_TRIANGLESTRIP) {
+            source_index[0] = triangle;
+            source_index[1] = triangle + (triangle & 1 ? 2 : 1);
+            source_index[2] = triangle + (triangle & 1 ? 1 : 2);
+        } else {
+            source_index[0] = 0;
+            source_index[1] = triangle + 1;
+            source_index[2] = triangle + 2;
+        }
+        for (corner = 0; corner < 3; ++corner) {
+            UINT vertex = d9_npatch_source_index(indices, index_size,
+                    source_index[corner], base_vertex);
+            UINT byte_offset;
+            /* Vertices addressable by this draw start after the stream's
+             * OffsetInBytes, not at the start of the buffer. */
+            if (!multiply_u32(vertex, stream_stride, &byte_offset)
+                    || byte_offset > 0xFFFFFFFFu - device->streams[0].offset
+                    || (byte_offset += device->streams[0].offset,
+                        byte_offset + format.stride > source->length)) {
+                HeapFree(GetProcessHeap(), 0, vertices);
+                HeapFree(GetProcessHeap(), 0, out_indices);
+                HeapFree(GetProcessHeap(), 0, corners);
+                HeapFree(GetProcessHeap(), 0, scratch);
+                return D3DERR_INVALIDCALL;
+            }
+            d9_patch_decode(&format, source->shadow + byte_offset,
+                    corners + corner * format.component_count);
+        }
+        d9_npatch_triangle(&format, level, corners, scratch,
+                vertices + triangle * per_triangle_points * format.stride,
+                out_indices + triangle * per_triangle_indices,
+                triangle * per_triangle_points, cubic_position,
+                quadratic_normal);
+    }
+
+    result = device_draw_indexed_primitive_up(iface, D3DPT_TRIANGLELIST, 0,
+            total_points, total_indices / 3u, out_indices, D3DFMT_INDEX16,
+            vertices, format.stride);
+    HeapFree(GetProcessHeap(), 0, vertices);
+    HeapFree(GetProcessHeap(), 0, out_indices);
+    HeapFree(GetProcessHeap(), 0, corners);
+    HeapFree(GetProcessHeap(), 0, scratch);
+    return result;
+}
+
+static HRESULT WINAPI device_draw_rect_patch(IDirect3DDevice9 *iface,
+        UINT handle, const float *segments, const D3DRECTPATCH_INFO *info)
+{
+    D9Device *device = device_from_iface(iface);
+    D9PatchFormat format;
+    D9VertexBuffer *source;
+    UINT source_stride;
+    UINT segment_count;
+    UINT grid;
+    UINT degree_u;
+    UINT degree_v;
+    BYTE *vertices;
+    uint16_t *indices;
+    float *control;
+    float *accumulator;
+    UINT row;
+    UINT column;
+    UINT index;
+    HRESULT result;
+
+    TRACE_MARK_ENTER("Device.DrawRectPatch");
+    /* A cached patch handle would let a later call redraw with no info; this
+     * profile advertises D3DDEVCAPS_RTPATCHHANDLEZERO only, so every call has
+     * to carry its own description. */
+    if (!info) {
+        HOSTLOG_REFUSED("DrawRectPatch refused: this profile advertises "
+                "D3DDEVCAPS_RTPATCHHANDLEZERO only, so a cached patch handle "
+                "cannot be redrawn without its D3DRECTPATCH_INFO");
+        TRACE_MARK_EXIT("Device.DrawRectPatch", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    (void)handle;
+    if (!d9_patch_basis_supported(info->Basis, info->Degree, "DrawRectPatch")) {
+        TRACE_MARK_EXIT("Device.DrawRectPatch", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    degree_u = (UINT)info->Degree;
+    degree_v = (UINT)info->Degree;
+    if (info->Width != degree_u + 1 || info->Height != degree_v + 1) {
+        HOSTLOG_REFUSED("DrawRectPatch refused: %lux%lu control points is more "
+                "than the single patch this implementation evaluates "
+                "(%lux%lu for degree %lu)", info->Width, info->Height,
+                degree_u + 1, degree_v + 1, (DWORD)info->Degree);
+        TRACE_MARK_EXIT("Device.DrawRectPatch", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    source = device->streams[0].buffer;
+    source_stride = device->streams[0].stride;
+    if (!source || !source_stride || device->vertex_shader
+            || !d9_patch_format(device, &format)
+            || source_stride < format.stride) {
+        HOSTLOG_REFUSED("DrawRectPatch refused: stream 0 must hold the control "
+                "points under a fixed-function declaration this path can "
+                "decode");
+        TRACE_MARK_EXIT("Device.DrawRectPatch", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    segment_count = d9_patch_segments(segments, 4);
+    grid = segment_count + 1;
+
+    {
+        UINT vertex_bytes;
+        UINT index_bytes;
+        UINT control_bytes;
+        if (!multiply_u32(grid * grid, format.stride, &vertex_bytes)
+                || !multiply_u32(segment_count * segment_count * 6u,
+                        sizeof(uint16_t), &index_bytes)
+                || !multiply_u32(info->Width * info->Height,
+                        format.component_count * sizeof(float),
+                        &control_bytes)) {
+            TRACE_MARK_EXIT("Device.DrawRectPatch", D3DERR_INVALIDCALL, NULL);
+            return D3DERR_INVALIDCALL;
+        }
+        vertices = (BYTE *)HeapAlloc(GetProcessHeap(), 0, vertex_bytes);
+        indices = (uint16_t *)HeapAlloc(GetProcessHeap(), 0, index_bytes);
+        control = (float *)HeapAlloc(GetProcessHeap(), 0, control_bytes);
+        accumulator = (float *)HeapAlloc(GetProcessHeap(), 0,
+                format.component_count * sizeof(float));
+        if (!vertices || !indices || !control || !accumulator) {
+            if (vertices) HeapFree(GetProcessHeap(), 0, vertices);
+            if (indices) HeapFree(GetProcessHeap(), 0, indices);
+            if (control) HeapFree(GetProcessHeap(), 0, control);
+            if (accumulator) HeapFree(GetProcessHeap(), 0, accumulator);
+            TRACE_MARK_EXIT("Device.DrawRectPatch", E_OUTOFMEMORY, NULL);
+            return E_OUTOFMEMORY;
+        }
+    }
+
+    /* Decode the control net once. `Stride` is in vertices per row of the
+     * source buffer, which is how D3D9 lets a patch be a window onto a larger
+     * grid of control points. */
+    for (row = 0; row < info->Height; ++row) {
+        for (column = 0; column < info->Width; ++column) {
+            UINT vertex = (info->StartVertexOffsetHeight + row) * info->Stride
+                    + info->StartVertexOffsetWidth + column;
+            UINT byte_offset;
+            if (!multiply_u32(vertex, source_stride, &byte_offset)
+                    || byte_offset > 0xFFFFFFFFu - device->streams[0].offset
+                    || (byte_offset += device->streams[0].offset,
+                        byte_offset + format.stride > source->length)) {
+                HeapFree(GetProcessHeap(), 0, vertices);
+                HeapFree(GetProcessHeap(), 0, indices);
+                HeapFree(GetProcessHeap(), 0, control);
+                HeapFree(GetProcessHeap(), 0, accumulator);
+                TRACE_MARK_EXIT("Device.DrawRectPatch", D3DERR_INVALIDCALL,
+                        NULL);
+                return D3DERR_INVALIDCALL;
+            }
+            d9_patch_decode(&format, source->shadow + byte_offset,
+                    control + (row * info->Width + column)
+                            * format.component_count);
+        }
+    }
+
+    for (row = 0; row < grid; ++row) {
+        float basis_v[4];
+        float v = segment_count ? (float)row / (float)segment_count : 0.0f;
+        d9_bernstein(degree_v, v, basis_v);
+        for (column = 0; column < grid; ++column) {
+            float basis_u[4];
+            float u = segment_count
+                    ? (float)column / (float)segment_count : 0.0f;
+            UINT i;
+            UINT j;
+            d9_bernstein(degree_u, u, basis_u);
+            for (i = 0; i < format.component_count; ++i)
+                accumulator[i] = 0.0f;
+            for (j = 0; j <= degree_v; ++j) {
+                for (i = 0; i <= degree_u; ++i) {
+                    float weight = basis_u[i] * basis_v[j];
+                    const float *point = control
+                            + (j * info->Width + i) * format.component_count;
+                    UINT c;
+                    for (c = 0; c < format.component_count; ++c)
+                        accumulator[c] += weight * point[c];
+                }
+            }
+            d9_patch_encode(&format, accumulator,
+                    vertices + (row * grid + column) * format.stride);
+        }
+    }
+
+    d9_patch_grid_indices(segment_count, indices);
+    index = segment_count * segment_count * 2u;
+    result = device_draw_indexed_primitive_up(iface, D3DPT_TRIANGLELIST, 0,
+            grid * grid, index, indices, D3DFMT_INDEX16, vertices,
+            format.stride);
+
+    HeapFree(GetProcessHeap(), 0, vertices);
+    HeapFree(GetProcessHeap(), 0, indices);
+    HeapFree(GetProcessHeap(), 0, control);
+    HeapFree(GetProcessHeap(), 0, accumulator);
+    TRACE("%s DrawRectPatch device=%08lX segments=%lu triangles=%lu",
+            SUCCEEDED(result) ? "OK" : "FAIL", device->handle, segment_count,
+            index);
+    TRACE_MARK_EXIT("Device.DrawRectPatch", result, NULL);
+    return result;
+}
+
+/*
+ * A triangular Bezier patch. Its control net is the triangular array of
+ * (Degree+1)(Degree+2)/2 points D3D9 lays out row by row, and the surface is
+ * the Bernstein sum over barycentric coordinates.
+ *
+ * The result is still evaluated onto a square grid and drawn as a triangle
+ * list, with the barycentric pair clamped inside the triangle: that keeps one
+ * index-buffer builder for both patch kinds, at the cost of the degenerate
+ * triangles along the folded edge, which have zero area and rasterise to
+ * nothing.
+ */
+static HRESULT WINAPI device_draw_tri_patch(IDirect3DDevice9 *iface,
+        UINT handle, const float *segments, const D3DTRIPATCH_INFO *info)
+{
+    D9Device *device = device_from_iface(iface);
+    D9PatchFormat format;
+    D9VertexBuffer *source;
+    UINT source_stride;
+    UINT segment_count;
+    UINT grid;
+    UINT degree;
+    UINT expected_points;
+    BYTE *vertices;
+    uint16_t *indices;
+    float *control;
+    float *accumulator;
+    UINT row;
+    UINT column;
+    UINT triangles;
+    HRESULT result;
+
+    TRACE_MARK_ENTER("Device.DrawTriPatch");
+    if (!info) {
+        HOSTLOG_REFUSED("DrawTriPatch refused: this profile advertises "
+                "D3DDEVCAPS_RTPATCHHANDLEZERO only, so a cached patch handle "
+                "cannot be redrawn without its D3DTRIPATCH_INFO");
+        TRACE_MARK_EXIT("Device.DrawTriPatch", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    (void)handle;
+    if (!d9_patch_basis_supported(info->Basis, info->Degree, "DrawTriPatch")) {
+        TRACE_MARK_EXIT("Device.DrawTriPatch", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    degree = (UINT)info->Degree;
+    expected_points = (degree + 1) * (degree + 2) / 2;
+    if (info->NumVertices != expected_points) {
+        HOSTLOG_REFUSED("DrawTriPatch refused: degree %lu needs %lu control "
+                "points and %lu were given", (DWORD)info->Degree,
+                expected_points, info->NumVertices);
+        TRACE_MARK_EXIT("Device.DrawTriPatch", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    source = device->streams[0].buffer;
+    source_stride = device->streams[0].stride;
+    if (!source || !source_stride || device->vertex_shader
+            || !d9_patch_format(device, &format)
+            || source_stride < format.stride) {
+        HOSTLOG_REFUSED("DrawTriPatch refused: stream 0 must hold the control "
+                "points under a fixed-function declaration this path can "
+                "decode");
+        TRACE_MARK_EXIT("Device.DrawTriPatch", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    segment_count = d9_patch_segments(segments, 3);
+    grid = segment_count + 1;
+
+    {
+        UINT vertex_bytes;
+        UINT index_bytes;
+        UINT control_bytes;
+        if (!multiply_u32(grid * grid, format.stride, &vertex_bytes)
+                || !multiply_u32(segment_count * segment_count * 6u,
+                        sizeof(uint16_t), &index_bytes)
+                || !multiply_u32(expected_points,
+                        format.component_count * sizeof(float),
+                        &control_bytes)) {
+            TRACE_MARK_EXIT("Device.DrawTriPatch", D3DERR_INVALIDCALL, NULL);
+            return D3DERR_INVALIDCALL;
+        }
+        vertices = (BYTE *)HeapAlloc(GetProcessHeap(), 0, vertex_bytes);
+        indices = (uint16_t *)HeapAlloc(GetProcessHeap(), 0, index_bytes);
+        control = (float *)HeapAlloc(GetProcessHeap(), 0, control_bytes);
+        accumulator = (float *)HeapAlloc(GetProcessHeap(), 0,
+                format.component_count * sizeof(float));
+        if (!vertices || !indices || !control || !accumulator) {
+            if (vertices) HeapFree(GetProcessHeap(), 0, vertices);
+            if (indices) HeapFree(GetProcessHeap(), 0, indices);
+            if (control) HeapFree(GetProcessHeap(), 0, control);
+            if (accumulator) HeapFree(GetProcessHeap(), 0, accumulator);
+            TRACE_MARK_EXIT("Device.DrawTriPatch", E_OUTOFMEMORY, NULL);
+            return E_OUTOFMEMORY;
+        }
+    }
+
+    for (row = 0; row < expected_points; ++row) {
+        UINT byte_offset;
+        if (!multiply_u32(info->StartVertexOffset + row, source_stride,
+                    &byte_offset)
+                || byte_offset > 0xFFFFFFFFu - device->streams[0].offset
+                || (byte_offset += device->streams[0].offset,
+                    byte_offset + format.stride > source->length)) {
+            HeapFree(GetProcessHeap(), 0, vertices);
+            HeapFree(GetProcessHeap(), 0, indices);
+            HeapFree(GetProcessHeap(), 0, control);
+            HeapFree(GetProcessHeap(), 0, accumulator);
+            TRACE_MARK_EXIT("Device.DrawTriPatch", D3DERR_INVALIDCALL, NULL);
+            return D3DERR_INVALIDCALL;
+        }
+        d9_patch_decode(&format, source->shadow + byte_offset,
+                control + row * format.component_count);
+    }
+
+    for (row = 0; row < grid; ++row) {
+        float v = segment_count ? (float)row / (float)segment_count : 0.0f;
+        for (column = 0; column < grid; ++column) {
+            float u = segment_count
+                    ? (float)column / (float)segment_count : 0.0f;
+            float w;
+            UINT i;
+            UINT j;
+            UINT point = 0;
+            /* Fold the square onto the triangle: everything past the diagonal
+             * collapses onto it, producing degenerate triangles that rasterise
+             * to nothing rather than geometry outside the patch. */
+            if (u + v > 1.0f) {
+                float scale = 1.0f / (u + v);
+                u *= scale;
+                v *= scale;
+            }
+            w = 1.0f - u - v;
+            if (w < 0.0f) w = 0.0f;
+            for (i = 0; i < format.component_count; ++i)
+                accumulator[i] = 0.0f;
+            /* Bernstein over barycentric coordinates, walked in the same row
+             * order D3D9 lays the control net out in: i counts along u, j
+             * along v, and the remainder is w. */
+            for (j = 0; j <= degree; ++j) {
+                for (i = 0; i + j <= degree; ++i) {
+                    UINT k = degree - i - j;
+                    float weight = d9_trinomial(degree, i, j, k);
+                    UINT c;
+                    const float *source_point;
+                    weight *= d9_powi(u, i) * d9_powi(v, j) * d9_powi(w, k);
+                    source_point = control + point * format.component_count;
+                    for (c = 0; c < format.component_count; ++c)
+                        accumulator[c] += weight * source_point[c];
+                    ++point;
+                }
+            }
+            d9_patch_encode(&format, accumulator,
+                    vertices + (row * grid + column) * format.stride);
+        }
+    }
+
+    d9_patch_grid_indices(segment_count, indices);
+    triangles = segment_count * segment_count * 2u;
+    result = device_draw_indexed_primitive_up(iface, D3DPT_TRIANGLELIST, 0,
+            grid * grid, triangles, indices, D3DFMT_INDEX16, vertices,
+            format.stride);
+
+    HeapFree(GetProcessHeap(), 0, vertices);
+    HeapFree(GetProcessHeap(), 0, indices);
+    HeapFree(GetProcessHeap(), 0, control);
+    HeapFree(GetProcessHeap(), 0, accumulator);
+    TRACE("%s DrawTriPatch device=%08lX segments=%lu triangles=%lu",
+            SUCCEEDED(result) ? "OK" : "FAIL", device->handle, segment_count,
+            triangles);
+    TRACE_MARK_EXIT("Device.DrawTriPatch", result, NULL);
+    return result;
+}
+
+/*
+ * Nothing is cached, so there is nothing to delete. D3D9 documents
+ * DeletePatch as returning D3DERR_INVALIDCALL for a handle that was never
+ * cached, which is every handle here -- and this profile advertises
+ * D3DDEVCAPS_RTPATCHHANDLEZERO rather than the caching form, so an app that
+ * reads caps never gets here with an expectation to disappoint.
+ */
+static HRESULT WINAPI device_delete_patch(IDirect3DDevice9 *iface, UINT handle)
 { (void)iface; (void)handle; return TRACE_REFUSE(D3DERR_INVALIDCALL); }
 
 /* ---- M3: render targets, cube textures, scissor rect, queries ---- */
