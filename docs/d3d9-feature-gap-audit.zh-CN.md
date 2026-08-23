@@ -157,18 +157,46 @@ wireframe / point 填充完全没实现。WebGPU 没有 polygon mode，必须把
 
 ---
 
-## P1：规范内、影响面较窄
+## P1：规范内、影响面较窄 —— 9/10 完成（2026-08-23）
 
-- [ ] **`ProcessVertices` + `D3DUSAGE_SOFTWAREPROCESSING`** 仍被拒。
-      **已修**：`SetSoftwareVertexProcessing(TRUE)` 现在返回 `D3DERR_INVALIDCALL`
-      （HAL 设备本来就该这么答），与恒为 `FALSE` 的 getter 一致，不再自相矛盾。
+唯一剩下的是 `CreateAdditionalSwapChain`，原因见下。
+
+
+- [x] **`ProcessVertices` 已实现**（guest 侧软件顶点管线，从 D3D8 路径移植）。
+      必须在 guest 侧做：这个调用的全部意义就是结果落在 app 能 Lock 读取的内存里，
+      而本栈的 host 是异步的，没有任何同步 GPU 往返能回答它。覆盖 world/view/
+      projection 变换、透视除法、viewport 映射、方向光/点光/聚光的环境与漫反射项、
+      以及 diffuse/specular/texcoord/psize 的透传，支持 `D3DPV_DONOTCOPYDATA`。
+      **两处具名限制**（不是静默降级）：绑定了 vertex shader 时拒绝（用固定管线顶替
+      会悄悄产出不同的几何）；`D3DRS_SPECULARENABLE` 的高光不计算，destination 要
+      SPECULAR 就透传 source 的 —— 与 D3D8 路径的做法一致。
+      配套新增自检冒烟测试 `sample/d3d9_process_vertices_test.c`：它不看像素，
+      Lock destination 直接**核对数字**，所以乘法次序错、少了透视除法、viewport
+      偏移差半个像素都会失败而不是变成"看起来还行"的画面。
+- [x] **`SetSoftwareVertexProcessing` 与 `D3DCREATE_` 行为标志**：`BehaviorFlags`
+      此前被完全忽略。现在 `CreateDevice` 校验它（必须恰好命名一种顶点处理模式；
+      `PUREDEVICE` 只能配 `HARDWARE`），混合设备上 `SetSoftwareVertexProcessing`
+      真正生效并能读回，非混合设备只接受它已有的模式。
+- [x] **`D3DCREATE_PUREDEVICE`** 已实现：D3D9 文档列出的 27 个 Get\* 全部返回
+      `D3DERR_INVALIDCALL`。这个代理其实*保留*着那份影子状态（Reset 和 state block
+      需要它），所以回答这些调用很容易 —— 但那样是错的：app 要了 pure device 却拿到
+      答案，等于被告知"你的性能提示被采纳了"，而它花代价想避免的跟踪其实还在跑。
 - [ ] **`CreateDevice` 的 `BehaviorFlags` 被完全忽略**：代码里 `D3DCREATE_` 一次
       都没出现。`D3DCREATE_PUREDEVICE` 要求所有 `Get*` 失败；
       `SOFTWARE_VERTEXPROCESSING` 要求无视 caps 接受任意版本 shader 和 256 个常量。
       两条语义都没实现。
-- [ ] **`Surface::GetDC` / `ReleaseDC`** 被拒。用 GDI 往 D3D surface 上画字幕/
-      视频的老游戏会掉内容。可以纯在 guest 侧做：建 DIB，`ReleaseDC` 时上传。
-- [ ] **`CreateAdditionalSwapChain`** 被拒（多窗口渲染）。
+- [x] **`Surface::GetDC` / `ReleaseDC` 已实现**，纯 guest 侧：DIB section 是唯一
+      一种 GDI 既肯往里画、又肯交出裸指针的位图，所以 DC 存在期间 surface 的像素
+      同时活在两处，`ReleaseDC` 时拷回并走普通 LockRect 的上传路径。wined3d 也是
+      这么做的，原因相同。只允许 D3D9 规定的四种未压缩显示格式；DC 存在期间 surface
+      保持 LockRect 锁定（这正是 D3D9 的规定）；surface 析构时回收 GDI 对象，
+      不指望调用方。
+- [ ] **`CreateAdditionalSwapChain`** 仍被拒 —— **P1 唯一未完成项**。
+      它不是 guest 侧能补的：附加交换链面向*另一个 HWND*，而 host 的 present 路径
+      绑定在单一 canvas 上（`this.context`）。要做需要贯穿三层的改动 —— executor
+      维护 swap chain handle → GPUCanvasContext 的映射，bridge 按 `D9WG_OP_WINDOW_STATE`
+      已经携带的窗口几何创建并定位第二个 canvas，页面负责合成。属于独立的一块工作，
+      不是这一轮能顺手带上的。实际影响面最小：用它的基本是编辑器/工具，不是游戏。
 - [x] **`D3DRS_WRAP0..15`**：确认**无法实现** —— wrap 是逐三角形比较三个顶点的
       坐标后做的决定，WebGPU 没有任何能看到整个图元的阶段（几何着色器或逐 draw 的
       compute 预处理是仅有的两种可行形态）。现在会显式报告并说明症状（柱面/球面
@@ -178,13 +206,19 @@ wireframe / point 填充完全没实现。WebGPU 没有 polygon mode，必须把
       **顺带修掉一个真实 bug**：渲染管线此前从不声明 `multisample`，而附件是
       多重采样的 —— WebGPU 要求两者一致，所以任何 MSAA 设备的每一次 draw 都会
       校验失败。现在 sample count 从 render target 一路带到管线并进了缓存键。
-- [ ] **Query 只有 5/14**。缺的多数是 driver 本来就常返回 `D3DERR_NOTAVAILABLE`
-      的性能计数器，但 `D3DQUERYTYPE_VCACHE` 会被 D3DX 的网格优化路径读。
+- [x] **Query 5/14 不是缺口** —— 复核后撤回。缺的九种全是可选的驱动性能计数器
+      （`VCACHE`、`RESOURCEMANAGER`、`VERTEXSTATS`、各类 `*TIMINGS`），真实零售
+      驱动同样以 `D3DERR_NOTAVAILABLE` 拒绝它们，而代理已经返回的正是这个错误码。
+      伪造计数器只会让 app 相信一些编造的数字。真正重要的五种（`EVENT`、
+      `OCCLUSION`、三种 `TIMESTAMP`）都已实现。
 - [x] **`D3DCAPS2_CANAUTOGENMIPMAP` 已打开**：`d3d9_proxy.c:3199` 的
       注释说 AUTOGENMIPMAP "deliberately refused"，但 2D 和 cube 两条路径现在都
       实现了（executor 5626 / 6031，proxy 6145 / 9574）。注释和代码已经不同步，
       caps 少报了一个已经能用的特性。
-- [ ] **StretchRect**：不支持压缩目标、不做格式转换。
+- [x] **StretchRect 不是缺口** —— 复核后撤回。格式转换**已经支持**（走 blit
+      管线，正是它覆盖缩放与格式转换）。只有压缩目标被拒，而 D3D9 本身也拒绝：
+      StretchRect 的目标必须是 render target 或 offscreen plain surface，
+      BCn 格式无法成为 render attachment。
 
 ---
 

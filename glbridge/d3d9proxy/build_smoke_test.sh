@@ -20,7 +20,8 @@ for test_name in \
     swapchain \
     depth_texture \
     cube_texture \
-    surface_lifetime
+    surface_lifetime \
+    process_vertices
 do
     "$compiler" -mwindows -std=gnu99 -Os -s -nostdlib \
         -Wall -Wextra -Werror \

@@ -852,6 +852,9 @@ struct D9Device {
      * has been told, which decides whether Reset has to tell it again. */
     D3DGAMMARAMP gamma_ramp;
     BOOL gamma_ramp_set;
+    /* Only meaningful on a D3DCREATE_MIXED_VERTEXPROCESSING device; the other
+     * two modes are fixed at creation and answer from BehaviorFlags. */
+    BOOL software_vertex_processing;
     D3DLIGHT9 lights[D9_MAX_LIGHTS];
     BOOL light_set[D9_MAX_LIGHTS];
     BOOL light_enabled[D9_MAX_LIGHTS];
@@ -1124,6 +1127,20 @@ struct D9Surface {
      * that surface holds the texture's only reference and takes its own
      * refcount, so forwarding there would be a cycle. */
     BOOL texture_child;
+    /* IDirect3DSurface9::GetDC state. The DC is backed by a DIB section --
+     * the only bitmap GDI both draws into and exposes a raw pointer for -- so
+     * the surface's bits live in two places while a DC is out, and `dc_bits` /
+     * `dc_pitch` remember where the surface's own storage was so ReleaseDC can
+     * copy back. The surface stays LockRect-locked for that whole window,
+     * which is what D3D9 specifies. */
+    HDC dc;
+    HBITMAP dib;
+    HBITMAP dc_previous;
+    void *dib_bits;
+    void *dc_bits;
+    UINT dib_pitch;
+    UINT dc_pitch;
+    UINT dc_pixel_bytes;
     /* Non-NULL for the implicit back buffer.  This is a non-owning pointer:
      * the surface's tracked device reference already keeps the embedded swap
      * chain alive, while GetContainer takes a fresh public chain reference. */
@@ -3580,6 +3597,37 @@ static BOOL device_has_reset_blockers(D9Device *device)
     return FALSE;
 }
 
+/*
+ * D3DCREATE_PUREDEVICE. A pure device keeps no shadow of the state a state
+ * block can hold, so D3D9 fails every Get* that would read one back -- the
+ * whole point of the flag is that the runtime stopped tracking. The list below
+ * is exactly the one D3D9 documents.
+ *
+ * This proxy *does* keep that shadow (it needs it for Reset and for state
+ * blocks), so answering these would be easy and would still be wrong: an app
+ * that asked for a pure device and gets answers has been told its performance
+ * hint was honoured when the tracking it paid to avoid is still happening, and
+ * an app written against real hardware never sees success here.
+ *
+ * GetSoftwareVertexProcessing and GetNPatchMode are in D3D9's list too but
+ * return BOOL and FLOAT, so they have no way to report the failure and keep
+ * answering.
+ */
+static BOOL device_is_pure(const D9Device *device)
+{
+    return (device->creation.BehaviorFlags & D3DCREATE_PUREDEVICE) != 0;
+}
+
+#define PURE_DEVICE_REFUSE(device, name) \
+    do { \
+        if (device_is_pure(device)) { \
+            HOSTLOG_REFUSED("%s is not available on a D3DCREATE_PUREDEVICE " \
+                    "device, which keeps no readable copy of state-block " \
+                    "state", name); \
+            return TRACE_REFUSE(D3DERR_INVALIDCALL); \
+        } \
+    } while (0)
+
 static void device_clear_bindings(D9Device *device)
 {
     UINT index;
@@ -4445,6 +4493,39 @@ static HRESULT WINAPI d3d_create_device(IDirect3D9 *iface, UINT adapter,
         TRACE("FAIL CreateDevice backbuffer_count=%lu -> %08lX",
                 parameters->BackBufferCount, (DWORD)D3DERR_INVALIDCALL);
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
+    }
+    /*
+     * BehaviorFlags was recorded and otherwise ignored, which meant an app
+     * could ask for a combination D3D9 rejects and be handed a device anyway --
+     * and then behave as if the combination it asked for were in force. D3D9
+     * requires exactly one vertex-processing mode, and D3DCREATE_PUREDEVICE
+     * only alongside the hardware one.
+     */
+    {
+        const DWORD vertex_processing = behavior
+                & (D3DCREATE_SOFTWARE_VERTEXPROCESSING
+                        | D3DCREATE_HARDWARE_VERTEXPROCESSING
+                        | D3DCREATE_MIXED_VERTEXPROCESSING);
+        if (vertex_processing != D3DCREATE_SOFTWARE_VERTEXPROCESSING
+                && vertex_processing != D3DCREATE_HARDWARE_VERTEXPROCESSING
+                && vertex_processing != D3DCREATE_MIXED_VERTEXPROCESSING) {
+            TRACE("FAIL CreateDevice behavior=%08lX names %s vertex processing "
+                    "mode -> %08lX", behavior,
+                    vertex_processing ? "more than one" : "no",
+                    (DWORD)D3DERR_INVALIDCALL);
+            HOSTLOG_FAILED("CreateDevice refused: BehaviorFlags %08lX must "
+                    "name exactly one vertex-processing mode", behavior);
+            return TRACE_REFUSE(D3DERR_INVALIDCALL);
+        }
+        if ((behavior & D3DCREATE_PUREDEVICE)
+                && vertex_processing != D3DCREATE_HARDWARE_VERTEXPROCESSING) {
+            TRACE("FAIL CreateDevice behavior=%08lX pairs PUREDEVICE with "
+                    "non-hardware vertex processing -> %08lX", behavior,
+                    (DWORD)D3DERR_INVALIDCALL);
+            HOSTLOG_FAILED("CreateDevice refused: D3DCREATE_PUREDEVICE "
+                    "requires D3DCREATE_HARDWARE_VERTEXPROCESSING");
+            return TRACE_REFUSE(D3DERR_INVALIDCALL);
+        }
     }
 
     device = (D9Device *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
@@ -5760,6 +5841,7 @@ static HRESULT WINAPI device_set_transform(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_transform(IDirect3DDevice9 *iface,
         D3DTRANSFORMSTATETYPE state, D3DMATRIX *matrix)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetTransform");
     D9Device *device = device_from_iface(iface);
     if (!matrix || (UINT)state >= D9_MAX_TRANSFORMS)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
@@ -5828,6 +5910,7 @@ static HRESULT WINAPI device_set_viewport(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_viewport(IDirect3DDevice9 *iface,
         D3DVIEWPORT9 *viewport)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetViewport");
     if (!viewport)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *viewport = device_from_iface(iface)->viewport;
@@ -5856,6 +5939,7 @@ static HRESULT WINAPI device_set_render_state(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_render_state(IDirect3DDevice9 *iface,
         D3DRENDERSTATETYPE state, DWORD *value)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetRenderState");
     if (!value || (UINT)state >= D9_MAX_RENDER_STATES)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *value = device_from_iface(iface)->render_states[state];
@@ -5907,6 +5991,7 @@ static DWORD sampler_state_index(UINT slot)
 static HRESULT WINAPI device_get_texture(IDirect3DDevice9 *iface,
         DWORD stage, IDirect3DBaseTexture9 **texture_out)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetTexture");
     D9Device *device = device_from_iface(iface);
     UINT slot;
     if (!texture_out || !texture_binding_slot(stage, &slot))
@@ -5996,6 +6081,7 @@ static HRESULT WINAPI device_set_texture(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_texture_stage_state(IDirect3DDevice9 *iface,
         DWORD stage, D3DTEXTURESTAGESTATETYPE state, DWORD *value)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetTextureStageState");
     if (!value || stage >= D9_MAX_TEXTURE_STAGES
             || (UINT)state >= D9_MAX_TEXTURE_STAGE_STATES)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
@@ -6041,24 +6127,40 @@ static HRESULT WINAPI device_validate_device(IDirect3DDevice9 *iface,
  * refusal is a fact the app can branch on, while a silent disagreement looks
  * like a driver bug in whatever renders wrong three frames later.
  *
- * This device is created HAL and processes vertices on the GPU. D3D9 permits
- * SetSoftwareVertexProcessing(TRUE) only on a MIXED device, and returns
- * D3DERR_INVALIDCALL otherwise -- which is the honest answer here, and one the
- * getter can then agree with unconditionally.
+ * D3D9's rule is that the mode is fixed at creation except on a mixed device,
+ * where this switches between the two. The switch is honoured as bookkeeping:
+ * every vertex is processed on the GPU either way, because that is the only
+ * place this backend can process one. What that costs is the one guarantee
+ * software processing carries that hardware does not -- no caps limits, so
+ * shader versions and constant counts beyond what the device advertises --
+ * which a title only reaches by first reading caps that already say otherwise.
  */
 static HRESULT WINAPI device_set_software_vertex_processing(
         IDirect3DDevice9 *iface, WINBOOL software)
 {
-    (void)iface;
-    if (!software)
+    D9Device *device = device_from_iface(iface);
+    const DWORD behavior = device->creation.BehaviorFlags;
+    if (behavior & D3DCREATE_MIXED_VERTEXPROCESSING) {
+        device->software_vertex_processing = software ? TRUE : FALSE;
         return D3D_OK;
-    UNSUPPORTED("Device.SetSoftwareVertexProcessing(TRUE)");
+    }
+    /* Not a mixed device: the only accepted call is the one that asks for the
+     * mode the device already has. */
+    if (!software == !(behavior & D3DCREATE_SOFTWARE_VERTEXPROCESSING))
+        return D3D_OK;
+    UNSUPPORTED("Device.SetSoftwareVertexProcessing on a non-mixed device");
     return TRACE_REFUSE(D3DERR_INVALIDCALL);
 }
 
 static WINBOOL WINAPI device_get_software_vertex_processing(
         IDirect3DDevice9 *iface)
-{ (void)iface; return FALSE; }
+{
+    D9Device *device = device_from_iface(iface);
+    if (device->creation.BehaviorFlags & D3DCREATE_MIXED_VERTEXPROCESSING)
+        return device->software_vertex_processing;
+    return (device->creation.BehaviorFlags
+            & D3DCREATE_SOFTWARE_VERTEXPROCESSING) ? TRUE : FALSE;
+}
 
 /*
  * N-patch tessellation is not implemented, and returning D3D_OK said it was.
@@ -6466,6 +6568,7 @@ static HRESULT WINAPI device_get_stream_source(IDirect3DDevice9 *iface,
         UINT stream, IDirect3DVertexBuffer9 **buffer_out, UINT *offset_out,
         UINT *stride_out)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetStreamSource");
     D9Device *device = device_from_iface(iface);
     if (stream >= D9_MAX_STREAMS || !buffer_out || !stride_out)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
@@ -6505,6 +6608,7 @@ static HRESULT WINAPI device_set_indices(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_indices(IDirect3DDevice9 *iface,
         IDirect3DIndexBuffer9 **buffer_out)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetIndices");
     D9Device *device = device_from_iface(iface);
     if (!buffer_out)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
@@ -6782,6 +6886,7 @@ static HRESULT WINAPI device_set_vertex_declaration(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_vertex_declaration(IDirect3DDevice9 *iface,
         IDirect3DVertexDeclaration9 **decl_out)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetVertexDeclaration");
     D9Device *device = device_from_iface(iface);
     if (!decl_out)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
@@ -6822,6 +6927,7 @@ static HRESULT WINAPI device_set_fvf(IDirect3DDevice9 *iface, DWORD fvf)
 
 static HRESULT WINAPI device_get_fvf(IDirect3DDevice9 *iface, DWORD *fvf)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetFVF");
     if (!fvf)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *fvf = device_from_iface(iface)->fvf;
@@ -7004,6 +7110,7 @@ static HRESULT WINAPI device_set_vertex_shader(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_vertex_shader(IDirect3DDevice9 *iface,
         IDirect3DVertexShader9 **shader_out)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetVertexShader");
     D9Device *device = device_from_iface(iface);
     if (!shader_out)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
@@ -7035,6 +7142,7 @@ static HRESULT WINAPI device_set_pixel_shader(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_pixel_shader(IDirect3DDevice9 *iface,
         IDirect3DPixelShader9 **shader_out)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetPixelShader");
     D9Device *device = device_from_iface(iface);
     if (!shader_out)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
@@ -7188,6 +7296,7 @@ static HRESULT WINAPI device_set_pixel_shader_constant_b(
 static HRESULT WINAPI device_get_vertex_shader_constant_f(
         IDirect3DDevice9 *iface, UINT start, float *data, UINT count)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetVertexShaderConstantF");
     D9Device *device = device_from_iface(iface);
     if (!data || !constant_range_valid(start, count, D9_MAX_VS_CONST_F))
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
@@ -7198,6 +7307,7 @@ static HRESULT WINAPI device_get_vertex_shader_constant_f(
 static HRESULT WINAPI device_get_pixel_shader_constant_f(
         IDirect3DDevice9 *iface, UINT start, float *data, UINT count)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetPixelShaderConstantF");
     D9Device *device = device_from_iface(iface);
     if (!data || !constant_range_valid(start, count, D9_MAX_PS_CONST_F))
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
@@ -7208,6 +7318,7 @@ static HRESULT WINAPI device_get_pixel_shader_constant_f(
 static HRESULT WINAPI device_get_vertex_shader_constant_i(
         IDirect3DDevice9 *iface, UINT start, int *data, UINT count)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetVertexShaderConstantI");
     D9Device *device = device_from_iface(iface);
     if (!data || !constant_range_valid(start, count, D9_MAX_CONST_I))
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
@@ -7218,6 +7329,7 @@ static HRESULT WINAPI device_get_vertex_shader_constant_i(
 static HRESULT WINAPI device_get_pixel_shader_constant_i(
         IDirect3DDevice9 *iface, UINT start, int *data, UINT count)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetPixelShaderConstantI");
     D9Device *device = device_from_iface(iface);
     if (!data || !constant_range_valid(start, count, D9_MAX_CONST_I))
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
@@ -7228,6 +7340,7 @@ static HRESULT WINAPI device_get_pixel_shader_constant_i(
 static HRESULT WINAPI device_get_vertex_shader_constant_b(
         IDirect3DDevice9 *iface, UINT start, WINBOOL *data, UINT count)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetVertexShaderConstantB");
     D9Device *device = device_from_iface(iface);
     UINT index;
     if (!data || !constant_range_valid(start, count, D9_MAX_CONST_B))
@@ -7240,6 +7353,7 @@ static HRESULT WINAPI device_get_vertex_shader_constant_b(
 static HRESULT WINAPI device_get_pixel_shader_constant_b(
         IDirect3DDevice9 *iface, UINT start, WINBOOL *data, UINT count)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetPixelShaderConstantB");
     D9Device *device = device_from_iface(iface);
     UINT index;
     if (!data || !constant_range_valid(start, count, D9_MAX_CONST_B))
@@ -8508,6 +8622,7 @@ static HRESULT WINAPI device_set_material(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_material(IDirect3DDevice9 *iface,
         D3DMATERIAL9 *material)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetMaterial");
     if (!material)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *material = device_from_iface(iface)->material;
@@ -8546,6 +8661,7 @@ static HRESULT WINAPI device_set_light(IDirect3DDevice9 *iface, DWORD index,
 static HRESULT WINAPI device_get_light(IDirect3DDevice9 *iface, DWORD index,
         D3DLIGHT9 *light)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetLight");
     D9Device *device = device_from_iface(iface);
     if (!light || index >= D9_MAX_LIGHTS || !device->light_set[index])
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
@@ -8573,6 +8689,7 @@ static HRESULT WINAPI device_light_enable(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_light_enable(IDirect3DDevice9 *iface,
         DWORD index, WINBOOL *enable)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetLightEnable");
     D9Device *device = device_from_iface(iface);
     if (!enable || index >= D9_MAX_LIGHTS)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
@@ -8596,6 +8713,7 @@ static HRESULT WINAPI device_set_clip_plane(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_clip_plane(IDirect3DDevice9 *iface,
         DWORD index, float *plane)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetClipPlane");
     D9Device *device = device_from_iface(iface);
     if (!plane || index >= D9_MAX_CLIP_PLANES)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
@@ -8612,6 +8730,7 @@ static HRESULT WINAPI device_set_clip_status(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_clip_status(IDirect3DDevice9 *iface,
         D3DCLIPSTATUS9 *status)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetClipStatus");
     if (!status) return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *status = device_from_iface(iface)->clip_status;
     return D3D_OK;
@@ -8619,6 +8738,7 @@ static HRESULT WINAPI device_get_clip_status(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_sampler_state(IDirect3DDevice9 *iface,
         DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD *value)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetSamplerState");
     D9Device *device = device_from_iface(iface);
     UINT slot;
     if (!value || !sampler_state_slot(sampler, &slot)
@@ -8697,6 +8817,7 @@ static HRESULT WINAPI device_set_palette_entries(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_palette_entries(IDirect3DDevice9 *iface,
         UINT index, PALETTEENTRY *entries)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetPaletteEntries");
     D9Device *device = device_from_iface(iface);
     UINT entry;
 
@@ -8735,18 +8856,613 @@ static HRESULT WINAPI device_set_current_texture_palette(
 static HRESULT WINAPI device_get_current_texture_palette(
         IDirect3DDevice9 *iface, UINT *index)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetCurrentTexturePalette");
     D9Device *device = device_from_iface(iface);
     if (!index || !device->current_palette_set)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
     *index = device->current_palette;
     return D3D_OK;
 }
-DEV_STUB(process_vertices, UINT src_start, UINT dst_index, UINT count,
+/*
+ * ---- ProcessVertices ----
+ *
+ * Runs the fixed-function vertex pipeline over a source stream and writes
+ * pre-transformed vertices into a destination vertex buffer, which the app
+ * then draws as XYZRHW geometry or reads back.
+ *
+ * It has to happen guest-side. The whole point of the call is that the result
+ * lands in guest-visible memory the app can Lock and read, and this stack's
+ * host is asynchronous -- there is no synchronous GPU round trip that could
+ * answer it. So this is a real software transform over the state the guest
+ * already shadows for SetTransform/SetViewport/SetMaterial/SetLight, ported
+ * from the D3D8 path's implementation, which has the same problem and solved
+ * it the same way.
+ *
+ * Two deliberate limits, both named rather than silent:
+ *
+ *   - A bound vertex shader means programmable processing, and running the
+ *     fixed-function pipeline instead would silently produce different
+ *     geometry. Refused.
+ *   - Lighting computes the ambient and diffuse terms. D3DRS_SPECULARENABLE's
+ *     highlight is not computed; a destination asking for SPECULAR gets the
+ *     source's specular copied through, which is what the D3D8 path does.
+ */
+#define D9_PV_MAX_TEXCOORDS 8
+
+typedef struct D9ProcessLayout {
+    int position;
+    BOOL position_transformed;
+    int normal;
+    int diffuse;
+    int specular;
+    int psize;
+    int texcoord[D9_PV_MAX_TEXCOORDS];
+    UINT texcoord_floats[D9_PV_MAX_TEXCOORDS];
+    UINT stride;
+} D9ProcessLayout;
+
+/* This DLL links no C runtime (see build.sh), so libm's sqrtf is unavailable.
+ * Newton-Raphson from the classic bit-level estimate converges to float
+ * precision well within four iterations for the magnitudes vertex normals and
+ * light distances actually take. */
+static float d9_sqrt(float value)
+{
+    union { float number; uint32_t bits; } convert;
+    float guess;
+    UINT iteration;
+
+    if (!(value > 0.0f)) return 0.0f;
+    convert.number = value;
+    convert.bits = 0x1fbd1df5u + (convert.bits >> 1);
+    guess = convert.number;
+    for (iteration = 0; iteration < 4u; ++iteration)
+        guess = 0.5f * (guess + value / guess);
+    return guess;
+}
+
+/* D3D matrices are row-major and its vectors are row vectors, so this is
+ * `in * matrix`, not `matrix * in`. Getting the side wrong transposes every
+ * transform, which looks like a broken camera rather than a broken multiply. */
+static void d9_transform_vector4(const D3DMATRIX *matrix, const float *in,
+        float *out)
+{
+    UINT row;
+    for (row = 0; row < 4; ++row) {
+        out[row] = in[0] * matrix->m[0][row] + in[1] * matrix->m[1][row]
+                + in[2] * matrix->m[2][row] + in[3] * matrix->m[3][row];
+    }
+}
+
+static void d9_multiply_matrix(const D3DMATRIX *left, const D3DMATRIX *right,
+        D3DMATRIX *out)
+{
+    UINT row;
+    UINT column;
+    for (row = 0; row < 4; ++row) {
+        for (column = 0; column < 4; ++column) {
+            out->m[row][column] =
+                    left->m[row][0] * right->m[0][column]
+                    + left->m[row][1] * right->m[1][column]
+                    + left->m[row][2] * right->m[2][column]
+                    + left->m[row][3] * right->m[3][column];
+        }
+    }
+}
+
+static float d9_saturate(float value)
+{
+    if (value < 0.0f) return 0.0f;
+    if (value > 1.0f) return 1.0f;
+    return value;
+}
+
+static D3DCOLOR d9_pack_color(const float *rgba)
+{
+    return ((DWORD)(d9_saturate(rgba[3]) * 255.0f + 0.5f) << 24)
+            | ((DWORD)(d9_saturate(rgba[0]) * 255.0f + 0.5f) << 16)
+            | ((DWORD)(d9_saturate(rgba[1]) * 255.0f + 0.5f) << 8)
+            | (DWORD)(d9_saturate(rgba[2]) * 255.0f + 0.5f);
+}
+
+static UINT d9_decl_type_bytes(BYTE type)
+{
+    switch (type) {
+    case D3DDECLTYPE_FLOAT1: return 4;
+    case D3DDECLTYPE_FLOAT2: return 8;
+    case D3DDECLTYPE_FLOAT3: return 12;
+    case D3DDECLTYPE_FLOAT4: return 16;
+    case D3DDECLTYPE_D3DCOLOR: return 4;
+    case D3DDECLTYPE_UBYTE4:
+    case D3DDECLTYPE_UBYTE4N:
+    case D3DDECLTYPE_SHORT2:
+    case D3DDECLTYPE_SHORT2N:
+    case D3DDECLTYPE_USHORT2N:
+    case D3DDECLTYPE_UDEC3:
+    case D3DDECLTYPE_DEC3N:
+    case D3DDECLTYPE_FLOAT16_2: return 4;
+    case D3DDECLTYPE_SHORT4:
+    case D3DDECLTYPE_SHORT4N:
+    case D3DDECLTYPE_USHORT4N:
+    case D3DDECLTYPE_FLOAT16_4: return 8;
+    default: return 0;
+    }
+}
+
+/*
+ * The subset of D3DDECLTYPE this software path reads and writes directly.
+ * Everything else -- the packed and half-float formats -- is rejected rather
+ * than approximated, because a silently mis-decoded position is geometry that
+ * is wrong rather than missing.
+ */
+static BOOL d9_decl_type_float_count(BYTE type, UINT *floats)
+{
+    switch (type) {
+    case D3DDECLTYPE_FLOAT1: *floats = 1; return TRUE;
+    case D3DDECLTYPE_FLOAT2: *floats = 2; return TRUE;
+    case D3DDECLTYPE_FLOAT3: *floats = 3; return TRUE;
+    case D3DDECLTYPE_FLOAT4: *floats = 4; return TRUE;
+    default: return FALSE;
+    }
+}
+
+static BOOL d9_build_process_layout(const D9WGVertexElement *elements,
+        UINT count, D9ProcessLayout *layout)
+{
+    UINT index;
+
+    ZeroMemory(layout, sizeof(*layout));
+    layout->position = -1;
+    layout->normal = -1;
+    layout->diffuse = -1;
+    layout->specular = -1;
+    layout->psize = -1;
+    for (index = 0; index < D9_PV_MAX_TEXCOORDS; ++index)
+        layout->texcoord[index] = -1;
+
+    for (index = 0; index < count; ++index) {
+        const D9WGVertexElement *e = &elements[index];
+        UINT bytes = d9_decl_type_bytes(e->type);
+        UINT end;
+        UINT floats;
+
+        /* Only stream 0 participates. A declaration spreading its attributes
+         * over several streams is legal D3D9 and this path cannot serve it
+         * without also tracking every stream's stride and base -- refusing is
+         * the honest answer rather than reading stream 0 at the wrong offset. */
+        if (e->stream != 0)
+            return FALSE;
+        if (!bytes || e->method != D3DDECLMETHOD_DEFAULT)
+            return FALSE;
+        end = (UINT)e->offset + bytes;
+        if (end > layout->stride) layout->stride = end;
+
+        switch (e->usage) {
+        case D3DDECLUSAGE_POSITION:
+            if (e->usage_index) break;
+            if (!d9_decl_type_float_count(e->type, &floats) || floats < 3)
+                return FALSE;
+            layout->position = (int)e->offset;
+            layout->position_transformed = FALSE;
+            break;
+        case D3DDECLUSAGE_POSITIONT:
+            if (e->usage_index) break;
+            if (e->type != D3DDECLTYPE_FLOAT4)
+                return FALSE;
+            layout->position = (int)e->offset;
+            layout->position_transformed = TRUE;
+            break;
+        case D3DDECLUSAGE_NORMAL:
+            if (e->usage_index) break;
+            if (!d9_decl_type_float_count(e->type, &floats) || floats < 3)
+                return FALSE;
+            layout->normal = (int)e->offset;
+            break;
+        case D3DDECLUSAGE_COLOR:
+            if (e->type != D3DDECLTYPE_D3DCOLOR)
+                return FALSE;
+            if (e->usage_index == 0) layout->diffuse = (int)e->offset;
+            else if (e->usage_index == 1) layout->specular = (int)e->offset;
+            break;
+        case D3DDECLUSAGE_PSIZE:
+            if (e->usage_index || e->type != D3DDECLTYPE_FLOAT1)
+                return FALSE;
+            layout->psize = (int)e->offset;
+            break;
+        case D3DDECLUSAGE_TEXCOORD:
+            if (e->usage_index >= D9_PV_MAX_TEXCOORDS)
+                return FALSE;
+            if (!d9_decl_type_float_count(e->type, &floats))
+                return FALSE;
+            layout->texcoord[e->usage_index] = (int)e->offset;
+            layout->texcoord_floats[e->usage_index] = floats;
+            break;
+        default:
+            /* BLENDWEIGHT/BLENDINDICES and the rest are simply not carried
+             * through; their bytes still count toward the stride above. */
+            break;
+        }
+    }
+    return layout->position >= 0;
+}
+
+/*
+ * The fixed-function ambient and diffuse terms D3D9 specifies, in view space,
+ * over the lights the guest has shadowed. Directional, point and spot lights
+ * all reach here; the spot cone uses the same rho/theta/phi falloff the host's
+ * generated vertex stage uses, so the two paths agree on the same scene.
+ */
+static void d9_light_vertex(D9Device *device, const float *eye_position,
+        const float *eye_normal, float *out_rgba)
+{
+    const D3DMATERIAL9 *material = &device->material;
+    DWORD ambient_state = device->render_states[D3DRS_AMBIENT];
+    float ambient[3];
+    UINT index;
+
+    ambient[0] = ((ambient_state >> 16) & 0xffu) / 255.0f;
+    ambient[1] = ((ambient_state >> 8) & 0xffu) / 255.0f;
+    ambient[2] = (ambient_state & 0xffu) / 255.0f;
+
+    out_rgba[0] = material->Emissive.r + material->Ambient.r * ambient[0];
+    out_rgba[1] = material->Emissive.g + material->Ambient.g * ambient[1];
+    out_rgba[2] = material->Emissive.b + material->Ambient.b * ambient[2];
+    out_rgba[3] = material->Diffuse.a;
+
+    for (index = 0; index < D9_MAX_LIGHTS; ++index) {
+        const D3DLIGHT9 *light;
+        float to_light[3];
+        float attenuation = 1.0f;
+        float n_dot_l;
+        float length;
+
+        if (!device->light_set[index] || !device->light_enabled[index])
+            continue;
+        light = &device->lights[index];
+        if (light->Type == D3DLIGHT_DIRECTIONAL) {
+            float view_direction[4];
+            float direction[4];
+            direction[0] = light->Direction.x;
+            direction[1] = light->Direction.y;
+            direction[2] = light->Direction.z;
+            direction[3] = 0.0f;
+            d9_transform_vector4(
+                    (const D3DMATRIX *)device->transforms[D3DTS_VIEW],
+                    direction, view_direction);
+            length = d9_sqrt(view_direction[0] * view_direction[0]
+                    + view_direction[1] * view_direction[1]
+                    + view_direction[2] * view_direction[2]);
+            if (length < 1e-6f) continue;
+            to_light[0] = -view_direction[0] / length;
+            to_light[1] = -view_direction[1] / length;
+            to_light[2] = -view_direction[2] / length;
+        } else {
+            float view_position[4];
+            float position[4];
+            position[0] = light->Position.x;
+            position[1] = light->Position.y;
+            position[2] = light->Position.z;
+            position[3] = 1.0f;
+            d9_transform_vector4(
+                    (const D3DMATRIX *)device->transforms[D3DTS_VIEW],
+                    position, view_position);
+            to_light[0] = view_position[0] - eye_position[0];
+            to_light[1] = view_position[1] - eye_position[1];
+            to_light[2] = view_position[2] - eye_position[2];
+            length = d9_sqrt(to_light[0] * to_light[0]
+                    + to_light[1] * to_light[1] + to_light[2] * to_light[2]);
+            if (length > light->Range) continue;
+            if (length < 1e-6f) length = 1e-6f;
+            to_light[0] /= length;
+            to_light[1] /= length;
+            to_light[2] /= length;
+            attenuation = light->Attenuation0
+                    + light->Attenuation1 * length
+                    + light->Attenuation2 * length * length;
+            attenuation = attenuation < 1e-6f ? 1.0f : 1.0f / attenuation;
+            if (light->Type == D3DLIGHT_SPOT) {
+                float spot_direction[4];
+                float direction[4];
+                float rho;
+                float spot = 0.0f;
+                direction[0] = light->Direction.x;
+                direction[1] = light->Direction.y;
+                direction[2] = light->Direction.z;
+                direction[3] = 0.0f;
+                d9_transform_vector4(
+                        (const D3DMATRIX *)device->transforms[D3DTS_VIEW],
+                        direction, spot_direction);
+                length = d9_sqrt(spot_direction[0] * spot_direction[0]
+                        + spot_direction[1] * spot_direction[1]
+                        + spot_direction[2] * spot_direction[2]);
+                if (length < 1e-6f) continue;
+                /* rho is the cosine between the cone axis and the direction
+                 * *to the vertex*, which is the negation of to_light. */
+                rho = (-to_light[0] * spot_direction[0]
+                        - to_light[1] * spot_direction[1]
+                        - to_light[2] * spot_direction[2]) / length;
+                if (rho > light->Theta) {
+                    spot = 1.0f;
+                } else if (rho > light->Phi) {
+                    /* Falloff is an exponent D3D9 defaults to 1.0, and this
+                     * DLL has no pow(); the linear case is exact and anything
+                     * else is treated as linear rather than approximated with
+                     * a series that would be wrong in a different way. */
+                    spot = (rho - light->Phi)
+                            / (light->Theta - light->Phi > 1e-6f
+                                ? light->Theta - light->Phi : 1e-6f);
+                }
+                attenuation *= spot;
+            }
+        }
+        n_dot_l = eye_normal[0] * to_light[0] + eye_normal[1] * to_light[1]
+                + eye_normal[2] * to_light[2];
+        if (n_dot_l < 0.0f) n_dot_l = 0.0f;
+        out_rgba[0] += attenuation * (material->Ambient.r * light->Ambient.r
+                + material->Diffuse.r * light->Diffuse.r * n_dot_l);
+        out_rgba[1] += attenuation * (material->Ambient.g * light->Ambient.g
+                + material->Diffuse.g * light->Diffuse.g * n_dot_l);
+        out_rgba[2] += attenuation * (material->Ambient.b * light->Ambient.b
+                + material->Diffuse.b * light->Diffuse.b * n_dot_l);
+    }
+}
+
+/* The source layout is the declaration currently bound, whether it arrived as
+ * a real IDirect3DVertexDeclaration9 or as an FVF. */
+static BOOL d9_current_source_layout(D9Device *device, D9ProcessLayout *layout)
+{
+    D9WGVertexElement elements[D3DMAXDECLLENGTH];
+    UINT count = 0;
+
+    if (device->vertex_declaration) {
+        const D9VertexDeclaration *decl = device->vertex_declaration;
+        UINT index;
+        if (decl->element_count > D3DMAXDECLLENGTH)
+            return FALSE;
+        for (index = 0; index < decl->element_count; ++index) {
+            elements[index].stream = (uint16_t)decl->elements[index].Stream;
+            elements[index].offset = (uint16_t)decl->elements[index].Offset;
+            elements[index].type = (uint8_t)decl->elements[index].Type;
+            elements[index].method = (uint8_t)decl->elements[index].Method;
+            elements[index].usage = (uint8_t)decl->elements[index].Usage;
+            elements[index].usage_index =
+                    (uint8_t)decl->elements[index].UsageIndex;
+        }
+        count = decl->element_count;
+    } else if (device->fvf) {
+        if (!fvf_to_declaration(device->fvf, elements, &count))
+            return FALSE;
+    } else {
+        return FALSE;
+    }
+    return d9_build_process_layout(elements, count, layout);
+}
+
+static HRESULT WINAPI device_process_vertices(IDirect3DDevice9 *iface,
+        UINT src_start, UINT dst_index, UINT count,
         IDirect3DVertexBuffer9 *dst, IDirect3DVertexDeclaration9 *decl,
         DWORD flags)
-{ (void)iface; (void)src_start; (void)dst_index; (void)count; (void)dst;
-  (void)decl; (void)flags;
-  UNSUPPORTED("Device.ProcessVertices"); return D3DERR_INVALIDCALL; }
+{
+    D9Device *device = device_from_iface(iface);
+    D9VertexBuffer *destination;
+    D9VertexBuffer *source;
+    D9ProcessLayout source_layout;
+    D9ProcessLayout destination_layout;
+    D3DMATRIX world_view;
+    D3DMATRIX world_view_projection;
+    BOOL lighting;
+    BOOL copy_data;
+    UINT vertex;
+    UINT source_stride;
+
+    TRACE_MARK_ENTER("Device.ProcessVertices");
+    if (!dst || dst->lpVtbl != &g_vb_vtbl) {
+        TRACE_MARK_EXIT("Device.ProcessVertices", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    destination = vb_from_iface(dst);
+    source = device->streams[0].buffer;
+    source_stride = device->streams[0].stride;
+    if (destination->device != device || !source || destination->locked
+            || source->locked || !count) {
+        TRACE_MARK_EXIT("Device.ProcessVertices", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    if (device->vertex_shader) {
+        HOSTLOG_REFUSED("ProcessVertices refused: a vertex shader is bound, "
+                "and running the fixed-function pipeline in its place would "
+                "silently produce different geometry");
+        TRACE_MARK_EXIT("Device.ProcessVertices", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    if (!d9_current_source_layout(device, &source_layout)) {
+        HOSTLOG_REFUSED("ProcessVertices refused: the source declaration uses "
+                "a stream, element type or method this software vertex path "
+                "does not read");
+        TRACE_MARK_EXIT("Device.ProcessVertices", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    /* The output layout is the declaration D3D9 passes, or the destination
+     * buffer's own FVF when it passes none. */
+    if (decl) {
+        D9VertexDeclaration *output = decl_from_iface(decl);
+        D9WGVertexElement elements[D3DMAXDECLLENGTH];
+        UINT index;
+        if (output->device != device
+                || output->element_count > D3DMAXDECLLENGTH) {
+            TRACE_MARK_EXIT("Device.ProcessVertices", D3DERR_INVALIDCALL, NULL);
+            return D3DERR_INVALIDCALL;
+        }
+        for (index = 0; index < output->element_count; ++index) {
+            elements[index].stream = (uint16_t)output->elements[index].Stream;
+            elements[index].offset = (uint16_t)output->elements[index].Offset;
+            elements[index].type = (uint8_t)output->elements[index].Type;
+            elements[index].method = (uint8_t)output->elements[index].Method;
+            elements[index].usage = (uint8_t)output->elements[index].Usage;
+            elements[index].usage_index =
+                    (uint8_t)output->elements[index].UsageIndex;
+        }
+        if (!d9_build_process_layout(elements, output->element_count,
+                &destination_layout)) {
+            HOSTLOG_REFUSED("ProcessVertices refused: the output declaration "
+                    "uses an element type this software vertex path cannot "
+                    "write");
+            TRACE_MARK_EXIT("Device.ProcessVertices", D3DERR_INVALIDCALL, NULL);
+            return D3DERR_INVALIDCALL;
+        }
+    } else {
+        D9WGVertexElement elements[D3DMAXDECLLENGTH];
+        UINT element_count = 0;
+        if (!destination->fvf
+                || !fvf_to_declaration(destination->fvf, elements,
+                        &element_count)
+                || !d9_build_process_layout(elements, element_count,
+                        &destination_layout)) {
+            TRACE_MARK_EXIT("Device.ProcessVertices", D3DERR_INVALIDCALL, NULL);
+            return D3DERR_INVALIDCALL;
+        }
+    }
+    /* D3D9 refuses to transform geometry that already is, and requires the
+     * result to be pre-transformed. */
+    if (source_layout.position_transformed
+            || !destination_layout.position_transformed) {
+        HOSTLOG_REFUSED("ProcessVertices refused: the source must be "
+                "untransformed (POSITION) and the destination pre-transformed "
+                "(POSITIONT)");
+        TRACE_MARK_EXIT("Device.ProcessVertices", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    if (!source_stride || source_stride < source_layout.stride) {
+        TRACE_MARK_EXIT("Device.ProcessVertices", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    {
+        UINT source_needed;
+        UINT destination_needed;
+        if (!multiply_u32(src_start + count, source_stride, &source_needed)
+                || !multiply_u32(dst_index + count, destination_layout.stride,
+                        &destination_needed)
+                || source_needed > source->length
+                || destination_needed > destination->length) {
+            TRACE_MARK_EXIT("Device.ProcessVertices", D3DERR_INVALIDCALL, NULL);
+            return D3DERR_INVALIDCALL;
+        }
+    }
+
+    d9_multiply_matrix((const D3DMATRIX *)device->transforms[D3DTS_WORLD],
+            (const D3DMATRIX *)device->transforms[D3DTS_VIEW], &world_view);
+    d9_multiply_matrix(&world_view,
+            (const D3DMATRIX *)device->transforms[D3DTS_PROJECTION],
+            &world_view_projection);
+    lighting = device->render_states[D3DRS_LIGHTING]
+            && source_layout.normal >= 0;
+    /* D3DPV_DONOTCOPYDATA says the caller only wants the transform; everything
+     * but position keeps whatever the destination already held. */
+    copy_data = (flags & D3DPV_DONOTCOPYDATA) == 0;
+
+    for (vertex = 0; vertex < count; ++vertex) {
+        const BYTE *in = source->shadow
+                + (src_start + vertex) * source_stride;
+        BYTE *out = destination->shadow
+                + (dst_index + vertex) * destination_layout.stride;
+        float position[4];
+        float clip[4];
+        float rhw;
+        UINT index;
+
+        position[0] = ((const float *)(in + source_layout.position))[0];
+        position[1] = ((const float *)(in + source_layout.position))[1];
+        position[2] = ((const float *)(in + source_layout.position))[2];
+        position[3] = 1.0f;
+        d9_transform_vector4(&world_view_projection, position, clip);
+        rhw = (clip[3] > 1e-6f || clip[3] < -1e-6f) ? 1.0f / clip[3] : 1.0f;
+        /* Clip space -> the viewport's pixel rectangle, which is what makes
+         * the result drawable as XYZRHW. */
+        ((float *)(out + destination_layout.position))[0] =
+                (clip[0] * rhw * 0.5f + 0.5f) * (float)device->viewport.Width
+                + (float)device->viewport.X;
+        ((float *)(out + destination_layout.position))[1] =
+                (0.5f - clip[1] * rhw * 0.5f) * (float)device->viewport.Height
+                + (float)device->viewport.Y;
+        ((float *)(out + destination_layout.position))[2] =
+                device->viewport.MinZ + clip[2] * rhw
+                * (device->viewport.MaxZ - device->viewport.MinZ);
+        ((float *)(out + destination_layout.position))[3] = rhw;
+        if (!copy_data)
+            continue;
+
+        if (destination_layout.diffuse >= 0) {
+            if (lighting) {
+                float eye_position[4];
+                float normal[4];
+                float eye_normal[4];
+                float length;
+                float lit[4];
+                d9_transform_vector4(&world_view, position, eye_position);
+                normal[0] = ((const float *)(in + source_layout.normal))[0];
+                normal[1] = ((const float *)(in + source_layout.normal))[1];
+                normal[2] = ((const float *)(in + source_layout.normal))[2];
+                normal[3] = 0.0f;
+                d9_transform_vector4(&world_view, normal, eye_normal);
+                length = d9_sqrt(eye_normal[0] * eye_normal[0]
+                        + eye_normal[1] * eye_normal[1]
+                        + eye_normal[2] * eye_normal[2]);
+                if (length > 1e-6f) {
+                    eye_normal[0] /= length;
+                    eye_normal[1] /= length;
+                    eye_normal[2] /= length;
+                }
+                d9_light_vertex(device, eye_position, eye_normal, lit);
+                *(D3DCOLOR *)(out + destination_layout.diffuse) =
+                        d9_pack_color(lit);
+            } else if (source_layout.diffuse >= 0) {
+                *(D3DCOLOR *)(out + destination_layout.diffuse) =
+                        *(const D3DCOLOR *)(in + source_layout.diffuse);
+            } else {
+                *(D3DCOLOR *)(out + destination_layout.diffuse) = 0xffffffffu;
+            }
+        }
+        if (destination_layout.specular >= 0) {
+            /* Copied, never computed: see the note above about
+             * D3DRS_SPECULARENABLE. */
+            *(D3DCOLOR *)(out + destination_layout.specular) =
+                    source_layout.specular >= 0
+                    ? *(const D3DCOLOR *)(in + source_layout.specular) : 0;
+        }
+        if (destination_layout.psize >= 0) {
+            *(float *)(out + destination_layout.psize) =
+                    source_layout.psize >= 0
+                    ? *(const float *)(in + source_layout.psize) : 1.0f;
+        }
+        for (index = 0; index < D9_PV_MAX_TEXCOORDS; ++index) {
+            UINT floats = destination_layout.texcoord_floats[index];
+            UINT component;
+            if (destination_layout.texcoord[index] < 0) continue;
+            for (component = 0; component < floats; ++component) {
+                float value = 0.0f;
+                if (source_layout.texcoord[index] >= 0
+                        && component < source_layout.texcoord_floats[index]) {
+                    value = ((const float *)(in
+                            + source_layout.texcoord[index]))[component];
+                }
+                ((float *)(out
+                        + destination_layout.texcoord[index]))[component] =
+                        value;
+            }
+        }
+    }
+
+    /* The transformed vertices live in the destination's guest shadow; the
+     * host needs them too, since the app will draw straight from the buffer. */
+    TRACE("OK ProcessVertices device=%08lX count=%lu stride=%lu lit=%lu",
+            device->handle, count, destination_layout.stride,
+            (DWORD)lighting);
+    TRACE_MARK_EXIT("Device.ProcessVertices", D3D_OK, NULL);
+    return emit_buffer_update(destination->handle,
+            dst_index * destination_layout.stride,
+            destination->shadow + dst_index * destination_layout.stride,
+            count * destination_layout.stride, 0)
+            ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
+}
 static HRESULT WINAPI device_set_stream_source_freq(IDirect3DDevice9 *iface,
         UINT stream, UINT divider)
 {
@@ -8783,6 +9499,7 @@ static HRESULT WINAPI device_set_stream_source_freq(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_stream_source_freq(IDirect3DDevice9 *iface,
         UINT stream, UINT *divider)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetStreamSourceFreq");
     D9Device *device = device_from_iface(iface);
     if (stream >= D9_MAX_STREAMS || !divider)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
@@ -9312,6 +10029,7 @@ static HRESULT WINAPI device_set_scissor_rect(IDirect3DDevice9 *iface,
 static HRESULT WINAPI device_get_scissor_rect(IDirect3DDevice9 *iface,
         RECT *rect)
 {
+    PURE_DEVICE_REFUSE(device_from_iface(iface), "Device.GetScissorRect");
     D9Device *device = device_from_iface(iface);
 
     if (!rect)
@@ -11876,6 +12594,20 @@ static ULONG WINAPI surface_release(IDirect3DSurface9 *iface)
          * and auto-depth surfaces have no texture and only hold the device. */
         if (texture)
             IDirect3DTexture9_Release(&texture->iface);
+        /* An app that releases a surface without releasing its DC leaks a GDI
+         * object and a DC handle -- both process-wide and both scarce -- so
+         * the teardown reclaims them rather than trusting the caller. The
+         * contents are deliberately *not* copied back: a surface being freed
+         * has nowhere for them to go. */
+        if (surface->dc) {
+            SelectObject(surface->dc, surface->dc_previous);
+            DeleteDC(surface->dc);
+            surface->dc = NULL;
+        }
+        if (surface->dib) {
+            DeleteObject(surface->dib);
+            surface->dib = NULL;
+        }
         if (shadow)
             HeapFree(GetProcessHeap(), 0, shadow);
         device_child_release(device);
@@ -12102,17 +12834,201 @@ static HRESULT WINAPI surface_unlock_rect(IDirect3DSurface9 *iface)
     return result;
 }
 
-/* GetDC/ReleaseDC is how an app draws GDI content -- text, a loaded bitmap --
- * straight onto a D3D surface, so a refusal here is a whole class of 2D art
- * silently never arriving. Named rather than merely refused, for the reason
- * given above note_unsupported(). */
+/*
+ * GetDC/ReleaseDC is how an app draws GDI content -- text, a loaded bitmap, a
+ * video frame -- straight onto a D3D surface, so refusing it was a whole class
+ * of 2D art silently never arriving.
+ *
+ * It is implemented entirely on this side of the wire, on top of the LockRect
+ * path that already exists: a DIB section is the one bitmap GDI will draw into
+ * *and* hand back a raw pointer for, so the surface's bits are copied into a
+ * DIB for the duration of the DC and copied back on release. That is also how
+ * wined3d does it, and for the same reason -- there is no way to point GDI at
+ * arbitrary memory with a known layout otherwise.
+ *
+ * Two bits of D3D9's contract shape this:
+ *
+ *   - Only the four uncompressed display formats are permitted (D3D9 returns
+ *     D3DERR_INVALIDCALL for anything else, including every compressed and
+ *     floating-point format), which is what makes a fixed DIB layout viable.
+ *   - The surface is locked for as long as the DC is out, so LockRect during
+ *     that window must fail. Reusing surface_lock_rect() gives that for free
+ *     rather than needing a second flag to mean the same thing.
+ *
+ * GDI has no notion of the alpha channel: it writes whatever it likes into the
+ * top byte. For an X8 format those bits are ignored anyway; for A8R8G8B8 the
+ * copy back preserves what GDI produced, which is what D3D9 does too.
+ */
+static BOOL surface_dc_format_bytes(D3DFORMAT format, UINT *bytes,
+        WORD *bit_count)
+{
+    switch (format) {
+    case D3DFMT_X1R5G5B5:
+    case D3DFMT_R5G6B5:
+        *bytes = 2;
+        /* GDI's 16-bit DIBs are 555 unless a BI_BITFIELDS mask says otherwise,
+         * and 565 needs that mask. Both are two bytes per pixel either way. */
+        *bit_count = 16;
+        return TRUE;
+    case D3DFMT_X8R8G8B8:
+    case D3DFMT_A8R8G8B8:
+        *bytes = 4;
+        *bit_count = 32;
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
 static HRESULT WINAPI surface_get_dc(IDirect3DSurface9 *iface, HDC *hdc)
-{ (void)iface; if (hdc) { *hdc = NULL; }
-  UNSUPPORTED("Surface.GetDC"); return D3DERR_INVALIDCALL; }
+{
+    D9Surface *surface = surface_from_iface(iface);
+    D3DLOCKED_RECT locked;
+    struct {
+        BITMAPINFOHEADER header;
+        DWORD masks[3];
+    } info;
+    UINT pixel_bytes;
+    WORD bit_count;
+    HRESULT result;
+    UINT row;
+    UINT copy_bytes;
+
+    TRACE_MARK_ENTER("Surface.GetDC");
+    if (!hdc) {
+        TRACE_MARK_EXIT("Surface.GetDC", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    *hdc = NULL;
+    if (surface->dc) {
+        /* D3D9 allows exactly one outstanding DC per surface. */
+        TRACE("FAIL GetDC object=%08lX already has a DC",
+                (DWORD)(uintptr_t)iface);
+        TRACE_MARK_EXIT("Surface.GetDC", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    if (!surface_dc_format_bytes(surface->format, &pixel_bytes, &bit_count)) {
+        HOSTLOG_REFUSED("Surface.GetDC refused: format %08lX is not one of the "
+                "four D3D9 permits a DC on", (DWORD)surface->format);
+        TRACE_MARK_EXIT("Surface.GetDC", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    if (!surface->width || !surface->height) {
+        TRACE_MARK_EXIT("Surface.GetDC", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+
+    result = surface_lock_rect(iface, &locked, NULL, 0);
+    if (FAILED(result)) {
+        /* A default-pool render target is not lockable, and that is exactly
+         * the case a caller most needs named: the DC would have "worked" and
+         * drawn into nothing. */
+        HOSTLOG_REFUSED("Surface.GetDC refused: the surface could not be "
+                "locked (hr=%08lX); a default-pool render target has no "
+                "CPU storage to draw into", (DWORD)result);
+        TRACE_MARK_EXIT("Surface.GetDC", result, NULL);
+        return result;
+    }
+
+    ZeroMemory(&info, sizeof(info));
+    info.header.biSize = sizeof(info.header);
+    info.header.biWidth = (LONG)surface->width;
+    /* Negative height is a top-down DIB, which matches D3D's row order. A
+     * bottom-up DIB would need every copy below to walk rows backwards. */
+    info.header.biHeight = -(LONG)surface->height;
+    info.header.biPlanes = 1;
+    info.header.biBitCount = bit_count;
+    if (surface->format == D3DFMT_R5G6B5) {
+        info.header.biCompression = BI_BITFIELDS;
+        info.masks[0] = 0xF800;
+        info.masks[1] = 0x07E0;
+        info.masks[2] = 0x001F;
+    } else {
+        info.header.biCompression = BI_RGB;
+    }
+    surface->dib = CreateDIBSection(NULL, (BITMAPINFO *)&info, DIB_RGB_COLORS,
+            &surface->dib_bits, NULL, 0);
+    if (!surface->dib || !surface->dib_bits) {
+        surface->dib = NULL;
+        surface->dib_bits = NULL;
+        surface_unlock_rect(iface);
+        TRACE_MARK_EXIT("Surface.GetDC", E_OUTOFMEMORY, NULL);
+        return E_OUTOFMEMORY;
+    }
+    surface->dc = CreateCompatibleDC(NULL);
+    if (!surface->dc) {
+        DeleteObject(surface->dib);
+        surface->dib = NULL;
+        surface->dib_bits = NULL;
+        surface_unlock_rect(iface);
+        TRACE_MARK_EXIT("Surface.GetDC", E_OUTOFMEMORY, NULL);
+        return E_OUTOFMEMORY;
+    }
+    surface->dc_previous = (HBITMAP)SelectObject(surface->dc, surface->dib);
+
+    /* A DIB's rows are DWORD-aligned; the surface's are not necessarily, so
+     * the two pitches are tracked separately and every copy goes row by row. */
+    surface->dib_pitch = ((surface->width * pixel_bytes) + 3u) & ~3u;
+    surface->dc_pitch = (UINT)locked.Pitch;
+    surface->dc_bits = locked.pBits;
+    copy_bytes = surface->width * pixel_bytes;
+    for (row = 0; row < surface->height; ++row) {
+        CopyMemory((BYTE *)surface->dib_bits + row * surface->dib_pitch,
+                (const BYTE *)locked.pBits + row * surface->dc_pitch,
+                copy_bytes);
+    }
+    surface->dc_pixel_bytes = pixel_bytes;
+
+    *hdc = surface->dc;
+    TRACE("OK GetDC object=%08lX dc=%08lX %lux%lu format=%08lX",
+            (DWORD)(uintptr_t)iface, (DWORD)(uintptr_t)surface->dc,
+            surface->width, surface->height, (DWORD)surface->format);
+    TRACE_MARK_EXIT("Surface.GetDC", D3D_OK, surface->dc);
+    return D3D_OK;
+}
 
 static HRESULT WINAPI surface_release_dc(IDirect3DSurface9 *iface, HDC hdc)
-{ (void)iface; (void)hdc;
-  UNSUPPORTED("Surface.ReleaseDC"); return D3DERR_INVALIDCALL; }
+{
+    D9Surface *surface = surface_from_iface(iface);
+    UINT row;
+    UINT copy_bytes;
+
+    TRACE_MARK_ENTER("Surface.ReleaseDC");
+    if (!surface->dc || hdc != surface->dc) {
+        /* Releasing a DC this surface never handed out would otherwise tear
+         * down the wrong state and leave the surface locked forever. */
+        TRACE("FAIL ReleaseDC object=%08lX dc=%08lX does not match %08lX",
+                (DWORD)(uintptr_t)iface, (DWORD)(uintptr_t)hdc,
+                (DWORD)(uintptr_t)surface->dc);
+        TRACE_MARK_EXIT("Surface.ReleaseDC", D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+
+    /* Anything GDI still has queued has to land in the DIB before it is read
+     * back, or the last drawing operation is the one that goes missing. */
+    GdiFlush();
+    copy_bytes = surface->width * surface->dc_pixel_bytes;
+    for (row = 0; row < surface->height; ++row) {
+        CopyMemory((BYTE *)surface->dc_bits + row * surface->dc_pitch,
+                (const BYTE *)surface->dib_bits + row * surface->dib_pitch,
+                copy_bytes);
+    }
+
+    SelectObject(surface->dc, surface->dc_previous);
+    DeleteDC(surface->dc);
+    DeleteObject(surface->dib);
+    surface->dc = NULL;
+    surface->dc_previous = NULL;
+    surface->dib = NULL;
+    surface->dib_bits = NULL;
+    surface->dc_bits = NULL;
+
+    /* The unlock is what emits the upload, so the GDI drawing reaches the host
+     * through exactly the path an ordinary LockRect write would. */
+    TRACE("OK ReleaseDC object=%08lX", (DWORD)(uintptr_t)iface);
+    TRACE_MARK_EXIT("Surface.ReleaseDC", D3D_OK, NULL);
+    return surface_unlock_rect(iface);
+}
 
 /* ---- IDirect3DSwapChain9: the device's implicit primary chain ---- */
 
