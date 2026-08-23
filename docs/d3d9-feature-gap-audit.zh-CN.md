@@ -157,9 +157,7 @@ wireframe / point 填充完全没实现。WebGPU 没有 polygon mode，必须把
 
 ---
 
-## P1：规范内、影响面较窄 —— 9/10 完成（2026-08-23）
-
-唯一剩下的是 `CreateAdditionalSwapChain`，原因见下。
+## P1：规范内、影响面较窄 —— 已全部完成（2026-08-23）
 
 
 - [x] **`ProcessVertices` 已实现**（guest 侧软件顶点管线，从 D3D8 路径移植）。
@@ -191,12 +189,20 @@ wireframe / point 填充完全没实现。WebGPU 没有 polygon mode，必须把
       这么做的，原因相同。只允许 D3D9 规定的四种未压缩显示格式；DC 存在期间 surface
       保持 LockRect 锁定（这正是 D3D9 的规定）；surface 析构时回收 GDI 对象，
       不指望调用方。
-- [ ] **`CreateAdditionalSwapChain`** 仍被拒 —— **P1 唯一未完成项**。
-      它不是 guest 侧能补的：附加交换链面向*另一个 HWND*，而 host 的 present 路径
-      绑定在单一 canvas 上（`this.context`）。要做需要贯穿三层的改动 —— executor
-      维护 swap chain handle → GPUCanvasContext 的映射，bridge 按 `D9WG_OP_WINDOW_STATE`
-      已经携带的窗口几何创建并定位第二个 canvas，页面负责合成。属于独立的一块工作，
-      不是这一轮能顺手带上的。实际影响面最小：用它的基本是编辑器/工具，不是游戏。
+- [x] **`CreateAdditionalSwapChain` 已实现**，贯穿三层（协议 1.6，新增
+      `0x224/0x225/0x226`）：
+      - **关键设计**：附加链的后台缓冲是**普通的 render-target 纹理**，而不是第二个
+        "handle 0" 特例。这样 SetRenderTarget、StretchRect、GetRenderTargetData 和
+        整个 render pass 构建器全都不用改 —— 它们本来就会把纹理当目标。链只在
+        "把成品搬上它自己的 canvas" 这一步才特殊。
+      - executor 通过 `createSwapChainCanvas` 钩子向宿主要一块画布（只有页面知道
+        第二块 overlay 该放在文档的哪里），bridge 提供默认实现并按屏幕缩放定位。
+      - present 走 **blit 而非 copy**：后台缓冲的格式是 guest 要什么就是什么，而
+        canvas 是首选 canvas 格式，`copyTextureToTexture` 要求两者一致而它们通常不一致。
+      - 宿主没提供钩子时，链的帧会被**计数并报告**，不是静默渲染到虚空。
+      - 两处具名拒绝：多重采样的附加链（需要 present 时 resolve，没实现），以及
+        附加链上的 `GetFrontBufferData`（转发给设备会读到*另一个窗口*的像素，
+        错误的数据比拒绝更难归因）。
 - [x] **`D3DRS_WRAP0..15`**：确认**无法实现** —— wrap 是逐三角形比较三个顶点的
       坐标后做的决定，WebGPU 没有任何能看到整个图元的阶段（几何着色器或逐 draw 的
       compute 预处理是仅有的两种可行形态）。现在会显式报告并说明症状（柱面/球面

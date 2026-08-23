@@ -827,11 +827,26 @@ struct D9SwapChain {
     IDirect3DSwapChain9 iface;
     LONG refcount;
     D9Device *device;
+    /*
+     * Zero for the device's implicit chain, whose back buffer the host
+     * addresses as the canvas itself. An additional chain has a real handle and
+     * a real render-target texture behind `back_buffer`, which is what lets
+     * SetRenderTarget, StretchRect and GetRenderTargetData treat it as an
+     * ordinary target with no special cases anywhere but present.
+     */
+    uint32_t handle;
+    HWND window;
+    D3DPRESENT_PARAMETERS present;
+    IDirect3DSurface9 *back_buffer;
+    D9SwapChain *next_device_chain;
 };
 
 struct D9Device {
     IDirect3DDevice9 iface;
     D9SwapChain implicit_swap_chain;
+    /* CreateAdditionalSwapChain results, so device teardown and Reset can find
+     * them. The implicit chain is not on this list -- it is a member. */
+    D9SwapChain *additional_swap_chains;
     LONG refcount;
     LONG child_parent_refs;
     BOOL releasing_owned_refs;
@@ -5493,6 +5508,84 @@ static HRESULT WINAPI device_reset(IDirect3DDevice9 *iface,
     return D3D_OK;
 }
 
+/*
+ * Where a window's client area actually is, in screen coordinates.
+ *
+ * An empty client rect is not a curiosity to work around -- it means the host
+ * has no idea where the game's output is, and it positions the WebGPU overlay
+ * from exactly this. Get it wrong and the picture is drawn somewhere the guest
+ * does not think the window is, so a click at the pixel the user aimed at is
+ * delivered to whatever the guest really has there: another window, the
+ * desktop, anything.
+ *
+ * GetWindowRect is the fallback because it works on windows GetClientRect
+ * reports nothing useful for (fullscreen, above all), and it answers both
+ * questions at once.
+ */
+static void probe_window_rect(HWND window, int fallback_width,
+        int fallback_height, RECT *client, POINT *origin)
+{
+    SetRect(client, 0, 0, fallback_width, fallback_height);
+    origin->x = 0;
+    origin->y = 0;
+    if (window) {
+        GetClientRect(window, client);
+        ClientToScreen(window, origin);
+    }
+    if (client->right - client->left > 0 && client->bottom - client->top > 0)
+        return;
+    {
+        RECT window_rect;
+        if (window && GetWindowRect(window, &window_rect)
+                && window_rect.right > window_rect.left
+                && window_rect.bottom > window_rect.top) {
+            origin->x = window_rect.left;
+            origin->y = window_rect.top;
+            SetRect(client, 0, 0, window_rect.right - window_rect.left,
+                    window_rect.bottom - window_rect.top);
+        }
+    }
+}
+
+/*
+ * An additional swap chain's present. It carries the chain's own window rect
+ * for the same reason the implicit one does -- there is no window-move
+ * subclassing, so Present is the live source of truth for where the host should
+ * put that chain's canvas.
+ */
+static BOOL emit_present_swap_chain_and_flush(D9SwapChain *chain,
+        HWND override_window)
+{
+    D9Device *device = chain->device;
+    D9WGPresentSwapChain present;
+    HWND window = override_window ? override_window : chain->window;
+    RECT client;
+    POINT origin;
+    uint8_t *payload;
+    BOOL result;
+
+    probe_window_rect(window, (int)chain->present.BackBufferWidth,
+            (int)chain->present.BackBufferHeight, &client, &origin);
+    ZeroMemory(&present, sizeof(present));
+    present.device_handle = device->handle;
+    present.swap_chain_handle = chain->handle;
+    present.hwnd = (uint32_t)(uintptr_t)window;
+    present.x = origin.x;
+    present.y = origin.y;
+    present.width = (uint32_t)(client.right - client.left);
+    present.height = (uint32_t)(client.bottom - client.top);
+
+    EnterCriticalSection(&g_transport_lock);
+    result = reserve_command_locked(D9WG_OP_PRESENT_SWAP_CHAIN,
+            sizeof(present), 0, NULL, &payload, NULL);
+    if (result) {
+        CopyMemory(payload, &present, sizeof(present));
+        result = submit_batch_locked(TRUE);
+    }
+    LeaveCriticalSection(&g_transport_lock);
+    return result;
+}
+
 static BOOL emit_present_and_flush(D9Device *device, HWND override_window)
 {
     D9WGPresent present;
@@ -5505,14 +5598,8 @@ static BOOL emit_present_and_flush(D9Device *device, HWND override_window)
 
     if (!window)
         window = device->creation.hFocusWindow;
-    SetRect(&client, 0, 0, (int)device->display_mode.Width,
-            (int)device->display_mode.Height);
-    origin.x = 0;
-    origin.y = 0;
-    if (window) {
-        GetClientRect(window, &client);
-        ClientToScreen(window, &origin);
-    }
+    probe_window_rect(window, (int)device->display_mode.Width,
+            (int)device->display_mode.Height, &client, &origin);
     present.device_handle = device->handle;
     present.hwnd = (uint32_t)(uintptr_t)window;
     present.x = origin.x;
@@ -5529,18 +5616,6 @@ static BOOL emit_present_and_flush(D9Device *device, HWND override_window)
      * reports nothing useful for, and it answers both questions at once
      * (position and size, in screen coordinates).
      */
-    if (client.right - client.left <= 0 || client.bottom - client.top <= 0) {
-        RECT window_rect;
-        if (window && GetWindowRect(window, &window_rect)
-                && window_rect.right > window_rect.left
-                && window_rect.bottom > window_rect.top) {
-            origin.x = window_rect.left;
-            origin.y = window_rect.top;
-            SetRect(&client, 0, 0, window_rect.right - window_rect.left,
-                    window_rect.bottom - window_rect.top);
-        }
-
-    }
     present.width = (uint32_t)(client.right - client.left);
     present.height = (uint32_t)(client.bottom - client.top);
 
@@ -7376,17 +7451,145 @@ static HRESULT WINAPI device_get_pixel_shader_constant_b(
 /* The refusals below all report themselves through UNSUPPORTED(), defined next
  * to HOSTLOG_REFUSED() above -- see the rationale there. */
 
-DEV_STUB(create_additional_swap_chain, D3DPRESENT_PARAMETERS *params,
+/*
+ * IDirect3DDevice9::CreateAdditionalSwapChain.
+ *
+ * The chain's back buffer is an ordinary render-target texture rather than a
+ * second "the canvas" special case, which is what keeps the rest of the stack
+ * unchanged: SetRenderTarget, StretchRect, GetRenderTargetData and the host's
+ * render-pass builder already treat a texture as a target. The chain becomes
+ * special only in the step that moves the finished image onto its own canvas.
+ *
+ * D3D9 permits additional chains on a windowed device only -- a fullscreen
+ * device owns the display -- and each needs its own window.
+ */
+static HRESULT WINAPI device_create_additional_swap_chain(
+        IDirect3DDevice9 *iface, D3DPRESENT_PARAMETERS *params,
         IDirect3DSwapChain9 **out)
 {
-    TRACE("STUB CreateAdditionalSwapChain device=%08lX params=%08lX outarg=%08lX -> %08lX",
-            device_from_iface(iface)->handle, (DWORD)(uintptr_t)params,
-            (DWORD)(uintptr_t)out, (DWORD)D3DERR_INVALIDCALL);
-    (void)iface;
-    (void)params;
-    if (out)
-        *out = NULL;
-    return TRACE_REFUSE(D3DERR_INVALIDCALL);
+    D9Device *device = device_from_iface(iface);
+    D9SwapChain *chain;
+    D9WGCreateSwapChain command;
+    IDirect3DSurface9 *back_buffer = NULL;
+    D9Surface *surface;
+    HWND window;
+    UINT width;
+    UINT height;
+    D3DFORMAT format;
+    RECT client;
+    POINT origin;
+    HRESULT hr;
+
+    TRACE_MARK_ENTER("Device.CreateAdditionalSwapChain");
+    if (out) *out = NULL;
+    if (!params || !out) {
+        TRACE_MARK_EXIT("Device.CreateAdditionalSwapChain",
+                D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    if (!params->Windowed || !device->present.Windowed) {
+        HOSTLOG_REFUSED("CreateAdditionalSwapChain refused: D3D9 allows "
+                "additional chains only on a windowed device, and only for a "
+                "windowed chain");
+        TRACE_MARK_EXIT("Device.CreateAdditionalSwapChain",
+                D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    if (params->MultiSampleType != D3DMULTISAMPLE_NONE) {
+        /* The chain's back buffer would have to be a multisampled texture that
+         * also resolves at present; nothing here does that resolve, and a
+         * silently single-sampled chain is a difference the app cannot see. */
+        HOSTLOG_REFUSED("CreateAdditionalSwapChain refused: multisample=%lu is "
+                "not implemented for an additional chain",
+                (DWORD)params->MultiSampleType);
+        TRACE_MARK_EXIT("Device.CreateAdditionalSwapChain",
+                D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+
+    window = params->hDeviceWindow ? params->hDeviceWindow
+            : device->creation.hFocusWindow;
+    if (!window) {
+        TRACE_MARK_EXIT("Device.CreateAdditionalSwapChain",
+                D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    /* D3D9 fills a zero width/height from the window's client area. */
+    probe_window_rect(window, (int)device->display_mode.Width,
+            (int)device->display_mode.Height, &client, &origin);
+    width = params->BackBufferWidth ? params->BackBufferWidth
+            : (UINT)(client.right - client.left);
+    height = params->BackBufferHeight ? params->BackBufferHeight
+            : (UINT)(client.bottom - client.top);
+    if (!width || !height) {
+        TRACE_MARK_EXIT("Device.CreateAdditionalSwapChain",
+                D3DERR_INVALIDCALL, NULL);
+        return D3DERR_INVALIDCALL;
+    }
+    format = params->BackBufferFormat == D3DFMT_UNKNOWN
+            ? device->display_mode.Format : params->BackBufferFormat;
+
+    hr = create_target_texture(device, width, height, format,
+            D3DUSAGE_RENDERTARGET, D3DMULTISAMPLE_NONE, 0, &back_buffer);
+    if (FAILED(hr)) {
+        HOSTLOG_FAILED("CreateAdditionalSwapChain refused: its back buffer "
+                "(%lux%lu format=%08lX) could not be created", width, height,
+                (DWORD)format);
+        TRACE_MARK_EXIT("Device.CreateAdditionalSwapChain", hr, NULL);
+        return hr;
+    }
+    surface = surface_from_iface(back_buffer);
+
+    chain = (D9SwapChain *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+            sizeof(*chain));
+    if (!chain) {
+        IDirect3DSurface9_Release(back_buffer);
+        TRACE_MARK_EXIT("Device.CreateAdditionalSwapChain", E_OUTOFMEMORY,
+                NULL);
+        return E_OUTOFMEMORY;
+    }
+    chain->iface.lpVtbl = &g_swap_chain_vtbl;
+    chain->refcount = 1;
+    chain->device = device;
+    chain->handle = allocate_handle();
+    chain->window = window;
+    chain->back_buffer = back_buffer;
+    chain->present = *params;
+    chain->present.BackBufferWidth = width;
+    chain->present.BackBufferHeight = height;
+    chain->present.BackBufferFormat = format;
+    chain->present.BackBufferCount = params->BackBufferCount
+            ? params->BackBufferCount : 1;
+    chain->present.hDeviceWindow = window;
+
+    command.device_handle = device->handle;
+    command.swap_chain_handle = chain->handle;
+    command.back_buffer_handle = surface->texture ? surface->texture->handle : 0;
+    command.hwnd = (uint32_t)(uintptr_t)window;
+    command.x = origin.x;
+    command.y = origin.y;
+    command.width = width;
+    command.height = height;
+    if (!command.back_buffer_handle
+            || !emit_command(D9WG_OP_CREATE_SWAP_CHAIN, &command,
+                    sizeof(command))) {
+        IDirect3DSurface9_Release(back_buffer);
+        HeapFree(GetProcessHeap(), 0, chain);
+        TRACE_MARK_EXIT("Device.CreateAdditionalSwapChain",
+                D3DERR_DRIVERINTERNALERROR, NULL);
+        return D3DERR_DRIVERINTERNALERROR;
+    }
+
+    chain->next_device_chain = device->additional_swap_chains;
+    device->additional_swap_chains = chain;
+    device_child_add_ref(device);
+    *out = &chain->iface;
+    TRACE("OK CreateAdditionalSwapChain device=%08lX chain=%08lX back=%08lX "
+            "%lux%lu window=%08lX", device->handle, chain->handle,
+            command.back_buffer_handle, width, height,
+            (DWORD)(uintptr_t)window);
+    TRACE_MARK_EXIT("Device.CreateAdditionalSwapChain", D3D_OK, *out);
+    return D3D_OK;
 }
 
 static HRESULT WINAPI device_get_swap_chain(IDirect3DDevice9 *iface,
@@ -13076,6 +13279,29 @@ static ULONG WINAPI swap_chain_release(IDirect3DSwapChain9 *iface)
     ULONG refs;
 
     TRACE_MARK_ENTER("SwapChain.Release");
+    if (swap_chain->handle) {
+        /* An additional chain is an ordinary heap object with its own
+         * lifetime, unlike the implicit one, which is a member of the device
+         * and whose refcount is really the device's. */
+        refs = (ULONG)InterlockedDecrement(&swap_chain->refcount);
+        if (!refs) {
+            D9SwapChain **link = &device->additional_swap_chains;
+            D9WGDestroySwapChain destroy;
+            while (*link && *link != swap_chain)
+                link = &(*link)->next_device_chain;
+            if (*link) *link = swap_chain->next_device_chain;
+            destroy.device_handle = device->handle;
+            destroy.swap_chain_handle = swap_chain->handle;
+            emit_command(D9WG_OP_DESTROY_SWAP_CHAIN, &destroy,
+                    sizeof(destroy));
+            if (swap_chain->back_buffer)
+                IDirect3DSurface9_Release(swap_chain->back_buffer);
+            HeapFree(GetProcessHeap(), 0, swap_chain);
+            device_child_release(device);
+        }
+        TRACE_MARK_EXIT("SwapChain.Release", (HRESULT)refs, iface);
+        return refs;
+    }
     refs = (ULONG)InterlockedDecrement(&swap_chain->refcount);
     TRACE("CALL SwapChain.Release object=%08lX refs=%lu device_refs_before=%ld",
             (DWORD)(uintptr_t)iface, refs,
@@ -13102,11 +13328,19 @@ static HRESULT WINAPI swap_chain_present(IDirect3DSwapChain9 *iface,
             (DWORD)(uintptr_t)iface, flags,
             (DWORD)(uintptr_t)override_window);
     (void)flags;
+    (void)src_rect;
+    (void)dst_rect;
+    (void)dirty_region;
     /* The bridge presents synchronously, so DONOTWAIT cannot make it return
      * WASSTILLDRAWING.  LINEAR_CONTENT does not change the guest-side work;
      * both flags can otherwise use the device's normal presentation path. */
-    result = device_present(&swap_chain->device->iface, src_rect, dst_rect,
-            override_window, dirty_region);
+    if (swap_chain->handle) {
+        result = emit_present_swap_chain_and_flush(swap_chain, override_window)
+                ? D3D_OK : D3DERR_DRIVERINTERNALERROR;
+    } else {
+        result = device_present(&swap_chain->device->iface, src_rect, dst_rect,
+                override_window, dirty_region);
+    }
     TRACE("%s SwapChain.Present object=%08lX -> %08lX",
             SUCCEEDED(result) ? "OK" : "FAIL", (DWORD)(uintptr_t)iface,
             (DWORD)result);
@@ -13121,6 +13355,16 @@ static HRESULT WINAPI swap_chain_get_front_buffer_data(
     HRESULT result;
 
     TRACE_MARK_ENTER("SwapChain.GetFrontBufferData");
+    if (swap_chain->handle) {
+        /* Forwarding to the device would read the *implicit* chain's pixels --
+         * a different window's picture, returned as if it were this one's.
+         * Wrong data is harder to attribute than a refusal, so refuse. */
+        HOSTLOG_REFUSED("SwapChain.GetFrontBufferData is not implemented for "
+                "an additional swap chain");
+        TRACE_MARK_EXIT("SwapChain.GetFrontBufferData", D3DERR_INVALIDCALL,
+                NULL);
+        return D3DERR_INVALIDCALL;
+    }
     result = device_get_front_buffer_data(&swap_chain->device->iface, 0,
             destination);
     TRACE("%s SwapChain.GetFrontBufferData object=%08lX dst=%08lX -> %08lX",
@@ -13137,8 +13381,23 @@ static HRESULT WINAPI swap_chain_get_back_buffer(IDirect3DSwapChain9 *iface,
     HRESULT result;
 
     TRACE_MARK_ENTER("SwapChain.GetBackBuffer");
-    result = device_get_back_buffer(&swap_chain->device->iface, 0, index,
-            type, out);
+    if (swap_chain->handle) {
+        /* An additional chain owns a real surface rather than borrowing the
+         * device's implicit one. */
+        if (!out) {
+            result = D3DERR_INVALIDCALL;
+        } else if (index || type != D3DBACKBUFFER_TYPE_MONO) {
+            *out = NULL;
+            result = D3DERR_INVALIDCALL;
+        } else {
+            *out = swap_chain->back_buffer;
+            IDirect3DSurface9_AddRef(*out);
+            result = D3D_OK;
+        }
+    } else {
+        result = device_get_back_buffer(&swap_chain->device->iface, 0, index,
+                type, out);
+    }
     TRACE("%s SwapChain.GetBackBuffer object=%08lX index=%lu type=%lu out=%08lX -> %08lX",
             SUCCEEDED(result) ? "OK" : "FAIL", (DWORD)(uintptr_t)iface,
             index, (DWORD)type,
@@ -13215,6 +13474,11 @@ static HRESULT WINAPI swap_chain_get_present_parameters(
         TRACE_MARK_EXIT("SwapChain.GetPresentParameters",
                 D3DERR_INVALIDCALL, NULL);
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
+    }
+    if (swap_chain->handle) {
+        *parameters = swap_chain->present;
+        TRACE_MARK_EXIT("SwapChain.GetPresentParameters", D3D_OK, NULL);
+        return D3D_OK;
     }
     *parameters = swap_chain->device->present;
     TRACE("OK SwapChain.GetPresentParameters object=%08lX %lux%lu fmt=%08lX count=%lu windowed=%lu",

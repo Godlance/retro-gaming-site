@@ -534,7 +534,7 @@ function makeExecutor(options = {}) {
     const canvas = { width: 1, height: 1, getContext: () => fake.context };
     const executor = new D3D9WebGPUExecutor(canvas,
         { gpu: fake.gpu, ...executorOptions });
-    return { fake, executor,
+    return { fake, executor, calls: fake.calls,
         find: name => fake.calls.filter(call => call[0] === name),
         last: name => {
             const matches = fake.calls.filter(call => call[0] === name);
@@ -1407,6 +1407,144 @@ await test("independent sampler state drives the GPUSampler, not the texture", a
     }, { u: "clamp-to-edge", v: "mirror-repeat", mag: "linear",
         min: "linear", mip: "linear" });
     assert.equal(executor.stats.samplersCreated, 1);
+});
+
+// CreateAdditionalSwapChain targets a second guest window, so the host needs a
+// second drawing surface. The back buffer is an ordinary render-target texture
+// -- that is what keeps draws, StretchRect and readback unchanged -- and the
+// chain is special only in the step that moves the finished image onto its own
+// canvas.
+const OP_CREATE_SWAP_CHAIN = 0x224;
+const OP_DESTROY_SWAP_CHAIN = 0x225;
+const OP_PRESENT_SWAP_CHAIN = 0x226;
+const D3DUSAGE_RENDERTARGET_BIT = 1;
+
+function makeSwapChainCanvas(calls) {
+    return {
+        width: 1, height: 1, style: {},
+        getContext(kind) {
+            calls.push(["swapchain-getContext", kind]);
+            return {
+                configure(descriptor) {
+                    calls.push(["swapchain-configure", descriptor]);
+                },
+                unconfigure() { calls.push(["swapchain-unconfigure"]); },
+                getCurrentTexture() {
+                    const texture = { width: 256, height: 128,
+                        createView: () => ({ swapchainOverlay: true }) };
+                    calls.push(["swapchain-getCurrentTexture", texture]);
+                    return texture;
+                },
+            };
+        },
+    };
+}
+
+await test("an additional swap chain gets its own configured canvas",
+        async () => {
+    const created = [];
+    const surfaces = [];
+    const { executor, find, calls } = makeExecutor({
+        createSwapChainCanvas: (surface) => {
+            created.push(surface);
+            return makeSwapChainCanvas(calls);
+        },
+        onSwapChainSurface: (surface, reason) => surfaces.push([reason, surface]),
+    });
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x901, 256, 128, 1, 21, D3DUSAGE_RENDERTARGET_BIT, 0)),
+        command(OP_CREATE_SWAP_CHAIN,
+            u32(DEVICE, 0x77, 0x901, 0xBEEF, 12, 34, 256, 128)),
+    ]));
+    await executor.idle();
+    assert.equal(executor.stats.swapChainsCreated, 1);
+    assert.equal(executor.stats.swapChainsRefused, 0);
+    assert.equal(created.length, 1, "the embedder must be asked for a canvas");
+    assert.equal(created[0].swapChain, 0x77);
+    assert.deepEqual(
+        { x: created[0].x, y: created[0].y,
+          width: created[0].width, height: created[0].height },
+        { x: 12, y: 34, width: 256, height: 128 });
+    assert.ok(find("swapchain-configure").length === 1,
+        "the chain's context has to be configured before it can be presented to");
+    assert.deepEqual(surfaces.map(entry => entry[0]), ["create"]);
+});
+
+await test("presenting an additional chain blits its back buffer to its canvas",
+        async () => {
+    const { executor, find, calls } = makeExecutor({
+        createSwapChainCanvas: () => makeSwapChainCanvas(calls),
+    });
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x901, 256, 128, 1, 21, D3DUSAGE_RENDERTARGET_BIT, 0)),
+        command(OP_CREATE_SWAP_CHAIN,
+            u32(DEVICE, 0x77, 0x901, 0xBEEF, 12, 34, 256, 128)),
+        command(OP_PRESENT_SWAP_CHAIN,
+            u32(DEVICE, 0x77, 0xBEEF, 40, 50, 256, 128, 0)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.swapChainPresents, 1);
+    assert.equal(executor.stats.swapChainPresentsDropped, 0);
+    assert.equal(find("swapchain-getCurrentTexture").length, 1,
+        "the chain's canvas is acquired inside the submitting task");
+    // A blit, not a copy: the back buffer is an ordinary D3D texture whose
+    // format need not match the canvas format, and a copy requires a match.
+    const blitPipelines = find("createRenderPipeline")
+        .map(call => call[1])
+        .filter(descriptor => /blit/.test(descriptor.label || ""));
+    assert.ok(blitPipelines.length >= 1,
+        "the present has to go through the format-converting blit path");
+});
+
+await test("an additional swap chain with no canvas hook is counted, not silent",
+        async () => {
+    // Rendering nowhere in silence is the failure mode that costs the most to
+    // diagnose; a refusal that says so costs nothing.
+    const { executor } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x901, 256, 128, 1, 21, D3DUSAGE_RENDERTARGET_BIT, 0)),
+        command(OP_CREATE_SWAP_CHAIN,
+            u32(DEVICE, 0x77, 0x901, 0xBEEF, 0, 0, 256, 128)),
+        command(OP_PRESENT_SWAP_CHAIN,
+            u32(DEVICE, 0x77, 0xBEEF, 0, 0, 256, 128, 0)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.swapChainsRefused, 1);
+    assert.equal(executor.stats.swapChainPresentsDropped, 1,
+        "the frame is dropped and counted rather than rendered nowhere");
+});
+
+await test("destroying an additional swap chain unconfigures and reports it",
+        async () => {
+    const surfaces = [];
+    const { executor, find, calls } = makeExecutor({
+        createSwapChainCanvas: () => makeSwapChainCanvas(calls),
+        onSwapChainSurface: (surface, reason) => surfaces.push([reason, surface]),
+    });
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x901, 256, 128, 1, 21, D3DUSAGE_RENDERTARGET_BIT, 0)),
+        command(OP_CREATE_SWAP_CHAIN,
+            u32(DEVICE, 0x77, 0x901, 0xBEEF, 0, 0, 256, 128)),
+        command(OP_DESTROY_SWAP_CHAIN, u32(DEVICE, 0x77)),
+        // A present after destruction must not resurrect it.
+        command(OP_PRESENT_SWAP_CHAIN,
+            u32(DEVICE, 0x77, 0xBEEF, 0, 0, 256, 128, 0)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.swapChainsDestroyed, 1);
+    assert.equal(find("swapchain-unconfigure").length, 1);
+    assert.equal(executor.stats.swapChainPresentsDropped, 1);
+    assert.deepEqual(surfaces.map(entry => entry[0]), ["create", "destroy"]);
+    assert.equal(surfaces[1][1].visible, false,
+        "the page needs to know the overlay is gone, not just that it existed");
 });
 
 await test("a multisampled target makes the pipeline declare its sample count",

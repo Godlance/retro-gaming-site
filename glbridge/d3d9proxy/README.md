@@ -331,12 +331,38 @@ restriction, and the `CreateTexture`/`CreateVertexBuffer`/`CreateIndexBuffer`
 failure paths. Protocol 1.3 deliberately requires the matching executor and
 bridge; older page/DLL pairs are not a compatibility target.
 
-The remaining deliberately unsupported legacy entry points trace
-`STUB <Method>` and are mirrored once to the browser console through
-`D9WG_OP_GUEST_LOG`: `ProcessVertices`, additional swap chains, palettized
-textures, higher-order patches, and `Surface::GetDC`/`ReleaseDC`. Their related
-caps/usages are not advertised. This is distinct from the rendering gaps above:
-none of these methods has a faithful WebGPU implementation in this profile.
+The remaining deliberately unsupported entry points trace `STUB <Method>` and
+are mirrored once to the browser console through `D9WG_OP_GUEST_LOG`:
+higher-order patches (`DrawRectPatch`/`DrawTriPatch`/`DeletePatch`, N-patches
+and adaptive tessellation), and `SwapChain::GetFrontBufferData` on an
+*additional* chain. Their related caps/usages are not advertised.
+
+`ProcessVertices`, additional swap chains, palettized textures and
+`Surface::GetDC`/`ReleaseDC` were on that list and are now implemented; three
+of the four live entirely on this side of the wire, because the thing each one
+returns is guest memory rather than a picture:
+
+- **`ProcessVertices`** is a real software vertex pipeline over the state the
+  guest already shadows for SetTransform/SetViewport/SetMaterial/SetLight. It
+  has to be here: the call's whole purpose is that the result lands in memory
+  the app can Lock and read, and this stack's host is asynchronous, so no
+  synchronous GPU round trip could answer it. A bound vertex shader is refused
+  rather than served by the fixed-function pipeline, and
+  `D3DRS_SPECULARENABLE`'s highlight is copied rather than computed --
+  `sample/d3d9_process_vertices_test.c` checks the numbers rather than the
+  pixels.
+- **`Surface::GetDC`/`ReleaseDC`** copy the surface into a DIB section for the
+  DC's lifetime and copy back on release, through the ordinary LockRect upload.
+  A DIB is the one bitmap GDI will both draw into and hand back a pointer for,
+  which is the same reason wined3d uses one.
+- **Additional swap chains** are the exception that needs the host: the chain
+  targets a different HWND, so it gets its own canvas through the executor's
+  `createSwapChainCanvas` hook. Its back buffer is deliberately an ordinary
+  render-target texture rather than a second "handle zero" special case, so
+  draws, `StretchRect` and readback all treat it as a texture and the chain is
+  special only in the step that puts its image on screen. An embedder that
+  supplies no hook gets the chain's frames counted and reported, not silently
+  dropped.
 
 **The diagnostic DLL now traces the paths a title can quietly give up in.**
 Chasing GTA San Andreas's silent exit turned up three blind spots, each able to

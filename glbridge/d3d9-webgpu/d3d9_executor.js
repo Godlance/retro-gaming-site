@@ -70,7 +70,7 @@
 
     const D9WG_MAGIC = 0x47573944; // "D9WG"
     const D9WG_VERSION_MAJOR = 1;
-    const D9WG_VERSION_MINOR = 5;
+    const D9WG_VERSION_MINOR = 6;
     // The oldest guest proxy this host still decodes. 1.3 payloads are simply
     // shorter than 1.4 ones; see the version check in executeBatch().
     const D9WG_VERSION_MIN_MINOR = 3;
@@ -121,6 +121,9 @@
     const OP_GENERATE_MIPS = 0x221;
     const OP_SET_TEXTURE_LOD = 0x222;
     const OP_SET_GAMMA_RAMP = 0x223;
+    const OP_CREATE_SWAP_CHAIN = 0x224;
+    const OP_DESTROY_SWAP_CHAIN = 0x225;
+    const OP_PRESENT_SWAP_CHAIN = 0x226;
     // D9WGSetDepthStencilSurface.depth_texture_handle sentinel: the device's own
     // auto depth-stencil surface. It needs a value distinct from 0 because
     // SetDepthStencilSurface(NULL) -- which really does turn depth testing off
@@ -2996,6 +2999,9 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 frameFlushes: 0,
                 unsupportedCommands: 0, malformedBatches: 0,
                 malformedCommands: 0, gammaRampUpdates: 0, fillModeDraws: 0,
+                swapChainsCreated: 0, swapChainsDestroyed: 0,
+                swapChainsRefused: 0, swapChainPresents: 0,
+                swapChainPresentsDropped: 0,
                 gammaPresents: 0,
                 droppedDraws: 0,
                 guestReports: 0,
@@ -3514,6 +3520,9 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 // depthStencil block.
                 hasDepth: false,
                 depthTexture: null,
+                // CreateAdditionalSwapChain results, keyed by chain handle.
+                // The implicit chain is not in here: it is the canvas.
+                swapChains: new Map(),
                 depthView: null,
                 samplerStates: new Map(), // sampler*64+state -> value, read by samplerFor()
                 textureStageStates: new Map(),
@@ -3672,6 +3681,9 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 [OP_GENERATE_MIPS]: this.onGenerateMips,
                 [OP_SET_TEXTURE_LOD]: this.onSetTextureLOD,
                 [OP_SET_GAMMA_RAMP]: this.onSetGammaRamp,
+                [OP_CREATE_SWAP_CHAIN]: this.onCreateSwapChain,
+                [OP_DESTROY_SWAP_CHAIN]: this.onDestroySwapChain,
+                [OP_PRESENT_SWAP_CHAIN]: this.onPresentSwapChain,
                 [OP_STRETCH_RECT]: this.onStretchRect,
                 [OP_COLOR_FILL]: this.onColorFill,
                 [OP_GUEST_LOG]: this.onGuestLog,
@@ -4811,6 +4823,47 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                         closePass();
                         const transient = this.replayBlit(encoder, op, swapView);
                         if (transient) frame.transientBuffers.push(transient);
+                        continue;
+                    }
+                    if (op.kind === "present-swap-chain") {
+                        // An additional chain's canvas is acquired here, in
+                        // the same synchronous stretch as the submit that
+                        // consumes it -- the rule getCurrentTexture() imposes
+                        // applies per canvas, not just to the implicit one.
+                        closePass();
+                        let target = null;
+                        try {
+                            target = op.chain.context.getCurrentTexture();
+                        } catch (error) {
+                            ++this.stats.swapChainPresentsDropped;
+                            this.warnOnce("swap-chain-acquire",
+                                "an additional swap chain's canvas could not " +
+                                "be acquired; its frame is dropped",
+                                { message: String(error) });
+                        }
+                        if (target) {
+                            const width = Math.min(target.width, op.width);
+                            const height = Math.min(target.height, op.height);
+                            // A blit rather than copyTextureToTexture: the
+                            // chain's back buffer is an ordinary D3D texture,
+                            // so its format is whatever the guest asked for,
+                            // while the canvas is the preferred canvas format.
+                            // A copy requires those to be identical and they
+                            // routinely are not.
+                            if (width && height) {
+                                const transient = this.replayBlit(encoder, {
+                                    sourceView: op.sourceView,
+                                    destinationView: null,
+                                    destinationFormat: this.format,
+                                    sourceFormat: op.sourceFormat,
+                                    sourceRect: [0, 0, 1, 1],
+                                    viewport: [0, 0, width, height],
+                                    filterPoint: false,
+                                }, target.createView());
+                                if (transient)
+                                    frame.transientBuffers.push(transient);
+                            }
+                        }
                         continue;
                     }
                     if (op.kind === "generate-mips") {
@@ -6597,6 +6650,152 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
         // Held as a 256x1 rgba32float lookup rather than as a curve fit: a
         // D3D9 ramp is an arbitrary table, and titles do use it for effects
         // (fades, damage flashes) that no gamma exponent can express.
+        // ---- additional swap chains ----
+        //
+        // An additional chain targets a *different* HWND, so it needs its own
+        // drawing surface: the implicit chain's canvas is the one the page
+        // composites over the device window and nothing else.
+        //
+        // The chain's back buffer arrives as an ordinary render-target texture
+        // handle, which is what keeps every other path unchanged -- draws,
+        // StretchRect and readback all treat it as a texture. It becomes
+        // special only here, in the step that moves the finished image onto
+        // its canvas.
+        //
+        // The canvas itself has to come from the embedder, because only the
+        // page knows where a second overlay may live in the document. Without
+        // that hook the chain is refused and named rather than quietly
+        // rendering nowhere.
+        onCreateSwapChain(bytes, view, offset) {
+            const state = this.deviceState(view.getUint32(offset, true));
+            if (!state) return;
+            const handle = view.getUint32(offset + 4, true);
+            const backBufferHandle = view.getUint32(offset + 8, true);
+            const surface = {
+                hwnd: view.getUint32(offset + 12, true),
+                x: view.getInt32(offset + 16, true),
+                y: view.getInt32(offset + 20, true),
+                width: view.getUint32(offset + 24, true),
+                height: view.getUint32(offset + 28, true),
+                swapChain: handle,
+                sessionKey: state.surface ? state.surface.sessionKey : null,
+                visible: true,
+            };
+            const create = this.options.createSwapChainCanvas;
+            if (typeof create !== "function") {
+                ++this.stats.swapChainsRefused;
+                this.warnOnce("additional-swap-chain",
+                    "the guest created an additional swap chain, but this " +
+                    "embedder supplies no createSwapChainCanvas hook, so " +
+                    "there is no second surface to present it on; its frames " +
+                    "are counted and dropped");
+                state.swapChains.set(handle, { handle, backBufferHandle,
+                    surface, canvas: null, context: null });
+                return;
+            }
+            let canvas = null;
+            try {
+                canvas = create(surface);
+            } catch (error) {
+                this.warnOnce("additional-swap-chain-canvas",
+                    "createSwapChainCanvas threw; the chain has no surface to " +
+                    "present on", { message: String(error) });
+            }
+            let context = null;
+            if (canvas) {
+                canvas.width = Math.max(1, surface.width);
+                canvas.height = Math.max(1, surface.height);
+                context = canvas.getContext("webgpu");
+                if (context) {
+                    context.configure({
+                        device: this.device, format: this.format,
+                        alphaMode: "opaque",
+                        usage: TEXTURE_USAGE_RENDER_ATTACHMENT |
+                            TEXTURE_USAGE_COPY_DST,
+                    });
+                }
+            }
+            state.swapChains.set(handle,
+                { handle, backBufferHandle, surface, canvas, context });
+            ++this.stats.swapChainsCreated;
+            this.notifySwapChainSurface(surface, "create");
+        }
+
+        onDestroySwapChain(bytes, view, offset) {
+            const state = this.deviceState(view.getUint32(offset, true));
+            if (!state) return;
+            const handle = view.getUint32(offset + 4, true);
+            const chain = state.swapChains.get(handle);
+            if (!chain) return;
+            state.swapChains.delete(handle);
+            if (chain.context && typeof chain.context.unconfigure === "function")
+                chain.context.unconfigure();
+            this.notifySwapChainSurface(
+                { ...chain.surface, visible: false }, "destroy");
+            ++this.stats.swapChainsDestroyed;
+        }
+
+        onPresentSwapChain(bytes, view, offset) {
+            const state = this.deviceState(view.getUint32(offset, true));
+            if (!state) return;
+            const handle = view.getUint32(offset + 4, true);
+            const chain = state.swapChains.get(handle);
+            if (!chain) {
+                ++this.stats.swapChainPresentsDropped;
+                return;
+            }
+            const width = view.getUint32(offset + 16, true);
+            const height = view.getUint32(offset + 20, true);
+            chain.surface = {
+                ...chain.surface,
+                hwnd: view.getUint32(offset + 8, true),
+                x: view.getInt32(offset + 12, true),
+                // An empty client rect means the guest could not find the
+                // window; the last non-empty size is the better answer, for
+                // the same reason the implicit chain keeps its own.
+                width: width || chain.surface.width,
+                height: height || chain.surface.height,
+                visible: true,
+            };
+            this.notifySwapChainSurface(chain.surface, "present");
+            if (!chain.context) {
+                ++this.stats.swapChainPresentsDropped;
+                return;
+            }
+            const texture = this.resources.get(chain.backBufferHandle);
+            if (!texture || !texture.gpuTexture) {
+                ++this.stats.swapChainPresentsDropped;
+                return;
+            }
+            if (chain.canvas) {
+                if (chain.canvas.width !== texture.width)
+                    chain.canvas.width = texture.width;
+                if (chain.canvas.height !== texture.height)
+                    chain.canvas.height = texture.height;
+            }
+            // Queued into the frame op list rather than run here, for the same
+            // reason draws are: the chain's current texture is only valid
+            // inside the task that acquires it, and a guest frame arrives
+            // across several PCI submits.
+            const frame = this.ensureFrame();
+            frame.ops.push({
+                kind: "present-swap-chain",
+                chain,
+                sourceView: this.blitSourceView(texture, 0, 0),
+                sourceFormat: texture.gpuFormat ||
+                    formatToGPU(texture.format),
+                width: texture.width,
+                height: texture.height,
+            });
+            texture.frameReferenced = frame.serial;
+            ++this.stats.swapChainPresents;
+        }
+
+        notifySwapChainSurface(surface, reason) {
+            if (typeof this.options.onSwapChainSurface === "function")
+                this.options.onSwapChainSurface(surface, reason);
+        }
+
         onSetGammaRamp(bytes, view, offset, length) {
             const state = this.deviceState(view.getUint32(offset, true));
             if (!state) return;

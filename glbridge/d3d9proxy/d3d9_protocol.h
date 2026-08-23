@@ -20,7 +20,7 @@
 
 #define D9WG_MAGIC 0x47573944u /* "D9WG" */
 #define D9WG_VERSION_MAJOR 1u
-#define D9WG_VERSION_MINOR 5u
+#define D9WG_VERSION_MINOR 6u
 
 /* The last four MiB of v86gl.sys's mapped DMA allocation are never used for
  * command batches.  The browser writes asynchronous query/readback results
@@ -190,6 +190,25 @@ enum D9WGOpcode {
      * and a windowed title's brightness slider works where on hardware it
      * would not. */
     D9WG_OP_SET_GAMMA_RAMP = 0x223,
+
+    /*
+     * Protocol 1.6. IDirect3DDevice9::CreateAdditionalSwapChain and the
+     * per-chain Present.
+     *
+     * An additional swap chain targets a *different* HWND, so the host needs a
+     * second drawing surface for it -- the implicit chain's canvas is the one
+     * the page composites over the device window and nothing else.
+     *
+     * The back buffer is deliberately an ordinary render-target texture with an
+     * ordinary resource handle, not a second "handle zero" special case. That
+     * makes every other path work unchanged: SetRenderTarget, StretchRect,
+     * GetRenderTargetData and the whole render-pass builder already know how to
+     * treat a texture as a target, and the chain only becomes special in the
+     * one step that moves the finished image onto its canvas.
+     */
+    D9WG_OP_CREATE_SWAP_CHAIN = 0x224,
+    D9WG_OP_DESTROY_SWAP_CHAIN = 0x225,
+    D9WG_OP_PRESENT_SWAP_CHAIN = 0x226,
 
     D9WG_OP_DRAW_PRIMITIVE = 0x300,
     D9WG_OP_DRAW_INDEXED_PRIMITIVE = 0x301,
@@ -573,6 +592,38 @@ typedef struct D9WGSetTextureLOD {
     uint32_t reserved;
 } D9WGSetTextureLOD;
 
+typedef struct D9WGCreateSwapChain {
+    uint32_t device_handle;
+    uint32_t swap_chain_handle;
+    /* The render-target texture the chain draws into, created through the
+     * ordinary CREATE_TEXTURE_2D path before this arrives. */
+    uint32_t back_buffer_handle;
+    uint32_t hwnd;
+    int32_t  x;
+    int32_t  y;
+    uint32_t width;
+    uint32_t height;
+} D9WGCreateSwapChain;
+
+typedef struct D9WGDestroySwapChain {
+    uint32_t device_handle;
+    uint32_t swap_chain_handle;
+} D9WGDestroySwapChain;
+
+/* The window rect is re-sent on every present for the same reason the implicit
+ * chain's is: the guest has no window-move subclassing, so Present is the live
+ * source of truth for where the canvas belongs. */
+typedef struct D9WGPresentSwapChain {
+    uint32_t device_handle;
+    uint32_t swap_chain_handle;
+    uint32_t hwnd;
+    int32_t  x;
+    int32_t  y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t reserved;
+} D9WGPresentSwapChain;
+
 /* 256 entries of red, then 256 green, then 256 blue -- the memory order of
  * D3DGAMMARAMP itself, so the guest copies it in one go. */
 typedef struct D9WGSetGammaRamp {
@@ -942,6 +993,12 @@ typedef char D9WGAssertSetTextureLODSize[
         sizeof(D9WGSetTextureLOD) == 16 ? 1 : -1];
 typedef char D9WGAssertSetGammaRampSize[
         sizeof(D9WGSetGammaRamp) == 1552 ? 1 : -1];
+typedef char D9WGAssertCreateSwapChainSize[
+        sizeof(D9WGCreateSwapChain) == 32 ? 1 : -1];
+typedef char D9WGAssertDestroySwapChainSize[
+        sizeof(D9WGDestroySwapChain) == 8 ? 1 : -1];
+typedef char D9WGAssertPresentSwapChainSize[
+        sizeof(D9WGPresentSwapChain) == 32 ? 1 : -1];
 typedef char D9WGAssertSetScissorRectSize[
         sizeof(D9WGSetScissorRect) == 20 ? 1 : -1];
 typedef char D9WGAssertStretchRectSize[

@@ -3817,6 +3817,11 @@
             this.d3d9Surface = { hwnd: 0, x: 0, y: 0, width: 0, height: 0 };
             this.d3d9OwnerSessionKey = null;
             this.d3d9Visible = false;
+            /* CreateAdditionalSwapChain overlays, keyed by chain handle. Each
+             * targets a different guest window, so each needs its own element:
+             * the d3d9Canvas above is the one composited over the *device*
+             * window and cannot serve a second one. */
+            this.d3d9SwapChainCanvases = new Map();
             this.buf = [];
             this.pendingPackets = [];
             this.pendingPCIBatches = [];
@@ -3974,6 +3979,40 @@
                 if (typeof userDestroy === "function") {
                     userDestroy(surface, reason);
                 }
+            };
+            /*
+             * An additional swap chain needs a drawing surface of its own, and
+             * only the page knows where a second overlay may live in the
+             * document -- so the executor asks for one rather than inventing
+             * it. Returning null is a supported answer: the executor then
+             * counts the chain's frames and says so, instead of rendering
+             * nowhere in silence.
+             */
+            const userSwapChainCanvas = executorOptions.createSwapChainCanvas;
+            executorOptions.createSwapChainCanvas = (surface) => {
+                if (typeof userSwapChainCanvas === "function")
+                    return userSwapChainCanvas(surface);
+                if (typeof document === "undefined" || !this.container)
+                    return null;
+                const canvas = document.createElement("canvas");
+                canvas.className = "v86gl-d3d9-swapchain-overlay";
+                canvas.width = Math.max(1, surface.width || 1);
+                canvas.height = Math.max(1, surface.height || 1);
+                this.styleOverlayCanvas(canvas, 0, 0, canvas.width,
+                        canvas.height, false);
+                this.container.appendChild(canvas);
+                this.d3d9SwapChainCanvases.set(surface.swapChain, canvas);
+                return canvas;
+            };
+            const userSwapChainSurface = executorOptions.onSwapChainSurface;
+            executorOptions.onSwapChainSurface = (surface, reason) => {
+                if (reason === "destroy") {
+                    this.removeD3D9SwapChainCanvas(surface.swapChain);
+                } else {
+                    this.positionD3D9SwapChainCanvas(surface);
+                }
+                if (typeof userSwapChainSurface === "function")
+                    userSwapChainSurface(surface, reason);
             };
             this.d3d9Executor = install(this.d3d9Canvas, executorOptions);
         }
@@ -5652,6 +5691,60 @@
             this.styleOverlayCanvas(this.d3d9Canvas, left, top,
                 width, height, shouldShow);
             this.d3d9Canvas.style.visibility = shouldShow ? "visible" : "hidden";
+        }
+
+        /*
+         * An additional swap chain's overlay. It goes through the same
+         * screen-canvas scaling as the device overlay -- the guest reports
+         * screen coordinates and the page may be showing the VM's framebuffer
+         * at any size, so a chain placed in raw guest pixels lands in the wrong
+         * place on every zoom level but 1:1.
+         */
+        positionD3D9SwapChainCanvas(surface) {
+            const canvas = this.d3d9SwapChainCanvases.get(surface.swapChain);
+            if (!canvas) {
+                return;
+            }
+            const w = surface.width || canvas.width || 1;
+            const h = surface.height || canvas.height || 1;
+            let left = surface.x || 0;
+            let top = surface.y || 0;
+            let width = w;
+            let height = h;
+
+            if (this.container && this.screenCanvas &&
+                    this.screenCanvas.width && this.screenCanvas.height) {
+                const containerRect = this.container.getBoundingClientRect();
+                const screenRect = this.screenCanvas.getBoundingClientRect();
+                const scaleX = screenRect.width / this.screenCanvas.width;
+                const scaleY = screenRect.height / this.screenCanvas.height;
+                left = screenRect.left - containerRect.left +
+                        (surface.x || 0) * scaleX;
+                top = screenRect.top - containerRect.top +
+                        (surface.y || 0) * scaleY;
+                width = w * scaleX;
+                height = h * scaleY;
+            }
+
+            const visible = surface.visible !== false;
+            this.styleOverlayCanvas(canvas, left, top, width, height, visible);
+            canvas.style.visibility = visible ? "visible" : "hidden";
+        }
+
+        removeD3D9SwapChainCanvas(handle) {
+            const canvas = this.d3d9SwapChainCanvases.get(handle);
+            if (!canvas) {
+                return;
+            }
+            this.d3d9SwapChainCanvases.delete(handle);
+            /* Only elements this bridge created are removed; one supplied by an
+             * embedder's own createSwapChainCanvas belongs to the page. */
+            if (canvas.className === "v86gl-d3d9-swapchain-overlay" &&
+                    canvas.parentElement) {
+                canvas.parentElement.removeChild(canvas);
+            } else {
+                this.styleOverlayCanvas(canvas, 0, 0, 0, 0, false);
+            }
         }
 
         cancelOverlayHide() {
