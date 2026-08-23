@@ -116,17 +116,19 @@
         return names;
     })();
 
-    // The ps_1_x bump-environment and 3x2/3x3 matrix texture-addressing
-    // family. These carry hidden state (the D3DTSS_BUMPENVMAT* stage matrix,
-    // implicit cross-stage register chaining) that has no WGSL analogue
-    // without also modelling texture-stage state inside the shader. Refusing
-    // them keeps the plan's "no pretending" discipline: the shader is marked
+    // What remains of the ps_1_x texture-addressing family after the bump and
+    // matrix forms were implemented (see the TEXBEM/TEXM3x* cases in emit()).
+    //
+    // These three are the ones with no honest translation. TEXDEPTH and
+    // TEXM3x2DEPTH replace the fragment's depth from a texture-addressing
+    // result, which needs a frag_depth output the surrounding pipeline is not
+    // built for; TEXM3x3 is the Radeon-era variant that writes a 3x3 result
+    // without sampling, and nothing that reaches this translator emits it.
+    // Refusing keeps the "no pretending" discipline: the shader is marked
     // unusable and draws that bind it are counted and skipped, rather than
     // silently rendering something wrong.
     const UNSUPPORTED_OPS = new Set([
-        OP.TEXBEM, OP.TEXBEML, OP.BEM, OP.TEXM3x2PAD, OP.TEXM3x2TEX,
-        OP.TEXM3x3PAD, OP.TEXM3x3TEX, OP.TEXM3x3SPEC, OP.TEXM3x3VSPEC,
-        OP.TEXM3x2DEPTH, OP.TEXM3x3, OP.TEXDEPTH, OP.TEXDP3TEX, OP.TEXDP3,
+        OP.BEM, OP.TEXM3x2DEPTH, OP.TEXM3x3, OP.TEXDEPTH,
     ]);
 
     // Operand shape per opcode: [destCount, sourceCount]. SM2.0+ instruction
@@ -409,6 +411,19 @@
             // comparison one, and no reference value at all.
             this.requestedDepthFetchSamplers = new Set(
                 (this.options.depthFetchSamplers || []).map(index => index | 0));
+            // D3DSAMP_MIPMAPLODBIAS per sampler, already quantised by the
+            // caller. WebGPU samplers have no bias field, so it can only be
+            // applied at the sample call; it arrives as a compile option rather
+            // than a uniform because that keeps it out of the per-draw uniform
+            // writer, and the caller folds it into the shader variant key.
+            this.samplerLodBias = this.options.samplerLodBias || null;
+            // D3DTADDRESS_MIRRORONCE per sampler, as the axis letters that use
+            // it ("xy", "x", ...). The host sampler is already clamp-to-edge
+            // for such an axis, so mirroring about zero is all that is left,
+            // and abs() on the coordinate is exactly that. It arrives as a
+            // compile option for the same reason the LOD bias does: it changes
+            // the WGSL, so it belongs in the shader variant key.
+            this.samplerMirrorOnce = this.options.samplerMirrorOnce || null;
             this.writtenVaryings = new Set();
             this.usesAddress = false;
             this.usesLoopCounter = false;
@@ -425,6 +440,12 @@
             this.intDefaults = new Map();
             this.boolDefaults = new Map();
             this.psTexcoordInputs = new Set(); // ps t# registers touched
+            // ps_1_x texture addressing. bumpStages are the samplers whose
+            // D3DTSS_BUMPENVMAT* matrix a texbem/texbeml needs; matrixRows is
+            // the running accumulator the texm3x*pad instructions feed and the
+            // texm3x*tex/spec/vspec that follows consumes.
+            this.bumpStages = new Set();
+            this.matrixRows = [];
             this.psColorInputs = new Set();    // ps v# registers touched
             this.colorOutputs = new Set();
             this.controlDepth = 0;             // >0 => inside if/loop
@@ -988,6 +1009,142 @@
             case OP.TEX: this.textureLoad(instruction); return;
             case OP.TEXLDL: this.textureLoad(instruction, { explicitLod: true }); return;
             case OP.TEXLDD: this.textureLoad(instruction, { gradients: true }); return;
+            case OP.TEXBEM:
+            case OP.TEXBEML: {
+                // ps_1_x environment bump mapping. The source register holds a
+                // sampled (du, dv) pair; this stage's own texture coordinate is
+                // displaced by it through the stage's D3DTSS_BUMPENVMAT*
+                // matrix, and the displaced coordinate is what gets sampled.
+                //
+                // The matrix is texture-stage state, not shader state, so it
+                // arrives through the uniform block the host fills from
+                // textureStageStates -- see bumpStageCount in the reflection.
+                const index = dest.index;
+                if (!this.samplers.has(index)) this.samplers.set(index, "2d");
+                this.psTexcoordInputs.add(index);
+                this.bumpStages.add(index);
+                const bump = "d9c.bump[" + index + "]";
+                const source = this.rawSource({ type: sources[0].type,
+                    index: sources[0].index, swizzle: 0xe4, modifier: 0,
+                    relative: false, relativeToken: 0 });
+                const perturbed = this.fresh("bem");
+                this.emit("let " + perturbed + " = t" + index + ".xy + vec2<f32>(" +
+                    bump + ".x * (" + source + ").x + " + bump + ".z * (" +
+                    source + ").y, " + bump + ".y * (" + source + ").x + " +
+                    bump + ".w * (" + source + ").y);");
+                const sampled = this.sampleExpression(index,
+                    { coord: perturbed, ref: null }, {});
+                if (instruction.opcode === OP.TEXBEM) {
+                    this.store(dest, sampled);
+                } else {
+                    // The luminance form scales the sampled colour by the bump
+                    // map's blue channel through BUMPENVLSCALE/BUMPENVLOFFSET.
+                    const lit = this.fresh("beml");
+                    const lum = "d9c.bump_lum[" + index + "]";
+                    this.emit("let " + lit + " = " + sampled + ";");
+                    this.store(dest, "vec4<f32>(" + lit + ".rgb * clamp(" +
+                        lum + ".x * (" + source + ").z + " + lum +
+                        ".y, 0.0, 1.0), " + lit + ".a)");
+                }
+                return;
+            }
+            case OP.TEXDP3: {
+                // A 3-component dot of this stage's texture coordinate with the
+                // source register, replicated across the destination.
+                const index = dest.index;
+                this.psTexcoordInputs.add(index);
+                const value = "dot(t" + index + ".xyz, (" +
+                    this.rawSource({ type: sources[0].type,
+                        index: sources[0].index, swizzle: 0xe4, modifier: 0,
+                        relative: false, relativeToken: 0 }) + ").xyz)";
+                this.store(dest, "vec4<f32>(" + value + ")");
+                return;
+            }
+            case OP.TEXDP3TEX: {
+                // Same dot, then a 1D lookup with it. WGSL has no 1D texture,
+                // so the sampler is treated as 2D with v = 0 -- which is how
+                // every desktop driver implements the ps_1_x 1D forms too.
+                const index = dest.index;
+                if (!this.samplers.has(index)) this.samplers.set(index, "2d");
+                this.psTexcoordInputs.add(index);
+                const coord = this.fresh("dp3tex");
+                this.emit("let " + coord + " = vec2<f32>(dot(t" + index +
+                    ".xyz, (" + this.rawSource({ type: sources[0].type,
+                        index: sources[0].index, swizzle: 0xe4, modifier: 0,
+                        relative: false, relativeToken: 0 }) +
+                    ").xyz), 0.0);");
+                this.store(dest, this.sampleExpression(index,
+                    { coord, ref: null }, {}));
+                return;
+            }
+            case OP.TEXM3x2PAD:
+            case OP.TEXM3x3PAD: {
+                // A "pad" instruction contributes one row of the matrix and
+                // produces no visible result; the row is consumed by the
+                // TEXM3x*TEX/SPEC/VSPEC that follows it. ps_1_x guarantees the
+                // ordering, so a running list is enough.
+                const row = this.fresh("m3row");
+                this.psTexcoordInputs.add(dest.index);
+                this.emit("let " + row + " = dot(t" + dest.index + ".xyz, (" +
+                    this.rawSource({ type: sources[0].type,
+                        index: sources[0].index, swizzle: 0xe4, modifier: 0,
+                        relative: false, relativeToken: 0 }) + ").xyz);");
+                this.matrixRows.push(row);
+                return;
+            }
+            case OP.TEXM3x2TEX: {
+                const index = dest.index;
+                if (!this.samplers.has(index)) this.samplers.set(index, "2d");
+                this.psTexcoordInputs.add(index);
+                const last = this.fresh("m3row");
+                this.emit("let " + last + " = dot(t" + index + ".xyz, (" +
+                    this.rawSource({ type: sources[0].type,
+                        index: sources[0].index, swizzle: 0xe4, modifier: 0,
+                        relative: false, relativeToken: 0 }) + ").xyz);");
+                const rows = this.takeMatrixRows(1, last);
+                const coord = this.fresh("m3x2");
+                this.emit("let " + coord + " = vec2<f32>(" + rows.join(", ") + ");");
+                this.store(dest, this.sampleExpression(index,
+                    { coord, ref: null }, {}));
+                return;
+            }
+            case OP.TEXM3x3TEX:
+            case OP.TEXM3x3SPEC:
+            case OP.TEXM3x3VSPEC: {
+                const index = dest.index;
+                // The 3x3 forms address a cube map or a volume; both take a
+                // three-component coordinate, and a cube is what environment
+                // mapping actually binds.
+                if (!this.samplers.has(index)) this.samplers.set(index, "cube");
+                this.psTexcoordInputs.add(index);
+                const last = this.fresh("m3row");
+                this.emit("let " + last + " = dot(t" + index + ".xyz, (" +
+                    this.rawSource({ type: sources[0].type,
+                        index: sources[0].index, swizzle: 0xe4, modifier: 0,
+                        relative: false, relativeToken: 0 }) + ").xyz);");
+                const rows = this.takeMatrixRows(2, last);
+                const normal = this.fresh("m3x3");
+                this.emit("let " + normal + " = vec3<f32>(" + rows.join(", ") + ");");
+                let coord = normal;
+                if (instruction.opcode !== OP.TEXM3x3TEX) {
+                    // SPEC takes the eye vector from a constant register;
+                    // VSPEC takes it from the q components of the three
+                    // texture coordinates the rows were built from.
+                    const eye = instruction.opcode === OP.TEXM3x3SPEC
+                        ? "(" + this.sourceExpression(sources[1]) + ").xyz"
+                        : "vec3<f32>(t" + (index - 2) + ".w, t" + (index - 1) +
+                          ".w, t" + index + ".w)";
+                    const reflected = this.fresh("m3refl");
+                    // D3D's formula: 2 * N * (N.E) / (N.N) - E.
+                    this.emit("let " + reflected + " = 2.0 * " + normal +
+                        " * dot(" + normal + ", " + eye + ") / max(dot(" +
+                        normal + ", " + normal + "), 1e-6) - " + eye + ";");
+                    coord = reflected;
+                }
+                this.store(dest, this.sampleExpression(index,
+                    { coord, ref: null }, {}));
+                return;
+            }
             case OP.TEXREG2AR:
                 this.textureLoadFromComponents(instruction, "wx");
                 return;
@@ -1297,7 +1454,7 @@
         sampleExpression(index, coordinate, options) {
             const texture = "d9_tex" + index;
             const sampler = "d9_smp" + index;
-            const coord = coordinate.coord;
+            const coord = this.mirrorOnceCoord(index, coordinate.coord);
             if (coordinate.ref !== null && coordinate.ref !== undefined)
                 return this.compareExpression(texture, sampler, coord,
                     coordinate.ref, options);
@@ -1315,8 +1472,16 @@
                     ? this.degradedSample(texture, sampler, coord)
                     : "textureSampleBias(" + texture + ", " + sampler + ", " +
                         coord + ", " + options.bias + ")";
+            const stateBias = this.samplerLodBias
+                ? this.samplerLodBias[index] : 0;
             if (this.nonUniformDepth > 0)
                 return this.degradedSample(texture, sampler, coord);
+            // A sampler-state bias applies to the ordinary implicit-derivative
+            // sample only. D3D9 ignores it for the explicit-LOD and gradient
+            // forms above, and a vertex fetch has no mip chain to bias.
+            if (stateBias && this.kind !== "vertex")
+                return "textureSampleBias(" + texture + ", " + sampler + ", " +
+                    coord + ", " + floatLiteral(stateBias) + ")";
             // Vertex shaders have no implicit derivatives. D3D9 permits VTF
             // only in vs_3_0 and its ordinary texld form selects mip zero;
             // texldl above still uses the explicit LOD carried in coord.w.
@@ -1324,6 +1489,22 @@
                 return "textureSampleLevel(" + texture + ", " + sampler + ", " +
                     coord + ", 0.0)";
             return "textureSample(" + texture + ", " + sampler + ", " + coord + ")";
+        }
+
+        // D3DTADDRESS_MIRRORONCE folded into the coordinate. Cube addressing
+        // ignores address modes entirely, so a cube sampler is left alone.
+        mirrorOnceCoord(index, coord) {
+            const axes = this.samplerMirrorOnce
+                ? this.samplerMirrorOnce[index] : null;
+            if (!axes) return coord;
+            const type = this.samplers.get(index) || "2d";
+            if (type === "cube") return coord;
+            const components = type === "3d" ? ["x", "y", "z"] : ["x", "y"];
+            const vector = type === "3d" ? "vec3<f32>" : "vec2<f32>";
+            return vector + "(" + components.map(component =>
+                (axes.includes(component)
+                    ? "abs((" + coord + ")." + component + ")"
+                    : "(" + coord + ")." + component)).join(", ") + ")";
         }
 
         // Reading a depth texture's stored value. texture_depth_2d sampling
@@ -1435,6 +1616,24 @@
                 coordinate + ", 0.0)";
         }
 
+        // Consumes the rows the preceding texm3x*pad instructions produced,
+        // plus the row the consuming instruction just computed.
+        //
+        // A shader whose pad/tex pairing is malformed (a texm3x3tex with no
+        // pads before it, say) would otherwise read undefined rows. Padding
+        // with zero keeps the translation well-formed and notes it, rather
+        // than emitting WGSL that references a variable that was never let.
+        takeMatrixRows(expected, last) {
+            const rows = this.matrixRows.splice(-expected, expected);
+            while (rows.length < expected) {
+                rows.unshift("0.0");
+                this.note("a texm3x* instruction found fewer preceding " +
+                    "texm3x*pad rows than it needs; the missing rows read zero");
+            }
+            rows.push(last);
+            return rows;
+        }
+
         textureLoad(instruction, options) {
             const dest = instruction.dest;
             const sources = instruction.sources;
@@ -1543,6 +1742,14 @@
             if (kind === "vertex" && this.options.pointExpansion) {
                 out.push("    point_viewport: vec4<f32>,");
                 out.push("    point_params: vec4<f32>,");
+            }
+            if (kind === "pixel" && this.bumpStages.size) {
+                // One (m00, m01, m10, m11) per sampler up to the highest one a
+                // texbem names, plus the luminance scale/offset pair. Indexed
+                // by sampler so the WGSL can subscript it directly.
+                const count = Math.max(...this.bumpStages) + 1;
+                out.push("    bump: array<vec4<f32>, " + count + ">,");
+                out.push("    bump_lum: array<vec4<f32>, " + count + ">,");
             }
             out.push("};");
             out.push("@group(0) @binding(" + (kind === "vertex" ? 0 : 1) +
@@ -1907,6 +2114,13 @@
                 ? registerUniformBytes + 16 : -1;
             const trailingOffset = registerUniformBytes + (isVertex ? 16 : 0)
                 + clipPlaneCount * 16;
+            // ps_1_x texbem/texbeml: the stage matrices follow the register
+            // region, in the same order the struct above declares them.
+            const bumpStageCount = (!isVertex && this.bumpStages.size)
+                ? Math.max(...this.bumpStages) + 1 : 0;
+            const bumpOffset = bumpStageCount ? trailingOffset : -1;
+            const bumpLuminanceOffset = bumpStageCount
+                ? trailingOffset + bumpStageCount * 16 : -1;
             return {
                 kind: this.kind,
                 version: { major: this.major, minor: this.minor },
@@ -1934,7 +2148,11 @@
                 floatDefaults, intDefaults, boolDefaults,
                 levelZeroSamples: this.levelZeroSamples,
                 warnings: this.warnings.slice(),
-                uniformBytes: trailingOffset + (pointExpansion ? 32 : 0),
+                uniformBytes: trailingOffset + (pointExpansion ? 32 : 0) +
+                    bumpStageCount * 32,
+                bumpStageCount,
+                bumpOffset,
+                bumpLuminanceOffset,
                 floatRegionBytes: floatCount * 16,
                 intRegionBytes: intCount * 16,
                 boolRegionBytes: boolVectors * 16,

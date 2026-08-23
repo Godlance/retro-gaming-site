@@ -20,7 +20,7 @@
 
 #define D9WG_MAGIC 0x47573944u /* "D9WG" */
 #define D9WG_VERSION_MAJOR 1u
-#define D9WG_VERSION_MINOR 4u
+#define D9WG_VERSION_MINOR 5u
 
 /* The last four MiB of v86gl.sys's mapped DMA allocation are never used for
  * command batches.  The browser writes asynchronous query/readback results
@@ -166,6 +166,30 @@ enum D9WGOpcode {
      * than the guest does when the chain went stale. This carries only the
      * explicit call. */
     D9WG_OP_GENERATE_MIPS = 0x221,
+
+    /* Protocol 1.5. IDirect3DBaseTexture9::SetLOD, the per-texture floor on
+     * which mip level may be sampled. It is deliberately not folded into
+     * D3DSAMP_MAXMIPLEVEL: that one is sampler state and applies to whatever
+     * texture is bound to the stage, while this one travels with the texture
+     * and outlives any particular binding. The host takes the more restrictive
+     * of the two, which is what D3D9 does. */
+    D9WG_OP_SET_TEXTURE_LOD = 0x222,
+
+    /* Protocol 1.5. IDirect3DDevice9::SetGammaRamp.
+     *
+     * D3D9 applies this at scanout, after everything else, which is why it is
+     * carried as its own command rather than folded into any render state: it
+     * has to survive being set once at startup and never mentioned again, and
+     * it applies to frames drawn long afterwards. The host applies it in the
+     * present blit -- the last place a pixel passes through -- as a 256-entry
+     * lookup, which is what the hardware does.
+     *
+     * Real D3D9 honours the ramp only on a fullscreen device, and silently
+     * ignores it windowed. That distinction does not survive here: every frame
+     * reaches the page through the same blit, so the ramp is always applied,
+     * and a windowed title's brightness slider works where on hardware it
+     * would not. */
+    D9WG_OP_SET_GAMMA_RAMP = 0x223,
 
     D9WG_OP_DRAW_PRIMITIVE = 0x300,
     D9WG_OP_DRAW_INDEXED_PRIMITIVE = 0x301,
@@ -542,6 +566,23 @@ typedef struct D9WGGenerateMips {
     uint32_t resource_handle;
 } D9WGGenerateMips;
 
+typedef struct D9WGSetTextureLOD {
+    uint32_t device_handle;
+    uint32_t resource_handle;
+    uint32_t lod;
+    uint32_t reserved;
+} D9WGSetTextureLOD;
+
+/* 256 entries of red, then 256 green, then 256 blue -- the memory order of
+ * D3DGAMMARAMP itself, so the guest copies it in one go. */
+typedef struct D9WGSetGammaRamp {
+    uint32_t device_handle;
+    uint32_t swap_chain;
+    uint32_t flags;
+    uint32_t reserved;
+    uint16_t ramp[768];
+} D9WGSetGammaRamp;
+
 typedef struct D9WGSetScissorRect {
     uint32_t device_handle;
     int32_t  left;
@@ -897,6 +938,10 @@ typedef char D9WGAssertSetCurrentTexturePaletteSize[
         sizeof(D9WGSetCurrentTexturePalette) == 8 ? 1 : -1];
 typedef char D9WGAssertGenerateMipsSize[
         sizeof(D9WGGenerateMips) == 8 ? 1 : -1];
+typedef char D9WGAssertSetTextureLODSize[
+        sizeof(D9WGSetTextureLOD) == 16 ? 1 : -1];
+typedef char D9WGAssertSetGammaRampSize[
+        sizeof(D9WGSetGammaRamp) == 1552 ? 1 : -1];
 typedef char D9WGAssertSetScissorRectSize[
         sizeof(D9WGSetScissorRect) == 20 ? 1 : -1];
 typedef char D9WGAssertStretchRectSize[

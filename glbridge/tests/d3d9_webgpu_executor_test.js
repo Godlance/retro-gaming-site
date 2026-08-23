@@ -273,11 +273,13 @@ const PS_SAMPLER15_BYTECODE = [
     END,
 ];
 
-// A shader the translator refuses (ps_1_x bump environment mapping).
+// A shader the translator refuses. texbem and the texm3x* family used to sit
+// here; they are translated now, so this reaches for one of the few ps_1_x
+// instructions that still has no honest translation -- texdepth replaces the
+// fragment's depth, which this pipeline has no frag_depth path for.
 const PS_UNSUPPORTED = [
-    PS(1, 1),
-    instr(SIO.TEX), dst(REG.TEXTURE, 0),
-    instr(SIO.TEXBEM), dst(REG.TEXTURE, 1), src(REG.TEXTURE, 0),
+    PS(1, 4),
+    instr(SIO.TEXDEPTH), dst(REG.TEMP, 0),
     END,
 ];
 
@@ -1407,6 +1409,470 @@ await test("independent sampler state drives the GPUSampler, not the texture", a
     assert.equal(executor.stats.samplersCreated, 1);
 });
 
+await test("a multisampled target makes the pipeline declare its sample count",
+        async () => {
+    // WebGPU takes the count on the pipeline as well as on the attachments and
+    // rejects a mismatch, so a multisampled device used to fail every draw.
+    const D3DMULTISAMPLE_4_SAMPLES = 4;
+    const { executor, find } = makeExecutor();
+    const createDevice = createDevicePayload(640, 480);
+    createDevice.writeUInt32LE(D3DMULTISAMPLE_4_SAMPLES, 44);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevice),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    const descriptor = find("createRenderPipeline").pop()[1];
+    assert.ok(descriptor.multisample,
+        "a multisampled pass needs a multisample block on the pipeline");
+    assert.equal(descriptor.multisample.count, 4);
+    assert.equal(descriptor.multisample.mask, 0xffffffff,
+        "the default D3DRS_MULTISAMPLEMASK writes every sample");
+});
+
+await test("D3DRS_MULTISAMPLEMASK reaches the pipeline's sample mask",
+        async () => {
+    const D3DRS_MULTISAMPLEMASK = 162, D3DMULTISAMPLE_4_SAMPLES = 4;
+    const { executor, find } = makeExecutor();
+    const createDevice = createDevicePayload(640, 480);
+    createDevice.writeUInt32LE(D3DMULTISAMPLE_4_SAMPLES, 44);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevice),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_MULTISAMPLEMASK, 0x5)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(find("createRenderPipeline").pop()[1].multisample.mask, 0x5);
+});
+
+await test("a single-sampled target leaves the multisample block off",
+        async () => {
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(find("createRenderPipeline").pop()[1].multisample, undefined,
+        "the ordinary path must be untouched");
+});
+
+await test("D3DFILL_WIREFRAME turns each triangle into its three edges",
+        async () => {
+    // WebGPU has no polygon mode, so wireframe is different geometry rather
+    // than a pipeline flag: a line list carrying every triangle's edges.
+    const D3DRS_FILLMODE = 8, D3DFILL_WIREFRAME = 2;
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_RENDER_STATE,
+            u32(DEVICE, D3DRS_FILLMODE, D3DFILL_WIREFRAME)),
+        // Two triangles, non-indexed.
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 2)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.fillModeDraws, 1);
+    const pipeline = find("createRenderPipeline").pop()[1];
+    assert.equal(pipeline.primitive.topology, "line-list",
+        "the pipeline has to rasterise lines, not triangles");
+    // Two triangles -> six edges -> twelve indices.
+    const write = find("writeBuffer")
+        .map(call => call[3])
+        .filter(data => data instanceof Uint32Array).pop();
+    assert.ok(write, "an index buffer of edges must have been written");
+    assert.equal(write.length, 12,
+        "two triangles are six edges, and each edge is two indices");
+    assert.deepEqual(Array.from(write.slice(0, 6)), [0, 1, 1, 2, 2, 0],
+        "the first triangle's edges are (0,1) (1,2) (2,0)");
+});
+
+await test("D3DFILL_SOLID is the default and rewrites nothing", async () => {
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 2)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.fillModeDraws, 0,
+        "solid fill must cost nothing at all");
+    assert.equal(find("createRenderPipeline").pop()[1].primitive.topology,
+        "triangle-list");
+});
+
+await test("D3DFILL_WIREFRAME unrolls a triangle strip before building edges",
+        async () => {
+    // A strip of N+2 vertices is N triangles that share edges; unrolling is
+    // what makes the edge set match the solid form's silhouette.
+    const D3DRS_FILLMODE = 8, D3DFILL_WIREFRAME = 2;
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_RENDER_STATE,
+            u32(DEVICE, D3DRS_FILLMODE, D3DFILL_WIREFRAME)),
+        // D3DPT_TRIANGLESTRIP, two triangles = four vertices.
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(5, 0, 2)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(find("createRenderPipeline").pop()[1].primitive.topology,
+        "line-list");
+    const write = find("writeBuffer")
+        .map(call => call[3])
+        .filter(data => data instanceof Uint32Array).pop();
+    assert.equal(write.length, 12, "two strip triangles are still six edges");
+});
+
+await test("D3DSHADE_FLAT stops interpolating the two colour varyings",
+        async () => {
+    const D3DRS_SHADEMODE = 9, D3DSHADE_FLAT = 1;
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x42, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+            element(0, 12, DECLTYPE.D3DCOLOR, DECLUSAGE.COLOR)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 16)),
+        command(OP.SET_RENDER_STATE,
+            u32(DEVICE, D3DRS_SHADEMODE, D3DSHADE_FLAT)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    const pipeline = find("createRenderPipeline").pop()[1];
+    // Both sides of the interface have to agree or the pipeline is invalid.
+    for (const [name, wgsl] of [["vertex", pipeline.vertex.module.code],
+            ["fragment", pipeline.fragment.module.code]]) {
+        assert.match(wgsl, /@location\(0\) @interpolate\(flat\) varying0/,
+            "the diffuse varying must be flat in the " + name + " stage:\n" + wgsl);
+        assert.match(wgsl, /@location\(1\) @interpolate\(flat\) varying1/,
+            "the specular varying must be flat in the " + name + " stage");
+        // Texture coordinates keep interpolating under flat shading in D3D9.
+        assert.doesNotMatch(wgsl, /@location\(2\) @interpolate\(flat\)/,
+            "only the colour varyings are flat in the " + name + " stage");
+    }
+});
+
+await test("gouraud shading is the default and adds no interpolate attribute",
+        async () => {
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x42, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+            element(0, 12, DECLTYPE.D3DCOLOR, DECLUSAGE.COLOR)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 16)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    const wgsl = find("createRenderPipeline").pop()[1].vertex.module.code;
+    assert.doesNotMatch(wgsl, /@interpolate\(flat\)/,
+        "the default must not change the shader at all:\n" + wgsl);
+});
+
+await test("D3DTADDRESS_MIRRORONCE mirrors the coordinate about zero",
+        async () => {
+    // The sampler is already clamp-to-edge for the mode, so abs() on that axis
+    // is the whole of what is left -- not an approximation of it.
+    const D3DSAMP_ADDRESSU = 1, D3DSAMP_ADDRESSV = 2;
+    const D3DTADDRESS_MIRRORONCE = 5;
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD),
+    ];
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 4, 4, 1, 21, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x102, elements)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        command(OP.SET_SAMPLER_STATE,
+            u32(DEVICE, 0, D3DSAMP_ADDRESSU, D3DTADDRESS_MIRRORONCE)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(find("createSampler").pop()[1].addressModeU, "clamp-to-edge",
+        "the physical sampler clamps; the mirror is the shader's half");
+    const wgsl = find("createRenderPipeline").pop()[1].fragment.module.code;
+    assert.match(wgsl, /abs\(/,
+        "the U axis has to be mirrored about zero:\n" + wgsl);
+    // Only the axis that asked for it.
+    assert.doesNotMatch(wgsl, /abs\([^)]*\)\.y/,
+        "V is still WRAP and must be left alone:\n" + wgsl);
+});
+
+// D3D9 applies the gamma ramp at scanout, so the host applies it in the step
+// that puts the finished frame on the canvas -- and only when it would change
+// anything, because a lookup pass costs a full-screen draw the plain copy does
+// not.
+function gammaRampPayload(build) {
+    const payload = Buffer.alloc(16 + 768 * 2);
+    payload.writeUInt32LE(DEVICE, 0);
+    for (let index = 0; index < 256; ++index) {
+        const [r, g, b] = build(index);
+        payload.writeUInt16LE(r & 0xffff, 16 + index * 2);
+        payload.writeUInt16LE(g & 0xffff, 16 + (256 + index) * 2);
+        payload.writeUInt16LE(b & 0xffff, 16 + (512 + index) * 2);
+    }
+    return payload;
+}
+
+await test("a non-identity gamma ramp turns the present copy into a lookup pass",
+        async () => {
+    const OP_SET_GAMMA_RAMP = 0x223;
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        // A half-brightness ramp: entry = index * 257 / 2.
+        command(OP_SET_GAMMA_RAMP,
+            gammaRampPayload(index => {
+                const value = Math.round(index * 257 / 2);
+                return [value, value, value];
+            })),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.gammaRampUpdates, 1);
+    assert.equal(executor.stats.gammaPresents, 1,
+        "the ramp has to be applied on the way to the canvas");
+    assert.equal(find("copyTextureToTexture").length, 0,
+        "the plain copy cannot also run, or the ramp would be overwritten");
+    const wgsl = find("createRenderPipeline")
+        .map(call => call[1].fragment && call[1].fragment.module.code)
+        .find(code => code && /d9_gamma_ramp/.test(code));
+    assert.ok(wgsl, "a gamma lookup pipeline must have been built");
+    assert.match(wgsl, /textureLoad\(d9_gamma_ramp/,
+        "the table is indexed, never interpolated:\n" + wgsl);
+});
+
+await test("the identity gamma ramp keeps the plain present copy", async () => {
+    // Titles set the identity ramp on startup and on exit. Paying for a
+    // full-screen pass on every frame for a no-op transform is exactly the
+    // cost this has to avoid.
+    const OP_SET_GAMMA_RAMP = 0x223;
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP_SET_GAMMA_RAMP,
+            gammaRampPayload(index => [index * 257, index * 257, index * 257])),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.gammaRampUpdates, 1);
+    assert.equal(executor.stats.gammaPresents, 0,
+        "an identity ramp changes nothing and must not add a pass");
+    assert.equal(find("copyTextureToTexture").length, 1,
+        "the ordinary present copy still runs");
+});
+
+await test("a gamma ramp reset back to identity releases the lookup pass",
+        async () => {
+    const OP_SET_GAMMA_RAMP = 0x223;
+    const { executor } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP_SET_GAMMA_RAMP, gammaRampPayload(() => [0, 0, 0])),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.gammaPresents, 1);
+    await executor.submit(buildBatch([
+        command(OP_SET_GAMMA_RAMP,
+            gammaRampPayload(index => [index * 257, index * 257, index * 257])),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.gammaPresents, 1,
+        "the second present is back on the copy path");
+});
+
+await test("D3DSAMP_MAXMIPLEVEL becomes the sampler's LOD floor", async () => {
+    const { executor, find } = makeExecutor();
+    const D3DSAMP_MIPFILTER = 7, D3DSAMP_MAXMIPLEVEL = 9;
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD),
+    ];
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        // Four levels, so a floor of 2 is inside the chain.
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 8, 8, 4, 21, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x102, elements)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        command(OP.SET_SAMPLER_STATE, u32(DEVICE, 0, D3DSAMP_MIPFILTER, 2)),
+        command(OP.SET_SAMPLER_STATE, u32(DEVICE, 0, D3DSAMP_MAXMIPLEVEL, 2)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    const descriptor = find("createSampler").pop()[1];
+    assert.equal(descriptor.lodMinClamp, 2,
+        "MAXMIPLEVEL 2 forbids sampling levels 0 and 1");
+    assert.ok(descriptor.lodMaxClamp === undefined ||
+        descriptor.lodMaxClamp > 2,
+        "the coarse end of the chain stays available");
+});
+
+await test("SetLOD reaches the host and combines with D3DSAMP_MAXMIPLEVEL",
+        async () => {
+    // Two independent floors; D3D9 applies the more restrictive of the pair.
+    const OP_SET_TEXTURE_LOD = 0x222;
+    const D3DSAMP_MIPFILTER = 7, D3DSAMP_MAXMIPLEVEL = 9;
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD),
+    ];
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 8, 8, 4, 21, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x102, elements)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        command(OP.SET_SAMPLER_STATE, u32(DEVICE, 0, D3DSAMP_MIPFILTER, 2)),
+        command(OP.SET_SAMPLER_STATE, u32(DEVICE, 0, D3DSAMP_MAXMIPLEVEL, 1)),
+        command(OP_SET_TEXTURE_LOD, u32(DEVICE, 0x401, 3, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(find("createSampler").pop()[1].lodMinClamp, 3,
+        "SetLOD(3) is more restrictive than MAXMIPLEVEL(1) and wins");
+});
+
+await test("a SetLOD past the end of the chain is clamped, not passed through",
+        async () => {
+    // lodMinClamp above lodMaxClamp is a WebGPU validation error, so a stale
+    // level index has to be clamped against the chain that actually exists.
+    const OP_SET_TEXTURE_LOD = 0x222;
+    const D3DSAMP_MIPFILTER = 7;
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD),
+    ];
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 8, 8, 4, 21, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x102, elements)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        command(OP.SET_SAMPLER_STATE, u32(DEVICE, 0, D3DSAMP_MIPFILTER, 2)),
+        command(OP_SET_TEXTURE_LOD, u32(DEVICE, 0x401, 99, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(find("createSampler").pop()[1].lodMinClamp, 3,
+        "a four-level chain floors at level 3, not 99");
+});
+
+await test("D3DSAMP_MIPMAPLODBIAS becomes textureSampleBias in the cascade",
+        async () => {
+    // WebGPU samplers carry no bias field, so the only place it can land is
+    // the sample call.
+    const D3DSAMP_MIPFILTER = 7, D3DSAMP_MIPMAPLODBIAS = 8;
+    const floatBits = value => {
+        const buffer = Buffer.alloc(4);
+        buffer.writeFloatLE(value, 0);
+        return buffer.readUInt32LE(0);
+    };
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD),
+    ];
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 8, 8, 4, 21, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x102, elements)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        command(OP.SET_SAMPLER_STATE, u32(DEVICE, 0, D3DSAMP_MIPFILTER, 2)),
+        command(OP.SET_SAMPLER_STATE,
+            u32(DEVICE, 0, D3DSAMP_MIPMAPLODBIAS, floatBits(-1.5))),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    const wgsl = find("createRenderPipeline").pop()[1].fragment.module.code;
+    assert.match(wgsl, /textureSampleBias\(d9_tex0, d9_smp0, .*-1\.5/,
+        "the bias has to reach the sample call:\n" + wgsl);
+});
+
+await test("a zero D3DSAMP_MIPMAPLODBIAS leaves the plain sample form alone",
+        async () => {
+    // The bias is baked as a literal, so every distinct value is a pipeline
+    // variant. The default must not mint one.
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD),
+    ];
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 8, 8, 1, 21, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x102, elements)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    const wgsl = find("createRenderPipeline").pop()[1].fragment.module.code;
+    assert.ok(!/textureSampleBias/.test(wgsl),
+        "an unbiased stage keeps textureSample:\n" + wgsl);
+});
+
 await test("a second draw with the same sampler state reuses the cached sampler", async () => {
     const { executor } = makeExecutor();
     const elements = [
@@ -2084,6 +2550,66 @@ await test("the lock flags decide whether a mid-frame write has to rename", asyn
     assert.equal(plain.bufferFullCopyRenames, 1);
 });
 
+// The D3D8 frontend sends WINDOW_STATE on move/size/show because a title that
+// draws one frame and then only pumps messages has no further Present to carry
+// its geometry. If the host only logged it, the overlay would stay where the
+// window used to be.
+await test("window state moves the overlay for a title that stops presenting",
+        async () => {
+    const surfaces = [];
+    const { executor } = makeExecutor({
+        onSurface: (surface, reason) => surfaces.push({ ...surface, reason }) });
+    const windowState = (flags, x, y, width, height) => {
+        const payload = Buffer.alloc(40);
+        payload.writeUInt32LE(DEVICE, 0);
+        payload.writeUInt32LE(0xa0180, 4);
+        payload.writeUInt32LE(0xa0180, 8);   // foreground is the game itself
+        payload.writeUInt32LE(flags, 12);
+        payload.writeInt32LE(x, 16);
+        payload.writeInt32LE(y, 20);
+        payload.writeUInt32LE(width, 24);
+        payload.writeUInt32LE(height, 28);
+        payload.writeUInt32LE(width, 32);    // client width
+        payload.writeUInt32LE(height, 36);   // client height
+        return payload;
+    };
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.PRESENT, u32(DEVICE, 0xa0180, 10, 20, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    const afterPresent = executor.stats.surfaceChanges;
+
+    // IS_WINDOW | VISIBLE | FOREGROUND, moved to a new origin.
+    await executor.submit(buildBatch([
+        command(0x21D, windowState(1 | 2 | 8, 100, 200, 640, 480)),
+    ]));
+    await executor.idle();
+    assert.equal(executor.stats.surfaceChanges, afterPresent + 1,
+        "a move with no Present must still reposition the overlay");
+    const moved = surfaces[surfaces.length - 1];
+    assert.equal(moved.reason, "window-state");
+    assert.equal(moved.x, 100);
+    assert.equal(moved.y, 200);
+    assert.equal(moved.visible, true);
+
+    // Repeating the identical report must not churn the canvas.
+    await executor.submit(buildBatch([
+        command(0x21D, windowState(1 | 2 | 8, 100, 200, 640, 480)),
+    ]));
+    await executor.idle();
+    assert.equal(executor.stats.surfaceChanges, afterPresent + 1,
+        "an unchanged window report must not re-notify");
+
+    // Minimised: hide rather than move.
+    await executor.submit(buildBatch([
+        command(0x21D, windowState(1 | 2 | 4 | 8, 100, 200, 640, 480)),
+    ]));
+    await executor.idle();
+    assert.equal(surfaces[surfaces.length - 1].visible, false,
+        "a minimised window hides the overlay");
+});
+
 await test("window state reports a game whose window cannot receive input", async () => {
     const { executor } = makeExecutor();
     const windowState = (flags) => {
@@ -2396,7 +2922,9 @@ const D3DTSS = {
 const D3DTOP = {
     DISABLE: 1, SELECTARG1: 2, SELECTARG2: 3, MODULATE: 4, ADD: 7,
     ADDSIGNED: 8, BLENDTEXTUREALPHA: 13, DOTPRODUCT3: 24, MULTIPLYADD: 25,
-    LERP: 26,
+    LERP: 26, PREMODULATE: 17, MODULATEALPHA_ADDCOLOR: 18,
+    MODULATECOLOR_ADDALPHA: 19, MODULATEINVALPHA_ADDCOLOR: 20,
+    MODULATEINVCOLOR_ADDALPHA: 21,
 };
 const D3DTA = { DIFFUSE: 0, CURRENT: 1, TEXTURE: 2, TFACTOR: 3, SPECULAR: 4,
     TEMP: 5, CONSTANT: 6, COMPLEMENT: 0x10, ALPHAREPLICATE: 0x20 };
@@ -2973,10 +3501,18 @@ await test("D3DTSS_RESULTARG threads a stage result through the temp register",
         "D3DRS_TEXTUREFACTOR is 0xAARRGGBB");
 });
 
-await test("a texture stage op outside TextureOpCaps is counted, not invented",
+const D3DTOP_BUMPENVMAP = 22;
+const D3DTOP_BUMPENVMAPLUMINANCE = 23;
+const D3DTSS_BUMPENVMAT00 = 7, D3DTSS_BUMPENVMAT01 = 8;
+const D3DTSS_BUMPENVMAT10 = 9, D3DTSS_BUMPENVMAT11 = 10;
+
+// A bump stage displaces the *next* stage's coordinate, so a BUMPENVMAP with
+// no stage after it displaces nothing at all. That renders a frame which looks
+// almost right, which is exactly the case worth reporting rather than drawing
+// silently.
+await test("a trailing D3DTOP_BUMPENVMAP has nothing to displace and is reported",
         async () => {
     const { executor } = makeExecutor();
-    const D3DTOP_BUMPENVMAP = 22;
     await executor.submit(buildBatch([
         command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
         command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
@@ -2992,9 +3528,165 @@ await test("a texture stage op outside TextureOpCaps is counted, not invented",
     ], { present: true }));
     await executor.idle();
     assert.equal(executor.stats.drawsWithUnsupportedTextureOp, 1,
-        "D3DTOP_BUMPENVMAP is not in TextureOpCaps and must be reported");
+        "a bump stage with no consumer must be reported");
     assert.equal(executor.stats.droppedDraws, 0,
-        "the draw still renders, with the stage falling back to its arg1");
+        "the draw still renders rather than disappearing");
+});
+
+await test("D3DTOP_BUMPENVMAP displaces the next stage through its matrix",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const floatBitsOf = value => {
+        const buffer = new ArrayBuffer(4);
+        new Float32Array(buffer)[0] = value;
+        return new Uint32Array(buffer)[0];
+    };
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
+        // Stage 0 is the (du, dv) map, stage 1 the environment it displaces.
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 4, 4, 1, 60, 0, 1)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x402, 4, 4, 1, 21, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x104, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+            element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD, 0)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 1, 0x402, 0)),
+        command(0x202, u32(DEVICE, 0, D3DTSS.COLOROP, D3DTOP_BUMPENVMAP)),
+        command(0x202, u32(DEVICE, 0, D3DTSS_BUMPENVMAT00, floatBitsOf(0.25))),
+        command(0x202, u32(DEVICE, 0, D3DTSS_BUMPENVMAT01, floatBitsOf(0.5))),
+        command(0x202, u32(DEVICE, 0, D3DTSS_BUMPENVMAT10, floatBitsOf(0.75))),
+        command(0x202, u32(DEVICE, 0, D3DTSS_BUMPENVMAT11, floatBitsOf(1.5))),
+        command(0x202, u32(DEVICE, 1, D3DTSS.COLOROP, 2 /* SELECTARG1 */)),
+        command(0x202, u32(DEVICE, 1, D3DTSS.COLORARG1, 2 /* TEXTURE */)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.drawsWithUnsupportedTextureOp, 0,
+        "a bump pair is supported and must not be reported as unsupported");
+    assert.equal(executor.stats.drawCalls, 1);
+
+    // The bump stage must sample even though no argument named its texture:
+    // the displacement is its whole purpose.
+    const module = find("createShaderModule")
+        .map(call => call[1].code)
+        .find(code => /stage_bump0/.test(code));
+    assert.ok(module, "the cascade must declare a bump matrix uniform");
+    const code = module;
+    assert.match(code, /textureSample\(d9_tex0/,
+        "the bump stage samples its own (du, dv) map");
+    assert.match(code,
+        /stage_bump0\.x \* tex0\.r \+ uniforms\.stage_bump0\.z \* tex0\.g/,
+        "u is displaced by m00*du + m10*dv: " + code);
+    assert.match(code,
+        /stage_bump0\.y \* tex0\.r \+ uniforms\.stage_bump0\.w \* tex0\.g/,
+        "v is displaced by m01*du + m11*dv");
+});
+
+// The MODULATE*_ADD* family is the one part of the cascade that mixes a
+// argument's colour with the *same* argument's alpha, so each case is checked
+// against the algebra D3D9 documents rather than against "it compiled".
+for (const { name, op, pattern } of [
+    { name: "MODULATEALPHA_ADDCOLOR", op: D3DTOP.MODULATEALPHA_ADDCOLOR,
+      // Arg1.RGB + Arg1.A * Arg2.RGB
+      pattern: /\(tex0\.rgb \+ tex0\.a \* [a-z_0-9.]+\.rgb\)/ },
+    { name: "MODULATECOLOR_ADDALPHA", op: D3DTOP.MODULATECOLOR_ADDALPHA,
+      // Arg1.RGB * Arg2.RGB + Arg1.A
+      pattern: /\(tex0\.rgb \* [a-z_0-9.]+\.rgb \+ vec3<f32>\(tex0\.a\)\)/ },
+    { name: "MODULATEINVALPHA_ADDCOLOR", op: D3DTOP.MODULATEINVALPHA_ADDCOLOR,
+      // (1 - Arg1.A) * Arg2.RGB + Arg1.RGB
+      pattern: /\(\(1\.0 - tex0\.a\) \* [a-z_0-9.]+\.rgb \+ tex0\.rgb\)/ },
+    { name: "MODULATEINVCOLOR_ADDALPHA", op: D3DTOP.MODULATEINVCOLOR_ADDALPHA,
+      // (1 - Arg1.RGB) * Arg2.RGB + Arg1.A
+      pattern: /\(\(vec3<f32>\(1\.0\) - tex0\.rgb\) \* [a-z_0-9.]+\.rgb \+ vec3<f32>\(tex0\.a\)\)/ },
+]) {
+    await test("D3DTOP_" + name + " emits the algebra D3D9 documents",
+            async () => {
+        const { executor, find } = makeExecutor();
+        const tss = (stage, state, value) =>
+            command(0x202, u32(DEVICE, stage, state, value));
+        await executor.submit(buildBatch([
+            command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+            command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
+            command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 4, 4, 1, 21, 0, 1)),
+            command(OP.SET_FVF, fvfPayload(0x104, [
+                element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+                element(0, 12, DECLTYPE.D3DCOLOR, DECLUSAGE.COLOR),
+                element(0, 16, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD, 0)])),
+            command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 24)),
+            command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+            tss(0, D3DTSS.COLOROP, op),
+            tss(0, D3DTSS.COLORARG1, D3DTA.TEXTURE),
+            tss(0, D3DTSS.COLORARG2, D3DTA.DIFFUSE),
+            command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+            command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+        ], { present: true }));
+        await executor.idle();
+        assert.equal(executor.stats.drawsWithUnsupportedTextureOp, 0,
+            "D3DTOP_" + name + " is advertised in TextureOpCaps and must " +
+            "not be counted as unsupported");
+        assert.equal(executor.stats.droppedDraws, 0);
+        const wgsl = find("createRenderPipeline").pop()[1].fragment.module.code;
+        assert.match(wgsl, pattern,
+            "D3DTOP_" + name + " must emit its documented form:\n" + wgsl);
+    });
+}
+
+await test("the MODULATE*_ADD* family is refused as an alpha operation",
+        async () => {
+    // D3D9 defines all four for D3DTSS_COLOROP only. Counting the refusal is
+    // what keeps a caps claim from covering a channel it was never made for.
+    const { executor } = makeExecutor();
+    const tss = (stage, state, value) =>
+        command(0x202, u32(DEVICE, stage, state, value));
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 4, 4, 1, 21, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x104, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+            element(0, 12, DECLTYPE.D3DCOLOR, DECLUSAGE.COLOR),
+            element(0, 16, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD, 0)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 24)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        tss(0, D3DTSS.COLOROP, D3DTOP.SELECTARG1),
+        tss(0, D3DTSS.COLORARG1, D3DTA.TEXTURE),
+        tss(0, D3DTSS.ALPHAOP, D3DTOP.MODULATEALPHA_ADDCOLOR),
+        tss(0, D3DTSS.ALPHAARG1, D3DTA.TEXTURE),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.drawsWithUnsupportedTextureOp, 1,
+        "an alpha-channel MODULATEALPHA_ADDCOLOR must be counted, not emitted");
+});
+
+await test("D3DTOP_PREMODULATE stays refused and is counted", async () => {
+    // It modulates against the *next* stage's texture; nothing in the cascade
+    // carries a value backwards, and fill_caps() does not advertise it.
+    const { executor } = makeExecutor();
+    const tss = (stage, state, value) =>
+        command(0x202, u32(DEVICE, stage, state, value));
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 240)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0x401, 4, 4, 1, 21, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x104, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+            element(0, 12, DECLTYPE.D3DCOLOR, DECLUSAGE.COLOR),
+            element(0, 16, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD, 0)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 24)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x401, 0)),
+        tss(0, D3DTSS.COLOROP, D3DTOP.PREMODULATE),
+        tss(0, D3DTSS.COLORARG1, D3DTA.TEXTURE),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.drawsWithUnsupportedTextureOp, 1,
+        "PREMODULATE is outside TextureOpCaps and must be counted");
 });
 
 await test("a render target redirects the pass and keys its own pipeline",

@@ -417,15 +417,69 @@ test("every vertex shader emits the full varying set so VS/PS always link", () =
             "varying slot " + slot + " missing from the vertex output struct");
 });
 
-test("unsupported ps_1_x bump-environment instructions are refused, not approximated", () => {
-    const result = pipeline.compileShader(tokens([
+test("ps_1_x texbem displaces the coordinate by the stage's bump matrix", () => {
+    const result = compileOk([
         PS(1, 1),
         instruction(OP.TEX), dst(REG.TEXTURE, 0),
         instruction(OP.TEXBEM), dst(REG.TEXTURE, 1), src(REG.TEXTURE, 0),
         END,
+    ]);
+    // The displacement must be the D3D formula -- u by (m00, m10) and v by
+    // (m01, m11) -- against the bump register, not an axis-swapped variant.
+    // Getting the transpose wrong still renders a plausible bumpy surface, so
+    // the shape of the expression is the only thing that catches it.
+    assert.match(result.wgsl, /bump\[1\]\.x \* \([^)]*\)\.x \+ d9c\.bump\[1\]\.z \* \([^)]*\)\.y/,
+        "u displacement should be m00*du + m10*dv: " + result.wgsl);
+    assert.match(result.wgsl, /bump\[1\]\.y \* \([^)]*\)\.x \+ d9c\.bump\[1\]\.w \* \([^)]*\)\.y/,
+        "v displacement should be m01*du + m11*dv");
+    assert.strictEqual(result.reflection.bumpStageCount, 2,
+        "the bump matrix array must cover sampler 1");
+    assert.ok(result.reflection.bumpOffset >= 0,
+        "the reflection must tell the host where to write the bump matrices");
+});
+
+test("ps_1_x texbeml scales by luminance from the bump map's blue channel", () => {
+    const result = compileOk([
+        PS(1, 1),
+        instruction(OP.TEX), dst(REG.TEXTURE, 0),
+        instruction(OP.TEXBEML), dst(REG.TEXTURE, 1), src(REG.TEXTURE, 0),
+        END,
+    ]);
+    assert.match(result.wgsl, /clamp\(d9c\.bump_lum\[1\]\.x \* \([^)]*\)\.z \+ d9c\.bump_lum\[1\]\.y, 0\.0, 1\.0\)/,
+        "luminance should be scale*b + offset, clamped: " + result.wgsl);
+});
+
+test("ps_1_x texm3x3 forms build their coordinate from the preceding pads", () => {
+    const result = compileOk([
+        PS(1, 1),
+        instruction(OP.TEX), dst(REG.TEXTURE, 0),
+        instruction(OP.TEXM3x3PAD), dst(REG.TEXTURE, 1), src(REG.TEXTURE, 0),
+        instruction(OP.TEXM3x3PAD), dst(REG.TEXTURE, 2), src(REG.TEXTURE, 0),
+        instruction(OP.TEXM3x3TEX), dst(REG.TEXTURE, 3), src(REG.TEXTURE, 0),
+        END,
+    ]);
+    // Three dot products, assembled into one vec3 that samples a cube map --
+    // the shape tangent-space environment mapping needs.
+    assert.strictEqual((result.wgsl.match(/let _m3row\d+ = dot\(/g) || []).length, 3,
+        "each pad plus the tex should contribute one row: " + result.wgsl);
+    assert.match(result.wgsl, /let _m3x3\d+ = vec3<f32>\(_m3row\d+, _m3row\d+, _m3row\d+\)/,
+        "the three rows should assemble into a vec3 coordinate");
+    assert.strictEqual(result.reflection.samplers.find(s => s.index === 3).type,
+        "cube", "a texm3x3tex addresses a cube map");
+});
+
+test("ps_1_x instructions with no honest translation are still refused", () => {
+    // TEXDEPTH replaces the fragment's depth from a texture-addressing result,
+    // which this pipeline has no frag_depth path for. Refusing keeps it out of
+    // the "renders something plausible but wrong" category.
+    const result = pipeline.compileShader(tokens([
+        PS(1, 4),
+        instruction(OP.TEXDEPTH), dst(REG.TEMP, 0),
+        END,
     ]));
     assert.strictEqual(result.ok, false);
-    assert.ok(/texbem/.test(result.error), "error should name the instruction: " + result.error);
+    assert.ok(/texdepth/.test(result.error),
+        "error should name the instruction: " + result.error);
 });
 
 test("vs_3_0 vertex texture fetch uses an explicit LOD and isolated bindings", () => {
@@ -517,8 +571,8 @@ test("the shader cache translates identical bytecode exactly once", () => {
 
 test("the shader cache remembers failures instead of retrying them every frame", () => {
     const cache = new pipeline.D3D9ShaderCache();
-    const stream = tokens([PS(1, 1), instruction(OP.TEXBEM), dst(REG.TEXTURE, 1),
-        src(REG.TEXTURE, 0), END]);
+    const stream = tokens([PS(1, 4), instruction(OP.TEXDEPTH),
+        dst(REG.TEMP, 0), END]);
     const hash = pipeline.hashTokens(stream);
     assert.strictEqual(cache.compile(stream, hash.low, hash.high).ok, false);
     assert.strictEqual(cache.compile(stream, hash.low, hash.high).ok, false);

@@ -219,6 +219,57 @@ const CORPUS = [
             src(REG.TEXTURE, 0), src(REG.INPUT, 0),
         END,
     ]],
+    // The ps_1_x texture-addressing family. These build their sample
+    // coordinate out of a bump matrix or a chain of dot products rather than
+    // reading a texcoord directly, so they are the entries most likely to
+    // produce WGSL that parses but does not type-check.
+    ["ps_1_1 texbem environment bump mapping", [
+        PS(1, 1),
+        instruction(OP.TEX), dst(REG.TEXTURE, 0),
+        instruction(OP.TEXBEM), dst(REG.TEXTURE, 1), src(REG.TEXTURE, 0),
+        instruction(OP.MOV), dst(REG.TEMP, 0), src(REG.TEXTURE, 1),
+        END,
+    ]],
+    ["ps_1_1 texbeml bump mapping with luminance", [
+        PS(1, 1),
+        instruction(OP.TEX), dst(REG.TEXTURE, 0),
+        instruction(OP.TEXBEML), dst(REG.TEXTURE, 1), src(REG.TEXTURE, 0),
+        instruction(OP.MOV), dst(REG.TEMP, 0), src(REG.TEXTURE, 1),
+        END,
+    ]],
+    ["ps_1_1 texm3x3tex tangent-space environment map", [
+        PS(1, 1),
+        instruction(OP.TEX), dst(REG.TEXTURE, 0),
+        instruction(OP.TEXM3x3PAD), dst(REG.TEXTURE, 1), src(REG.TEXTURE, 0),
+        instruction(OP.TEXM3x3PAD), dst(REG.TEXTURE, 2), src(REG.TEXTURE, 0),
+        instruction(OP.TEXM3x3TEX), dst(REG.TEXTURE, 3), src(REG.TEXTURE, 0),
+        instruction(OP.MOV), dst(REG.TEMP, 0), src(REG.TEXTURE, 3),
+        END,
+    ]],
+    ["ps_1_1 texm3x3vspec reflective environment map", [
+        PS(1, 1),
+        instruction(OP.TEX), dst(REG.TEXTURE, 0),
+        instruction(OP.TEXM3x3PAD), dst(REG.TEXTURE, 1), src(REG.TEXTURE, 0),
+        instruction(OP.TEXM3x3PAD), dst(REG.TEXTURE, 2), src(REG.TEXTURE, 0),
+        instruction(OP.TEXM3x3VSPEC), dst(REG.TEXTURE, 3), src(REG.TEXTURE, 0),
+        instruction(OP.MOV), dst(REG.TEMP, 0), src(REG.TEXTURE, 3),
+        END,
+    ]],
+    ["ps_1_1 texm3x2tex two-row matrix lookup", [
+        PS(1, 1),
+        instruction(OP.TEX), dst(REG.TEXTURE, 0),
+        instruction(OP.TEXM3x2PAD), dst(REG.TEXTURE, 1), src(REG.TEXTURE, 0),
+        instruction(OP.TEXM3x2TEX), dst(REG.TEXTURE, 2), src(REG.TEXTURE, 0),
+        instruction(OP.MOV), dst(REG.TEMP, 0), src(REG.TEXTURE, 2),
+        END,
+    ]],
+    ["ps_1_1 texdp3tex dot-product lookup", [
+        PS(1, 1),
+        instruction(OP.TEX), dst(REG.TEXTURE, 0),
+        instruction(OP.TEXDP3TEX), dst(REG.TEXTURE, 1), src(REG.TEXTURE, 0),
+        instruction(OP.MOV), dst(REG.TEMP, 0), src(REG.TEXTURE, 1),
+        END,
+    ]],
     ["ps_1_4 texld with an explicit coordinate register", [
         PS(1, 4),
         instruction(OP.TEXCOORD), dst(REG.TEMP, 0), src(REG.TEXTURE, 0),

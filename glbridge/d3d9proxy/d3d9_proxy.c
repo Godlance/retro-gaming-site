@@ -694,7 +694,13 @@ static void trace_close(void)
 #define D9FMT_DF24 D9_FOURCC('D', 'F', '2', '4')
 #define D9FMT_INTZ D9_FOURCC('I', 'N', 'T', 'Z')
 #define D9_MAX_TEXTURE_STAGE_STATES 33u
-#define D9_MAX_STREAMS 4u
+/* D3D9's architectural maximum. The host does not bind 16 WebGPU vertex
+ * buffers per draw to honour this -- vertexBufferLayoutsFor() builds one layout
+ * per stream the *declaration* actually references, which is what WebGPU's
+ * maxVertexBuffers bounds, and a slot nothing references costs nothing. 4 was
+ * the DX7-era figure and it rejects ordinary skinned formats that split
+ * position, weights, normals and two UV sets across separate streams. */
+#define D9_MAX_STREAMS 16u
 #define D9_MAX_TRANSFORMS 512u
 #define D9_MAX_LIGHTS 8u
 #define D9_MAX_SAMPLERS 20u /* 16 pixel + 4 D3DVERTEXTEXTURESAMPLER slots */
@@ -840,6 +846,12 @@ struct D9Device {
     DWORD texture_stage_states[D9_MAX_TEXTURE_STAGES][D9_MAX_TEXTURE_STAGE_STATES];
     DWORD sampler_states[D9_MAX_SAMPLERS][D9_MAX_SAMPLER_STATES];
     D3DMATERIAL9 material;
+    /* The last ramp SetGammaRamp was given, kept so GetGammaRamp answers with
+     * it rather than with zeroes. D3D9 has no "no ramp set" state -- a device
+     * starts at identity -- so `gamma_ramp_set` only records whether the host
+     * has been told, which decides whether Reset has to tell it again. */
+    D3DGAMMARAMP gamma_ramp;
+    BOOL gamma_ramp_set;
     D3DLIGHT9 lights[D9_MAX_LIGHTS];
     BOOL light_set[D9_MAX_LIGHTS];
     BOOL light_enabled[D9_MAX_LIGHTS];
@@ -1732,6 +1744,27 @@ static void host_log(uint32_t severity, const char *format, ...)
     host_log(D9WG_LOG_SEVERITY_INFO, __VA_ARGS__)
 #define HOSTLOG_REFUSED(...) \
     host_log(D9WG_LOG_SEVERITY_REFUSED, __VA_ARGS__)
+
+/*
+ * Every refusal reported through this is a real API the game asked for and did
+ * not get, and a bare D3DERR_INVALIDCALL is indistinguishable from "the game
+ * never called it" -- from the host console, from the trace, from everywhere.
+ * That blind spot is what made Kart Rider's missing shop art un-diagnosable:
+ * the picture was wrong, the executor reported a clean frame with no dropped
+ * draws, and nothing anywhere recorded that the guest had been turned down.
+ * Name the refusal so the next round starts from a fact instead of a
+ * hypothesis.
+ *
+ * D9WG_OP_GUEST_LOG mirrors these bounded, deduplicated refusals into the
+ * browser console, while the diagnostic DLL retains the full trace.
+ */
+#define UNSUPPORTED(name) \
+    do { \
+        TRACE("STUB %s -> D3DERR_INVALIDCALL (unimplemented)", name); \
+        HOSTLOG_REFUSED("%s is not implemented and returned " \
+                "D3DERR_INVALIDCALL", name); \
+    } while (0)
+
 #define HOSTLOG_FAILED(...) \
     host_log(D9WG_LOG_SEVERITY_FAILED, __VA_ARGS__)
 
@@ -1984,6 +2017,14 @@ static BOOL supported_depth_stencil_format(D3DFORMAT format)
 
 static BOOL supported_volume_texture_format(D3DFORMAT format);
 static BOOL emit_generate_mips(D9Device *device, uint32_t resource_handle);
+/*
+ * IDirect3DBaseTexture9::SetLOD. D3D9 defines it as a no-op on anything but a
+ * MANAGED texture, so the three callers below apply it under the same
+ * condition and only then tell the host -- a host that clamped a DEFAULT-pool
+ * texture's LOD would be honouring a call D3D9 ignores.
+ */
+static BOOL emit_texture_lod(D9Device *device, uint32_t resource_handle,
+        DWORD lod);
 static HRESULT create_target_texture(D9Device *device, UINT width, UINT height,
         D3DFORMAT format, DWORD usage, D3DMULTISAMPLE_TYPE multisample,
         DWORD multisample_quality, IDirect3DSurface9 **surface_out);
@@ -3196,9 +3237,15 @@ static void fill_caps(D3DCAPS9 *caps)
             /* device_set_gamma_ramp(). */
             | D3DCAPS2_FULLSCREENGAMMA
             /* D3DUSAGE_DYNAMIC passes CheckDeviceFormat and CreateTexture, and
-             * the lock paths honour DISCARD/NOOVERWRITE. AUTOGENMIPMAP is
-             * deliberately refused, so D3DCAPS2_CANAUTOGENMIPMAP stays off. */
-            | D3DCAPS2_DYNAMICTEXTURES;
+             * the lock paths honour DISCARD/NOOVERWRITE. */
+            | D3DCAPS2_DYNAMICTEXTURES
+            /* D3DUSAGE_AUTOGENMIPMAP: CreateTexture and CreateCubeTexture both
+             * accept it, the host allocates the full chain and regenerates
+             * everything below level 0 whenever level 0 is written -- by upload
+             * or by a render pass -- and GenerateMipSubLevels forces it. The
+             * comment here used to say the usage was refused, which stopped
+             * being true and left a working capability unadvertised. */
+            | D3DCAPS2_CANAUTOGENMIPMAP;
     /* SetCursorProperties/SetCursorPosition/ShowCursor are all implemented, so
      * reporting no hardware cursor at all was simply wrong. */
     caps->CursorCaps = D3DCURSORCAPS_COLOR;
@@ -3254,9 +3301,14 @@ static void fill_caps(D3DCAPS9 *caps)
             /* M3: SetScissorRect reaches the host and its render pass. */
             | D3DPRASTERCAPS_SCISSORTEST
             /* WGSL interpolates varyings perspective-correct unless a stage is
-             * declared @interpolate(linear), and none are.  MIPMAPLODBIAS stays
-             * absent: D3DSAMP_MIPMAPLODBIAS reaches no sampler on the host. */
-            | D3DPRASTERCAPS_COLORPERSPECTIVE;
+             * declared @interpolate(linear), and none are. */
+            | D3DPRASTERCAPS_COLORPERSPECTIVE
+            /* D3DSAMP_MIPMAPLODBIAS. WebGPU samplers have no bias field, so the
+             * host applies it at the sample call instead -- textureSampleBias
+             * in both the fixed-function cascade and a translated pixel shader,
+             * baked as a literal and quantised to 1/16 of a level so a title
+             * that animates the bias cannot mint a pipeline per frame. */
+            | D3DPRASTERCAPS_MIPMAPLODBIAS;
     caps->ZCmpCaps = 0xFFu;
     /* ZERO through BOTHINVSRCALPHA plus the BLENDFACTOR pair. The host maps
      * BOTH* to its resolved source/destination pair and installs WebGPU's
@@ -3316,10 +3368,14 @@ static void fill_caps(D3DCAPS9 *caps)
             /* WebGPU has no border-colour sampler, so the host clamps for the
              * physical sample and then substitutes D3DSAMP_BORDERCOLOR for every
              * coordinate that fell outside the unit domain on a BORDER axis --
-             * a real implementation of the mode, not an approximation of it.
-             * MIRRORONCE is the opposite case and stays absent: it has no
-             * emulation at all and silently falls back to clamp. */
+             * a real implementation of the mode, not an approximation of it. */
             | D3DPTADDRESSCAPS_BORDER
+            /* MIRRORONCE is exact rather than emulated: "mirror about zero,
+             * then clamp" is a clamp-to-edge sampler -- which is what the host
+             * already selects for the mode -- plus abs() on that axis of the
+             * coordinate, applied in both the fixed-function cascade and a
+             * translated pixel shader. */
+            | D3DPTADDRESSCAPS_MIRRORONCE
             /* ADDRESSU, ADDRESSV and ADDRESSW are read and applied separately
              * per stage; nothing forces them to agree. */
             | D3DPTADDRESSCAPS_INDEPENDENTUV;
@@ -3340,7 +3396,24 @@ static void fill_caps(D3DCAPS9 *caps)
             | D3DTEXOPCAPS_BLENDTEXTUREALPHA | D3DTEXOPCAPS_BLENDFACTORALPHA
             | D3DTEXOPCAPS_BLENDTEXTUREALPHAPM
             | D3DTEXOPCAPS_BLENDCURRENTALPHA | D3DTEXOPCAPS_DOTPRODUCT3
-            | D3DTEXOPCAPS_MULTIPLYADD | D3DTEXOPCAPS_LERP;
+            | D3DTEXOPCAPS_MULTIPLYADD | D3DTEXOPCAPS_LERP
+            /* Environment bump mapping: the host displaces the next stage's
+             * coordinate by this stage's sampled (du, dv) through
+             * D3DTSS_BUMPENVMAT00..11, and the luminance form additionally
+             * modulates by BUMPENVLSCALE/BUMPENVLOFFSET. */
+            | D3DTEXOPCAPS_BUMPENVMAP
+            | D3DTEXOPCAPS_BUMPENVMAPLUMINANCE
+            /* The four "modulate one channel set, add the other" operations,
+             * emitted by textureOpExpression() in the host's cascade. D3D9
+             * defines all four for D3DTSS_COLOROP only; the host refuses them
+             * as an alpha operation, which is what D3D9 does too.
+             * D3DTEXOPCAPS_PREMODULATE stays absent: it modulates against the
+             * *next* stage's texture and nothing in the cascade carries a value
+             * backwards. */
+            | D3DTEXOPCAPS_MODULATEALPHA_ADDCOLOR
+            | D3DTEXOPCAPS_MODULATECOLOR_ADDALPHA
+            | D3DTEXOPCAPS_MODULATEINVALPHA_ADDCOLOR
+            | D3DTEXOPCAPS_MODULATEINVCOLOR_ADDALPHA;
     /* WebGPU guarantees maxTextureDimension2D >= 8192 on every implementation,
      * and the host creates its device with the default limits, so 4096 was
      * half of what actually works. */
@@ -3425,7 +3498,13 @@ static void fill_caps(D3DCAPS9 *caps)
              * are consumed, so a vertex colour can stand in for any material
              * channel.  Without this bit an engine duplicates its meshes per
              * material instead of colouring them per vertex. */
-            | D3DVTXPCAPS_MATERIALSOURCE7;
+            | D3DVTXPCAPS_MATERIALSOURCE7
+            /* D3DTSS_TCI_SPHEREMAP. The host's fixed-function vertex stage
+             * generates the classic sphere-map projection of the eye-space
+             * reflection vector -- the same formula GL_SPHERE_MAP and wined3d
+             * use, which is what titles authored their sphere-map art
+             * against. */
+            | D3DVTXPCAPS_TEXGEN_SPHEREMAP;
     caps->MaxActiveLights = 8;
     /* Implemented through interpolated distances plus fragment discard because
      * core WGSL has no user clip-distance builtin. */
@@ -5509,13 +5588,66 @@ static HRESULT WINAPI device_set_dialog_box_mode(IDirect3DDevice9 *iface,
         WINBOOL enable)
 { (void)iface; (void)enable; return D3D_OK; }
 
+/*
+ * D3D9's gamma ramp is applied at scanout rather than by the renderer, so it
+ * reaches the host as its own command and is applied in the present blit.
+ *
+ * SetGammaRamp returns void: there is no way to tell the caller it failed, and
+ * a title's brightness slider is expected to work with no acknowledgement. The
+ * ramp is therefore recorded locally whether or not the emit succeeds, so
+ * GetGammaRamp still answers correctly on a device whose command ring is full.
+ */
 static void WINAPI device_set_gamma_ramp(IDirect3DDevice9 *iface,
         UINT swapchain, DWORD flags, const D3DGAMMARAMP *ramp)
-{ (void)iface; (void)swapchain; (void)flags; (void)ramp; }
+{
+    D9Device *device = device_from_iface(iface);
+    D9WGSetGammaRamp command;
+    UINT index;
+
+    TRACE("CALL SetGammaRamp device=%08lX chain=%lu flags=%08lX ramp=%08lX",
+            device->handle, swapchain, flags, (DWORD)(uintptr_t)ramp);
+    if (!ramp || swapchain)
+        return;
+    device->gamma_ramp = *ramp;
+    device->gamma_ramp_set = TRUE;
+    command.device_handle = device->handle;
+    command.swap_chain = swapchain;
+    command.flags = flags;
+    command.reserved = 0;
+    for (index = 0; index < 256; ++index) {
+        command.ramp[index] = (uint16_t)ramp->red[index];
+        command.ramp[256 + index] = (uint16_t)ramp->green[index];
+        command.ramp[512 + index] = (uint16_t)ramp->blue[index];
+    }
+    emit_command(D9WG_OP_SET_GAMMA_RAMP, &command, sizeof(command));
+}
 
 static void WINAPI device_get_gamma_ramp(IDirect3DDevice9 *iface,
         UINT swapchain, D3DGAMMARAMP *ramp)
-{ (void)iface; (void)swapchain; if (ramp) ZeroMemory(ramp, sizeof(*ramp)); }
+{
+    D9Device *device = device_from_iface(iface);
+    UINT index;
+    if (!ramp)
+        return;
+    if (swapchain) {
+        ZeroMemory(ramp, sizeof(*ramp));
+        return;
+    }
+    if (device->gamma_ramp_set) {
+        *ramp = device->gamma_ramp;
+        return;
+    }
+    /* A device that has never been given a ramp is at identity, not at zero.
+     * Answering zero tells a title the display is black, and one that reads the
+     * ramp before writing it -- to restore it on exit -- would then "restore"
+     * the screen to black. */
+    for (index = 0; index < 256; ++index) {
+        WORD level = (WORD)((index << 8) | index);
+        ramp->red[index] = level;
+        ramp->green[index] = level;
+        ramp->blue[index] = level;
+    }
+}
 
 static HRESULT WINAPI device_begin_scene(IDirect3DDevice9 *iface)
 {
@@ -5902,17 +6034,51 @@ static HRESULT WINAPI device_validate_device(IDirect3DDevice9 *iface,
     return D3D_OK;
 }
 
+/*
+ * These two used to disagree: the setter returned D3D_OK and the getter always
+ * answered FALSE, so an app that set software processing and read it back was
+ * told its own call had not happened. That is worse than a refusal -- a
+ * refusal is a fact the app can branch on, while a silent disagreement looks
+ * like a driver bug in whatever renders wrong three frames later.
+ *
+ * This device is created HAL and processes vertices on the GPU. D3D9 permits
+ * SetSoftwareVertexProcessing(TRUE) only on a MIXED device, and returns
+ * D3DERR_INVALIDCALL otherwise -- which is the honest answer here, and one the
+ * getter can then agree with unconditionally.
+ */
 static HRESULT WINAPI device_set_software_vertex_processing(
         IDirect3DDevice9 *iface, WINBOOL software)
-{ (void)iface; (void)software; return D3D_OK; }
+{
+    (void)iface;
+    if (!software)
+        return D3D_OK;
+    UNSUPPORTED("Device.SetSoftwareVertexProcessing(TRUE)");
+    return TRACE_REFUSE(D3DERR_INVALIDCALL);
+}
 
 static WINBOOL WINAPI device_get_software_vertex_processing(
         IDirect3DDevice9 *iface)
 { (void)iface; return FALSE; }
 
+/*
+ * N-patch tessellation is not implemented, and returning D3D_OK said it was.
+ * An engine that enables N-patches and is told "yes" draws its un-tessellated
+ * meshes and has no way to discover why they look faceted; told "no", it keeps
+ * its own LOD path. D3D9 returns D3DERR_INVALIDCALL when the device cannot do
+ * it, so refusing is the documented answer rather than an approximation.
+ *
+ * Setting it back to 0.0 -- "no tessellation" -- is what every title does on
+ * shutdown and is always honoured.
+ */
 static HRESULT WINAPI device_set_npatch_mode(IDirect3DDevice9 *iface,
         float segments)
-{ (void)iface; (void)segments; return D3D_OK; }
+{
+    (void)iface;
+    if (segments <= 1.0f)
+        return D3D_OK;
+    UNSUPPORTED("Device.SetNPatchMode");
+    return TRACE_REFUSE(D3DERR_INVALIDCALL);
+}
 
 static float WINAPI device_get_npatch_mode(IDirect3DDevice9 *iface)
 { (void)iface; return 0.0f; }
@@ -7093,24 +7259,8 @@ static HRESULT WINAPI device_get_pixel_shader_constant_b(
 #define DEV_STUB(name, ...) \
     static HRESULT WINAPI device_##name(IDirect3DDevice9 *iface, __VA_ARGS__)
 
-/*
- * Every refusal here is a real API the game asked for and did not get, and a
- * bare D3DERR_INVALIDCALL is indistinguishable from "the game never called it"
- * -- from the host console, from the trace, from everywhere. That blind spot is
- * what made Kart Rider's missing shop art un-diagnosable: the picture was wrong,
- * the executor reported a clean frame with no dropped draws, and nothing
- * anywhere recorded that the guest had been turned down. Name the refusal so
- * the next round starts from a fact instead of a hypothesis.
- *
- * D9WG_OP_GUEST_LOG also mirrors these bounded, deduplicated refusals into the
- * browser console, while the diagnostic DLL retains the full trace.
- */
-#define UNSUPPORTED(name) \
-    do { \
-        TRACE("STUB %s -> D3DERR_INVALIDCALL (unimplemented)", name); \
-        HOSTLOG_REFUSED("%s is not implemented and returned " \
-                "D3DERR_INVALIDCALL", name); \
-    } while (0)
+/* The refusals below all report themselves through UNSUPPORTED(), defined next
+ * to HOSTLOG_REFUSED() above -- see the rationale there. */
 
 DEV_STUB(create_additional_swap_chain, D3DPRESENT_PARAMETERS *params,
         IDirect3DSwapChain9 **out)
@@ -7537,7 +7687,10 @@ static DWORD WINAPI volume_texture_set_lod(IDirect3DVolumeTexture9 *iface,
         DWORD lod)
 { D9VolumeTexture *texture = volume_texture_from_iface(iface);
   DWORD previous = texture->lod;
-  if (texture->pool == D3DPOOL_MANAGED) texture->lod = lod;
+  if (texture->pool != D3DPOOL_MANAGED) return previous;
+  if (lod >= texture->level_count) lod = texture->level_count - 1;
+  texture->lod = lod;
+  emit_texture_lod(texture->device, texture->handle, lod);
   return previous; }
 static DWORD WINAPI volume_texture_get_lod(IDirect3DVolumeTexture9 *iface)
 { return volume_texture_from_iface(iface)->lod; }
@@ -9744,7 +9897,10 @@ static DWORD WINAPI cube_set_lod(IDirect3DCubeTexture9 *iface, DWORD lod)
 {
     D9CubeTexture *texture = cube_from_iface(iface);
     DWORD previous = texture->lod;
-    if (texture->pool == D3DPOOL_MANAGED) texture->lod = lod;
+    if (texture->pool != D3DPOOL_MANAGED) return previous;
+    if (lod >= texture->level_count) lod = texture->level_count - 1;
+    texture->lod = lod;
+    emit_texture_lod(texture->device, texture->handle, lod);
     return previous;
 }
 
@@ -11150,9 +11306,12 @@ static DWORD WINAPI texture_set_lod(IDirect3DTexture9 *iface, DWORD lod)
 {
     D9Texture *texture = texture_from_iface(iface);
     DWORD old = texture->lod;
+    if (texture->pool != D3DPOOL_MANAGED)
+        return old;
     if (lod >= texture->level_count)
         lod = texture->level_count - 1;
     texture->lod = lod;
+    emit_texture_lod(texture->device, texture->handle, lod);
     return old;
 }
 
@@ -11171,6 +11330,17 @@ static BOOL emit_generate_mips(D9Device *device, uint32_t resource_handle)
     command.device_handle = device->handle;
     command.resource_handle = resource_handle;
     return emit_command(D9WG_OP_GENERATE_MIPS, &command, sizeof(command));
+}
+
+static BOOL emit_texture_lod(D9Device *device, uint32_t resource_handle,
+        DWORD lod)
+{
+    D9WGSetTextureLOD command;
+    command.device_handle = device->handle;
+    command.resource_handle = resource_handle;
+    command.lod = (uint32_t)lod;
+    command.reserved = 0;
+    return emit_command(D9WG_OP_SET_TEXTURE_LOD, &command, sizeof(command));
 }
 
 /*

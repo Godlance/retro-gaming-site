@@ -70,7 +70,7 @@
 
     const D9WG_MAGIC = 0x47573944; // "D9WG"
     const D9WG_VERSION_MAJOR = 1;
-    const D9WG_VERSION_MINOR = 4;
+    const D9WG_VERSION_MINOR = 5;
     // The oldest guest proxy this host still decodes. 1.3 payloads are simply
     // shorter than 1.4 ones; see the version check in executeBatch().
     const D9WG_VERSION_MIN_MINOR = 3;
@@ -119,6 +119,8 @@
     const OP_SET_PALETTE = 0x21F;
     const OP_SET_CURRENT_TEXTURE_PALETTE = 0x220;
     const OP_GENERATE_MIPS = 0x221;
+    const OP_SET_TEXTURE_LOD = 0x222;
+    const OP_SET_GAMMA_RAMP = 0x223;
     // D9WGSetDepthStencilSurface.depth_texture_handle sentinel: the device's own
     // auto depth-stencil surface. It needs a value distinct from 0 because
     // SetDepthStencilSurface(NULL) -- which really does turn depth testing off
@@ -195,7 +197,15 @@
     const MAX_CONST_I = 16;
     const MAX_CONST_B = 16;
     const MAX_SAMPLERS = 16;
-    const MAX_STREAMS = 4;
+    // fill_caps() reports MaxStreams = 16, D3D9's architectural maximum, and
+    // the guest keeps 16 binding slots. This is the different, WebGPU-imposed
+    // number: how many vertex buffers one *draw* may bind. WebGPU guarantees
+    // maxVertexBuffers >= 8 on every implementation, and a layout is built only
+    // for the streams a declaration actually references, so the two limits meet
+    // only for a declaration that spreads its attributes over more than eight
+    // streams -- which is refused and counted rather than silently truncated.
+    const MAX_STREAMS = 16;
+    const MAX_VERTEX_BUFFERS_PER_DRAW = 8;
     // fill_caps() reports NumSimultaneousRTs = 4.
     const MAX_RENDER_TARGETS = 4;
     // WebGPU's minUniformBufferOffsetAlignment default. The vertex and pixel
@@ -354,6 +364,13 @@
     // MaxTextureBlendStages = 8, D3DVTXPCAPS_DIRECTIONALLIGHTS/POSITIONALLIGHTS
     // and a large TextureOpCaps set, so those were caps promises the renderer
     // did not keep; this section is what makes them true.
+    const D3DRS_FILLMODE = 8;
+    // D3DRS_WRAP0..7 are contiguous at 128..135; WRAP8..15 live at 198..205.
+    const D3DRS_WRAP0 = 128, D3DRS_WRAP7 = 135;
+    const D3DRS_MULTISAMPLEANTIALIAS = 161;
+    const D3DRS_MULTISAMPLEMASK = 162;
+    const D3DFILL_POINT = 1, D3DFILL_WIREFRAME = 2, D3DFILL_SOLID = 3;
+    const D3DRS_SHADEMODE = 9;
     const D3DRS_SPECULARENABLE = 29;
     const D3DRS_TEXTUREFACTOR = 60;
     const D3DRS_COLORVERTEX = 141;
@@ -403,15 +420,23 @@
     const D3DTSS_COLOROP = 1, D3DTSS_COLORARG1 = 2, D3DTSS_COLORARG2 = 3;
     const D3DTSS_ALPHAOP = 4, D3DTSS_ALPHAARG1 = 5, D3DTSS_ALPHAARG2 = 6;
     const D3DTSS_TEXCOORDINDEX = 11;
+    // The 2x2 matrix D3DTOP_BUMPENVMAP applies to the (du, dv) it samples,
+    // and the luminance scale/offset BUMPENVMAPLUMINANCE adds on top. All six
+    // are D3DTSS values holding raw float bits.
+    const D3DTSS_BUMPENVMAT00 = 7, D3DTSS_BUMPENVMAT01 = 8;
+    const D3DTSS_BUMPENVMAT10 = 9, D3DTSS_BUMPENVMAT11 = 10;
+    const D3DTSS_BUMPENVLSCALE = 22, D3DTSS_BUMPENVLOFFSET = 23;
     const D3DTSS_TEXTURETRANSFORMFLAGS = 24;
     const D3DTSS_COLORARG0 = 26, D3DTSS_ALPHAARG0 = 27, D3DTSS_RESULTARG = 28;
     const D3DTSS_CONSTANT = 32;
 
     // D3DTEXTUREOP. Only the operations fill_caps() advertises in TextureOpCaps
-    // are implemented below; PREMODULATE and the BUMPENVMAP pair are absent
-    // from both, and a stage asking for one is counted rather than approximated
-    // (an approximated bump map renders as wrong-but-plausible shading, which
-    // is the failure mode hardest to attribute).
+    // are implemented below; a stage asking for one that is absent is counted
+    // rather than approximated (an approximated blend renders as
+    // wrong-but-plausible shading, which is the failure mode hardest to
+    // attribute). D3DTOP_PREMODULATE is the one remaining hole: it modulates
+    // this stage's result with the *next* stage's texture, and nothing in the
+    // cascade carries a value backwards.
     const D3DTOP_DISABLE = 1, D3DTOP_SELECTARG1 = 2, D3DTOP_SELECTARG2 = 3;
     const D3DTOP_MODULATE = 4, D3DTOP_MODULATE2X = 5, D3DTOP_MODULATE4X = 6;
     const D3DTOP_ADD = 7, D3DTOP_ADDSIGNED = 8, D3DTOP_ADDSIGNED2X = 9;
@@ -419,6 +444,16 @@
     const D3DTOP_BLENDDIFFUSEALPHA = 12, D3DTOP_BLENDTEXTUREALPHA = 13;
     const D3DTOP_BLENDFACTORALPHA = 14, D3DTOP_BLENDTEXTUREALPHAPM = 15;
     const D3DTOP_BLENDCURRENTALPHA = 16;
+    const D3DTOP_PREMODULATE = 17;
+    // The four "modulate one channel set, add the other" operations. D3D9
+    // documents all four as valid for D3DTSS_COLOROP only -- each one mixes
+    // arg1's colour with arg1's *alpha*, which has no scalar analogue -- so the
+    // alpha form below returns null and is counted like any other refusal.
+    const D3DTOP_MODULATEALPHA_ADDCOLOR = 18;
+    const D3DTOP_MODULATECOLOR_ADDALPHA = 19;
+    const D3DTOP_MODULATEINVALPHA_ADDCOLOR = 20;
+    const D3DTOP_MODULATEINVCOLOR_ADDALPHA = 21;
+    const D3DTOP_BUMPENVMAP = 22, D3DTOP_BUMPENVMAPLUMINANCE = 23;
     const D3DTOP_DOTPRODUCT3 = 24, D3DTOP_MULTIPLYADD = 25, D3DTOP_LERP = 26;
 
     // D3DTA_* argument selectors and their two modifier bits.
@@ -548,6 +583,13 @@
     const D3DSAMP_MAGFILTER = 5;
     const D3DSAMP_MINFILTER = 6;
     const D3DSAMP_MIPFILTER = 7;
+    // Float bits in a DWORD. WebGPU samplers carry no LOD bias, so this one is
+    // applied at the sample call instead -- see lodBiasFor().
+    const D3DSAMP_MIPMAPLODBIAS = 8;
+    // The floor on which mip level may be sampled, as a level index. WebGPU
+    // spells the same restriction as a LOD clamp, so both this and the
+    // per-texture SetLOD become lodMinClamp -- see samplerFor().
+    const D3DSAMP_MAXMIPLEVEL = 9;
     const D3DSAMP_MAXANISOTROPY = 10;
     // D3D9 decodes an sRGB-tagged texture to linear *on read*. WebGPU has no
     // sampler-level equivalent -- it is a property of the texture format -- so
@@ -685,6 +727,28 @@
     function floatFromDWORD(value) {
         FLOAT_BITS_U32[0] = value >>> 0;
         return FLOAT_BITS_F32[0];
+    }
+
+    // D3DSAMP_MIPMAPLODBIAS, also float bits in a DWORD.
+    //
+    // WebGPU samplers have no LOD bias at all, so the only place to apply one
+    // is the sample call -- textureSampleBias -- which means the value lands in
+    // the shader rather than in the sampler. Baking it as a literal (rather
+    // than reading it from a uniform) keeps it out of the per-draw uniform
+    // writers on both the fixed-function and translated paths, at the price of
+    // one pipeline variant per distinct bias.
+    //
+    // Quantising to 1/16 of a mip level is what bounds that price: a title that
+    // animates the bias continuously would otherwise mint a pipeline per frame,
+    // and 1/16 is far finer than the difference is visible at. The range clamp
+    // matches D3D9's own, which no hardware exceeded.
+    const LOD_BIAS_STEPS = 16;
+    const LOD_BIAS_LIMIT = 16;
+    function lodBiasFor(dword) {
+        const bias = floatFromDWORD(dword);
+        if (!Number.isFinite(bias) || bias === 0) return 0;
+        return Math.round(Math.max(-LOD_BIAS_LIMIT,
+            Math.min(LOD_BIAS_LIMIT, bias)) * LOD_BIAS_STEPS) / LOD_BIAS_STEPS;
     }
 
     // The "-srgb" sibling of a GPU format, or null when there is none. A view
@@ -1523,6 +1587,24 @@
     // uses (see the file header).
     const VARYING_COUNT = shaderPipeline.VARYING_COUNT;
     const VARYING_COLOR0 = shaderPipeline.VARYING_COLOR0;
+    // D3DRS_SHADEMODE. D3DSHADE_FLAT takes the colour of the primitive's first
+    // vertex instead of interpolating, which is exactly WGSL's
+    // @interpolate(flat) -- whose default sampling is `first`, the same
+    // provoking vertex D3D9 uses.
+    //
+    // It applies to the two colour varyings only. Texture coordinates and fog
+    // keep interpolating under flat shading in D3D9, and a title that flat
+    // shades a textured surface expects the texture to still follow the
+    // surface. D3DSHADE_PHONG is in the enum but no D3D9 device ever
+    // implemented it; D3D9 treats it as GOURAUD, and so does this.
+    const D3DSHADE_FLAT = 1, D3DSHADE_GOURAUD = 2;
+    function varyingDeclaration(slot, flatShading) {
+        const flat = flatShading &&
+            (slot === VARYING_COLOR0 || slot === shaderPipeline.VARYING_COLOR1);
+        return "    @location(" + slot + ")" +
+            (flat ? " @interpolate(flat)" : "") +
+            " varying" + slot + ": vec4<f32>,";
+    }
     const VARYING_TEXCOORD0 = shaderPipeline.VARYING_TEXCOORD0;
 
     // Vertex attribute locations the fixed-function vertex stage consumes.
@@ -1780,6 +1862,16 @@
             if (stage.usesConstant)
                 fields.push({ name: "stage_constant" + stage.index,
                     type: "vec4<f32>", bytes: 16, source: stage.index });
+            // The bump matrix and luminance terms belong to the stage that
+            // declared BUMPENVMAP, not to the stage that samples with them.
+            if (stage.isBumpSource) {
+                fields.push({ name: "stage_bump" + stage.index,
+                    type: "vec4<f32>", bytes: 16, bumpSource: stage.index });
+                if (stage.colorOp === D3DTOP_BUMPENVMAPLUMINANCE)
+                    fields.push({ name: "stage_bump_lum" + stage.index,
+                        type: "vec4<f32>", bytes: 16,
+                        bumpLuminanceSource: stage.index });
+            }
         }
         return uniformBlockLayout(fields);
     }
@@ -1839,6 +1931,35 @@
                 args.rgb2 + " - vec3<f32>(0.5)))";
             return type === "vec3<f32>" ? "vec3<f32>(" + dot + ")" : dot;
         }
+        case D3DTOP_BUMPENVMAP:
+        case D3DTOP_BUMPENVMAPLUMINANCE:
+            // A bump stage produces no colour of its own: its whole effect is
+            // the coordinate perturbation the *next* stage samples with (see
+            // the bump handling in buildFixedFunctionPixelShader). D3D leaves
+            // the running result untouched, which is arg2 -- D3DTA_CURRENT by
+            // default.
+            return a2;
+        // The four "modulate one channel set, add the other" forms. Each
+        // reaches for arg1's alpha alongside arg1's colour, which is why the
+        // caller supplies `args.alpha1` separately -- `a1` here is already
+        // reduced to the channel being computed. D3D9 defines all four for
+        // D3DTSS_COLOROP only, so the f32 form falls through to the null
+        // default and is counted rather than invented.
+        case D3DTOP_MODULATEALPHA_ADDCOLOR:
+            if (type !== "vec3<f32>") return null;
+            return "(" + args.rgb1 + " + " + args.alpha1 + " * " + args.rgb2 + ")";
+        case D3DTOP_MODULATECOLOR_ADDALPHA:
+            if (type !== "vec3<f32>") return null;
+            return "(" + args.rgb1 + " * " + args.rgb2 + " + " +
+                "vec3<f32>(" + args.alpha1 + "))";
+        case D3DTOP_MODULATEINVALPHA_ADDCOLOR:
+            if (type !== "vec3<f32>") return null;
+            return "((1.0 - " + args.alpha1 + ") * " + args.rgb2 + " + " +
+                args.rgb1 + ")";
+        case D3DTOP_MODULATEINVCOLOR_ADDALPHA:
+            if (type !== "vec3<f32>") return null;
+            return "((vec3<f32>(1.0) - " + args.rgb1 + ") * " + args.rgb2 +
+                " + vec3<f32>(" + args.alpha1 + "))";
         case D3DTOP_MULTIPLYADD:
             return "(" + a0 + " + " + a1 + " * " + a2 + ")";
         case D3DTOP_LERP:
@@ -1880,7 +2001,7 @@
 
         const varyings = [];
         for (let slot = 0; slot < VARYING_COUNT; ++slot)
-            varyings.push("    @location(" + slot + ") varying" + slot + ": vec4<f32>,");
+            varyings.push(varyingDeclaration(slot, signature.flatShading));
         const clipVaryings = [];
         let clipBody = "";
         if (signature.clipPlaneCount) {
@@ -2173,6 +2294,16 @@
                 raw = "vec4<f32>(reflect(normalize(position_view.xyz), " +
                     "normalize(normal_view)), 1.0)";
                 break;
+            case D3DTSS_TCI_SPHEREMAP:
+                // The classic sphere-map projection of the eye-space
+                // reflection vector: the same formula OpenGL's GL_SPHERE_MAP
+                // and wined3d use, which is what titles authored their
+                // sphere-map art against. m is twice the length of
+                // (R.x, R.y, R.z + 1), and the +0.5 recentres the result into
+                // the [0,1] texture domain.
+                raw = "(func_sphere_map(reflect(normalize(position_view.xyz), " +
+                    "normalize(normal_view))))";
+                break;
             default:
                 raw = signature.texCoordSets.includes(stage.texCoordIndex)
                     ? "in" + (FF_LOCATION_TEXCOORD0 + stage.texCoordIndex)
@@ -2249,8 +2380,23 @@
 };
 ` : "";
 
+        // Emitted only when a stage asks for it, so the ordinary vertex stage
+        // is unchanged.
+        const sphereMapHelper = signature.coordStages.some(stage =>
+            stage.tciMode === D3DTSS_TCI_SPHEREMAP) ? `
+fn func_sphere_map(r: vec3<f32>) -> vec4<f32> {
+    // m = 2 * |(R.x, R.y, R.z + 1)|. The guard keeps the division finite for
+    // the one reflection vector that degenerates it, R = (0, 0, -1), which is
+    // the direction looking straight down the reflected axis.
+    let m = 2.0 * sqrt(r.x * r.x + r.y * r.y + (r.z + 1.0) * (r.z + 1.0));
+    return vec4<f32>(r.x / max(m, 1e-6) + 0.5, r.y / max(m, 1e-6) + 0.5,
+        0.0, 1.0);
+}
+` : "";
+
         return `${lightStruct}${uniformBlockStruct("D9FixedUniforms", layout)}
 @group(0) @binding(0) var<uniform> uniforms: D9FixedUniforms;
+${sphereMapHelper}
 
 struct D9VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -2331,8 +2477,48 @@ ${coordBody}${fogBody}${clipBody}${pointBody}    return result;
                 coordExpression = "(" + coordExpression + " / (" +
                     safeDivisor + "))";
             }
-            const sampled = "textureSample(d9_tex" + stage.index +
-                ", d9_smp" + stage.index + ", " + coordExpression + ")";
+            // D3DTOP_BUMPENVMAP: the previous stage sampled a (du, dv) pair,
+            // and this stage's coordinate is displaced by it through that
+            // stage's 2x2 bump matrix. The bump formats decode signed (see
+            // signedNormalized in the upload path), so du/dv are used as
+            // sampled rather than being rescaled from unorm here.
+            if (stage.bumpFrom !== undefined && stage.textureType === "2d") {
+                const bump = "uniforms.stage_bump" + stage.bumpFrom;
+                const source = "tex" + stage.bumpFrom;
+                coordExpression = "((" + coordExpression + ") + vec2<f32>(" +
+                    bump + ".x * " + source + ".r + " + bump + ".z * " +
+                    source + ".g, " + bump + ".y * " + source + ".r + " +
+                    bump + ".w * " + source + ".g))";
+            }
+            // D3DTADDRESS_MIRRORONCE: mirror about zero, then clamp. The
+            // sampler is already clamp-to-edge for such an axis (see
+            // ADDRESS_MODES), so taking the absolute value of the coordinate
+            // here completes the mode exactly rather than approximating it --
+            // abs() folds the [-1,0] half onto [0,1] and the clamp handles
+            // everything beyond. Cube addressing ignores address modes, so it
+            // is excluded.
+            const mirrorOnceAxes = stage.textureType === "cube" ? [] :
+                (stage.textureType === "3d"
+                    ? [[stage.addressU, "x"], [stage.addressV, "y"],
+                       [stage.addressW, "z"]]
+                    : [[stage.addressU, "x"], [stage.addressV, "y"]])
+                .filter(axis => axis[0] === 5).map(axis => axis[1]);
+            if (mirrorOnceAxes.length) {
+                const axes = stage.textureType === "3d"
+                    ? ["x", "y", "z"] : ["x", "y"];
+                const vector = stage.textureType === "3d"
+                    ? "vec3<f32>" : "vec2<f32>";
+                coordExpression = vector + "(" + axes.map(axis =>
+                    (mirrorOnceAxes.includes(axis)
+                        ? "abs((" + coordExpression + ")." + axis + ")"
+                        : "(" + coordExpression + ")." + axis)).join(", ") + ")";
+            }
+            const sampled = stage.lodBias
+                ? "textureSampleBias(d9_tex" + stage.index + ", d9_smp" +
+                    stage.index + ", " + coordExpression + ", " +
+                    stage.lodBias.toFixed(6) + ")"
+                : "textureSample(d9_tex" + stage.index +
+                    ", d9_smp" + stage.index + ", " + coordExpression + ")";
             const borderAxes = stage.textureType === "cube" ? [] :
                 (stage.textureType === "3d"
                     ? [[stage.addressU, "x"], [stage.addressV, "y"],
@@ -2361,7 +2547,22 @@ ${coordBody}${fogBody}${clipBody}${pointBody}    return result;
             } else {
                 samples.push("    let tex" + stage.index + " = " + sampled + ";");
             }
+            // D3DTOP_BUMPENVMAPLUMINANCE additionally modulates this stage's
+            // colour by the bump texture's luminance channel, scaled and
+            // biased by BUMPENVLSCALE/BUMPENVLOFFSET and clamped to [0,1].
+            if (stage.bumpLuminanceFrom !== undefined) {
+                const lum = "uniforms.stage_bump_lum" + stage.bumpLuminanceFrom;
+                const source = "tex" + stage.bumpLuminanceFrom;
+                samples.push("    let tex" + stage.index + "_lit = vec4<f32>(" +
+                    "tex" + stage.index + ".rgb * clamp(" + lum + ".x * " +
+                    source + ".b + " + lum + ".y, 0.0, 1.0), tex" +
+                    stage.index + ".a);");
+            }
         }
+
+        const luminanceScaledStages = new Set(signature.stages
+            .filter(stage => stage.bumpLuminanceFrom !== undefined)
+            .map(stage => stage.index));
 
         // The argument pool. `current` and `temp` are the two mutable registers
         // the cascade threads through, so they are read from variables the
@@ -2372,7 +2573,13 @@ ${coordBody}${fogBody}${clipBody}${pointBody}    return result;
             switch (selector) {
             case D3DTA_DIFFUSE: value = diffuse; break;
             case D3DTA_CURRENT: value = "current"; break;
-            case D3DTA_TEXTURE: value = "tex" + stageIndex; break;
+            case D3DTA_TEXTURE:
+                // A stage sampled under BUMPENVMAPLUMINANCE reads the
+                // luminance-modulated copy, which is what the luminance form
+                // exists to produce.
+                value = "tex" + stageIndex +
+                    (luminanceScaledStages.has(stageIndex) ? "_lit" : "");
+                break;
             case D3DTA_TFACTOR: value = "uniforms.texture_factor"; break;
             case D3DTA_SPECULAR: value = specular; break;
             case D3DTA_TEMP: value = "temp"; break;
@@ -2414,10 +2621,15 @@ ${coordBody}${fogBody}${clipBody}${pointBody}    return result;
                 rgb(stage.colorArg2)];
             colorArgs.rgb1 = rgb(stage.colorArg1);
             colorArgs.rgb2 = rgb(stage.colorArg2);
+            // The MODULATE*_ADD* family reads arg1's alpha while computing the
+            // colour channel, so it needs the alpha reduction of the *colour*
+            // argument rather than of D3DTSS_ALPHAARG1.
+            colorArgs.alpha1 = alpha(stage.colorArg1);
             const alphaArgs = [alpha(stage.alphaArg0), alpha(stage.alphaArg1),
                 alpha(stage.alphaArg2)];
             alphaArgs.rgb1 = rgb(stage.colorArg1);
             alphaArgs.rgb2 = rgb(stage.colorArg2);
+            alphaArgs.alpha1 = alpha(stage.colorArg1);
             const colorExpression = textureOpExpression(stage.colorOp,
                 "vec3<f32>", colorArgs, blendAlpha[stage.colorOp] || "0.0");
             const alphaExpression = stage.alphaOp === D3DTOP_DISABLE ? null
@@ -2479,7 +2691,7 @@ ${coordBody}${fogBody}${clipBody}${pointBody}    return result;
         }
         const varyings = [];
         for (let slot = 0; slot < VARYING_COUNT; ++slot)
-            varyings.push("    @location(" + slot + ") varying" + slot + ": vec4<f32>,");
+            varyings.push(varyingDeclaration(slot, signature.flatShading));
         const clipVaryings = [];
         let clipDiscard = "";
         for (let group = 0; group < Math.ceil(
@@ -2783,6 +2995,8 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 readbackRequests: 0,
                 frameFlushes: 0,
                 unsupportedCommands: 0, malformedBatches: 0,
+                malformedCommands: 0, gammaRampUpdates: 0, fillModeDraws: 0,
+                gammaPresents: 0,
                 droppedDraws: 0,
                 guestReports: 0,
                 texturesCreated: 0, textureUploads: 0, textureBytesUploaded: 0,
@@ -3456,6 +3670,8 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 [OP_SET_CURRENT_TEXTURE_PALETTE]:
                     this.onSetCurrentTexturePalette,
                 [OP_GENERATE_MIPS]: this.onGenerateMips,
+                [OP_SET_TEXTURE_LOD]: this.onSetTextureLOD,
+                [OP_SET_GAMMA_RAMP]: this.onSetGammaRamp,
                 [OP_STRETCH_RECT]: this.onStretchRect,
                 [OP_COLOR_FILL]: this.onColorFill,
                 [OP_GUEST_LOG]: this.onGuestLog,
@@ -4794,10 +5010,48 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                     const copyHeight = Math.min(swapTexture.height,
                         this.backBufferTextureHeight);
                     if (copyWidth && copyHeight) {
-                        encoder.copyTextureToTexture({ texture: backTexture },
-                            { texture: swapTexture },
-                            { width: copyWidth, height: copyHeight,
-                                depthOrArrayLayers: 1 });
+                        // A gamma ramp is applied here, at the one point every
+                        // finished pixel passes through on its way to the
+                        // canvas -- which is where the hardware applies it too.
+                        // The plain copy stays the path for the overwhelmingly
+                        // common identity case, because a lookup pass costs a
+                        // full-screen draw the copy does not.
+                        const gammaView = this.presentGammaView();
+                        if (gammaView) {
+                            // The configured canvas format, not
+                            // swapTexture.format: the context was configured
+                            // with the former and a pipeline target has to
+                            // match what the pass writes.
+                            const entry = this.gammaBlitPipelineFor(this.format);
+                            const pass = encoder.beginRenderPass({
+                                colorAttachments: [{
+                                    view: swapTexture.createView(),
+                                    loadOp: "clear",
+                                    clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                                    storeOp: "store" }],
+                            });
+                            ++this.stats.renderPasses;
+                            pass.setPipeline(entry.pipeline);
+                            pass.setBindGroup(0, this.device.createBindGroup({
+                                layout: entry.bindGroupLayout,
+                                entries: [
+                                    { binding: 0,
+                                      resource: backTexture.createView() },
+                                    { binding: 1, resource: entry.sampler },
+                                    { binding: 2, resource: gammaView },
+                                ],
+                            }));
+                            pass.setViewport(0, 0, copyWidth, copyHeight, 0, 1);
+                            pass.draw(6);
+                            pass.end();
+                            ++this.stats.gammaPresents;
+                        } else {
+                            encoder.copyTextureToTexture(
+                                { texture: backTexture },
+                                { texture: swapTexture },
+                                { width: copyWidth, height: copyHeight,
+                                    depthOrArrayLayers: 1 });
+                        }
                         ++this.stats.backBufferPresents;
                     }
                     // Drawn onto the canvas copy rather than the back buffer,
@@ -6321,6 +6575,168 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             ++this.stats.explicitMipGenerations;
         }
 
+        onSetTextureLOD(bytes, view, offset) {
+            const resource = this.resources.get(
+                view.getUint32(offset + 4, true));
+            if (!resource) return;
+            // Clamped against the chain that actually exists rather than
+            // trusted: the guest clamps too, but a texture recreated at a
+            // different level count between the two would otherwise leave a
+            // lodMinClamp above lodMaxClamp, which WebGPU rejects outright.
+            const levels = Math.max(1, resource.levelCount || 1);
+            resource.lod = Math.min(view.getUint32(offset + 8, true) >>> 0,
+                levels - 1);
+        }
+
+        // IDirect3DDevice9::SetGammaRamp. D3D9 applies this at scanout, after
+        // everything the renderer did, so it is applied here in the step that
+        // moves the finished back buffer onto the canvas -- see the present
+        // path in finishFrame(), which swaps its plain copy for a lookup pass
+        // whenever a non-identity ramp is set.
+        //
+        // Held as a 256x1 rgba32float lookup rather than as a curve fit: a
+        // D3D9 ramp is an arbitrary table, and titles do use it for effects
+        // (fades, damage flashes) that no gamma exponent can express.
+        onSetGammaRamp(bytes, view, offset, length) {
+            const state = this.deviceState(view.getUint32(offset, true));
+            if (!state) return;
+            if (length < 16 + 768 * 2) {
+                ++this.stats.malformedCommands;
+                return;
+            }
+            const values = new Float32Array(256 * 4);
+            let identity = true;
+            for (let index = 0; index < 256; ++index) {
+                for (let channel = 0; channel < 3; ++channel) {
+                    const raw = view.getUint16(
+                        offset + 16 + (channel * 256 + index) * 2, true);
+                    values[index * 4 + channel] = raw / 65535;
+                    // The identity ramp is entry = index * 257 (0x0000, 0x0101,
+                    // ... 0xffff). Recognising it matters: a title that sets the
+                    // identity ramp on startup would otherwise pay for a lookup
+                    // pass on every frame for no visible difference.
+                    if (raw !== index * 257) identity = false;
+                }
+                values[index * 4 + 3] = 1;
+            }
+            state.gammaRampIdentity = identity;
+            // Counted for every accepted ramp, identity included: "the title
+            // never called SetGammaRamp" and "the title set the identity ramp"
+            // are different facts, and a counter that only moved for the second
+            // kind could not tell them apart.
+            ++this.stats.gammaRampUpdates;
+            if (identity) {
+                this.retireGPUObject(state.gammaRampTexture);
+                state.gammaRampTexture = null;
+                state.gammaRampView = null;
+                return;
+            }
+            if (!state.gammaRampTexture) {
+                state.gammaRampTexture = this.device.createTexture({
+                    label: "D3D9 gamma ramp",
+                    size: { width: 256, height: 1, depthOrArrayLayers: 1 },
+                    format: "rgba32float",
+                    usage: TEXTURE_USAGE_TEXTURE_BINDING |
+                        TEXTURE_USAGE_COPY_DST,
+                });
+                state.gammaRampView = state.gammaRampTexture.createView();
+            }
+            this.device.queue.writeTexture({ texture: state.gammaRampTexture },
+                values, { bytesPerRow: 256 * 16 },
+                { width: 256, height: 1, depthOrArrayLayers: 1 });
+        }
+
+        // Which device's ramp the canvas should show. A page runs one D3D9
+        // device at a time in practice, but the state table is keyed by handle
+        // and nothing guarantees a single entry, so this picks the first device
+        // that actually has a non-identity ramp rather than assuming there is
+        // exactly one.
+        presentGammaView() {
+            for (const state of this.devices.values()) {
+                if (state && state.gammaRampView) return state.gammaRampView;
+            }
+            return null;
+        }
+
+        // The present-time lookup pass. Separate from blitPipelineFor() because
+        // it binds a third resource the ordinary blit has no slot for, and
+        // because textureLoad -- not textureSample -- is what makes the lookup
+        // exact: a ramp entry is chosen by index, never interpolated between
+        // two neighbours.
+        gammaBlitPipelineFor(format) {
+            if (!this.gammaBlitPipelines) this.gammaBlitPipelines = new Map();
+            let entry = this.gammaBlitPipelines.get(format);
+            if (entry) return entry;
+            const module = this.moduleFor(`@group(0) @binding(0) var d9_gamma_source: texture_2d<f32>;
+@group(0) @binding(1) var d9_gamma_sampler: sampler;
+@group(0) @binding(2) var d9_gamma_ramp: texture_2d<f32>;
+
+struct D9GammaOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn d9_vs_main(@builtin(vertex_index) index: u32) -> D9GammaOutput {
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
+        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0));
+    let corner = corners[index];
+    var result: D9GammaOutput;
+    result.position = vec4<f32>(corner.x * 2.0 - 1.0, 1.0 - corner.y * 2.0,
+        0.0, 1.0);
+    result.uv = corner;
+    return result;
+}
+
+@fragment
+fn d9_ps_main(stage_in: D9GammaOutput) -> @location(0) vec4<f32> {
+    let source = textureSample(d9_gamma_source, d9_gamma_sampler, stage_in.uv);
+    // Each channel indexes the table independently -- D3D9's ramp is three
+    // separate curves, and titles do set them apart (a red damage flash is
+    // exactly that).
+    let index = vec3<i32>(clamp(source.rgb, vec3<f32>(0.0), vec3<f32>(1.0))
+        * 255.0 + vec3<f32>(0.5));
+    return vec4<f32>(
+        textureLoad(d9_gamma_ramp, vec2<i32>(index.r, 0), 0).r,
+        textureLoad(d9_gamma_ramp, vec2<i32>(index.g, 0), 0).g,
+        textureLoad(d9_gamma_ramp, vec2<i32>(index.b, 0), 0).b,
+        source.a);
+}
+`, "d3d9 gamma blit " + format);
+            const bindGroupLayout = this.device.createBindGroupLayout({
+                entries: [
+                    { binding: 0, visibility: SHADER_STAGE_FRAGMENT,
+                      texture: { sampleType: "float" } },
+                    { binding: 1, visibility: SHADER_STAGE_FRAGMENT,
+                      sampler: { type: "filtering" } },
+                    // The ramp is read with textureLoad, which is defined for
+                    // an unfilterable-float binding and needs no sampler.
+                    { binding: 2, visibility: SHADER_STAGE_FRAGMENT,
+                      texture: { sampleType: "unfilterable-float" } },
+                ],
+            });
+            entry = {
+                pipeline: this.device.createRenderPipeline({
+                    label: "D3D9 gamma blit " + format,
+                    layout: this.device.createPipelineLayout(
+                        { bindGroupLayouts: [bindGroupLayout] }),
+                    vertex: { module, entryPoint: "d9_vs_main" },
+                    fragment: { module, entryPoint: "d9_ps_main",
+                        targets: [{ format }] },
+                    primitive: { topology: "triangle-list" },
+                }),
+                bindGroupLayout,
+                sampler: this.device.createSampler({
+                    magFilter: "nearest", minFilter: "nearest",
+                    addressModeU: "clamp-to-edge",
+                    addressModeV: "clamp-to-edge",
+                }),
+            };
+            this.gammaBlitPipelines.set(format, entry);
+            return entry;
+        }
+
         onSetPalette(bytes, view, offset) {
             const deviceHandle = view.getUint32(offset, true);
             const index = view.getUint32(offset + 4, true);
@@ -6397,7 +6813,8 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                         const format = wantsSRGB && this.swapchainSrgbFormat
                             ? this.swapchainSrgbFormat : this.format;
                         colors.push({ view: null, format,
-                            swapchain: true });
+                            swapchain: true,
+                            sampleCount: state.sampleCount || 1 });
                         width = this.backBufferWidthOf(state);
                         height = this.backBufferHeightOf(state);
                         key += "bb" + (format === this.format ? "" : "s") + ";";
@@ -6442,6 +6859,7 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 colors.push({ view: targetView,
                     format: srgb ? resource.srgbFormat : resourceFormat,
                     swapchain: false,
+                    sampleCount: resource.sampleCount || 1,
                     resource });
                 if (index === 0) {
                     width = Math.max(1, resource.width >> level);
@@ -6541,8 +6959,26 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                     key += "!d";
                 }
             }
-            return { key, colors, depthView, width, height, substituteDepth,
-                hasDepth: !!depthView,
+            // WebGPU requires every attachment of a pass -- and the pipeline
+            // drawing into it -- to agree on the sample count, so slot 0 sets
+            // it and a disagreeing slot is named rather than left to fail
+            // pipeline creation with nothing pointing at the cause.
+            const sampleCount = colors[0].sampleCount || 1;
+            for (let index = 1; index < colors.length; ++index) {
+                if ((colors[index].sampleCount || 1) === sampleCount) continue;
+                this.warnOnce("mrt-sample-count",
+                    "the render target slots disagree about multisampling; " +
+                    "WebGPU needs one sample count for the whole pass, so " +
+                    "slot 0's is used", {
+                        slot0: sampleCount,
+                        slot: index,
+                        slotSampleCount: colors[index].sampleCount || 1,
+                    });
+                break;
+            }
+            return { key: key + "x" + sampleCount, colors, depthView, width,
+                height, substituteDepth,
+                hasDepth: !!depthView, sampleCount,
                 formats: colors.map(color => color.format) };
         }
 
@@ -7406,6 +7842,8 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                     addressV: samplerState(index, D3DSAMP_ADDRESSV, 1),
                     addressW: samplerState(index, D3DSAMP_ADDRESSW, 1),
                     borderColor: samplerState(index, D3DSAMP_BORDERCOLOR, 0),
+                    lodBias: lodBiasFor(samplerState(index,
+                        D3DSAMP_MIPMAPLODBIAS, 0)),
                 };
                 // Which arguments a stage reads decides what has to be declared
                 // and uploaded for it. Getting this wrong in either direction is
@@ -7425,6 +7863,13 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 if (readsArg0(stage.alphaOp)) argumentsUsed.push(stage.alphaArg0);
                 const opsUsed = [stage.colorOp];
                 if (stage.alphaOp !== D3DTOP_DISABLE) opsUsed.push(stage.alphaOp);
+                // Support is per *channel*, not per operation: the
+                // MODULATE*_ADD* family is colour-only by definition, so
+                // probing it as f32 would report every legitimate use as
+                // unsupported.
+                const opChannels = [{ op: stage.colorOp, type: "vec3<f32>" }];
+                if (stage.alphaOp !== D3DTOP_DISABLE)
+                    opChannels.push({ op: stage.alphaOp, type: "f32" });
                 for (const argument of argumentsUsed) {
                     switch (argument & D3DTA_SELECTMASK) {
                     case D3DTA_TEXTURE: stage.samplesTexture = true; break;
@@ -7462,18 +7907,46 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 const coordIndex = stageState(index, D3DTSS_TEXCOORDINDEX, index);
                 stage.texCoordIndex = coordIndex & 0xFFFF;
                 stage.tciMode = coordIndex & D3DTSS_TCI_MASK;
-                if (stage.tciMode === D3DTSS_TCI_SPHEREMAP)
-                    unsupported.push("stage " + index +
-                        " asks for D3DTSS_TCI_SPHEREMAP coordinate generation");
-                for (const op of opsUsed) {
+                for (const { op, type } of opChannels) {
                     if (op === D3DTOP_DISABLE) continue;
-                    if (textureOpExpression(op, "f32", ["0.0", "0.0", "0.0"],
+                    if (textureOpExpression(op, type, ["0.0", "0.0", "0.0"],
                             "0.0") === null)
                         unsupported.push("stage " + index + " asks for " +
-                            "D3DTEXTUREOP " + op + ", which is outside the set " +
-                            "fill_caps() advertises in TextureOpCaps");
+                            "D3DTEXTUREOP " + op + " on the " +
+                            (type === "f32" ? "alpha" : "colour") + " channel, " +
+                            "which is outside the set fill_caps() advertises " +
+                            "in TextureOpCaps");
                 }
                 stages.push(stage);
+            }
+            // D3DTOP_BUMPENVMAP couples two adjacent stages: the one that
+            // declares it samples the (du, dv) map, and the one after it is
+            // what actually gets displaced. Resolving that here keeps the
+            // shader builder from having to look at its neighbours.
+            for (let index = 0; index + 1 < stages.length; ++index) {
+                const producer = stages[index];
+                const consumer = stages[index + 1];
+                if (producer.colorOp !== D3DTOP_BUMPENVMAP &&
+                        producer.colorOp !== D3DTOP_BUMPENVMAPLUMINANCE)
+                    continue;
+                // The bump stage has to sample its own map for there to be a
+                // displacement at all, whatever its arguments named.
+                producer.samplesTexture = true;
+                producer.isBumpSource = true;
+                consumer.bumpFrom = producer.index;
+                if (producer.colorOp === D3DTOP_BUMPENVMAPLUMINANCE)
+                    consumer.bumpLuminanceFrom = producer.index;
+            }
+            {
+                // A trailing BUMPENVMAP with no stage after it displaces
+                // nothing. Say so rather than rendering a silently unbumped
+                // frame that looks almost right.
+                const last = stages[stages.length - 1];
+                if (last && (last.colorOp === D3DTOP_BUMPENVMAP ||
+                        last.colorOp === D3DTOP_BUMPENVMAPLUMINANCE))
+                    unsupported.push("stage " + last.index + " asks for " +
+                        "D3DTOP_BUMPENVMAP but is the last active stage, so " +
+                        "no stage samples the perturbed coordinate");
             }
             // With a translated vertex shader the fixed-function coordinate
             // generation and transform never ran, so the stage reads a varying
@@ -7603,6 +8076,18 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             // declaration, which keeps the pipeline cache key stable too.
             const layouts = Array.from(perStream.values())
                 .sort((a, b) => a.stream - b.stream);
+            if (layouts.length > MAX_VERTEX_BUFFERS_PER_DRAW) {
+                // Truncating here would drop whole attributes and render
+                // wrong-but-plausible geometry, which is the failure mode
+                // hardest to attribute. Name it instead.
+                this.warnOnce("vertex-buffer-limit",
+                    "this declaration spreads its attributes over " +
+                    layouts.length + " streams, and WebGPU binds at most " +
+                    MAX_VERTEX_BUFFERS_PER_DRAW + " vertex buffers per draw; " +
+                    "the draw is skipped rather than drawn with missing " +
+                    "attributes");
+                return null;
+            }
             for (const layout of layouts)
                 layout.attributes.sort((a, b) => a.shaderLocation - b.shaderLocation);
             return layouts;
@@ -7655,6 +8140,22 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             if (stateId === D3DRS_SRGBWRITEENABLE && value !== 0) {
                 ++this.stats.srgbWriteRequests;
             }
+            // D3DRS_WRAP0..15. Named rather than left in the passive
+            // unread-state list because it has a specific, recognisable
+            // symptom -- a seam across cylindrically or spherically mapped
+            // geometry where the coordinate crosses 0/1 -- and because it is
+            // the rare gap with no route to an implementation at all: the
+            // wrap decision is made per *triangle*, by comparing its three
+            // vertices' coordinates, and WebGPU has no stage that sees a whole
+            // primitive. A geometry shader or a compute pre-pass over every
+            // draw are the only shapes that could do it.
+            if (stateId >= D3DRS_WRAP0 && stateId <= D3DRS_WRAP7 && value !== 0)
+                this.warnOnce("render-state-wrap",
+                    "D3DRS_WRAP" + (stateId - D3DRS_WRAP0) + " asks for " +
+                    "shortest-path texture coordinate interpolation, which " +
+                    "is a per-primitive decision WebGPU has no stage to make; " +
+                    "coordinates interpolate linearly and a seam may appear " +
+                    "where they cross 0 or 1", { state: stateId, value });
         }
 
         // Every state the guest sends that nothing here reads. This exists
@@ -8037,11 +8538,60 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             this.cursor.visible = view.getUint32(offset + 4, true) !== 0;
         }
 
-        // Purely diagnostic; see D9WG_OP_WINDOW_STATE in d3d9_protocol.h for
-        // why the guest's window-manager view has to be reported rather than
-        // inferred from the rendering.
+        // Moves the overlay to match a WINDOW_STATE report.
+        //
+        // Deliberately conservative about what counts as a real move. The
+        // report also arrives for foreground changes and other events that say
+        // nothing about geometry, and a 0x0 client area is the same
+        // fullscreen GetClientRect artefact onPresent() already guards
+        // against -- letting either through makes the canvas flicker between
+        // the real size and nothing.
+        applyWindowStateGeometry(deviceHandle, report) {
+            if (!deviceHandle) return;
+            const state = this.devices.get(deviceHandle);
+            if (!state) return;
+            const hidden = !report.isWindow || report.iconic || !report.visible;
+            if (hidden) {
+                if (state.surface.visible === false) return;
+                state.surface = { ...state.surface, visible: false };
+                ++this.stats.surfaceChanges;
+                this.notifySurface(state, "window-state");
+                return;
+            }
+            const width = report.clientWidth || state.surface.width;
+            const height = report.clientHeight || state.surface.height;
+            if (!width || !height) {
+                ++this.stats.emptySurfaceReports;
+                return;
+            }
+            const changed = state.surface.hwnd !== report.hwnd ||
+                state.surface.x !== report.windowX ||
+                state.surface.y !== report.windowY ||
+                state.surface.width !== width ||
+                state.surface.height !== height ||
+                state.surface.visible === false;
+            if (!changed) return;
+            state.surface = { ...state.surface, hwnd: report.hwnd,
+                x: report.windowX, y: report.windowY, width, height,
+                visible: true };
+            ++this.stats.surfaceChanges;
+            this.notifySurface(state, "window-state");
+        }
+
+        // Two jobs. The diagnostic one is why the opcode exists: see
+        // D9WG_OP_WINDOW_STATE in d3d9_protocol.h for why the guest's
+        // window-manager view has to be reported rather than inferred.
+        //
+        // The second is placement, and it exists for the D3D8 frontend. A
+        // D3D9 title presents continuously, so onPresent() is a fine source of
+        // truth for where the overlay goes. A D3D8 title need not: one that
+        // draws a single frame and then only pumps messages still has to have
+        // the overlay follow its window, and there is no further Present to
+        // carry the geometry. d3d8_proxy.c sends this record on move/size/show
+        // for exactly that reason.
         onWindowState(bytes, view, offset) {
             const flags = view.getUint32(offset + 12, true);
+            const deviceHandle = view.getUint32(offset, true);
             const state = {
                 hwnd: view.getUint32(offset + 4, true),
                 foregroundHwnd: view.getUint32(offset + 8, true),
@@ -8059,6 +8609,7 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             };
             this.windowState = state;
             ++this.stats.windowStateChanges;
+            this.applyWindowStateGeometry(deviceHandle, state);
             if (!state.foreground) {
                 ++this.stats.windowNotForegroundReports;
                 // The guest re-takes the foreground for a fullscreen device
@@ -8357,6 +8908,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 reference: get(D3DRS_ALPHAREF, 0) & 0xFF,
             };
 
+            const sampleCount = (targets && targets.sampleCount) || 1;
             return { depthEnabled, depthWrite, depthCompare, depthBias,
                 depthBiasSlopeScale, blendEnabled, srcFactor, dstFactor,
                 blendOp, alphaSrcFactor, alphaDstFactor, alphaBlendOp,
@@ -8370,7 +8922,23 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 // to appear in its fragment targets, in order -- WebGPU matches
                 // them positionally, so an MRT pass needs the whole list baked
                 // into the pipeline and therefore into its cache key.
-                colorFormats: targets ? targets.formats : [this.format] };
+                colorFormats: targets ? targets.formats : [this.format],
+                // WebGPU takes the sample count on the pipeline as well as on
+                // the attachments, and the two must agree; without this the
+                // pipeline defaulted to 1 and every draw into a multisampled
+                // target failed validation.
+                sampleCount,
+                // D3DRS_MULTISAMPLEMASK maps straight onto WebGPU's
+                // multisample mask. D3DRS_MULTISAMPLEANTIALIAS turning
+                // antialiasing off for one draw has no WebGPU equivalent --
+                // the sample count is fixed for the whole pass -- so it is
+                // approximated by writing sample 0 only, which is what
+                // "no antialiasing" means for the pixels this draw covers.
+                sampleMask: sampleCount > 1
+                    ? (get(D3DRS_MULTISAMPLEANTIALIAS, 1) !== 0
+                        ? (get(D3DRS_MULTISAMPLEMASK, 0xffffffff) >>> 0)
+                        : 1)
+                    : 0xffffffff };
         }
 
         // ---- independent sampler state (plan 4.4/12) ----
@@ -8382,7 +8950,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         // they now drive a cache keyed by the parameter tuple, so a stage's
         // sampler follows the app's state rather than the texture it happens
         // to be bound to.
-        samplerFor(state, stage, unfilterable) {
+        samplerFor(state, stage, unfilterable, texture) {
             const get = (id, fallback) => {
                 const value = state.samplerStates.get(stage * 64 + id);
                 return value === undefined ? fallback : value;
@@ -8398,8 +8966,19 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 ? 1 : requestedMipFilter;
             let maxAnisotropy = get(D3DSAMP_MAXANISOTROPY, 1) | 0;
             if (unfilterable) maxAnisotropy = 1;
+            // Two independent floors on the mip chain, and D3D9 applies the
+            // more restrictive: D3DSAMP_MAXMIPLEVEL is sampler state and
+            // applies to whatever is bound here, while SetLOD travels with the
+            // texture. Both are level indices; WebGPU spells the same thing as
+            // a LOD clamp. Clamped against the chain that exists so a stale
+            // value cannot produce lodMinClamp > lodMaxClamp, which WebGPU
+            // rejects outright.
+            const levels = Math.max(1, (texture && texture.levelCount) || 1);
+            const lodFloor = Math.min(levels - 1,
+                Math.max(get(D3DSAMP_MAXMIPLEVEL, 0) >>> 0,
+                    (texture && texture.lod) || 0));
             const key = [addressU, addressV, addressW, magFilter, minFilter,
-                mipFilter, maxAnisotropy,
+                mipFilter, maxAnisotropy, lodFloor,
                 this.debug.forceMipLevel0 ? "top" : "",
                 unfilterable ? "non-filtering" : "filtering"].join(",");
             const cached = this.samplerCache.get(key);
@@ -8415,9 +8994,18 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 // what clamping the LOD range to 0 expresses in WebGPU.
                 mipmapFilter: mipFilter === 2 ? "linear" : "nearest",
             };
-            if (mipFilter === 0 || this.debug.forceMipLevel0) {
+            if (this.debug.forceMipLevel0) {
                 descriptor.lodMinClamp = 0;
                 descriptor.lodMaxClamp = 0;
+            } else if (mipFilter === 0) {
+                // D3DTEXF_NONE means "sample one level and do not blend
+                // between levels". That level is the most detailed one still
+                // allowed, which is the floor -- not level 0, once
+                // D3DSAMP_MAXMIPLEVEL or SetLOD has raised it.
+                descriptor.lodMinClamp = lodFloor;
+                descriptor.lodMaxClamp = lodFloor;
+            } else if (lodFloor > 0) {
+                descriptor.lodMinClamp = lodFloor;
             }
             // WebGPU only accepts maxAnisotropy > 1 when all three filters are
             // linear, so anisotropy is dropped rather than forcing filters the
@@ -8432,9 +9020,6 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     "native WebGPU sampler mode; the physical sample clamps " +
                     "to edge and the fixed-function fragment shader replaces " +
                     "out-of-domain coordinates with D3DSAMP_BORDERCOLOR");
-            if (addressU === 5 || addressV === 5 || addressW === 5)
-                this.warnOnce("address-mirroronce", "D3DTADDRESS_MIRRORONCE " +
-                    "has no WebGPU equivalent; clamping to edge instead");
             const sampler = this.device.createSampler(descriptor);
             ++this.stats.samplersCreated;
             this.samplerCache.set(key, sampler);
@@ -8456,6 +9041,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             const clipPlaneCount = clipMask
                 ? 32 - Math.clz32(clipMask) : 0;
             const clipKey = "_cl" + clipPlaneCount;
+            // D3DRS_SHADEMODE, applied to the two colour varyings of the
+            // fixed-function pipeline. A translated pixel shader is left alone:
+            // its varyings are the vertex shader's declared outputs, and D3D9
+            // does not reinterpolate a shader's outputs by shade mode.
+            const flatShading =
+                (rs.get(D3DRS_SHADEMODE) || D3DSHADE_GOURAUD) === D3DSHADE_FLAT;
             const vsHandle = state.vertexShaderHandle;
             const psHandle = state.pixelShaderHandle;
             const vsResource = vsHandle ? this.resources.get(vsHandle) : null;
@@ -8540,8 +9131,41 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                         (depthFetchSamplers.length
                             ? "_r" + depthFetchSamplers.join(".") : "")
                     : "";
-                const pixelVariantKey = alphaTestKey + clipKey + depthKey;
-                if (alphaTest.enabled || clipPlaneCount || depthSamplers.length) {
+                // D3DSAMP_MIPMAPLODBIAS is sampler state, but WebGPU has no
+                // sampler field for it, so it can only be applied at the sample
+                // call -- which puts it in the WGSL and therefore in the variant
+                // key. Only the samplers this shader actually declares are
+                // considered, so an unrelated stage's stale bias cannot mint a
+                // variant.
+                const samplerLodBias = {};
+                let lodBiasKey = "";
+                // D3DTADDRESS_MIRRORONCE is finished in the shader too: the
+                // sampler clamps, and abs() on the coordinate supplies the
+                // mirror. Same variant-key treatment as the bias.
+                const samplerMirrorOnce = {};
+                let mirrorOnceKey = "";
+                for (const sampler of psResource.translated.reflection.samplers) {
+                    const bias = lodBiasFor(state.samplerStates.get(
+                        sampler.index * 64 + D3DSAMP_MIPMAPLODBIAS) || 0);
+                    if (bias) {
+                        samplerLodBias[sampler.index] = bias;
+                        lodBiasKey += "_b" + sampler.index + ":" + bias;
+                    }
+                    const axes = [
+                        [D3DSAMP_ADDRESSU, "x"], [D3DSAMP_ADDRESSV, "y"],
+                        [D3DSAMP_ADDRESSW, "z"],
+                    ].filter(([id]) => (state.samplerStates.get(
+                        sampler.index * 64 + id) || 1) === 5)
+                        .map(([, axis]) => axis).join("");
+                    if (axes) {
+                        samplerMirrorOnce[sampler.index] = axes;
+                        mirrorOnceKey += "_m" + sampler.index + ":" + axes;
+                    }
+                }
+                const pixelVariantKey = alphaTestKey + clipKey + depthKey +
+                    lodBiasKey + mirrorOnceKey;
+                if (alphaTest.enabled || clipPlaneCount || depthSamplers.length
+                        || lodBiasKey || mirrorOnceKey) {
                     variant = psResource.variants.get(pixelVariantKey);
                     if (!variant) {
                         variant = shaderPipeline.compileShader(psResource.tokens, {
@@ -8550,6 +9174,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                             clipPlaneCount,
                             depthSamplers,
                             depthFetchSamplers,
+                            samplerLodBias,
+                            samplerMirrorOnce,
                         });
                         psResource.variants.set(pixelVariantKey, variant);
                         if (variant.ok) ++this.stats.shaderVariantsTranslated;
@@ -8648,6 +9274,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     // D3DRS_SPECULARENABLE is set, whether it came from lighting
                     // or straight off the vertex.
                     specularEnable: (rs.get(D3DRS_SPECULARENABLE) || 0) !== 0,
+                    flatShading,
                 };
                 fragmentKey = "ffps" + cascade.stages.map(stage =>
                     [stage.index, stage.colorOp, stage.colorArg0, stage.colorArg1,
@@ -8657,10 +9284,15 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                      stage.coordVarying, stage.projected ? "p" + stage.transformCount : "",
                      stage.samplesTexture
                          ? [stage.addressU, stage.addressV, stage.addressW,
-                            stage.borderColor >>> 0].join("b") : ""
+                            stage.borderColor >>> 0].join("b") : "",
+                     // Baked into the WGSL as a literal (WebGPU samplers have
+                     // no bias field), so two stages differing only in bias are
+                     // different shaders and must not share a cache entry.
+                     stage.lodBias ? "l" + stage.lodBias : ""
                     ].join(".")).join("|") +
                     (pixelSignature.usesTextureFactor ? "_tf" : "") +
                     (pixelSignature.specularEnable ? "_s" : "") +
+                    (flatShading ? "_flat" : "") +
                     alphaTestKey + (fogMode
                         ? (tableFog ? "_ft" : "_fv") + fogMode : "") +
                     clipKey + (debugMode ? "_" + debugMode : "");
@@ -8837,7 +9469,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     (signature.fogRange && !!signature.fogMode) ||
                     signature.coordStages.some(stage =>
                         stage.tciMode !== D3DTSS_TCI_PASSTHRU));
+                signature.flatShading = flatShading;
                 vertexKey = "ffvs_" + signature.positionType +
+                    (flatShading ? "_flat" : "") +
                     (signature.hasColor ? (signature.colorIsBGRA ? "_cb" : "_c") : "") +
                     (signature.hasColor1 ? (signature.color1IsBGRA ? "_sb" : "_s") : "") +
                     (signature.hasNormal ? "_n" : "") +
@@ -9011,6 +9645,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
             const vertexBuffers = this.vertexBufferLayoutsFor(elements, state,
                 locationFor, !!drawOptions.pointExpansion);
+            if (vertexBuffers === null)
+                return { error: "the declaration needs more vertex buffers " +
+                    "than WebGPU binds per draw" };
             if (!vertexBuffers.length)
                 return { error: "no vertex stream supplies any attribute the " +
                     "vertex stage reads" };
@@ -9230,6 +9867,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     targets: colorTargets },
                 primitive,
             };
+            if (pipelineState.sampleCount > 1) {
+                descriptor.multisample = {
+                    count: pipelineState.sampleCount,
+                    mask: pipelineState.sampleMask,
+                };
+            }
             // The pipeline must declare a depthStencil state whenever the
             // pass it runs in has a depth attachment, even for a draw that
             // does no depth testing -- hence depthCompare "always" plus
@@ -9674,6 +10317,34 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                         state.renderStates.get(D3DRS_TEXTUREFACTOR) === undefined
                             ? 0xffffffff
                             : state.renderStates.get(D3DRS_TEXTUREFACTOR));
+                } else if (entry.bumpSource !== undefined) {
+                    // BUMPENVMAT00/01/10/11 hold raw float bits, like the fog
+                    // states above. Packed as (m00, m01, m10, m11).
+                    const base = entry.offset / 4;
+                    const stageState = id => {
+                        const raw = state.textureStageStates.get(
+                            entry.bumpSource * 64 + id);
+                        if (raw === undefined) return 0;
+                        FLOAT_BITS_U32[0] = raw >>> 0;
+                        return FLOAT_BITS_F32[0];
+                    };
+                    floats[base] = stageState(D3DTSS_BUMPENVMAT00);
+                    floats[base + 1] = stageState(D3DTSS_BUMPENVMAT01);
+                    floats[base + 2] = stageState(D3DTSS_BUMPENVMAT10);
+                    floats[base + 3] = stageState(D3DTSS_BUMPENVMAT11);
+                } else if (entry.bumpLuminanceSource !== undefined) {
+                    const base = entry.offset / 4;
+                    const stageState = id => {
+                        const raw = state.textureStageStates.get(
+                            entry.bumpLuminanceSource * 64 + id);
+                        if (raw === undefined) return 0;
+                        FLOAT_BITS_U32[0] = raw >>> 0;
+                        return FLOAT_BITS_F32[0];
+                    };
+                    floats[base] = stageState(D3DTSS_BUMPENVLSCALE);
+                    floats[base + 1] = stageState(D3DTSS_BUMPENVLOFFSET);
+                    floats[base + 2] = 0;
+                    floats[base + 3] = 0;
                 } else {
                     // stage_constant<N>; D3DTSS_CONSTANT defaults to opaque
                     // black, unlike D3DRS_TEXTUREFACTOR's opaque white.
@@ -9732,6 +10403,31 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     values.set((mask & (1 << plane))
                         ? state.clipPlanes[plane] : [0, 0, 0, 1],
                         base + plane * 4);
+            }
+            if (reflection.bumpStageCount && state) {
+                // ps_1_x texbem/texbeml read the D3DTSS_BUMPENVMAT* matrix of
+                // the sampler they address. That is texture-stage state rather
+                // than shader state, so it is written here alongside the
+                // register file rather than coming from SetPixelShaderConstant.
+                const values = new Float32Array(backing, byteOffset);
+                const stageFloat = (stage, id) => {
+                    const raw = state.textureStageStates.get(stage * 64 + id);
+                    if (raw === undefined) return 0;
+                    FLOAT_BITS_U32[0] = raw >>> 0;
+                    return FLOAT_BITS_F32[0];
+                };
+                for (let stage = 0; stage < reflection.bumpStageCount; ++stage) {
+                    const base = reflection.bumpOffset / 4 + stage * 4;
+                    values[base] = stageFloat(stage, D3DTSS_BUMPENVMAT00);
+                    values[base + 1] = stageFloat(stage, D3DTSS_BUMPENVMAT01);
+                    values[base + 2] = stageFloat(stage, D3DTSS_BUMPENVMAT10);
+                    values[base + 3] = stageFloat(stage, D3DTSS_BUMPENVMAT11);
+                    const lum = reflection.bumpLuminanceOffset / 4 + stage * 4;
+                    values[lum] = stageFloat(stage, D3DTSS_BUMPENVLSCALE);
+                    values[lum + 1] = stageFloat(stage, D3DTSS_BUMPENVLOFFSET);
+                    values[lum + 2] = 0;
+                    values[lum + 3] = 0;
+                }
             }
             if (reflection.pointExpansion && state) {
                 const values = new Float32Array(backing, byteOffset);
@@ -10016,7 +10712,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     !!handle && handle === state.depthTargetHandle);
                 const sampler = compare
                     ? this.comparisonSamplerFor(state, index)
-                    : this.samplerFor(state, index, depth || unfilterable);
+                    : this.samplerFor(state, index, depth || unfilterable,
+                        texture);
                 entries.push(
                     { binding: 2 + index * 2,
                       resource: view },
@@ -10037,7 +10734,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 const view = this.viewForStage(texture, binding.stage, false,
                     binding.type, unfilterable, wantsSRGB);
                 const sampler = this.samplerFor(state, binding.stage,
-                    unfilterable);
+                    unfilterable, texture);
                 entries.push(
                     { binding: binding.textureBinding, resource: view },
                     { binding: binding.samplerBinding, resource: sampler });
@@ -10097,6 +10794,14 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     ["no usable colour render target is bound"]);
                 return;
             }
+            // D3DRS_FILLMODE. WebGPU has no polygon mode, so wireframe is
+            // reached by rewriting the topology and the indices instead: every
+            // triangle becomes its three edges as a line list. Done here, at
+            // the single funnel every draw path reaches, rather than at the
+            // four Draw* entry points -- and after the fan conversion above it,
+            // so a fan is already an ordinary triangle list by the time it
+            // arrives.
+            geometry = this.applyFillMode(state, geometry) || geometry;
             // A draw against a stand-in depth attachment that nothing cleared
             // is the one case where standing in changed the image; anything
             // else has no earlier contents to have lost.
@@ -10104,8 +10809,11 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     (state.renderStates.get(D3DRS_ZENABLE) || 0) !== 0)
                 this.noteSubstituteDepthUse(targets, false);
             const pipelineState = this.pipelineStateFor(state, targets);
+            // A point-list that came from D3DFILL_POINT is not a point
+            // sprite: sprite expansion is what D3DRS_POINTSPRITEENABLE asks
+            // for, and a wireframe-mode triangle mesh asked for neither.
             const pointExpansion = geometry.topology === "point-list" &&
-                !geometry.indexInfo;
+                !geometry.indexInfo && !geometry.fromFillMode;
             const instanceCount = this.drawInstanceCount(state);
             const hasInstanceStream = Array.from(state.streams.values()).some(stream =>
                 (((stream.frequency ?? 1) >>> 0) &
@@ -10394,16 +11102,17 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             if (primitiveType === D3DPT_TRIANGLEFAN) {
                 // WebGPU has no fan topology; synthesise the index buffer that
                 // turns one into a triangle list.
-                const indexBuffer = this.triangleFanIndexBuffer(vertexCount);
-                if (!indexBuffer) {
+                const fan = this.triangleFanIndexBuffer(vertexCount);
+                if (!fan) {
                     this.noteDroppedDraw("DrawPrimitive", state,
                         ["triangle fan with too few vertices"]);
                     return;
                 }
                 this.recordDraw(state, elements, "DrawPrimitive", {
                     topology: "triangle-list", streams,
-                    indexInfo: { buffer: indexBuffer, format: "uint32", offset: 0,
-                        count: (vertexCount - 2) * 3, firstIndex: 0, baseVertex: 0 },
+                    indexInfo: { buffer: fan.buffer, format: "uint32", offset: 0,
+                        count: (vertexCount - 2) * 3, firstIndex: 0, baseVertex: 0,
+                        cpuIndices: fan.indices },
                 });
                 return;
             }
@@ -10463,7 +11172,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     topology: "triangle-list", streams,
                     indexInfo: { buffer: converted.buffer, format: "uint32",
                         offset: 0, count: converted.count, firstIndex: 0,
-                        baseVertex: baseVertexIndex },
+                        baseVertex: baseVertexIndex,
+                        cpuIndices: converted.indices },
                 });
                 return;
             }
@@ -10510,16 +11220,16 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             const geometry = { streams, indexInfo: null, vertexCount: elementCount,
                 topology: topologyFor(primitiveType) };
             if (primitiveType === D3DPT_TRIANGLEFAN) {
-                const indexBuffer = this.triangleFanIndexBuffer(elementCount);
-                if (!indexBuffer) {
+                const fan = this.triangleFanIndexBuffer(elementCount);
+                if (!fan) {
                     this.noteDroppedDraw("DrawPrimitiveUP", state,
                         ["triangle fan with too few vertices"]);
                     return;
                 }
                 geometry.topology = "triangle-list";
-                geometry.indexInfo = { buffer: indexBuffer, format: "uint32",
+                geometry.indexInfo = { buffer: fan.buffer, format: "uint32",
                     offset: 0, count: (elementCount - 2) * 3, firstIndex: 0,
-                    baseVertex: 0 };
+                    baseVertex: 0, cpuIndices: fan.indices };
             }
             this.recordDrawWithStride(state, elements, "DrawPrimitiveUP",
                 geometry, stride);
@@ -10642,6 +11352,123 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
         // (0,1,2), (0,2,3), (0,3,4)... -- the triangle list a fan of
         // `vertexCount` vertices expands to.
+// D3DRS_FILLMODE for a triangle topology. Returns a replacement geometry, or
+        // null to leave the draw alone -- which is the common case: solid fill,
+        // or a topology that has no interior to fill.
+        //
+        // WebGPU deliberately omits a polygon mode (Metal and the WebGPU
+        // baseline both lack the feature Vulkan calls fillModeNonSolid), so
+        // wireframe cannot be a pipeline flag here the way it is in D3D9. What
+        // it can be is different geometry: a triangle drawn as its three edges
+        // is a line list, and that is an exact rendering of what D3DFILL_
+        // WIREFRAME asks for, not an approximation. The cost is an index buffer
+        // per draw, which is why nothing happens at all in solid fill.
+        applyFillMode(state, geometry) {
+            const fill = state.renderStates.get(D3DRS_FILLMODE) || D3DFILL_SOLID;
+            if (fill !== D3DFILL_WIREFRAME && fill !== D3DFILL_POINT) return null;
+            const topology = geometry.topology;
+            if (topology !== "triangle-list" && topology !== "triangle-strip")
+                return null;
+            if (fill === D3DFILL_POINT) {
+                // Every vertex becomes a point. WebGPU points are one pixel and
+                // there is no point-size equivalent for this mode, which is the
+                // one place D3DFILL_POINT differs from the hardware.
+                this.warnOnce("fill-point", "D3DFILL_POINT draws one-pixel " +
+                    "points: WebGPU has no point size outside the point-sprite " +
+                    "path, so the mode's size is not reproduced");
+                ++this.stats.fillModeDraws;
+                return Object.assign({}, geometry, {
+                    topology: "point-list",
+                    stripIndexFormat: undefined,
+                    fromFillMode: true,
+                });
+            }
+            const source = this.triangleIndicesFor(geometry);
+            if (!source) {
+                // Naming it beats drawing the solid form and letting the
+                // developer wonder why the wireframe toggle does nothing.
+                this.warnOnce("fill-wireframe-indices",
+                    "D3DFILL_WIREFRAME needs to read this draw's indices to " +
+                    "build its edges, and this index buffer has no CPU mirror; " +
+                    "the draw stays solid");
+                return null;
+            }
+            const triangles = Math.floor(source.length / 3);
+            if (!triangles) return null;
+            const lines = new Uint32Array(triangles * 6);
+            for (let i = 0; i < triangles; ++i) {
+                const a = source[i * 3], b = source[i * 3 + 1],
+                    c = source[i * 3 + 2];
+                lines[i * 6] = a; lines[i * 6 + 1] = b;
+                lines[i * 6 + 2] = b; lines[i * 6 + 3] = c;
+                lines[i * 6 + 4] = c; lines[i * 6 + 5] = a;
+            }
+            const buffer = this.device.createBuffer({
+                size: lines.byteLength,
+                usage: BUFFER_USAGE_INDEX | BUFFER_USAGE_COPY_DST,
+            });
+            this.device.queue.writeBuffer(buffer, 0, lines);
+            this.retireAfterSubmit(buffer);
+            ++this.stats.fillModeDraws;
+            return Object.assign({}, geometry, {
+                topology: "line-list",
+                stripIndexFormat: undefined,
+                indexResource: undefined,
+                indexInfo: {
+                    buffer, format: "uint32", offset: 0, count: lines.length,
+                    firstIndex: 0,
+                    baseVertex: geometry.indexInfo
+                        ? geometry.indexInfo.baseVertex : 0,
+                },
+                fromFillMode: true,
+            });
+        }
+
+        // The triangle-list index sequence behind a draw, as vertex indices, or
+        // null when it cannot be recovered. Strips are unrolled here so the
+        // edge builder above only ever sees triples.
+        triangleIndicesFor(geometry) {
+            const strip = geometry.topology === "triangle-strip";
+            let source = null;
+            if (!geometry.indexInfo) {
+                const count = geometry.vertexCount | 0;
+                if (count < 3) return null;
+                source = new Uint32Array(count);
+                for (let i = 0; i < count; ++i) source[i] = i;
+            } else if (geometry.indexInfo.cpuIndices) {
+                // A fan or a *UP draw already built its indices on the CPU and
+                // kept them for exactly this.
+                source = geometry.indexInfo.cpuIndices;
+            } else if (geometry.indexResource &&
+                    geometry.indexResource.shadow) {
+                const resource = geometry.indexResource;
+                const wide = resource.indexFormat === "uint32";
+                const all = wide
+                    ? new Uint32Array(resource.shadow.buffer,
+                        resource.shadow.byteOffset, resource.shadow.length >> 2)
+                    : new Uint16Array(resource.shadow.buffer,
+                        resource.shadow.byteOffset, resource.shadow.length >> 1);
+                const first = geometry.indexInfo.firstIndex | 0;
+                const count = geometry.indexInfo.count | 0;
+                if (first + count > all.length) return null;
+                source = all.subarray(first, first + count);
+            }
+            if (!source || source.length < 3) return null;
+            if (!strip) return source;
+            // A strip of N+2 vertices is N triangles, and every odd triangle
+            // has its winding reversed. Winding does not matter for edges, but
+            // unrolling in the same order the rasteriser would keeps the edge
+            // set identical to the solid form's silhouette.
+            const triangles = source.length - 2;
+            const out = new Uint32Array(triangles * 3);
+            for (let i = 0; i < triangles; ++i) {
+                out[i * 3] = source[i];
+                out[i * 3 + 1] = source[i + (i & 1 ? 2 : 1)];
+                out[i * 3 + 2] = source[i + (i & 1 ? 1 : 2)];
+            }
+            return out;
+        }
+
         triangleFanIndexBuffer(vertexCount) {
             if (vertexCount < 3) return null;
             const triangles = vertexCount - 2;
@@ -10657,7 +11484,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             });
             this.device.queue.writeBuffer(buffer, 0, indices);
             this.retireAfterSubmit(buffer);
-            return buffer;
+            // The CPU copy travels with the buffer because D3DFILL_WIREFRAME
+            // has to read these indices back to build edges, and by then the
+            // GPU copy is write-only.
+            return { buffer, indices };
         }
 
         triangleFanFromIndices(indexResource, firstIndex, indexCount) {
@@ -10683,7 +11513,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             });
             this.device.queue.writeBuffer(buffer, 0, indices);
             this.retireAfterSubmit(buffer);
-            return { buffer, count: indices.length };
+            return { buffer, count: indices.length, indices };
         }
     }
 
