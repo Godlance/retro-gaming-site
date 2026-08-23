@@ -258,7 +258,7 @@ test("ps_1_1: t# is both coordinate and sample destination, r0 is the output", (
     assert.ok(wgsl.includes("@fragment"), "no @fragment stage");
     // `tex t0` implies sampler 0 even without a dcl.
     assert.deepStrictEqual(reflection.samplers, [
-        { index: 0, type: "2d", textureBinding: 2, samplerBinding: 3 },
+        { index: 0, type: "2d", depth: false, textureBinding: 2, samplerBinding: 3 },
     ]);
     assert.ok(wgsl.includes("textureSample(d9_tex0, d9_smp0"), "no sample of texture 0");
     // ps_1_x has no oC0: the result is r0.
@@ -272,7 +272,7 @@ test("ps_1_1: t# is both coordinate and sample destination, r0 is the output", (
 test("ps_2_0: dcl_2d, def and texld produce a sampler pair and a constant default", () => {
     const { wgsl, reflection } = compileOk(PS_2_0_TEXTURED, "ps_2_0");
     assert.deepStrictEqual(reflection.samplers, [
-        { index: 0, type: "2d", textureBinding: 2, samplerBinding: 3 },
+        { index: 0, type: "2d", depth: false, textureBinding: 2, samplerBinding: 3 },
     ]);
     assert.ok(wgsl.includes("@group(0) @binding(2) var d9_tex0: texture_2d<f32>;"));
     assert.ok(wgsl.includes("@group(0) @binding(3) var d9_smp0: sampler;"));
@@ -428,14 +428,24 @@ test("unsupported ps_1_x bump-environment instructions are refused, not approxim
     assert.ok(/texbem/.test(result.error), "error should name the instruction: " + result.error);
 });
 
-test("vertex texture fetch is refused with a milestone-specific message", () => {
-    const result = pipeline.compileShader(tokens([
+test("vs_3_0 vertex texture fetch uses an explicit LOD and isolated bindings", () => {
+    const result = compileOk([
         VS(3, 0),
         instruction(OP.DCL, { length: 2 }), dclToken(0, 0, 2), dst(REG.SAMPLER, 0),
+        instruction(OP.DCL, { length: 2 }), dclToken(USAGE.POSITION),
+            dst(REG.INPUT, 0),
+        instruction(OP.DCL, { length: 2 }), dclToken(USAGE.POSITION),
+            dst(REG.OUTPUT, 0),
+        instruction(OP.TEXLDL, { length: 3 }), dst(REG.TEMP, 0),
+            src(REG.INPUT, 0), src(REG.SAMPLER, 0),
+        instruction(OP.MOV, { length: 2 }), dst(REG.OUTPUT, 0),
+            src(REG.TEMP, 0),
         END,
-    ]));
-    assert.strictEqual(result.ok, false);
-    assert.ok(/vertex texture fetch/.test(result.error), result.error);
+    ], "vs_3_0 vertex texture fetch");
+    assert.match(result.wgsl, /textureSampleLevel\(d9_tex0, d9_smp0/);
+    assert.match(result.wgsl, /@binding\(34\) var d9_tex0/);
+    assert.deepStrictEqual(result.reflection.samplers, [{ index: 0, type: "2d",
+        depth: false, textureBinding: 34, samplerBinding: 35 }]);
 });
 
 test("a truncated token stream is reported, never silently half-translated", () => {
@@ -760,6 +770,92 @@ test("generated WGSL is brace-balanced and declares every register it reads", ()
                 name + ": " + register + " is used but never declared");
         }
     }
+});
+
+test("a derivative inside a data-dependent branch is hoisted above it",
+        () => {
+    // r1 is computed before the branch, so dpdy(r1) above the branch is the
+    // same value D3D9 would have produced inside it.
+    const result = pipeline.compileShader(new Uint32Array([
+        PS(3, 0),
+        instruction(OP.DCL, { length: 2 }), dclToken(USAGE.TEXCOORD, 0), dst(REG.INPUT, 0),
+        instruction(OP.DEF, { length: 5 }), dst(REG.CONST, 0),
+            floatBits(0.5), floatBits(0), floatBits(0), floatBits(0),
+        instruction(OP.MOV, { length: 2 }), dst(REG.TEMP, 1), src(REG.INPUT, 0),
+        instruction(OP.IFC, { length: 2, control: 5 }),
+            src(REG.TEMP, 1), src(REG.CONST, 0),
+        instruction(OP.DSY, { length: 2 }), dst(REG.TEMP, 0), src(REG.TEMP, 1),
+        instruction(OP.ENDIF),
+        instruction(OP.MOV, { length: 2 }), dst(REG.COLOROUT, 0), src(REG.TEMP, 0),
+        END,
+    ]));
+    assert.ok(result.ok, "translation failed: " + result.error);
+    const lines = result.wgsl.split("\n");
+    const derivative = lines.findIndex(line => line.includes("dpdy("));
+    const branch = lines.findIndex(line => /^\s*if \(/.test(line));
+    assert.ok(derivative >= 0, "expected a dpdy call");
+    assert.ok(branch >= 0, "expected a branch");
+    // The whole point: WGSL rejects the call inside the branch, so it has to
+    // come out above it rather than being dropped.
+    assert.ok(derivative < branch,
+        "the derivative must be hoisted above the branch, not left inside it");
+    assert.ok(!/vec4<f32>\(0\.0\)/.test(lines[derivative]),
+        "a hoistable derivative must not degrade to zero");
+});
+
+test("a derivative of a register the branch rewrites degrades to zero", () => {
+    // r1 is assigned *inside* the branch, so there is no value above it to
+    // differentiate and hoisting would read the wrong one.
+    const result = pipeline.compileShader(new Uint32Array([
+        PS(3, 0),
+        instruction(OP.DCL, { length: 2 }), dclToken(USAGE.TEXCOORD, 0), dst(REG.INPUT, 0),
+        instruction(OP.DEF, { length: 5 }), dst(REG.CONST, 0),
+            floatBits(0.5), floatBits(0), floatBits(0), floatBits(0),
+        instruction(OP.IFC, { length: 2, control: 5 }),
+            src(REG.INPUT, 0), src(REG.CONST, 0),
+        instruction(OP.MOV, { length: 2 }), dst(REG.TEMP, 1), src(REG.CONST, 0),
+        instruction(OP.DSX, { length: 2 }), dst(REG.TEMP, 0), src(REG.TEMP, 1),
+        instruction(OP.ENDIF),
+        instruction(OP.MOV, { length: 2 }), dst(REG.COLOROUT, 0), src(REG.TEMP, 0),
+        END,
+    ]));
+    assert.ok(result.ok, "translation failed: " + result.error);
+    assert.ok(!result.wgsl.includes("dpdx("),
+        "an unhoistable derivative must not emit a call WGSL rejects");
+    assert.ok(result.reflection.warnings.some(warning =>
+        warning.includes("no value above the branch")),
+        "the approximation has to be reported");
+});
+
+test("an in-branch texture sample keeps its mip level via hoisted gradients",
+        () => {
+    const result = pipeline.compileShader(new Uint32Array([
+        PS(3, 0),
+        instruction(OP.DCL, { length: 2 }), dclToken(0, 0, 2), dst(REG.SAMPLER, 0),
+        instruction(OP.DCL, { length: 2 }), dclToken(USAGE.TEXCOORD, 0), dst(REG.INPUT, 0),
+        instruction(OP.DEF, { length: 5 }), dst(REG.CONST, 0),
+            floatBits(0.5), floatBits(0), floatBits(0), floatBits(0),
+        instruction(OP.IFC, { length: 2, control: 5 }),
+            src(REG.INPUT, 0), src(REG.CONST, 0),
+        instruction(OP.TEX, { length: 3 }), dst(REG.TEMP, 0),
+            src(REG.INPUT, 0), src(REG.SAMPLER, 0),
+        instruction(OP.ENDIF),
+        instruction(OP.MOV, { length: 2 }), dst(REG.COLOROUT, 0), src(REG.TEMP, 0),
+        END,
+    ]));
+    assert.ok(result.ok, "translation failed: " + result.error);
+    // textureSampleGrad is legal under non-uniform control flow because the
+    // gradients are explicit, so the sample keeps the mip level the shader
+    // asked for instead of dropping to level 0.
+    assert.ok(result.wgsl.includes("textureSampleGrad("),
+        "expected an explicit-gradient sample");
+    assert.ok(!/textureSampleLevel\(d9_tex0[^)]*0\.0\)/.test(result.wgsl),
+        "the level-0 fallback must not be used when gradients are available");
+    const lines = result.wgsl.split("\n");
+    const gradient = lines.findIndex(line => line.includes("dpdx("));
+    const branch = lines.findIndex(line => /^\s*if \(/.test(line));
+    assert.ok(gradient >= 0 && gradient < branch,
+        "the derivatives have to be computed above the branch");
 });
 
 // ---- report ----

@@ -27,7 +27,7 @@ canvas { width: 640px; height: 480px; }
         u32(handle, 0x1234, 0, 0, width, height);
     const createDevice = (handle, width, height) =>
         u32(handle, 0x1234, 0, 0, width, height, 22, 1, 0x20, 1,
-            75 /* D3DFMT_D24S8 */);
+            75 /* D3DFMT_D24S8 */, 0 /* no MSAA */, 0 /* quality */);
     const transform = (handle, state, matrix) => {
         const payload = new Uint8Array(72);
         const view = new DataView(payload.buffer);
@@ -106,7 +106,7 @@ canvas { width: 640px; height: 480px; }
         const view = new DataView(bytes.buffer);
         view.setUint32(0, 0x47573944, true); // D9WG_MAGIC ("D9WG")
         view.setUint16(4, 1, true); // version_major
-        view.setUint16(6, 0, true); // version_minor
+        view.setUint16(6, 3, true); // version_minor
         view.setUint32(8, 1, true); // frame_id
         view.setUint32(12, 1, true); // flags: D9WG_BATCH_FLAG_PRESENT
         view.setUint32(16, commands.length, true);
@@ -500,7 +500,7 @@ canvas { width: 640px; height: 480px; }
                     cubeFace.byteLength, 0),
                     [{ offsetField: 44, data: cubeFace }])),
             command(0x20F, u32(deviceHandle, 0, renderTargetHandle, 0)),
-            command(0x210, u32(deviceHandle, 0, 0, 0)), // no depth with it
+            command(0x21E, u32(deviceHandle, 0, 0, 0, 0)), // no depth
             command(0x204, u32(deviceHandle, 0, 0, 128, 128, 0, 0x3F800000, 0)),
             command(5, concatBytes([
                 u32(deviceHandle, 1, 0xFF203040, 0x3F800000, 0, 1),
@@ -534,7 +534,7 @@ canvas { width: 640px; height: 480px; }
             command(0x200, u32(deviceHandle, 137, 0, 0)),   // LIGHTING off
             command(0x200, u32(deviceHandle, 29, 0, 0)),    // SPECULARENABLE off
             command(0x20F, u32(deviceHandle, 0, 0, 0)),
-            command(0x210, u32(deviceHandle, 0xFFFFFFFF, 640, 480)),
+            command(0x21E, u32(deviceHandle, 0xFFFFFFFF, 0, 640, 480)),
             command(0x204, u32(deviceHandle, 0, 0, 640, 480, 0, 0x3F800000, 0)),
             command(0x203, u32(deviceHandle, 0, renderTargetHandle, 0)),
             command(0x203, u32(deviceHandle, 1, 0, 0)),

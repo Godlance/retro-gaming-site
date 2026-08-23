@@ -1,4 +1,4 @@
-# Direct D3D9 to WebGPU guest frontend (M5 rendering path)
+# Direct D3D9 to WebGPU guest frontend (protocol 1.3)
 
 This app-local `d3d9.dll` bypasses WineD3D, `opengl32.dll`, gl4es, and
 WebGL, the same way `../d3d8proxy/d3d8.dll` does for D3D8. It emits D9WG
@@ -9,21 +9,20 @@ protocol from D8WG (own opcode numbering, own resource handle namespace,
 own payload shapes) — see `d3d9_protocol.h` and
 `docs/d3d9-webgpu-implementation-plan.zh-CN.md` section 6.
 
-This implements the M1-M5 rendering path (protocol, SM2 translation,
-fixed-function rendering, M4 resource operations, the M4.5 caps profile, and
-M5 main-world primitives). It is still not a general-purpose D3D9
-implementation. Implemented:
+The current protocol intentionally breaks compatibility with older DLL/page
+pairs. It adds an asynchronous host-to-guest response tail for GPU queries and
+readback, and implements the SM3/HDR/MSAA and resource paths needed by a
+3DMark06-class workload. Implemented:
 
 - `IDirect3D9`/`IDirect3DDevice9` COM lifecycle, adapter enumeration, caps
-  (`VertexShaderVersion`/`PixelShaderVersion` now report `(2,0)`, with
-  `VS20Caps`/`PS20Caps` describing what the host translator genuinely
-  handles — see `fill_caps()` for why `PS20Caps.DynamicFlowControlDepth`
-  stays 0), and `CreateDevice`;
+  (`VertexShaderVersion`/`PixelShaderVersion` report `(3,0)` by default; the
+  `ffp` and `sm2` diagnostic profiles remain selectable), and `CreateDevice`;
 - `Reset`, `Present`, `Clear`, `BeginScene`, `EndScene`;
 - vertex/index buffer create/`Lock`/`Unlock` with dirty-range upload;
 - 2D textures: create, `LockRect`/`UnlockRect` with subrect upload,
   `A8R8G8B8`/`X8R8G8B8`/`R5G6B5`/`X1R5G5B5`/`A1R5G5B5`/`A4R4G4B4`/`L8`/`A8`/
-  DXT1/DXT3/DXT5;
+  DXT1/DXT3/DXT5, `R16F`/`G16R16F`/`A16B16G16R16F`, and
+  `R32F`/`G32R32F`/`A32B32G32R32F`;
 - vertex declarations (`CreateVertexDeclaration`/`SetVertexDeclaration`):
   `POSITION`/`POSITIONT`/`NORMAL`/`COLOR`/`TEXCOORD`/`PSIZE`/`BLENDWEIGHT`/
   `BLENDINDICES`/`TANGENT`/`BINORMAL`/`FOG` usages, default method,
@@ -60,10 +59,19 @@ implementation. Implemented:
   `CreateDevice`. See `maintain_fullscreen_foreground` for why one claim is not
   enough and why `SetForegroundWindow` needs help to work at all;
 - a 64-bit per-process session namespace carried by every D9WG batch and
-  verified by `HELLO`, and epoch-changing `Reset` with managed buffer/
+  verified by `HELLO`; the host keeps each live process's device, resource,
+  query, cursor and not-yet-presented frame context separate, so launchers and
+  Futuremark capability helpers can overlap the benchmark without destroying
+  its colliding numeric handles; and epoch-changing `Reset` with managed buffer/
   texture/cube-texture/vertex-declaration shadow reconstruction, reusing the
   exact transport/batching/handle-allocation strategy already validated by the
   D3D8 path;
+- persistent implicit-back-buffer contents across WebGPU canvas acquisitions:
+  each Present keeps an owned snapshot and the next frame restores it before
+  replay. This is required by partial-redraw loops such as 3DMark06's loader,
+  which issued 3342 consecutive frames without a colour Clear; `loadOp: load`
+  alone only loaded the new canvas texture's undefined contents and displayed
+  black;
 - **M3:** `SetMaterial`/`SetLight`/`LightEnable` are now consumed by the host's
   fixed-function vertex stage rather than only recorded, and the whole
   `SetTextureStageState` surface drives a real multi-stage blending cascade.
@@ -71,9 +79,7 @@ implementation. Implemented:
   (`MaxTextureBlendStages = 8`, `D3DVTXPCAPS_DIRECTIONALLIGHTS`,
   `MaxActiveLights = 8`, a large `TextureOpCaps` set) without keeping;
 - **M3:** `IDirect3DCubeTexture9` (six faces per level, `LockRect`/`UnlockRect`
-  per face). `GetCubeMapSurface` still fails honestly — the only thing an app
-  does with a face surface is lock it, which `LockRect` covers directly, and
-  handing back a surface whose `LockRect` wrote to face 0 would be worse;
+  per face) with stable `GetCubeMapSurface` child objects;
 - **M3:** `IDirect3DStateBlock9` — `CreateStateBlock(ALL/PIXELSTATE/
   VERTEXSTATE)`, `Apply`, `Capture`, and `BeginStateBlock`/`EndStateBlock`.
   Recording keeps an explicit Set-call mask (including same-value and
@@ -91,26 +97,32 @@ implementation. Implemented:
   Present, because that is the only point where the swap chain has a view), and
   scales or converts format through a blit pass when a plain copy cannot express
   it;
-- **M3:** `IDirect3DQuery9` for `OCCLUSION`/`EVENT`, answered inside the guest
-  with a deliberately conservative result. The reasoning is in the comment
-  above `IDirect3DQuery9`; the short version is that failing `CreateQuery`
-  makes engines disable whole render branches and returning `S_FALSE` forever
-  deadlocks the standard polling loop, so over-reporting visibility (which only
-  costs frame time) is the least-wrong answer until the host→guest return
-  channel of plan section 6.7 exists;
+- **Protocol 1.3:** real asynchronous `IDirect3DQuery9` results. `EVENT` waits
+  for `GPUQueue.onSubmittedWorkDone`, `OCCLUSION` resolves a WebGPU query set,
+  and `TIMESTAMP`/`TIMESTAMPFREQ`/`TIMESTAMPDISJOINT` use timestamp queries with
+  a monotonic-clock fallback when the optional WebGPU feature is absent;
 - **M3:** `D9WG_DUMP_SHADERS=1` writes every shader's raw token stream to
   `d3d9_dump\` beside this DLL, named by content hash, for offline replay
   through `../tests/d3d9_shader_corpus_test.js`. See the comment above
   `dump_shader_bytecode` for why a hand-written translator needs real-game
   bytecode more than it needs more hand-written tests;
-- **M4:** rectangle-list `Clear`, partial `ColorFill`, scaled/converted
-  `StretchRect`, and exact `GetRenderTargetData` for render-target contents
-  whose complete value is known from `Clear`/`ColorFill`/known-source copy.
-  Any GPU draw invalidates that CPU mirror, so arbitrary GPU-produced pixels
-  still fail honestly instead of returning stale data;
-- **M4.5:** `D9WG_CAPS_PROFILE=ffp` (aliases `m4.5` and `low`) exposes the
-  supported fixed-function-only caps profile. `sm2`/`m5` selects the default
-  shader-model-2 profile;
+- **Protocol 1.3:** GPU-produced render targets and the implicit back buffer
+  are copied to a mapped staging buffer, format-converted back to their D3D9
+  layout, and returned in bounded chunks by `GetRenderTargetData` and
+  `GetFrontBufferData`. Present also retains an owned GPU snapshot, because a
+  canvas current texture is no longer valid when a later guest batch requests
+  the front/back buffer. Known CPU shadows retain their fast path;
+- `UpdateSurface`, 3D `IDirect3DVolumeTexture9` creation/locking/upload/sampling,
+  `UpdateTexture` for 2D/cube/volume resources, stream-frequency instancing,
+  six user clip planes, `MultiplyTransform`, and clip/raster status state;
+- FP16/FP32 textures and render targets, MRT/depth pairing, sampling, blitting,
+  resolve and readback. Four-sample MSAA is advertised with one quality level
+  and resolved by the executor for swap-chain and texture render targets;
+- **SM3:** the translator accepts SM1.x–SM3 bytecode, including VS3 vertex
+  texture fetch. Pixel samplers s0–s15 and vertex samplers s0–s3 use disjoint
+  bind-group ranges;
+- `D9WG_CAPS_PROFILE=ffp` exposes the fixed-function-only profile and `sm2`
+  keeps a shader-model-2 diagnostic profile; the default is SM3;
 - **M5:** declaration-specific shader variants convert compact skinning inputs
   `UBYTE4`/`SHORT2`/`SHORT4`/`UDEC3`/`DEC3N`; sRGB reads and writes use
   compatible texture/target views; blend constants, separate-alpha blending,
@@ -274,6 +286,14 @@ implementation. Implemented:
   depth range so the object cannot collide in depth with the interface around
   it, and ignoring that puts the object at its natural depth instead.
 
+- **3DMark06 off-screen viewport fix (guest side):** `SetViewport` validates
+  against the dimensions of the currently bound RT0, not always against the
+  back buffer. `SetRenderTarget(0)` resets the viewport to the complete new
+  target as D3D9 requires; a 2048x2048 shadow/precomputation target on an
+  800x600 device is therefore valid. Rejecting that automatic viewport made
+  `SetRenderTarget` return `D3DERR_INVALIDCALL`, which 3DMark06 turned into a
+  C++ exception during Load Test before the queued target bind could flush.
+
 - **Kart Rider shop-panel fix (host side):** XYZRHW ("pre-transformed")
   coordinates are absolute render-target pixels, not viewport-relative ones, so
   the fixed-function screen path subtracts the viewport origin before
@@ -296,8 +316,8 @@ implementation. Implemented:
 
 **Guest refusals now reach the browser console.** `D9WG_OP_GUEST_LOG` (opcode
 11) carries a short ASCII string from the guest DLL to the executor, which
-prints it as `[d3d9-guest] …`. The protocol only ever ran one way, so a call the
-guest turned down was invisible everywhere a developer can look: the console
+prints it as `[d3d9-guest] …`. Before the 1.3 response tail, command traffic
+only ran guest-to-host, so a call the guest turned down was invisible: the console
 sees a clean stream of valid commands, and the guest's own trace file lives
 inside a VM whose filesystem the page cannot reach — the exact reason several
 "the picture is wrong" investigations here ran on guesswork. `host_log()` is
@@ -308,24 +328,15 @@ one per frame, capped at 48 distinct messages. It is deliberately not a general
 logging channel: only refusals and failures are sent — every `UNSUPPORTED()`
 site, `SetViewport` rejection, `CreateOffscreenPlainSurface`'s format
 restriction, and the `CreateTexture`/`CreateVertexBuffer`/`CreateIndexBuffer`
-failure paths. An executor too old to know the opcode counts it in
-`unsupportedCommands` and skips it, so a new DLL against a stale page degrades
-quietly instead of breaking.
+failure paths. Protocol 1.3 deliberately requires the matching executor and
+bridge; older page/DLL pairs are not a compatibility target.
 
-Every unimplemented entry point now traces `STUB <Method> -> D3DERR_INVALIDCALL`
-(see `UNSUPPORTED()`), including the ones that used to refuse in complete
-silence: `UpdateSurface`, `ProcessVertices`, `MultiplyTransform`,
-`CreateVolumeTexture`, `GetFrontBufferData`, `SetStreamSourceFreq`,
-`Surface::GetDC`/`ReleaseDC`, `GetCubeMapSurface`, clip planes, palettes and
-patches, plus `CreateOffscreenPlainSurface`'s deliberate cursor-format
-restriction. A silent `D3DERR_INVALIDCALL` is indistinguishable from "the app
-never called it" — from the host console, from the trace, from everywhere — and
-that blind spot is what left Kart Rider's missing shop art with no evidence at
-all to reason from: a picture that was wrong, an executor reporting clean frames
-and zero dropped draws, and nothing anywhere recording that the guest had been
-turned down. The D9WG protocol has no guest-to-host log channel, so these land
-in the diagnostic DLL's trace; `grep STUB` over a trace taken while reproducing
-names the APIs a title actually wanted in one step.
+The remaining deliberately unsupported legacy entry points trace
+`STUB <Method>` and are mirrored once to the browser console through
+`D9WG_OP_GUEST_LOG`: `ProcessVertices`, additional swap chains, palettized
+textures, higher-order patches, and `Surface::GetDC`/`ReleaseDC`. Their related
+caps/usages are not advertised. This is distinct from the rendering gaps above:
+none of these methods has a faithful WebGPU implementation in this profile.
 
 **The diagnostic DLL now traces the paths a title can quietly give up in.**
 Chasing GTA San Andreas's silent exit turned up three blind spots, each able to
@@ -378,6 +389,280 @@ build now wraps every one of them in `TRACE_REFUSE()`, which logs
 `REFUSE <function>:<line> -> <hr>`; it compiles to the identity in the shipping
 DLL, which carries no `REFUSE` string at all. Read "nothing in the trace failed"
 as evidence only for calls whose failure path is instrumented.
+
+**A refusal that cannot be explained cannot be fixed.** `TRACE_REFUSE()` gives
+every rejection a line, but a line is not the same as an answer.
+`device_create_cube_texture` had four reasons to refuse -- edge size, format,
+usage, pool -- and logged none of its arguments, so a 3DMark06 crash produced a
+six-megabyte trace whose decisive event read, in full,
+`REFUSE device_create_cube_texture:9013 -> 8876086C`. The refusal was visible
+and still unattributable. Entry points that can refuse for several reasons now
+log their parameters *before* anything can reject them, the way
+`device_create_texture` already did.
+
+### Saying yes and then failing
+
+`CheckDeviceFormat` and the `Create*` entry points encoded the same rules twice,
+and the copies had drifted. The query blessed any cube map whose format was
+sampleable; `device_create_cube_texture` refused every cube map carrying a usage
+flag. 3DMark06 asked whether it could filter a `G16R16` cube map, was told yes,
+and got `D3DERR_INVALIDCALL` from the create.
+
+Real D3D9 does not produce that combination, so nothing defends against it.
+3DMark threw a C++ exception out of the failed create (`E06D7363`, magic
+`0x19930520`) and died at `004A1406` dereferencing a COM smart pointer that
+still held uninitialised stack data -- `mov ecx,[eax]` with `eax=3F800000`,
+which is `1.0f`, the leftover of a matrix. A capability lie does not surface as
+a wrong image; it surfaces as a crash in someone else's error handling, several
+frames from anything we wrote.
+
+The asymmetry is worth stating plainly, because it is not symmetric between the
+two callers. For the **query**, answering "no" is always safe: an app told no
+picks another format, or does without. For the **create**, refusing is the
+dangerous direction -- that is the direction that produced this crash. So the
+shared `texture_create_supported()` predicate answers only the question a create
+asks (*can this resource exist?*), and `CheckDeviceFormat` layers the stricter
+"do we implement this behaviour?" test on top. The query is therefore never
+weaker than the create, and the create never refuses something D3D9 would build.
+
+Usage bits that describe what a resource is *for* rather than whether it can
+exist -- `D3DUSAGE_AUTOGENMIPMAP`, `_DMAP`, `_NPATCHES`, `_SOFTWAREPROCESSING`
+-- are on the query side of that line. `AUTOGENMIPMAP` in particular is handled
+the way D3D9 handles it: it is stripped, levels are clamped to one (nothing
+would fill a chain nobody generates, and sampling unwritten mips is worse than
+having none), and the create returns `D3DOK_NOAUTOGEN` -- a success code -- with
+a usable texture.
+
+`glbridge/sample/d3d9_cube_texture_test.c` asserts the invariant directly: for
+every format the query blesses, the matching create must succeed.
+
+The invariant has a second half that is easy to miss, and missing it cost a
+round trip. Routing `CheckDeviceFormat` through the creation predicate made it
+answer *yes* for `D3DRTYPE_SURFACE` with no usage -- correct as far as it goes,
+because `CreateOffscreenPlainSurface` really does succeed. But those surfaces
+are CPU-only here: they own their pixels and have no GPU resource, so
+`StretchRect` cannot use one, and D3D9 requires both its operands to be
+`D3DPOOL_DEFAULT` GPU surfaces. 3DMark06 asked, was told yes, created one,
+blitted with it, and put up an `IDirect3DDevice9::StretchRect failed` box.
+
+So "a create the query blessed must succeed" is not sufficient. **The
+operations D3D9 defines on the thing that was created have to work too**, and
+where they do not, the query is the last place to say so before the app
+commits. That surface type answers no again, deliberately and with the reason
+written down, until it has GPU backing.
+
+### Hardware shadow maps
+
+A D3D9 depth *texture* is not only an attachment. The standard shadow map is
+`CreateTexture(..., D3DUSAGE_DEPTHSTENCIL, D3DFMT_D24X8/D32, D3DPOOL_DEFAULT)`,
+rendered into through `GetSurfaceLevel` + `SetDepthStencilSurface`, then handed
+to `SetTexture` so the lighting pass can read it. There is no syntax for the
+read: `tex2D`/`tex2Dproj` on a sampler whose texture happens to be a depth
+format silently becomes a hardware depth comparison returning filtered
+visibility.
+
+The executor modelled a depth resource as attachment-only -- no
+`TEXTURE_BINDING` usage and `view: null` -- on the reasoning that nothing can
+read a depth surface's pixels back, so "a depth buffer exists" was the whole of
+its observable behaviour. 3DMark06 creates a 2048x2048 `D3DFMT_D32` shadow map
+and samples it, and the consequence was not a wrong image. The `null` reached
+`createBindGroup()` as a binding resource and threw a `TypeError`.
+
+WGSL makes the two cases different types -- `texture_depth_2d` sampled through a
+`sampler_comparison`, versus `texture_2d<f32>` through a `sampler` -- and
+neither substitutes for the other, so the same bytecode has to translate
+differently depending on what is bound. That decision lives in the pixel-shader
+variant key alongside alpha test and clip planes, and the translator reports
+which samplers it actually emitted as depth (`reflection.samplers[].depth`).
+The bind group layout is built from that report and nothing else: a
+`texture_depth_2d` declaration paired with a float layout entry does not draw
+badly, it fails pipeline creation. `tex2Dproj` supplies the comparison
+reference as `z/w`, which is why `coordinateFor()` carries `z` out alongside
+the uv for a depth sampler instead of discarding it with the other unread
+components.
+
+Three cases cannot be shadow maps and take the 1x1 fallback with a warning
+rather than an invalid binding: the fixed-function cascade and vertex texture
+fetch (neither has a comparison reference to offer), and a depth surface still
+bound as the current pass's attachment (WebGPU cannot read and write one
+texture in a single pass, and enforces it by failing the whole submit). The
+depth fallback is cleared to the far plane through an empty render pass --
+depth formats cannot be written with `writeTexture`, and a zero-initialised one
+would read as fully shadowed rather than fully lit.
+
+### Cube render targets (protocol 1.4)
+
+`D9WG_OP_SET_RENDER_TARGET` named a resource and a mip level. A cube map is
+bound one face at a time -- `SetRenderTarget` takes what
+`GetCubeMapSurface(face, level)` returned -- so with no face on the wire every
+face of a dynamic environment map resolved to array layer 0 and five of the six
+renders were painted over the first. The capability was previously reported as
+absent for exactly that reason; 1.4 carries the face and it is now real.
+
+`StretchRect` and `ColorFill` got the same field in the same version, because a
+cube render target that cannot be blitted or cleared per face is a feature that
+works until something touches it. `ColorFill` also stopped building its
+attachment view by hand: it left the array layers unbounded, which on a cube map
+is a six-layer view where a pass wants one.
+
+Minor versions are now accepted as a **range** rather than an exact match. The
+guest DLL is copied into the VM image and this file reloads with the page, so
+requiring them to agree exactly made every protocol addition a window where
+nothing rendered and the only symptom was `unsupported D9WG version`. Every
+field added since the minimum is length-gated at its decode site, so an older
+payload is simply shorter and each missing field reads as the default that
+version meant. A change that reinterprets *existing* bytes still needs the major
+version, which is still exact.
+
+### Depth surfaces larger than the render target
+
+D3D9 requires the depth surface to be **at least** the size of the colour
+target. WebGPU requires it to be **exactly** that size. Render-to-texture leans
+on the D3D9 rule constantly: one full-screen depth surface, reused by
+half-resolution HDR downsamples, shadow projections and reflections.
+
+Dropping depth for those passes -- which is what a size mismatch used to do --
+is not a small approximation. Nothing occludes anything any more, so every
+alpha-blended draw that should have been hidden behind geometry paints over it
+instead. The frame washes out and solid objects turn translucent, which reads as
+a shading bug rather than a missing depth buffer. An oversized depth surface now
+gets a size-matched substitute, so the depth *test* still happens. What the
+substitute cannot carry is depth written into the larger surface by an earlier
+pass; an app doing this almost always clears depth on entry, which is why this
+trades a fault that ruins the frame for one that is usually invisible. A depth
+surface *smaller* than the target is still refused: there is nothing to
+substitute that would be more correct than admitting the pass cannot depth-test.
+
+### Formats: palettes, packed pairs, and two kinds of depth read
+
+Everything `CheckDeviceFormat` used to say no to and an app quietly did without:
+
+- **D3DFMT_P8 / A8P8.** A D3D9 palette is device state consulted when a texel is
+  sampled, not something baked into the texture -- the same surface takes on
+  different colours as the app switches palettes with no upload in between.
+  WebGPU has no palettized format, so the expansion happens on the CPU, which
+  means the *indices* have to be kept and replayed whenever the table or the
+  selection changes. `SetPaletteEntries` and `SetCurrentTexturePalette` stopped
+  being stubs to make that possible.
+- **D3DFMT_UYVY / YUY2 / R8G8_B8G8 / G8R8_G8B8.** Two texels per 32-bit block
+  sharing chroma, expanded through the same block machinery BCn uses -- a 2x1
+  block rather than 4x4, which also enforces D3D9's even-width requirement. The
+  YUV pair is BT.601 studio swing, because these formats exist for video frames
+  and a decoder writes 16..235 luma; treating it as full range washes blacks out
+  to dark grey, which is exactly the kind of error that looks intentional.
+- **D3DFMT_Q16W16V16U16**, joining the other high-precision formats on
+  `rgba16float`.
+- **DF16 / DF24 / INTZ.** D3D9 has two ways to read a depth texture and they are
+  not interchangeable. A D16/D24X8/D32 texture bound to a sampler is a hardware
+  shadow map: the driver compares and returns filtered visibility. These FOURCC
+  formats return the stored depth itself, which is the entire reason an app
+  chooses one. Both are `texture_depth_2d` in WGSL; only the first takes a
+  `sampler_comparison`. Sampling either as though it were the other produces an
+  image that looks deliberate and is wrong, so the reflection reports which mode
+  a stage compiled to and the bind group layout is built from that.
+
+`naga` earned its place here: `textureSampleLevel` on a depth texture takes a
+*concrete integer* mip level, unlike the `f32` every colour-texture overload
+takes. The `f32` form was rejected at validation instead of failing
+driver-specifically inside the browser.
+
+### Automatic mipmap generation
+
+`D3DUSAGE_AUTOGENMIPMAP` hands the driver everything below level 0 and asks it
+to keep the chain current. It used to be stripped, with `D3DOK_NOAUTOGEN`
+reported back -- honest, and it left 3DMark06 building its own downsample chain
+and one `CheckDeviceFormat said no` line on every run.
+
+The shape D3D9 describes is unusual enough to be worth stating: such a texture
+reports `GetLevelCount() == 1` and hands out no surface below the top, because
+the sublevels are not the app's. So the guest keeps one visible level and the
+host allocates the full chain behind it -- one visible level is the documented
+contract, not a simplification.
+
+The trigger lives on the host, because the host is the side that can see when
+the top level actually changed: an upload landed on level 0, or a render pass
+had level 0 as its attachment. Regeneration is queued at the point the texture
+is next *sampled*, which is what orders it correctly -- after whatever wrote
+level 0, before the draw that reads below it -- and skipped entirely when
+nothing dirtied the chain, so a static texture is not rebuilt every frame.
+`GenerateMipSubLevels` arrives as its own opcode for the explicit case. Each
+level is a blit from the one above through the existing blit pipeline, which is
+the linear box downsample `D3DTEXF_LINEAR` describes.
+
+Volume textures are the exception, and only because D3D9 does not support
+automatic generation for those either; they still report `D3DOK_NOAUTOGEN`.
+
+### Offscreen plain surfaces are GPU surfaces
+
+The other half of the capability lesson, learned the hard way a second time.
+`CreateOffscreenPlainSurface` built a CPU-only surface: it owned its pixels and
+had no GPU resource. That is right for `D3DPOOL_SYSTEMMEM`, where the surface
+exists to be locked, and wrong for `D3DPOOL_DEFAULT`, where D3D9 lets it be a
+`StretchRect` operand -- both operands have to be `DEFAULT`, and this call is
+how apps get the second one.
+
+A `DEFAULT`-pool offscreen surface now carries the same texture a render target
+does. `ColorFill` moved with it: it used to require `D3DUSAGE_RENDERTARGET`,
+which such a surface does not carry even though ColorFill is defined on it, so
+the test is now whether the WebGPU texture can be an attachment at all -- which
+is the question that was actually being asked.
+
+### A warning that fires when nothing is wrong is not a warning
+
+The oversized-depth substitution above reported itself on every pass it touched.
+That was noise: the substitution only loses something if the pass depth-tests
+against contents an earlier pass wrote into the larger surface, and a pass that
+clears depth on entry -- which is what render-to-texture does -- has none to
+lose. It now tracks whether the stand-in was cleared this frame and reports only
+the case that actually changes the image, where geometry that should have been
+occluded is not.
+
+### Derivatives inside data-dependent branches
+
+D3D9 hardware runs both sides of a branch, so `dsx`/`dsy` inside an `if` is well
+defined there. WGSL forbids the call outright, and the whole module fails to
+compile -- which is not a subtle difference: 3DMark06's airship rendered as a
+solid black silhouette because its pixel shader would not build at all, and the
+only evidence was one `'dpdy' must only be called from uniform control flow`
+line in the console.
+
+The derivative almost always reads a register computed *before* the branch, so
+the call is hoisted to just above it: legal, and exactly the value the shader
+asked for. Whether that is true is tracked rather than assumed -- each open
+non-uniform region records the registers written inside it, and an operand the
+branch overwrote has no value above the branch to differentiate, so it degrades
+to zero with a note instead.
+
+The same machinery fixed a larger, older approximation. Sampling inside a
+data-dependent branch used to drop to mip level 0, which is correct-ish and
+visibly aliased wherever a surface is minified -- most of a scene. Hoisting the
+coordinate and both derivatives out and sampling with `textureSampleGrad`
+(explicit gradients, so WGSL permits it under any control flow) is not a
+degradation at all: it is the mip level the shader would have selected on D3D9
+hardware. Level 0 remains the fallback for coordinates the branch itself
+computes, and `naga` is what proves the gradient form really is legal there.
+
+Depth samplers are excluded from that path: WGSL has no
+`textureSampleCompareGrad`, so there is no gradient form to recover *to*.
+
+### One bad command is not a bad batch
+
+`executeBatch()` decoded its command loop without a per-command guard, so a
+throw from any handler unwound to `submit()`, which logged
+`batch failed` and discarded everything still queued behind it -- render target
+bindings, resource creations, vertex declarations. The guest was never told.
+Frames after that drew against state the host had never received and reported
+it as *"a render target slot names a resource the host does not know"* and
+*"no vertex declaration"*: symptoms several batches removed from the one
+command that actually failed, and pointing at subsystems that were working.
+
+Command failures are now contained to their own command and counted in
+`stats.commandsFailed`. The exception is framing: a payload that contradicts
+the batch layout means the producer and the consumer disagree about the bytes,
+so nothing else in the batch can be trusted either. Those throw
+`D9WGStreamError` and still fail the whole batch. The rule that keeps the two
+apart is mechanical -- every site that increments `stats.malformedBatches` is by
+definition saying the batch is malformed rather than that one command failed.
 
 ### Fixed-function vertex blending
 
@@ -433,20 +718,16 @@ missing" look alike from the outside, and a nonzero count next to a zero
 `blendedDraws` says which. The translated-shader skinning path (M5 `UBYTE4`/
 `SHORT2`/`SHORT4`/`UDEC3`/`DEC3N` inputs) is a separate path and is unaffected.
 
-Still unimplemented, each returning `D3DERR_INVALIDCALL` (or the closest
-matching real error) rather than pretending: volume textures
-(`CreateVolumeTexture`), user clip planes (`MaxUserClipPlanes` reports 0, so
-nothing asks for them — WGSL has no clip-distance facility, see plan section
-9.11), instancing (`SetStreamSourceFreq`), `ProcessVertices`, additional swap
-chains, palettes, patches, `MultiplyTransform`, arbitrary GPU-produced
-`GetRenderTargetData`, and `GetFrontBufferData` (plan section 2.2).
-`d3d9_protocol.h` reserves the opcodes the first few would need, frozen at v0.1
-so archived traces stay decodable across milestones.
+The protocol version is 1.3, and the executor accepts exactly that version.
+Older DLL batches and newer unmatched batches both fail before their first
+command executes: the command layouts and response tail change together, so
+mixing versions must never interpret resource data at the wrong offsets.
 
 Set `D9WG_CAPS_PROFILE=ffp` in the guest environment to make `GetDeviceCaps`
 report the supported M4.5 fixed-function profile (`VertexShaderVersion`/
-`PixelShaderVersion` = `(0,0)`); `D9WG_CAPS_PROFILE=sm2` is the default M5
-profile. The legacy `D9WG_SHADER_MODEL=0` spelling remains accepted.
+`PixelShaderVersion` = `(0,0)`); `D9WG_CAPS_PROFILE=sm2` selects the SM2
+diagnostic profile, while SM3 is the default. The legacy
+`D9WG_SHADER_MODEL=0` spelling remains accepted.
 
 Build an XP-compatible DLL without a C runtime dependency:
 

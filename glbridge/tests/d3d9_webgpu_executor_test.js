@@ -20,23 +20,28 @@ const shaderPipeline = require("../d3d9-webgpu/d3d9_shader_pipeline.js");
 
 const OP = {
     HELLO: 1, CREATE_DEVICE: 2, RESET: 3, PRESENT: 4, CLEAR: 5, COLOR_FILL: 9,
-    BEGIN_SCENE: 6, END_SCENE: 7, GUEST_LOG: 11,
+    BEGIN_SCENE: 6, END_SCENE: 7, GUEST_LOG: 11, READBACK_SURFACE: 12,
     CREATE_BUFFER: 0x100, UPDATE_BUFFER: 0x101, DESTROY_RESOURCE: 0x103,
-    CREATE_TEXTURE_2D: 0x110, UPDATE_TEXTURE: 0x113,
+    CREATE_TEXTURE_2D: 0x110, CREATE_TEXTURE_VOLUME: 0x112,
+    UPDATE_TEXTURE: 0x113,
     CREATE_VERTEX_DECLARATION: 0x120,
     CREATE_VERTEX_SHADER: 0x121, CREATE_PIXEL_SHADER: 0x122,
+    CREATE_QUERY: 0x123,
     SET_RENDER_STATE: 0x200, SET_SAMPLER_STATE: 0x201,
     SET_TEXTURE: 0x203, SET_VIEWPORT: 0x204, SET_TRANSFORM: 0x206,
     SET_MATERIAL: 0x207, SET_LIGHT: 0x208, LIGHT_ENABLE: 0x209,
-    SET_STREAM_SOURCE: 0x20A, SET_INDICES: 0x20C,
+    SET_STREAM_SOURCE: 0x20A, SET_STREAM_SOURCE_FREQ: 0x20B,
+    SET_INDICES: 0x20C,
     SET_VERTEX_DECLARATION: 0x20D, SET_FVF: 0x20E,
-    SET_RENDER_TARGET: 0x20F, SET_DEPTH_STENCIL_SURFACE: 0x210,
-    SET_DEPTH_STENCIL_SURFACE_LEVEL: 0x21E,
+    SET_RENDER_TARGET: 0x20F, SET_DEPTH_STENCIL_SURFACE_LEVEL: 0x21E,
     SET_VERTEX_SHADER: 0x211, SET_PIXEL_SHADER: 0x212,
     SET_VS_CONST_F: 0x213, SET_VS_CONST_I: 0x214, SET_VS_CONST_B: 0x215,
     SET_PS_CONST_F: 0x216, SET_PS_CONST_I: 0x217, SET_PS_CONST_B: 0x218,
+    SET_CLIP_PLANE: 0x219, SET_PALETTE: 0x21F, SET_CURRENT_PALETTE: 0x220,
+    GENERATE_MIPS: 0x221,
     DRAW_PRIMITIVE: 0x300, DRAW_INDEXED_PRIMITIVE: 0x301,
     DRAW_PRIMITIVE_UP: 0x302, DRAW_INDEXED_PRIMITIVE_UP: 0x303,
+    BEGIN_QUERY: 0x400, END_QUERY: 0x401,
 };
 
 const D9WG_MAGIC = 0x47573944;
@@ -69,11 +74,13 @@ function buildBatch(commands, options = {}) {
     const batch = Buffer.alloc(32 + commandBytes);
     batch.writeUInt32LE(D9WG_MAGIC, 0);
     batch.writeUInt16LE(1, 4);
-    batch.writeUInt16LE(options.versionMinor ?? 1, 6);
+    batch.writeUInt16LE(options.versionMinor ?? 4, 6);
     batch.writeUInt32LE(options.frameId || 1, 8);
     batch.writeUInt32LE(options.present ? BATCH_FLAG_PRESENT : 0, 12);
     batch.writeUInt32LE(commands.length, 16);
     batch.writeUInt32LE(commandBytes, 20);
+    batch.writeUInt32LE(options.sessionLow || 0, 24);
+    batch.writeUInt32LE(options.sessionHigh || 0, 28);
     let sequence = 1;
     for (const item of commands) {
         batch.writeUInt16LE(item.opcode, item.offset);
@@ -96,7 +103,7 @@ function u32(...values) {
 }
 
 function createDevicePayload(width, height, autoDepth = 1) {
-    const payload = Buffer.alloc(44);
+    const payload = Buffer.alloc(52);
     payload.writeUInt32LE(DEVICE, 0);
     payload.writeUInt32LE(0x1234, 4);
     payload.writeUInt32LE(width, 16);
@@ -104,6 +111,8 @@ function createDevicePayload(width, height, autoDepth = 1) {
     payload.writeUInt32LE(22, 24);
     payload.writeUInt32LE(1, 28);
     payload.writeUInt32LE(autoDepth, 36);
+    payload.writeUInt32LE(0, 44); // D3DMULTISAMPLE_NONE
+    payload.writeUInt32LE(0, 48); // multisample quality
     return payload;
 }
 
@@ -132,6 +141,10 @@ function createBufferPayload(handle, kind, byteCount, format = 0) {
 
 function setStreamSourcePayload(stream, handle, stride, offsetInBytes = 0) {
     return u32(DEVICE, stream, handle, stride, offsetInBytes, 0);
+}
+
+function setStreamSourceFreqPayload(stream, divider) {
+    return u32(DEVICE, stream, divider);
 }
 
 function drawPrimitivePayload(type, startVertex, primitiveCount) {
@@ -250,6 +263,16 @@ const PS_BYTECODE = [
     END,
 ];
 
+const PS_SAMPLER15_BYTECODE = [
+    PS(2, 0),
+    instr(SIO.DCL, 2), dcl(0, 0, 2), dst(REG.SAMPLER, 15),
+    instr(SIO.DCL, 2), dcl(DECLUSAGE.TEXCOORD, 0), dst(REG.TEXTURE, 0),
+    instr(SIO.TEX, 3), dst(REG.TEMP, 0),
+        src(REG.TEXTURE, 0), src(REG.SAMPLER, 15),
+    instr(SIO.MOV, 2), dst(REG.COLOROUT, 0), src(REG.TEMP, 0),
+    END,
+];
+
 // A shader the translator refuses (ps_1_x bump environment mapping).
 const PS_UNSUPPORTED = [
     PS(1, 1),
@@ -258,13 +281,40 @@ const PS_UNSUPPORTED = [
     END,
 ];
 
+// vs_3_0: dcl_2d s0 / dcl_position v0 / dcl_position o0 /
+// texldl r0, v0, s0 / mov o0, r0. Vertex texture samplers live in D3D9's
+// 256..259 namespace and must not alias pixel sampler s0.
+const VS3_VERTEX_TEXTURE_FETCH = [
+    VS(3, 0),
+    instr(SIO.DCL, 2), dcl(0, 0, 2), dst(REG.SAMPLER, 0),
+    instr(SIO.DCL, 2), dcl(DECLUSAGE.POSITION), dst(REG.INPUT, 0),
+    instr(SIO.DCL, 2), dcl(DECLUSAGE.POSITION), dst(REG.OUTPUT, 0),
+    instr(SIO.TEXLDL, 3), dst(REG.TEMP, 0),
+        src(REG.INPUT, 0), src(REG.SAMPLER, 0),
+    instr(SIO.MOV, 2), dst(REG.OUTPUT, 0), src(REG.TEMP, 0),
+    END,
+];
+
 // ---- fake WebGPU ----
 
-function makeFakeWebGPU() {
+function makeFakeWebGPU(options) {
+    options = options || {};
     const calls = [];
     const submittedWorkResolvers = [];
     class FakeBuffer {
-        constructor(descriptor) { this.descriptor = descriptor; this.size = descriptor.size; }
+        constructor(descriptor) {
+            this.descriptor = descriptor;
+            this.size = descriptor.size;
+            this.data = new Uint8Array(descriptor.size);
+        }
+        mapAsync() {
+            // A lost or errored device accepts the submit and then never
+            // signals; makeFakeWebGPU({ hangMapAsync: true }) reproduces it.
+            if (options.hangMapAsync) return new Promise(() => {});
+            return Promise.resolve();
+        }
+        getMappedRange() { return this.data.buffer; }
+        unmap() { this.mapped = false; }
         destroy() { this.destroyed = true; }
     }
     class FakeTexture {
@@ -279,7 +329,10 @@ function makeFakeWebGPU() {
     class FakePass {
         constructor(descriptor) { this.descriptor = descriptor; this.ops = []; }
         setPipeline(p) { this.ops.push(["pipeline", p]); }
-        setBindGroup(i, g) { this.ops.push(["bindGroup", i, g]); }
+        setBindGroup(i, g, dynamicOffsets) {
+            this.ops.push(["bindGroup", i, g, dynamicOffsets]);
+            calls.push(["setBindGroup", i, g, dynamicOffsets]);
+        }
         setViewport(...a) { this.ops.push(["viewport", ...a]); }
         setScissorRect(...a) {
             this.ops.push(["scissor", ...a]);
@@ -301,6 +354,17 @@ function makeFakeWebGPU() {
         }
         draw(...a) { this.ops.push(["draw", ...a]); }
         drawIndexed(...a) { this.ops.push(["drawIndexed", ...a]); }
+        beginOcclusionQuery(slot) {
+            this.occlusionSlot = slot;
+            this.ops.push(["beginOcclusionQuery", slot]);
+        }
+        endOcclusionQuery() {
+            if (this.descriptor.occlusionQuerySet &&
+                    this.occlusionSlot !== undefined)
+                this.descriptor.occlusionQuerySet.values[this.occlusionSlot] = 37n;
+            this.ops.push(["endOcclusionQuery"]);
+            this.occlusionSlot = undefined;
+        }
         end() { this.ended = true; }
     }
     class FakeEncoder {
@@ -313,6 +377,33 @@ function makeFakeWebGPU() {
         }
         copyTextureToTexture(...args) {
             calls.push(["copyTextureToTexture", ...args]);
+        }
+        copyTextureToBuffer(source, destination, size) {
+            const texture = source.texture;
+            const input = texture.readbackData || new Uint8Array(0);
+            const sourcePitch = texture.readbackPitch || size.width * 4;
+            const originY = source.origin ? source.origin.y || 0 : 0;
+            for (let row = 0; row < size.height; ++row) {
+                const from = (originY + row) * sourcePitch;
+                destination.buffer.data.set(input.subarray(from,
+                    from + Math.min(sourcePitch, destination.bytesPerRow)),
+                    row * destination.bytesPerRow);
+            }
+            calls.push(["copyTextureToBuffer", source, destination, size]);
+        }
+        writeTimestamp(querySet, slot) {
+            querySet.values[slot] = 1000n + BigInt(slot);
+        }
+        resolveQuerySet(querySet, first, count, buffer, offset) {
+            const out = new DataView(buffer.data.buffer);
+            for (let i = 0; i < count; ++i)
+                out.setBigUint64(offset + i * 8,
+                    querySet.values[first + i] || 0n, true);
+        }
+        copyBufferToBuffer(source, sourceOffset, destination,
+                destinationOffset, size) {
+            destination.data.set(source.data.subarray(sourceOffset,
+                sourceOffset + size), destinationOffset);
         }
         finish() { return { encoder: this }; }
     }
@@ -369,6 +460,13 @@ function makeFakeWebGPU() {
             calls.push(["createCommandEncoder", encoder]);
             return encoder;
         },
+        createQuerySet(descriptor) {
+            const querySet = { descriptor,
+                values: new BigUint64Array(descriptor.count),
+                destroy() { this.destroyed = true; } };
+            calls.push(["createQuerySet", descriptor, querySet]);
+            return querySet;
+        },
         createBindGroupLayout(descriptor) {
             const layout = { descriptor,
                 bindings: new Set(descriptor.entries.map(e => e.binding)) };
@@ -402,7 +500,10 @@ function makeFakeWebGPU() {
     const context = {
         configure(descriptor) { calls.push(["configure", descriptor]); },
         getCurrentTexture() {
-            return { width: 640, height: 480, createView: () => ({ swapchain: true }) };
+            const texture = { width: 640, height: 480,
+                createView: () => ({ swapchain: true }) };
+            calls.push(["getCurrentTexture", texture]);
+            return texture;
         },
     };
     const gpu = {
@@ -410,7 +511,7 @@ function makeFakeWebGPU() {
             return {
                 // A real adapter advertises optional features here, and a device
                 // gets none of them unless it names them in requiredFeatures.
-                features: new Set(["texture-compression-bc"]),
+                features: new Set(["texture-compression-bc", "timestamp-query"]),
                 async requestDevice(descriptor) {
                     calls.push(["requestDevice", descriptor || null]);
                     return device;
@@ -426,9 +527,11 @@ function makeFakeWebGPU() {
 }
 
 function makeExecutor(options = {}) {
-    const fake = makeFakeWebGPU();
+    const { fakeOptions, ...executorOptions } = options;
+    const fake = makeFakeWebGPU(fakeOptions);
     const canvas = { width: 1, height: 1, getContext: () => fake.context };
-    const executor = new D3D9WebGPUExecutor(canvas, { gpu: fake.gpu, ...options });
+    const executor = new D3D9WebGPUExecutor(canvas,
+        { gpu: fake.gpu, ...executorOptions });
     return { fake, executor,
         find: name => fake.calls.filter(call => call[0] === name),
         last: name => {
@@ -436,6 +539,28 @@ function makeExecutor(options = {}) {
             return matches[matches.length - 1];
         } };
 }
+
+/*
+ * Constants reach the GPU as one staged upload of the whole uniform ring per
+ * submit -- the shape a real driver's pushbuffer uses -- rather than one
+ * writeBuffer per draw. A block therefore lives inside that upload, at the
+ * dynamic offset the draw actually bound it at, so a test reads it through
+ * here instead of treating the write's payload as the block itself.
+ */
+function constantBlock(find, buffer) {
+    const write = find("writeBuffer").filter(call => call[1] === buffer).pop();
+    assert.ok(write, "the uniform ring was never uploaded");
+    const bind = find("setBindGroup").pop();
+    const offsets = bind && bind[3];
+    const dynamic = offsets && offsets.length ? offsets[0] : 0;
+    return { buffer: write[6].buffer,
+        byteOffset: write[6].byteOffset + dynamic - write[2] };
+}
+
+// Absolute DMA offset of the liveness counter: the response region base
+// plus D9WG_HEARTBEAT_OFFSET (its last 16 bytes).
+const HEARTBEAT_WRITE_OFFSET = (16 * 1024 * 1024 - 4 * 1024 * 1024) +
+    (4 * 1024 * 1024 - 16);
 
 // ---- harness ----
 
@@ -454,6 +579,360 @@ async function test(name, body) {
 // ---- tests ----
 
 async function main() {
+
+await test("a frame past the flush threshold submits early and never touches the swap chain",
+        async () => {
+    // The batch-size test's shape: one PCI batch carrying far more draws than
+    // a frame is supposed to hold. Before the flush existed they all stayed
+    // live as JS ops and then went into a single command buffer.
+    const THRESHOLD = 1024;                       // the option's floor
+    const DRAWS = THRESHOLD + 200;
+    const { executor, fake, find } = makeExecutor({ flushThreshold: THRESHOLD });
+    const draws = [];
+    for (let i = 0; i < DRAWS; ++i)
+        draws.push(command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)));
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        ...draws,
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(executor.stats.frameFlushes, 1,
+        "one flush for " + DRAWS + " draws at a threshold of " + THRESHOLD);
+    assert.equal(executor.stats.queueSubmits, 2,
+        "the flush submits, and Present submits the remainder");
+    // The whole point of owning the back buffer: a partial frame reaches the
+    // GPU without acquiring a canvas texture it would have to hold across
+    // tasks. One acquisition, at Present.
+    assert.equal(find("getCurrentTexture").length, 1);
+    // The flush is invisible to the guest's image: the second segment loads
+    // what the first one drew, because both target the same owned texture.
+    const passes = find("beginRenderPass");
+    assert.ok(passes.length >= 2);
+    assert.ok(passes.slice(1).every(call =>
+        call[1].colorAttachments.every(a => a.loadOp === "load")),
+        "a flush must not clear what the previous segment drew");
+    assert.equal(executor.stats.framesWithoutColorClear, 1,
+        "a flush is a fragment, not a frame that failed to clear");
+    assert.equal(executor.stats.framesWithNoOps, 0);
+});
+
+await test("a Present whose ops were all flushed away still reaches the canvas",
+        async () => {
+    // The flush makes this ordinary rather than exotic: the last flush can
+    // land on the final draw, so Present arrives with an empty frame -- and a
+    // canvas texture is new and undefined every frame, so "nothing to replay"
+    // must not mean "nothing to show".
+    const THRESHOLD = 1024;
+    const { executor, fake, find } = makeExecutor({ flushThreshold: THRESHOLD });
+    const draws = [];
+    for (let i = 0; i < THRESHOLD; ++i)
+        draws.push(command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)));
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        ...draws,
+    ]));
+    await executor.idle();
+    assert.equal(executor.stats.frameFlushes, 1);
+    assert.equal(executor.frame, null, "the flush consumed the whole frame");
+    const backBuffer = executor.backBufferTexture;
+    assert.ok(backBuffer);
+    assert.equal(find("getCurrentTexture").length, 0,
+        "a flush must never acquire the swap chain");
+
+    // Present arrives in a later batch with nothing of its own to draw.
+    await executor.submit(buildBatch([
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(find("getCurrentTexture").length, 1);
+    const presented = find("copyTextureToTexture")
+        .filter(call => call[1].texture === backBuffer);
+    assert.equal(presented.length, 1,
+        "the owned back buffer must still be copied to the canvas");
+    assert.equal(executor.stats.backBufferPresents, 1);
+});
+
+await test("the host reports liveness once per batch so a backlog is not a timeout",
+        async () => {
+    /*
+     * The fault this exists for: submission has no backpressure, so a host that
+     * has fallen thousands of batches behind still answers a readback -- just
+     * later than any wall-clock deadline the guest could pick. Without a
+     * liveness signal the guest cannot tell that apart from a dead host, and it
+     * reported "GetFrontBufferData failed" for a host that was working.
+     */
+    const beats = [];
+    const { executor } = makeExecutor();
+    const metadata = { writeGuestMemory(offset, data) {
+        if (offset === HEARTBEAT_WRITE_OFFSET)
+            beats.push(Buffer.from(data).readUInt32LE(0));
+    } };
+    for (let i = 0; i < 3; ++i) {
+        await executor.submit(buildBatch([
+            command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+            command(OP.CLEAR, u32(DEVICE, 1, 0xff000000, 0x3f800000, 0, 0)),
+            command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+        ], { present: true }), metadata);
+        await executor.idle();
+    }
+    assert.equal(beats.length, 3, "one beat per finished batch");
+    // Strictly increasing is what lets the guest reset its deadline on change
+    // rather than on a value it has to interpret.
+    assert.deepEqual(beats, [1, 2, 3]);
+
+    // A batch with no writer must not throw or stall the counter.
+    await executor.submit(buildBatch([
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(beats.length, 3, "no writer, no beat, no error");
+});
+
+await test("a readback whose map never completes fails instead of hanging the guest",
+        async () => {
+    // The guest spins on the response with interrupts of its own, so a map that
+    // never resolves is not slow -- it freezes the VM until the guest's own cap
+    // expires. Bounding it here turns a stall into a reported failure the guest
+    // can raise as D3DERR_DRIVERINTERNALERROR straight away.
+    const { executor } = makeExecutor(
+        { readbackTimeoutMs: 30, fakeOptions: { hangMapAsync: true } });
+    const writes = [];
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CLEAR, u32(DEVICE, 1, 0xff000000, 0x3f800000, 0, 0)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true, versionMinor: 3 }));
+    await executor.idle();
+
+    await executor.submit(buildBatch([
+        command(OP.READBACK_SURFACE,
+            u32(DEVICE, 0, 0, 21, 640, 480, 0, 1, 640 * 4, 640 * 4,
+                16 * 1024, 0x22334455)),
+    ], { versionMinor: 3 }), { writeGuestMemory(offset, data) {
+        // The host bumps a liveness counter once per batch at the very top
+        // of the response region; it is not a response to anything, so it
+        // must not be counted as one.
+        if (offset === HEARTBEAT_WRITE_OFFSET) return;
+        writes.push({ offset, data: Buffer.from(data) });
+    } });
+    await executor.idle();
+
+    assert.equal(executor.stats.renderTargetReadbackFailures, 1,
+        "the stalled map must be reported as a readback failure");
+    assert.equal(writes.length, 1,
+        "the guest must still get a response rather than spinning to its cap");
+    // status is the 4th u32 of D9WGReadbackResponse; 2 is D9WG_RESPONSE_FAILED.
+    assert.equal(writes[0].data.readUInt32LE(12), 2);
+});
+
+await test("constants go up as one staged upload per submit, not one per draw",
+        async () => {
+    // What a driver does with its pushbuffer: write constants into a mapped
+    // ring with a plain CPU pointer and ring the doorbell once. A 3DMark06
+    // batch-size run made 22 million per-draw writeBuffer calls carrying 6.8 GB;
+    // the bytes are unavoidable, the 22 million API calls were not.
+    const DRAWS = 40;
+    const { executor, find } = makeExecutor();
+    const body = [];
+    for (let i = 0; i < DRAWS; ++i) {
+        // A constant change between every pair, so no two draws can share a
+        // slot and the ring genuinely holds DRAWS distinct blocks.
+        const c = floatConstants(0, [i, i + 1, i + 2, i + 3]);
+        body.push(command(OP.SET_VS_CONST_F, c.payload, c.blob, c.blobOffsetField));
+        body.push(command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)));
+    }
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        ...body,
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    const ring = find("createBuffer").find(call =>
+        /^D3D9 uniform ring \d+$/.test(String(call[1].label || "")))[2];
+    const ringWrites = find("writeBuffer").filter(call => call[1] === ring);
+    assert.equal(ringWrites.length, 1,
+        DRAWS + " draws must produce one ring upload, not one each");
+    assert.equal(executor.stats.uniformStagingUploads, 1);
+    assert.equal(ringWrites[0][2], 0, "the staged upload starts at the ring base");
+    // Every distinct block is still in it: DRAWS slots at 256-byte alignment.
+    assert.ok(ringWrites[0][5] >= DRAWS * 256,
+        "the upload must cover every slot the frame allocated");
+});
+
+await test("a run of draws with no state change between them shares one slot",
+        async () => {
+    // The driver answer to "did the constants change": nothing called
+    // SetConstant, so nothing did. O(1), and it replaces hashing the assembled
+    // block on every draw.
+    const drawBatch = extra => {
+        const body = [];
+        for (let i = 0; i < 8; ++i) {
+            if (extra) {
+                const c = floatConstants(0, [i, i, i, i]);
+                body.push(command(OP.SET_VS_CONST_F, c.payload, c.blob,
+                    c.blobOffsetField));
+            }
+            body.push(command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)));
+        }
+        return buildBatch([
+            command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+            command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+            command(OP.SET_FVF, fvfPayload(0x2,
+                [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+            command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+            ...body,
+            command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+        ], { present: true });
+    };
+
+    const quiet = makeExecutor();
+    await quiet.executor.submit(drawBatch(false));
+    await quiet.executor.idle();
+    assert.equal(quiet.executor.stats.uniformSlotReuses, 7,
+        "seven draws after the first found the state unchanged");
+
+    const busy = makeExecutor();
+    await busy.executor.submit(drawBatch(true));
+    await busy.executor.idle();
+    assert.equal(busy.executor.stats.uniformSlotReuses, 0,
+        "a SetVertexShaderConstantF between draws must invalidate the slot");
+});
+
+await test("identical consecutive draws issue one pass-state call, not nine",
+        async () => {
+    // The batch-size test's shape: many draws that differ only in their index
+    // range. Pass state persists in WebGPU until it changes, so re-issuing it
+    // per draw is pure JS->Dawn overhead -- and at this draw count it is the
+    // dominant cost.
+    const DRAWS = 24;
+    const { executor, fake, find } = makeExecutor();
+    const draws = [];
+    for (let i = 0; i < DRAWS; ++i)
+        draws.push(command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)));
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        ...draws,
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    const pass = find("beginRenderPass").pop()[2];
+    const counted = kind => pass.ops.filter(op => op[0] === kind).length;
+    assert.equal(counted("draw"), DRAWS, "every draw must still be issued");
+    // Each of these is set once for the pass and then left alone.
+    for (const kind of ["pipeline", "bindGroup", "blendConstant",
+            "stencilReference", "viewport", "scissor", "vertexBuffer"])
+        assert.equal(counted(kind), 1,
+            kind + " should be set once per pass, not once per draw");
+    assert.equal(executor.stats.redundantStateSkipped, (DRAWS - 1) * 7,
+        "seven state calls skipped for each draw after the first");
+});
+
+await test("a new pass re-issues state that WebGPU forgot", async () => {
+    // The skip is only sound because beginRenderPass resets all of it. A
+    // target switch opens a new pass, and everything must be set again there
+    // or the second pass draws with no pipeline bound at all.
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        // A Clear always starts a new pass (WebGPU spells a clear only as a
+        // pass loadOp), so this is the cheapest way to force the boundary.
+        command(OP.CLEAR, u32(DEVICE, 1, 0xff000000, 0x3f800000, 0, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    const passes = find("beginRenderPass").map(call => call[2])
+        .filter(pass => pass.ops.some(op => op[0] === "draw"));
+    assert.equal(passes.length, 2, "the Clear must have split the passes");
+    for (const pass of passes)
+        for (const kind of ["pipeline", "bindGroup", "viewport", "scissor",
+                "vertexBuffer"])
+            assert.equal(pass.ops.filter(op => op[0] === kind).length, 1,
+                kind + " must be re-set in every pass that draws");
+});
+
+await test("uniform storage grows by pooled chunks, not one buffer per draw", async () => {
+    // 3DMark06's batch-size test issues draw calls by the hundred thousand --
+    // that is what it measures -- and each draw with distinct constants needs
+    // its own uniform slot. One 16 MiB ring holds 65536 of them; past that the
+    // old allocator handed out a fresh GPUBuffer per draw, each of which also
+    // forced an uncacheable bind group, and the pair was held until Present.
+    // That is what took the browser's GPU process down.
+    const CHUNK = 64 * 1024;                     // the allocator's floor
+    const SLOTS_PER_CHUNK = CHUNK / 256;         // UNIFORM_OFFSET_ALIGNMENT
+    const { executor, fake } = makeExecutor(
+        { uniformRingBytes: CHUNK, uniformRingChunks: 3 });
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(64, 64)),
+    ]));
+
+    // "D3D9 uniform ring overflow" also starts with "D3D9 uniform ring ", so
+    // the chunk label is matched exactly rather than by prefix.
+    const ringBuffers = () => fake.calls.filter(call =>
+        call[0] === "createBuffer" &&
+        /^D3D9 uniform ring \d+$/.test(String(call[1].label || "")));
+    const overflowBuffers = () => fake.calls.filter(call =>
+        call[0] === "createBuffer" &&
+        call[1].label === "D3D9 uniform ring overflow");
+
+    // Exactly the pool's worth of slots: every one comes out of a chunk, and
+    // the chunks are the only buffers allocated.
+    const distinct = new Set();
+    for (let i = 0; i < SLOTS_PER_CHUNK * 3; ++i) {
+        const slot = executor.allocateUniformSlot(256);
+        assert.equal(slot.transient, false, "slot " + i + " should be pooled");
+        distinct.add(slot.buffer);
+    }
+    assert.equal(distinct.size, 3, "three chunks should have been used");
+    assert.equal(ringBuffers().length, 3);
+    assert.equal(overflowBuffers().length, 0,
+        "nothing should overflow while the pool has room");
+
+    // Past the pool the old per-draw path is still the fallback, but it is now
+    // the documented last resort rather than the first thing a big frame hits.
+    const beyond = executor.allocateUniformSlot(256);
+    assert.equal(beyond.transient, true);
+    assert.equal(overflowBuffers().length, 1);
+    assert.equal(executor.stats.uniformRingOverflows, 1);
+
+    // A new frame rewinds to chunk 0 and reuses the same buffers rather than
+    // allocating more -- stable identity is what keeps bind groups cacheable.
+    executor.frame = null;
+    executor.ensureFrame();
+    const rewound = executor.allocateUniformSlot(256);
+    assert.equal(rewound.transient, false);
+    assert.equal(rewound.offset, 0);
+    assert.equal(rewound.buffer, [...distinct][0],
+        "the frame should restart in the first pooled chunk");
+    assert.equal(ringBuffers().length, 3, "no new chunk on the second frame");
+});
 
 await test("fixed-function FVF triangle still renders (M1 regression guard)", async () => {
     const { executor, fake, find } = makeExecutor();
@@ -634,14 +1113,63 @@ await test("programmable vs+ps: modules, bindings and constants all line up", as
 
     // And the values themselves: c0..c3 for the vertex stage, c1 for the
     // pixel stage at its own offset.
-    const write = find("writeBuffer").filter(
-        call => call[1] === entries.get(0).resource.buffer).pop();
-    const data = new DataView(write[3]);
+    const block = constantBlock(find, entries.get(0).resource.buffer);
+    const data = new DataView(block.buffer, block.byteOffset);
     assert.equal(data.getFloat32(12 * 4, true), 5, "vs c3.x");
     assert.equal(data.getFloat32(13 * 4, true), 6, "vs c3.y");
     const pixelBase = entries.get(1).resource.offset;
     assert.equal(data.getFloat32(pixelBase + 16, true), 0.25, "ps c1.x");
     assert.equal(data.getFloat32(pixelBase + 28, true), 1, "ps c1.w");
+});
+
+await test("all-draw solid probe overrides programmable shading and rejecting state",
+        async () => {
+    const { executor, find } = makeExecutor();
+    executor.debug.forceSolidAllDraws = true;
+    // The all-draw probe must win over the older diagnostic which drops
+    // programmable draws; otherwise a user carrying both toggles forward sees
+    // black and receives the same false geometry diagnosis as before.
+    executor.debug.skipProgrammableDraws = true;
+    const ps = shaderCreatePayload(0x40000003, PS_BYTECODE);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.CREATE_PIXEL_SHADER, ps.payload, ps.blob, ps.blobOffsetField),
+        command(OP.SET_PIXEL_SHADER, u32(DEVICE, 0x40000003)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, 15, 1, 0)),   // alpha test
+        command(OP.SET_RENDER_STATE, u32(DEVICE, 25, 1, 0)),   // NEVER
+        command(OP.SET_RENDER_STATE, u32(DEVICE, 27, 1, 0)),   // blending
+        command(OP.SET_RENDER_STATE, u32(DEVICE, 168, 0, 0)),  // no colour writes
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.programmableDraws, 1);
+    const descriptor = find("createRenderPipeline").pop()[1];
+    assert.ok(descriptor.fragment.module.code.includes(
+        "return vec4<f32>(0.0, 1.0, 0.0, 1.0)"));
+    assert.ok(!descriptor.fragment.module.code.includes("discard;"));
+    assert.equal(descriptor.fragment.targets[0].writeMask, 0xf);
+    assert.equal(descriptor.fragment.targets[0].blend, undefined);
+    assert.equal(descriptor.primitive.cullMode, "none");
+    assert.equal(descriptor.depthStencil.depthCompare, "always");
+    assert.equal(descriptor.depthStencil.depthWriteEnabled, false);
+
+    const pipelines = executor.debug.dumpPipelineStates();
+    assert.equal(pipelines.length, 1);
+    assert.equal(pipelines[0].draws, 1);
+    assert.equal(pipelines[0].state.writeMask, 0xf);
+    assert.equal(pipelines[0].state.alphaTest.enabled, false);
+    const report = executor.debug.blackScreenReport();
+    assert.equal(report.debug.forceSolidAllDraws, true);
+    assert.ok(report.draws.programmable);
+    assert.equal(report.draws.programmable.effectiveClip.width, 640);
+    assert.equal(report.draws.programmable.effectiveClip.height, 480);
 });
 
 await test("a programmable VS routes fixed-function stage n through oTn", async () => {
@@ -711,8 +1239,8 @@ await test("persistent WGSL cache is restored before CREATE_SHADER executes", as
     assert.equal(stats.shaderCacheHits, 1);
     assert.equal(stats.shadersCached, 1);
     assert.ok(stats.shaderWGSLBytesCached > 0);
-    assert.deepEqual(stats.occlusionQueries, { mode: "guest-conservative",
-        slotsUsed: 0, slotsCapacity: 0, slotExhaustionFallbacks: 0 });
+    assert.deepEqual(stats.occlusionQueries, { mode: "webgpu-query-set",
+        active: 0, perFrameCapacity: 8192, resolved: 0 });
 });
 
 await test("CREATE_SHADER translation can run through the M6 Worker path", async () => {
@@ -767,9 +1295,8 @@ await test("shader `def` literals override app-set constants for that register",
     assert.equal(executor.stats.droppedDraws, 0);
     const bindGroup = find("createBindGroup").pop()[1];
     const pixelEntry = bindGroup.entries.find(e => e.binding === 1);
-    const write = find("writeBuffer").filter(
-        call => call[1] === pixelEntry.resource.buffer).pop();
-    const data = new DataView(write[3]);
+    const block = constantBlock(find, pixelEntry.resource.buffer);
+    const data = new DataView(block.buffer, block.byteOffset);
     const base = pixelEntry.resource.offset;
     assert.equal(data.getFloat32(base, true), 0.5,
         "def c0 must win over SetPixelShaderConstantF");
@@ -810,9 +1337,8 @@ await test("int and bool constant registers land after the float region", async 
     await executor.idle();
     assert.equal(executor.stats.droppedDraws, 0);
     const bindGroup = find("createBindGroup").pop()[1];
-    const write = find("writeBuffer").filter(
-        call => call[1] === bindGroup.entries[0].resource.buffer).pop();
-    const data = new DataView(write[3]);
+    const block = constantBlock(find, bindGroup.entries[0].resource.buffer);
+    const data = new DataView(block.buffer, block.byteOffset);
     // The shader reads c0 and c1, so the float region is two vec4s (32 bytes),
     // then i0 (16 bytes), then the bool vector.
     assert.equal(data.getInt32(32, true), 3, "i0.x");
@@ -963,6 +1489,96 @@ await test("multi-stream declarations bind one vertex buffer per stream", async 
     assert.equal(binds[1][3], 32, "stream 1's OffsetInBytes was lost");
 });
 
+await test("indexed instancing maps D3D9 stream frequencies to WebGPU instances",
+        async () => {
+    const { executor, fake, find } = makeExecutor();
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(1, 0, DECLTYPE.D3DCOLOR, DECLUSAGE.COLOR),
+    ];
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 36)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x202, 1, 12)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x203, 2, 6, 101)),
+        command(OP.CREATE_VERTEX_DECLARATION,
+            declarationPayload(0x301, elements)),
+        command(OP.SET_VERTEX_DECLARATION, u32(DEVICE, 0x301)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(1, 0x202, 4)),
+        command(OP.SET_STREAM_SOURCE_FREQ,
+            setStreamSourceFreqPayload(0, 0x40000003)),
+        command(OP.SET_STREAM_SOURCE_FREQ,
+            setStreamSourceFreqPayload(1, 0x80000001)),
+        command(OP.SET_INDICES, u32(DEVICE, 0x203)),
+        command(OP.DRAW_INDEXED_PRIMITIVE,
+            drawIndexedPayload(4, 0, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    const pipeline = find("createRenderPipeline").pop()[1];
+    assert.equal(pipeline.vertex.buffers[0].stepMode, "vertex");
+    assert.equal(pipeline.vertex.buffers[1].stepMode, "instance");
+    const pass = fake.calls.filter(c => c[0] === "beginRenderPass").pop()[2];
+    assert.deepEqual(pass.ops.find(op => op[0] === "drawIndexed"),
+        ["drawIndexed", 3, 3, 0, 0]);
+    assert.equal(executor.stats.instancedDraws, 1);
+    assert.equal(executor.stats.instancesDrawn, 3);
+    assert.equal(executor.stats.expandedInstanceStreams, 0);
+});
+
+await test("D3D9 instance divisors greater than one are expanded exactly",
+        async () => {
+    const { executor, fake, find } = makeExecutor();
+    const elements = [
+        element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+        element(1, 0, DECLTYPE.D3DCOLOR, DECLUSAGE.COLOR),
+    ];
+    const instanceData = Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]);
+    const update = Buffer.alloc(24);
+    update.writeUInt32LE(0x202, 0);
+    update.writeUInt32LE(0, 4);
+    update.writeUInt32LE(instanceData.length, 8);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 36)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x202, 1, 8)),
+        command(OP.UPDATE_BUFFER, update, instanceData, 12),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x203, 2, 6, 101)),
+        command(OP.CREATE_VERTEX_DECLARATION,
+            declarationPayload(0x301, elements)),
+        command(OP.SET_VERTEX_DECLARATION, u32(DEVICE, 0x301)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(1, 0x202, 4)),
+        command(OP.SET_STREAM_SOURCE_FREQ,
+            setStreamSourceFreqPayload(0, 0x40000004)),
+        command(OP.SET_STREAM_SOURCE_FREQ,
+            setStreamSourceFreqPayload(1, 0x80000002)),
+        command(OP.SET_INDICES, u32(DEVICE, 0x203)),
+        command(OP.DRAW_INDEXED_PRIMITIVE,
+            drawIndexedPayload(4, 0, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    const expanded = find("createBuffer").find(call =>
+        call[1].label === "D3D9 instance divisor expansion");
+    assert.ok(expanded, "divisor > 1 did not create an expanded instance stream");
+    const upload = find("writeBuffer").find(call => call[1] === expanded[2]);
+    assert.ok(upload, "expanded instance stream was not uploaded");
+    assert.deepEqual([...upload[6].subarray(0, 16)], [
+        1, 2, 3, 4, 1, 2, 3, 4,
+        5, 6, 7, 8, 5, 6, 7, 8,
+    ]);
+    const pipeline = find("createRenderPipeline").pop()[1];
+    assert.equal(pipeline.vertex.buffers[1].stepMode, "instance");
+    const pass = fake.calls.filter(c => c[0] === "beginRenderPass").pop()[2];
+    assert.deepEqual(pass.ops.find(op => op[0] === "drawIndexed"),
+        ["drawIndexed", 3, 4, 0, 0]);
+    assert.equal(executor.stats.expandedInstanceStreams, 1);
+});
+
 await test("triangle strips use strip topology instead of being reinterpreted as a list", async () => {
     const { executor, find } = makeExecutor();
     await executor.submit(buildBatch([
@@ -1088,12 +1704,13 @@ await test("HELLO's feature bits report which guest DLL is loaded", async () => 
     const { executor } = makeExecutor();
     // guest_pointer_bits / feature_bits / session_id_low / session_id_high.
     await executor.submit(buildBatch([
-        command(OP.HELLO, u32(32, 1 /* D9WG_FEATURE_SHADER_MODEL_2 */, 0, 0)),
+        command(OP.HELLO, u32(32, 3 /* SM2 | SM3 */, 0, 0)),
         command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
         command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
     ], { present: true }));
     await executor.idle();
     assert.equal(executor.stats.guestShaderModel2, true);
+    assert.equal(executor.stats.guestShaderModel3, true);
 
     const stale = makeExecutor();
     await stale.executor.submit(buildBatch([
@@ -1105,6 +1722,7 @@ await test("HELLO's feature bits report which guest DLL is loaded", async () => 
     assert.equal(stale.executor.stats.guestShaderModel2, false,
         "a pre-M2 guest must be distinguishable from one that simply drew " +
         "no shaders");
+    assert.equal(stale.executor.stats.guestShaderModel3, false);
 });
 
 await test("an empty client rect on Present keeps the last known surface size", async () => {
@@ -1131,22 +1749,56 @@ await test("an empty client rect on Present keeps the last known surface size", 
     assert.equal(state.surface.height, 480);
 });
 
-await test("frames that never clear the colour target are counted", async () => {
-    const { executor } = makeExecutor();
+await test("a frame without Clear restores the previous D3D9 back buffer",
+        async () => {
+    const { executor, fake, find } = makeExecutor();
+    // Establish the persistent image that the next Present must inherit.
     await executor.submit(buildBatch([
         command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CLEAR, u32(DEVICE, 1, 0xff102030, 0x3f800000, 0, 0)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    const backBuffer = executor.backBufferTexture;
+    assert.ok(backBuffer, "the back buffer is an executor-owned texture");
+    assert.equal(executor.stats.backBufferAllocations, 1);
+    const passCountAfterFirst =
+        fake.calls.filter(call => call[0] === "beginRenderPass").length;
+
+    await executor.submit(buildBatch([
         command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
         command(OP.SET_FVF, fvfPayload(0x2,
             [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
         command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
-        // A draw with no preceding Clear: WebGPU does not preserve the
-        // canvas across Present, so this composites over an undefined buffer.
+        // 3DMark06's loading loop follows this path: it changes a small part
+        // of the already-presented image and deliberately does not Clear.
         command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
         command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
     ], { present: true }));
     await executor.idle();
     assert.equal(executor.stats.framesWithoutColorClear, 1);
     assert.equal(executor.stats.framesWithNoOps, 0);
+    // The image is inherited because it is literally the same texture, not
+    // because anything was copied back into a fresh canvas texture.
+    assert.equal(executor.backBufferTexture, backBuffer,
+        "the second frame must draw into the same owned texture");
+    assert.equal(executor.stats.backBufferAllocations, 1,
+        "no reallocation, so nothing to restore");
+    const secondFramePasses = fake.calls
+        .filter(call => call[0] === "beginRenderPass")
+        .slice(passCountAfterFirst);
+    assert.ok(secondFramePasses.length, "the draw must open a pass");
+    assert.ok(secondFramePasses.every(call =>
+        call[1].colorAttachments.every(attachment =>
+            attachment.loadOp === "load")),
+        "a frame that never Clears must load the existing image");
+    // Present is the only place the swap chain is touched.
+    const presented = find("copyTextureToTexture")
+        .filter(call => call[1].texture === backBuffer);
+    assert.equal(presented.length, 2, "one copy to the canvas per Present");
+    assert.notEqual(presented[0][2].texture, backBuffer,
+        "the copy target is the acquired swap-chain texture");
+    assert.equal(executor.stats.backBufferPresents, 2);
 });
 
 await test("a dynamic buffer rewritten between draws does not corrupt the earlier draw", async () => {
@@ -1510,9 +2162,8 @@ await test("the stage-0 texture matrix transforms fixed-function texcoords", asy
     // And the matrix has to actually reach the uniform, after the WVP,
     // viewport and padding.
     const bindGroup = find("createBindGroup").pop()[1];
-    const write = find("writeBuffer")
-        .filter(call => call[1] === bindGroup.entries[0].resource.buffer).pop();
-    const data = new Float32Array(write[6].buffer, write[6].byteOffset, 36);
+    const block = constantBlock(find, bindGroup.entries[0].resource.buffer);
+    const data = new Float32Array(block.buffer, block.byteOffset, 36);
     assert.deepEqual([...data.slice(20, 36)], scroll);
 });
 
@@ -1567,9 +2218,8 @@ await test("fixed-function fog tints the fragment towards D3DRS_FOGCOLOR", async
 
     const bindGroup = find("createBindGroup").pop()[1];
     const pixelEntry = bindGroup.entries.find(entry => entry.binding === 1);
-    const write = find("writeBuffer")
-        .filter(call => call[1] === pixelEntry.resource.buffer).pop();
-    const data = new Float32Array(write[6].buffer, write[6].byteOffset);
+    const block = constantBlock(find, pixelEntry.resource.buffer);
+    const data = new Float32Array(block.buffer, block.byteOffset);
     const fog = data.subarray(pixelEntry.resource.offset / 4,
         pixelEntry.resource.offset / 4 + 3);
     assert.deepEqual([...fog].map(v => Math.round(v * 255)), [0x40, 0x50, 0x60],
@@ -1808,9 +2458,8 @@ const WORLD2 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 700, 800, 900, 1];
 
 function blendedVertexUniforms(find) {
     const bindGroup = find("createBindGroup").pop()[1];
-    const write = find("writeBuffer")
-        .filter(call => call[1] === bindGroup.entries[0].resource.buffer).pop();
-    return new Float32Array(write[6].buffer, write[6].byteOffset);
+    const block = constantBlock(find, bindGroup.entries[0].resource.buffer);
+    return new Float32Array(block.buffer, block.byteOffset);
 }
 
 await test("D3DRS_VERTEXBLEND poses a vertex by several world matrices",
@@ -2112,9 +2761,8 @@ await test("fixed-function lighting reaches the shader and the uniform block",
     // And the light's position must arrive already multiplied by the view
     // matrix. (1,2,3) * view = (11,22,33).
     const bindGroup = find("createBindGroup").pop()[1];
-    const write = find("writeBuffer")
-        .filter(call => call[1] === bindGroup.entries[0].resource.buffer).pop();
-    const data = new Float32Array(write[6].buffer, write[6].byteOffset);
+    const block = constantBlock(find, bindGroup.entries[0].resource.buffer);
+    const data = new Float32Array(block.buffer, block.byteOffset);
     // world_view_projection(16) viewport(4) world_view(16) normal_matrix(16)
     // material diffuse/ambient/specular/emissive(16) ambient_power(4) lights...
     const materialDiffuse = 16 + 4 + 16 + 16;
@@ -2189,9 +2837,8 @@ await test("D3DRS_LIGHTING with no NORMAL preserves ambient and emissive",
         "black pre-lit COLOR0 must not bypass ambient lighting");
 
     const bindGroup = find("createBindGroup").pop()[1];
-    const write = find("writeBuffer")
-        .filter(call => call[1] === bindGroup.entries[0].resource.buffer).pop();
-    const data = new Float32Array(write[6].buffer, write[6].byteOffset);
+    const block = constantBlock(find, bindGroup.entries[0].resource.buffer);
+    const data = new Float32Array(block.buffer, block.byteOffset);
     // world_view_projection(16) viewport(4) world_view(16) normal_matrix(16)
     const materialDiffuse = 16 + 4 + 16 + 16;
     assert.deepEqual([...data.slice(materialDiffuse + 4, materialDiffuse + 8)],
@@ -2318,9 +2965,8 @@ await test("D3DTSS_RESULTARG threads a stage result through the temp register",
     // The texture factor has to actually be uploaded, as 0xAARRGGBB.
     const bindGroup = find("createBindGroup").pop()[1];
     const pixelEntry = bindGroup.entries.find(entry => entry.binding === 1);
-    const write = find("writeBuffer")
-        .filter(call => call[1] === pixelEntry.resource.buffer).pop();
-    const data = new Float32Array(write[6].buffer, write[6].byteOffset);
+    const block = constantBlock(find, pixelEntry.resource.buffer);
+    const data = new Float32Array(block.buffer, block.byteOffset);
     const factor = [...data.slice(pixelEntry.resource.offset / 4,
         pixelEntry.resource.offset / 4 + 4)].map(v => Math.round(v * 255));
     assert.deepEqual(factor, [0x40, 0x20, 0x10, 0x80],
@@ -2366,16 +3012,16 @@ await test("a render target redirects the pass and keys its own pipeline",
         command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
         // Into the texture...
         command(OP.SET_RENDER_TARGET, u32(DEVICE, 0, 0x501, 0)),
-        command(OP.SET_DEPTH_STENCIL_SURFACE,
-            u32(DEVICE, 0, 0, 0)), // v1.0 payload: no depth surface with it
+        command(OP.SET_DEPTH_STENCIL_SURFACE_LEVEL,
+            u32(DEVICE, 0, 0, 0, 0)),
         command(OP.SET_VIEWPORT, u32(DEVICE, 0, 0, 256, 256, 0, 0x3f800000, 0)),
         command(OP.CLEAR, u32(DEVICE, 1, 0xff112233, 0, 0, 0)),
         command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
         // ...and back to the back buffer, restoring the implicit depth surface
         // (D9WG_AUTO_DEPTH_STENCIL_HANDLE) the way an app that saved it does.
         command(OP.SET_RENDER_TARGET, u32(DEVICE, 0, 0, 0)),
-        command(OP.SET_DEPTH_STENCIL_SURFACE,
-            u32(DEVICE, 0xffffffff, 640, 480)),
+        command(OP.SET_DEPTH_STENCIL_SURFACE_LEVEL,
+            u32(DEVICE, 0xffffffff, 0, 640, 480)),
         command(OP.SET_VIEWPORT, u32(DEVICE, 0, 0, 640, 480, 0, 0x3f800000, 0)),
         command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
         command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
@@ -2404,37 +3050,190 @@ await test("a render target redirects the pass and keys its own pipeline",
     assert.equal(executor.stats.renderPasses, passes.length);
 });
 
-await test("a v1.0 depth-surface command still binds texture level zero",
+await test("a pre-1.3 batch is rejected before any command executes",
         async () => {
+    const { executor } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+    ], { versionMinor: 2 }));
+    await executor.idle();
+    assert.match(executor.failed && executor.failed.message,
+        /unsupported D9WG version 1\.2/);
+    assert.equal(executor.stats.malformedBatches, 1);
+    assert.equal(executor.devices.size, 0,
+        "an obsolete DLL must not partially initialize host state");
+});
+
+await test("a short pre-1.3 device payload is not decoded as 1.3", async () => {
+    const { executor } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, Buffer.alloc(44)),
+    ]));
+    await executor.idle();
+    assert.match(executor.failed && executor.failed.message,
+        /CREATE_DEVICE payload is not protocol 1\.3/);
+    assert.equal(executor.stats.malformedBatches, 1);
+    assert.equal(executor.devices.size, 0);
+});
+
+await test("a depth texture sampled by a pixel shader becomes a shadow map",
+        async () => {
+    const D3DUSAGE_DEPTHSTENCIL = 2;
+    const D3DFMT_D24S8 = 75;
     const { executor, find } = makeExecutor();
+    const ps = shaderCreatePayload(0x40000003, PS_BYTECODE);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x502, 1024, 1024, 1, D3DFMT_D24S8,
+                D3DUSAGE_DEPTHSTENCIL, 0)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.CREATE_PIXEL_SHADER, ps.payload, ps.blob, ps.blobOffsetField),
+        command(OP.SET_PIXEL_SHADER, u32(DEVICE, 0x40000003)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x502, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    // The regression this guards: the depth resource carried a null view, the
+    // null reached createBindGroup as a binding resource, and the TypeError it
+    // threw took the whole batch down with it.
+    assert.equal(executor.stats.commandsFailed, 0,
+        "sampling a depth texture must not throw out of its command");
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.depthStageWithoutDepthTexture, 0);
+
+    const layout = find("createBindGroupLayout").pop()[1];
+    const textureEntry = layout.entries.find(entry => entry.binding === 2);
+    const samplerEntry = layout.entries.find(entry => entry.binding === 3);
+    assert.equal(textureEntry.texture.sampleType, "depth");
+    assert.equal(samplerEntry.sampler.type, "comparison");
+    assert.ok(find("createSampler").some(call =>
+        call[1].compare === "less-equal"),
+        "a shadow map is read through a comparison sampler");
+
+    // The module and the layout have to agree: a texture_2d<f32> paired with a
+    // depth layout entry fails pipeline creation outright.
+    assert.ok(find("createShaderModule").some(call =>
+        call[1].code.includes("texture_depth_2d") &&
+        call[1].code.includes("sampler_comparison")),
+        "the pixel stage must be translated to a comparison sample");
+});
+
+await test("a shadow map still bound as the depth attachment is not sampled",
+        async () => {
+    const D3DUSAGE_DEPTHSTENCIL = 2;
+    const D3DFMT_D24S8 = 75;
+    const { executor } = makeExecutor();
+    const ps = shaderCreatePayload(0x40000003, PS_BYTECODE);
     await executor.submit(buildBatch([
         command(OP.CREATE_DEVICE, createDevicePayload(640, 480, 0)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
         command(OP.CREATE_TEXTURE_2D,
-            u32(DEVICE, 0x504, 640, 480, 3, 75, 2, 0)),
+            u32(DEVICE, 0x502, 640, 480, 1, D3DFMT_D24S8,
+                D3DUSAGE_DEPTHSTENCIL, 0)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.CREATE_PIXEL_SHADER, ps.payload, ps.blob, ps.blobOffsetField),
+        command(OP.SET_PIXEL_SHADER, u32(DEVICE, 0x40000003)),
+        // Attachment and sampler at once: legal enough in D3D9, a submit-level
+        // validation error in WebGPU.
+        command(OP.SET_DEPTH_STENCIL_SURFACE_LEVEL,
+            u32(DEVICE, 0x502, 0, 640, 480)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x502, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(executor.stats.commandsFailed, 0);
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.depthAttachmentSampledInPlace, 1,
+        "the read-write hazard must degrade the stage, not the submit");
+});
+
+await test("a depth texture on a fixed-function stage reads the white fallback",
+        async () => {
+    const D3DUSAGE_DEPTHSTENCIL = 2;
+    const D3DFMT_D24S8 = 75;
+    const { executor } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x502, 256, 256, 1, D3DFMT_D24S8,
+                D3DUSAGE_DEPTHSTENCIL, 0)),
+        command(OP.SET_FVF, fvfPayload(0x102,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+             element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x502, 0)),
+        // COLOROP = MODULATE with ARG1 = TEXTURE, so the cascade samples.
+        command(OP.SET_TEXTURE_STAGE_STATE, u32(DEVICE, 0, 1, 4)),
+        command(OP.SET_TEXTURE_STAGE_STATE, u32(DEVICE, 0, 2, 2)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    // Fixed function has no comparison reference to offer, so the stage cannot
+    // be a shadow map. It has to degrade to the white fallback rather than
+    // reach a float layout entry with a depth view, which is invalid.
+    assert.equal(executor.stats.commandsFailed, 0);
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.depthTextureOnNonDepthStage, 1);
+});
+
+await test("one failing command does not discard the rest of its batch",
+        async () => {
+    const { executor, fake } = makeExecutor();
+    // Force a runtime failure that is not a framing error, the way a bad
+    // binding resource used to be one.
+    executor.handlers[OP.SET_RENDER_STATE] = () => {
+        throw new Error("synthetic command failure");
+    };
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, 27, 1, 0)),
         command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
         command(OP.SET_FVF, fvfPayload(0x2,
             [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
         command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
-        // The frozen v1.0 wire payload has no level field. It always means the
-        // top level, even when the texture itself contains more mip levels.
-        command(OP.SET_DEPTH_STENCIL_SURFACE,
-            u32(DEVICE, 0x504, 640, 480)),
         command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
         command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
-    ], { present: true, versionMinor: 0 }));
+    ], { present: true }));
     await executor.idle();
 
+    assert.equal(executor.stats.commandsFailed, 1);
+    assert.equal(executor.failed, null,
+        "one bad command is not a bad batch");
     assert.equal(executor.stats.droppedDraws, 0);
-    const pass = find("beginRenderPass").find(call =>
-        call[1].depthStencilAttachment);
-    assert.ok(pass, "the stale guest's level-zero depth surface must bind");
-    assert.deepEqual(pass[1].depthStencilAttachment.view.descriptor, {
-        baseMipLevel: 0,
-        mipLevelCount: 1,
-        dimension: "2d",
-        baseArrayLayer: 0,
-        arrayLayerCount: 1,
-    });
+    const pass = fake.calls.filter(call => call[0] === "beginRenderPass").pop()[2];
+    assert.ok(pass.ops.some(op => op[0] === "draw"),
+        "commands queued behind the failure must still execute");
+});
+
+await test("a framing error still fails the whole batch", async () => {
+    const { executor } = makeExecutor();
+    const vs = shaderCreatePayload(0x40000015, VS_BYTECODE);
+    const batch = buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_VERTEX_SHADER, vs.payload, vs.blob, vs.blobOffsetField),
+    ]);
+    batch.writeUInt32LE(0x10000, batch.indexOf(vs.payload, 32) + 8);
+    await executor.submit(batch);
+    await executor.idle();
+
+    // The per-command guard must not swallow this: a blob reaching past the
+    // record means the byte layout itself is wrong, so nothing in the batch
+    // can be trusted -- unlike a command that simply could not be carried out.
+    assert.ok(executor.failed, "a malformed stream must still fail the batch");
+    assert.equal(executor.stats.commandsFailed, 0);
 });
 
 await test("a D24S8 mip is used as the explicit depth attachment",
@@ -2467,8 +3266,9 @@ await test("a D24S8 mip is used as the explicit depth attachment",
     assert.ok(creation, "CreateTexture(D24S8) must allocate a GPU depth target");
     assert.equal(creation[1].format, "depth24plus-stencil8");
     assert.equal(creation[1].mipLevelCount, 4);
-    assert.equal(creation[1].usage, 0x10,
-        "a depth texture is an attachment, not a sampled colour texture");
+    assert.equal(creation[1].usage, 0x14,
+        "a depth texture is a render attachment AND sampleable: D3D9 shadow " +
+        "mapping renders into it and then binds it to a sampler");
 
     const pass = find("beginRenderPass").find(call =>
         call[1].depthStencilAttachment);
@@ -2521,6 +3321,455 @@ await test("an out-of-range depth mip is rejected at binding without invalidatin
         "an invalid mip must be dropped before render-pass validation");
 });
 
+await test("an oversized depth surface still depth-tests a smaller target",
+        async () => {
+    const D3DUSAGE_DEPTHSTENCIL = 2;
+    const D3DUSAGE_RENDERTARGET = 1;
+    const D3DFMT_D24S8 = 75;
+    const D3DFMT_A16B16G16R16F = 113;
+    const { executor, fake } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480, 0)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        // The render-to-texture idiom D3D9 allows and WebGPU does not: one
+        // full-size depth surface reused by a half-resolution HDR pass.
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0xC01, 640, 480, 1, D3DFMT_D24S8,
+                D3DUSAGE_DEPTHSTENCIL, 0)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0xC02, 320, 240, 1, D3DFMT_A16B16G16R16F,
+                D3DUSAGE_RENDERTARGET, 0)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_RENDER_TARGET, u32(DEVICE, 0, 0xC02, 0, 0)),
+        command(OP.SET_DEPTH_STENCIL_SURFACE_LEVEL,
+            u32(DEVICE, 0xC01, 0, 640, 480)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.commandsFailed, 0);
+    assert.equal(executor.stats.depthTargetSubstitutions, 1);
+    // The point of the substitution: the pass keeps depth testing. Running it
+    // with no depth attachment lets every blended draw paint over geometry
+    // that should have occluded it, which reads as a washed-out translucent
+    // frame rather than as an error.
+    const pass = fake.calls.filter(call => call[0] === "beginRenderPass")
+        .map(call => call[1])
+        .find(descriptor => descriptor.depthStencilAttachment);
+    assert.ok(pass, "the half-resolution pass must still have depth");
+    const substitute = fake.calls.filter(call => call[0] === "createTexture")
+        .find(call => call[1].label &&
+            call[1].label.startsWith("D3D9 substitute depth"));
+    assert.ok(substitute, "a matching depth texture has to be allocated");
+    assert.equal(substitute[1].size.width, 320);
+    assert.equal(substitute[1].size.height, 240);
+    // Nothing was lost -- the draw did not depth-test against contents an
+    // earlier pass wrote -- so the substitution must not be reported as one.
+    assert.equal(executor.stats.depthTargetSubstitutionsUncleared, 0);
+});
+
+await test("an uncleared oversized-depth pass is reported, a cleared one is not",
+        async () => {
+    const D3DUSAGE_DEPTHSTENCIL = 2;
+    const D3DUSAGE_RENDERTARGET = 1;
+    const D3DFMT_D24S8 = 75;
+    const D3DFMT_A8R8G8B8 = 21;
+    const D3DRS_ZENABLE = 7;
+    const D3DCLEAR_ZBUFFER = 2;
+    const setup = () => [
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480, 0)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0xF01, 640, 480, 1, D3DFMT_D24S8, D3DUSAGE_DEPTHSTENCIL, 0)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0xF02, 320, 240, 1, D3DFMT_A8R8G8B8, D3DUSAGE_RENDERTARGET, 0)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_ZENABLE, 1, 0)),
+        command(OP.SET_RENDER_TARGET, u32(DEVICE, 0, 0xF02, 0, 0)),
+        command(OP.SET_DEPTH_STENCIL_SURFACE_LEVEL, u32(DEVICE, 0xF01, 0, 640, 480)),
+    ];
+
+    // Clearing depth on entry is what render-to-texture does, and it makes the
+    // stand-in exactly equivalent to the surface it replaced.
+    {
+        const { executor } = makeExecutor();
+        await executor.submit(buildBatch([
+            ...setup(),
+            command(OP.CLEAR, u32(DEVICE, D3DCLEAR_ZBUFFER, 0, 0x3f800000, 0)),
+            command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+            command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+        ], { present: true }));
+        await executor.idle();
+        // Counted per target resolution, and both the Clear and the draw
+        // resolve, so the interesting number is the second one.
+        assert.ok(executor.stats.depthTargetSubstitutions >= 1);
+        assert.equal(executor.stats.depthTargetSubstitutionsUncleared, 0,
+            "a cleared substitute loses nothing and must stay quiet");
+    }
+
+    // Depth-testing without clearing reads a stand-in that never received what
+    // an earlier pass wrote, which is the case worth reporting.
+    {
+        const { executor } = makeExecutor();
+        await executor.submit(buildBatch([
+            ...setup(),
+            command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+            command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+        ], { present: true }));
+        await executor.idle();
+        assert.equal(executor.stats.depthTargetSubstitutionsUncleared, 1);
+    }
+});
+
+await test("an autogen texture allocates the chain and fills it after a write",
+        async () => {
+    const D3DUSAGE_AUTOGENMIPMAP = 0x400;
+    const D3DFMT_A8R8G8B8 = 21;
+    const { executor, fake, find } = makeExecutor();
+    const ps = shaderCreatePayload(0x40000003, PS_BYTECODE);
+    // The guest reports one level, which is what D3D9's GetLevelCount says for
+    // an autogen texture; the chain lives entirely on this side.
+    const update = Buffer.alloc(48);
+    update.writeUInt32LE(0xE01, 0);
+    update.writeUInt32LE(8, 20);   // width
+    update.writeUInt32LE(8, 24);   // height
+    update.writeUInt32LE(1, 28);
+    update.writeUInt32LE(32, 32);  // row pitch
+    update.writeUInt32LE(256, 40);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0xE01, 8, 8, 1, D3DFMT_A8R8G8B8,
+                D3DUSAGE_AUTOGENMIPMAP, 0)),
+        command(OP.UPDATE_TEXTURE, update, Buffer.alloc(256, 0x80), 44),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.CREATE_PIXEL_SHADER, ps.payload, ps.blob, ps.blobOffsetField),
+        command(OP.SET_PIXEL_SHADER, u32(DEVICE, 0x40000003)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0xE01, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(executor.stats.commandsFailed, 0);
+    assert.equal(executor.stats.droppedDraws, 0);
+    const created = find("createTexture").find(call =>
+        call[1].size && call[1].size.width === 8)[1];
+    assert.equal(created.mipLevelCount, 4, "8x8 is a four-level chain");
+    assert.ok(created.usage & 0x10,
+        "each level is rendered from the one above, so it is an attachment");
+
+    // The chain has to be filled between the upload and the draw that samples
+    // it -- not at some later point, and not never.
+    assert.equal(executor.stats.mipChainsGenerated, 1);
+    assert.equal(executor.stats.mipLevelsGenerated, 3, "levels 1..3");
+    // And it must not be reported as an incomplete upload: the app only ever
+    // supplies level 0 by design.
+    assert.equal(executor.stats.drawsWithIncompleteMipChain, 0);
+});
+
+await test("an autogen chain is regenerated only when level 0 changes",
+        async () => {
+    const D3DUSAGE_AUTOGENMIPMAP = 0x400;
+    const D3DFMT_A8R8G8B8 = 21;
+    const { executor } = makeExecutor();
+    const ps = shaderCreatePayload(0x40000003, PS_BYTECODE);
+    // A factory, not an array: buildBatch() stamps size/offset onto each
+    // command object, so reusing one twice rewrites the first copy's framing.
+    const draw = () => [
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0xE02, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+    ];
+    const update = Buffer.alloc(48);
+    update.writeUInt32LE(0xE02, 0);
+    update.writeUInt32LE(8, 20);
+    update.writeUInt32LE(8, 24);
+    update.writeUInt32LE(1, 28);
+    update.writeUInt32LE(32, 32);
+    update.writeUInt32LE(256, 40);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0xE02, 8, 8, 1, D3DFMT_A8R8G8B8,
+                D3DUSAGE_AUTOGENMIPMAP, 0)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.CREATE_PIXEL_SHADER, ps.payload, ps.blob, ps.blobOffsetField),
+        command(OP.SET_PIXEL_SHADER, u32(DEVICE, 0x40000003)),
+        command(OP.UPDATE_TEXTURE, update, Buffer.alloc(256, 0x80), 44),
+        ...draw(),
+        // Sampling again without touching level 0 must not rebuild anything.
+        ...draw(),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.mipChainsGenerated, 1,
+        "a clean chain is not rebuilt on every draw");
+
+    // An explicit GenerateMipSubLevels rebuilds regardless.
+    await executor.submit(buildBatch([
+        command(OP.GENERATE_MIPS, u32(DEVICE, 0xE02)),
+    ]));
+    await executor.idle();
+    assert.equal(executor.stats.explicitMipGenerations, 1);
+    assert.equal(executor.stats.mipChainsGenerated, 2);
+});
+
+await test("two depth surfaces of one size get separate substitutes",
+        async () => {
+    const D3DUSAGE_DEPTHSTENCIL = 2;
+    const D3DUSAGE_RENDERTARGET = 1;
+    const D3DFMT_D24S8 = 75;
+    const D3DFMT_A8R8G8B8 = 21;
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480, 0)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        // Two full-size depth surfaces, two half-size targets. Sharing one
+        // substitute across both passes would let them depth-test against
+        // each other's fragments.
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0xD01, 640, 480, 1, D3DFMT_D24S8, D3DUSAGE_DEPTHSTENCIL, 0)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0xD02, 640, 480, 1, D3DFMT_D24S8, D3DUSAGE_DEPTHSTENCIL, 0)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0xD03, 320, 240, 1, D3DFMT_A8R8G8B8, D3DUSAGE_RENDERTARGET, 0)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.SET_RENDER_TARGET, u32(DEVICE, 0, 0xD03, 0, 0)),
+        command(OP.SET_DEPTH_STENCIL_SURFACE_LEVEL, u32(DEVICE, 0xD01, 0, 640, 480)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.SET_DEPTH_STENCIL_SURFACE_LEVEL, u32(DEVICE, 0xD02, 0, 640, 480)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.depthTargetSubstitutions, 2);
+    const substitutes = find("createTexture").filter(call =>
+        call[1].label && call[1].label.startsWith("D3D9 substitute depth"));
+    assert.equal(substitutes.length, 2,
+        "each depth surface needs its own stand-in, not one shared by size");
+});
+
+await test("packed 4:2:2 and RGBG formats expand two pixels per block",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const D3DFMT_YUY2 = 0x32595559;
+    const D3DFMT_UYVY = 0x59565955;
+    const D3DFMT_R8G8_B8G8 = 0x47424752;
+    const D3DFMT_G8R8_G8B8 = 0x42475247;
+    // BT.601 studio swing: Y=16 is black, Y=235 white, neutral chroma at 128.
+    const cases = [
+        // Y0 U Y1 V -- black then white, both neutral.
+        { name: "YUY2", format: D3DFMT_YUY2, source: [16, 128, 235, 128] },
+        // U Y0 V Y1 -- same two pixels, chroma first.
+        { name: "UYVY", format: D3DFMT_UYVY, source: [128, 16, 128, 235] },
+        // R G0 B G1 -- shared red and blue, per-pixel green.
+        { name: "RGBG", format: D3DFMT_R8G8_B8G8, source: [10, 0, 30, 255],
+          expected: [[10, 0, 30, 255], [10, 255, 30, 255]] },
+        // G0 R G1 B -- the same pair, bytes reordered.
+        { name: "GRGB", format: D3DFMT_G8R8_G8B8, source: [0, 10, 255, 30],
+          expected: [[10, 0, 30, 255], [10, 255, 30, 255]] },
+    ];
+    const commands = [command(OP.CREATE_DEVICE, createDevicePayload(640, 480))];
+    cases.forEach((item, index) => {
+        const handle = 0x900 + index;
+        const source = Buffer.from(item.source);
+        const update = Buffer.alloc(48);
+        update.writeUInt32LE(handle, 0);
+        update.writeUInt32LE(2, 20); // width: one block is two pixels
+        update.writeUInt32LE(1, 24); // height
+        update.writeUInt32LE(1, 28); // depth
+        update.writeUInt32LE(4, 32); // row pitch
+        update.writeUInt32LE(4, 40); // data bytes
+        commands.push(command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, handle, 2, 1, 1, item.format, 0, 1)));
+        commands.push(command(OP.UPDATE_TEXTURE, update, source, 44));
+    });
+    await executor.submit(buildBatch(commands));
+    await executor.idle();
+
+    assert.equal(executor.stats.texturesRejected, 0,
+        "every packed format must be accepted");
+    const writes = find("writeTexture").slice(-cases.length);
+    cases.forEach((item, index) => {
+        const data = Array.from(writes[index][2]);
+        assert.equal(data.length, 8, item.name + ": two RGBA8 pixels");
+        if (item.expected) {
+            assert.deepEqual(data, item.expected.flat(),
+                item.name + ": the pair shares chroma and differs in green");
+            return;
+        }
+        // YUV: neutral chroma means grey, and the two luma values must not
+        // come out equal -- that is the failure a naive "use byte 0 twice"
+        // expansion produces, and it looks like a plausible dark image.
+        assert.ok(data[0] < 40 && data[1] < 40 && data[2] < 40,
+            item.name + ": Y=16 is black, got " + data.slice(0, 3));
+        assert.ok(data[4] > 215 && data[5] > 215 && data[6] > 215,
+            item.name + ": Y=235 is white, got " + data.slice(4, 7));
+    });
+});
+
+await test("a palette change repaints P8 textures without a re-upload",
+        async () => {
+    const D3DFMT_P8 = 41;
+    const { executor, find } = makeExecutor();
+    const paletteCommand = (index, colorFor) => {
+        const payload = Buffer.alloc(16);
+        payload.writeUInt32LE(DEVICE, 0);
+        payload.writeUInt32LE(index, 4);
+        payload.writeUInt32LE(256, 8);
+        const blob = Buffer.alloc(256 * 4);
+        for (let entry = 0; entry < 256; ++entry)
+            blob.writeUInt32LE(colorFor(entry) >>> 0, entry * 4);
+        return command(OP.SET_PALETTE, payload, blob, 12);
+    };
+    // Index 1 is opaque red under palette 0, opaque blue under palette 1.
+    const indices = Buffer.from([1, 1, 1, 1]);
+    const update = Buffer.alloc(48);
+    update.writeUInt32LE(0xA01, 0);
+    update.writeUInt32LE(2, 20);
+    update.writeUInt32LE(2, 24);
+    update.writeUInt32LE(1, 28);
+    update.writeUInt32LE(2, 32);  // row pitch: one byte per texel
+    update.writeUInt32LE(4, 40);
+
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        paletteCommand(0, entry => entry === 1 ? 0xffff0000 : 0xff000000),
+        paletteCommand(1, entry => entry === 1 ? 0xff0000ff : 0xff000000),
+        command(OP.SET_CURRENT_PALETTE, u32(DEVICE, 0)),
+        command(OP.CREATE_TEXTURE_2D, u32(DEVICE, 0xA01, 2, 2, 1, D3DFMT_P8, 0, 1)),
+        command(OP.UPDATE_TEXTURE, update, indices, 44),
+    ]));
+    await executor.idle();
+
+    assert.equal(executor.stats.palettesSet, 2);
+    assert.equal(executor.stats.texturesRejected, 0);
+    const first = Array.from(find("writeTexture").pop()[2]).slice(0, 4);
+    assert.deepEqual(first, [255, 0, 0, 255],
+        "palette 0 makes index 1 red");
+
+    // The whole point of a palettized format: switching tables repaints the
+    // texture with no new upload from the guest.
+    const uploadsBefore = executor.stats.textureUploads;
+    await executor.submit(buildBatch([
+        command(OP.SET_CURRENT_PALETTE, u32(DEVICE, 1)),
+    ]));
+    await executor.idle();
+
+    assert.equal(executor.stats.textureUploads, uploadsBefore,
+        "a palette swap is not a guest upload");
+    assert.equal(executor.stats.palettizedRepaints, 1);
+    const second = Array.from(find("writeTexture").pop()[2]).slice(0, 4);
+    assert.deepEqual(second, [0, 0, 255, 255],
+        "palette 1 makes the same indices blue");
+});
+
+await test("FOURCC depth textures read the stored value, not a comparison",
+        async () => {
+    const D3DFMT_INTZ = 0x5A544E49;
+    const { executor, find } = makeExecutor();
+    const ps = shaderCreatePayload(0x40000003, PS_BYTECODE);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        // INTZ is routinely created with usage 0 and then used as depth.
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0xB01, 256, 256, 1, D3DFMT_INTZ, 0, 0)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.CREATE_PIXEL_SHADER, ps.payload, ps.blob, ps.blobOffsetField),
+        command(OP.SET_PIXEL_SHADER, u32(DEVICE, 0x40000003)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0xB01, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(executor.stats.commandsFailed, 0);
+    assert.equal(executor.stats.droppedDraws, 0);
+    const created = find("createTexture").find(call =>
+        call[1].label === "D3D9 depth surface");
+    assert.ok(created, "a FOURCC depth format allocates a depth target");
+
+    // Depth sample type, but an ordinary sampler: a raw fetch does not compare.
+    const layout = find("createBindGroupLayout").pop()[1];
+    assert.equal(layout.entries.find(e => e.binding === 2).texture.sampleType,
+        "depth");
+    assert.equal(layout.entries.find(e => e.binding === 3).sampler.type,
+        "non-filtering",
+        "an INTZ fetch reads through a plain sampler, not a comparison one");
+    assert.ok(find("createShaderModule").some(call =>
+        call[1].code.includes("texture_depth_2d") &&
+        !call[1].code.includes("sampler_comparison")),
+        "the stage must be a depth fetch, not a shadow-map comparison");
+});
+
+await test("a cube render target attaches one face per pass", async () => {
+    const D3DUSAGE_RENDERTARGET = 1;
+    const { executor, fake, find } = makeExecutor();
+    // SetRenderTarget with the protocol-1.4 face field.
+    const setCubeTarget = face =>
+        command(OP.SET_RENDER_TARGET, u32(DEVICE, 0, 0x601, 0, face));
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(0x111, u32(DEVICE, 0x601, 64, 1, 21, D3DUSAGE_RENDERTARGET, 0, 0)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        // The environment-map idiom: render the scene once per face.
+        ...[0, 1, 2, 3, 4, 5].flatMap(face => [
+            setCubeTarget(face),
+            command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        ]),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.commandsFailed, 0);
+    const created = find("createTexture").find(call =>
+        call[1].label === "D3D9 cube 64")[1];
+    assert.ok(created.usage & 0x10,
+        "a cube render target needs the attachment usage");
+
+    // Six distinct attachment views, one per layer. Before the face reached
+    // the host every one of these was layer 0, so five faces of an environment
+    // map were painted over the first.
+    const attachmentLayers = find("createView")
+        .filter(call => call[2] && call[2].arrayLayerCount === 1 &&
+            call[2].mipLevelCount === 1)
+        .map(call => call[2].baseArrayLayer);
+    for (const face of [0, 1, 2, 3, 4, 5])
+        assert.ok(attachmentLayers.includes(face),
+            "face " + face + " must get its own attachment view");
+    assert.equal(executor.stats.cubeFaceTargetBinds, 5,
+        "faces 1..5 are non-zero binds");
+
+    // And they must not be merged into one pass: same texture, different
+    // subresource, so the pass key has to separate them.
+    const passes = fake.calls.filter(call => call[0] === "beginRenderPass");
+    assert.ok(passes.length >= 6,
+        "each face is its own render pass, got " + passes.length);
+});
+
 await test("a cube texture binds as a cube view and uploads per face",
         async () => {
     const { executor, find } = makeExecutor();
@@ -2561,7 +3810,8 @@ await test("a cube texture binds as a cube view and uploads per face",
     assert.equal(executor.stats.drawsWithIncompleteMipChain, 0,
         "all six faces of the single level were uploaded");
 
-    const created = find("createTexture").pop()[1];
+    const created = find("createTexture").find(call =>
+        call[1].label === "D3D9 cube 4")[1];
     assert.equal(created.size.depthOrArrayLayers, 6,
         "a cube is six array layers");
     assert.ok(find("createView").some(call =>
@@ -2606,6 +3856,47 @@ await test("legacy D3D9 texture formats preserve colour and signed bump values",
           expected: [0x55, 0x55, 0x55, 0xaa] },
         { format: 81, gpu: "rgba16float", source: [0x00, 0x80],
           expected: [...halfHalf, ...halfHalf, ...halfHalf, ...halfOne] },
+        // 10:10:10:2 and 16-bit integer formats are expanded to RGBA16F so
+        // sampling and blending preserve their precision and component order.
+        { format: 31, gpu: "rgba16float", source: [0xff, 0x03, 0x00, 0xc0],
+          expected: [...halfOne, ...halfZero, ...halfZero, ...halfOne] },
+        { format: 35, gpu: "rgba16float", source: [0x00, 0x00, 0xf0, 0xff],
+          expected: [...halfOne, ...halfZero, ...halfZero, ...halfOne] },
+        { format: 34, gpu: "rgba16float", source: [0x00, 0x80, 0xff, 0xff],
+          expected: [...halfHalf, ...halfOne, ...halfZero, ...halfOne] },
+        { format: 36, gpu: "rgba16float",
+          source: [0x00, 0x00, 0x00, 0x80, 0xff, 0xff, 0xff, 0xff],
+          expected: [...halfZero, ...halfHalf, ...halfOne, ...halfOne] },
+        // D3D half-float texels already have the exact representation WebGPU
+        // needs; missing channels receive D3D's documented (0,0,1) defaults.
+        { format: 111, gpu: "rgba16float", source: halfHalf,
+          expected: [...halfHalf, ...halfZero, ...halfZero, ...halfOne] },
+        { format: 112, gpu: "rgba16float",
+          source: [...halfHalf, ...halfOne],
+          expected: [...halfHalf, ...halfOne, ...halfZero, ...halfOne] },
+        { format: 113, gpu: "rgba16float",
+          source: [...halfHalf, ...halfZero, ...halfOne, ...halfOne],
+          expected: [...halfHalf, ...halfZero, ...halfOne, ...halfOne] },
+        // WebGPU has native 32-bit float texture formats.  Their texels must
+        // remain bit-exact: CPU conversion would both waste time and destroy
+        // NaN/Inf payloads an HDR post-process is entitled to preserve.
+        { format: 114, gpu: "r32float",
+          source: [0x00, 0x00, 0x00, 0x3f],
+          expected: [0x00, 0x00, 0x00, 0x3f] },
+        { format: 115, gpu: "rg32float",
+          source: [0x00, 0x00, 0x00, 0x3f,
+                   0x00, 0x00, 0x80, 0x3f],
+          expected: [0x00, 0x00, 0x00, 0x3f,
+                     0x00, 0x00, 0x80, 0x3f] },
+        { format: 116, gpu: "rgba32float",
+          source: [0x00, 0x00, 0x00, 0x3f,
+                   0x00, 0x00, 0x80, 0x3f,
+                   0x00, 0x00, 0x00, 0x40,
+                   0x00, 0x00, 0x40, 0x40],
+          expected: [0x00, 0x00, 0x00, 0x3f,
+                     0x00, 0x00, 0x80, 0x3f,
+                     0x00, 0x00, 0x00, 0x40,
+                     0x00, 0x00, 0x40, 0x40] },
         { format: 60, gpu: "rgba8snorm", source: [0x80, 0x7f],
           expected: [0x80, 0x7f, 0x7f, 0x7f] },
         { format: 63, gpu: "rgba8snorm", source: [0x80, 0xc0, 0x40, 0x7f],
@@ -2654,6 +3945,68 @@ await test("legacy D3D9 texture formats preserve colour and signed bump values",
     });
 });
 
+await test("HDR render targets use a blendable rgba16float attachment",
+        async () => {
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x76f, 320, 180, 1, 113, 1, 0)),
+        command(OP.SET_RENDER_TARGET, u32(DEVICE, 0, 0x76f, 0)),
+        command(OP.CLEAR, u32(DEVICE, 1, 0xff102030, 0x3f800000, 0, 0)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.texturesRejected, 0);
+    const texture = find("createTexture").find(call =>
+        call[1].label === "D3D9 render target");
+    assert.ok(texture, "A16B16G16R16F must allocate a render target");
+    assert.equal(texture[1].format, "rgba16float");
+    assert.ok(texture[1].usage & 0x10,
+        "the HDR texture must carry RENDER_ATTACHMENT usage");
+    assert.ok(find("beginRenderPass").some(call =>
+        call[1].colorAttachments?.[0]?.view?.texture === texture[2]));
+});
+
+await test("FP32 textures use unfilterable bindings on baseline WebGPU",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const tss = (stage, state, value) =>
+        command(0x202, u32(DEVICE, stage, state, value));
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x780, 1, 60)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x781, 4, 4, 1, 114 /* R32F */, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x104, [
+            element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+            element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD, 0)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x780, 20)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 0, 0x781, 0)),
+        // Ask for linear filtering.  A baseline device without the optional
+        // float32-filterable feature must legally degrade this one sampler to
+        // nearest instead of creating an invalid bind group.
+        command(OP.SET_SAMPLER_STATE, u32(DEVICE, 0, 5, 2)),
+        command(OP.SET_SAMPLER_STATE, u32(DEVICE, 0, 6, 2)),
+        tss(0, D3DTSS.COLOROP, D3DTOP.SELECTARG1),
+        tss(0, D3DTSS.COLORARG1, D3DTA.TEXTURE),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.droppedDraws, 0);
+    const layout = find("createBindGroupLayout").find(call =>
+        call[1].entries.some(entry => entry.binding === 2));
+    assert.ok(layout, "sampled FP32 draw needs a texture binding layout");
+    assert.equal(layout[1].entries.find(entry => entry.binding === 2)
+        .texture.sampleType, "unfilterable-float");
+    assert.equal(layout[1].entries.find(entry => entry.binding === 3)
+        .sampler.type, "non-filtering");
+    const sampler = find("createSampler").pop()[1];
+    assert.equal(sampler.minFilter, "nearest");
+    assert.equal(sampler.magFilter, "nearest");
+});
+
 await test("signed textures reject render-target use but keep direct copies",
         async () => {
     const { executor, find } = makeExecutor();
@@ -2690,7 +4043,9 @@ await test("signed textures reject render-target use but keep direct copies",
         "same-size same-format signed textures can use a GPU copy");
     assert.equal(executor.stats.blitsSkipped, 1,
         "scaling cannot render into an rgba8snorm texture");
-    assert.equal(find("copyTextureToTexture").length, 1);
+    // Present's own back-buffer-to-canvas copy is not one of the blits.
+    assert.equal(find("copyTextureToTexture").filter(call =>
+        call[1].texture !== executor.backBufferTexture).length, 1);
     assert.ok(!find("createTexture").some(call =>
         call[1].format === "rgba8snorm" && (call[1].usage & 0x10)),
         "rgba8snorm must never request RENDER_ATTACHMENT");
@@ -2901,35 +4256,99 @@ await test("a viewport clips, and carries its D3D9 depth range", async () => {
         [64, 48, 128, 96, 0.25, 0.5]);
 });
 
-await test("a new guest session releases the previous process's resources",
+await test("concurrent guest sessions keep colliding handles isolated",
         async () => {
     const { executor } = makeExecutor();
-    const hello = session => {
+    const hello = (low, high) => {
         const payload = Buffer.alloc(16);
         payload.writeUInt32LE(32, 0);
-        payload.writeUInt32LE(1, 4); // D9WG_FEATURE_SHADER_MODEL_2
-        payload.writeUInt32LE(session, 8);
-        payload.writeUInt32LE(0, 12);
+        payload.writeUInt32LE(3, 4); // SM2 | SM3
+        payload.writeUInt32LE(low, 8);
+        payload.writeUInt32LE(high, 12);
         return command(OP.HELLO, payload);
     };
     await executor.submit(buildBatch([
-        hello(0xabcd),
+        hello(0x1001, 0xfedcba98),
         command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
         command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
-    ]));
+    ], { sessionLow: 0x1001, sessionHigh: 0xfedcba98 }));
     await executor.idle();
     assert.equal(executor.resources.size, 1);
     assert.equal(executor.stats.sessionChanges, 0);
+    assert.equal(executor.resources.get(0x201).byteCount, 96);
 
-    // A different process reuses the same numeric handles for different
-    // objects; keeping the old entries would let one process draw with the
-    // other's geometry.
-    await executor.submit(buildBatch([hello(0x1234)]));
+    // A Futuremark helper process is alive concurrently and reuses both the
+    // device and buffer handles. Its objects must occupy another namespace,
+    // without destroying the benchmark process's resources. The two 64-bit
+    // IDs differ only in their low bit, so converting them to Number would
+    // round them together above 2^53.
+    await executor.submit(buildBatch([
+        hello(0x1002, 0xfedcba98),
+        command(OP.CREATE_DEVICE, createDevicePayload(320, 240)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 128)),
+    ], { sessionLow: 0x1002, sessionHigh: 0xfedcba98 }));
     await executor.idle();
     assert.equal(executor.stats.sessionChanges, 1);
-    assert.equal(executor.resources.size, 0,
-        "the departing process's resources must be released");
-    assert.equal(executor.devices.size, 0);
+    assert.equal(executor.resources.get(0x201).byteCount, 128);
+
+    // A later batch from the first process carries no HELLO. The batch header
+    // alone must restore its exact resource table and in-flight state.
+    await executor.submit(buildBatch([], {
+        sessionLow: 0x1001, sessionHigh: 0xfedcba98,
+    }));
+    await executor.idle();
+    assert.equal(executor.stats.sessionChanges, 2);
+    assert.equal(executor.resources.get(0x201).byteCount, 96,
+        "the benchmark process's buffer was replaced by its helper");
+    assert.equal(executor.devices.get(DEVICE).backBufferWidth, 640);
+    const stats = executor.getStats();
+    assert.equal(stats.activeSession, "fedcba9800001001");
+    assert.equal(stats.sessionsLive, 2);
+    assert.equal(stats.devicesLive, 2);
+    assert.equal(stats.resourcesLive, 2);
+});
+
+await test("a helper process cannot discard another session's in-flight frame",
+        async () => {
+    const { executor } = makeExecutor();
+    const helloPayload = Buffer.alloc(16);
+    helloPayload.writeUInt32LE(32, 0);
+    helloPayload.writeUInt32LE(3, 4); // SM2 | SM3
+    helloPayload.writeUInt32LE(0xa001, 8);
+    await executor.submit(buildBatch([
+        command(OP.HELLO, helloPayload),
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x201, 1, 96)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 12)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+    ], { sessionLow: 0xa001 }));
+    await executor.idle();
+    assert.ok(executor.frame, "the benchmark frame should remain pending");
+    assert.equal(executor.stats.queueSubmits, 0,
+        "the recorded frame must wait for Present before GPU submission");
+
+    // 3DMark06 launches short-lived capability helpers while the benchmark
+    // process is alive. Merely receiving their HELLO used to release every
+    // resource and drop the benchmark's recorded draw operations.
+    const helperHello = Buffer.from(helloPayload);
+    helperHello.writeUInt32LE(0xb002, 8);
+    await executor.submit(buildBatch([
+        command(OP.HELLO, helperHello),
+    ], { sessionLow: 0xb002 }));
+    await executor.idle();
+    assert.equal(executor.frame, null,
+        "the helper must see its own empty frame context");
+
+    await executor.submit(buildBatch([
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { sessionLow: 0xa001, present: true }));
+    await executor.idle();
+    assert.equal(executor.stats.drawCalls, 1,
+        "the benchmark's draw command should be retained exactly once");
+    assert.equal(executor.stats.droppedDraws, 0);
+    assert.equal(executor.stats.queueSubmits, 1);
 });
 
 await test("the device requests texture-compression-bc so DXT textures work",
@@ -2949,8 +4368,8 @@ await test("the device requests texture-compression-bc so DXT textures work",
     const request = find("requestDevice").pop();
     assert.ok(request, "requestDevice must be observed");
     assert.deepEqual(request[1] && request[1].requiredFeatures,
-        ["texture-compression-bc"],
-        "the adapter advertises BC, so the device has to ask for it");
+        ["texture-compression-bc", "timestamp-query"],
+        "the adapter's optional BC and timestamp features must be requested");
     const created = find("createTexture").map(call => call[1]);
     assert.ok(created.some(descriptor => descriptor.format === "bc2-rgba-unorm"),
         "DXT3 must reach WebGPU as bc2-rgba-unorm");
@@ -3555,7 +4974,10 @@ await test("pre-transformed geometry subtracts the viewport origin",
             element(0, 16, DECLTYPE.D3DCOLOR, DECLUSAGE.COLOR)])),
         command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x201, 20)),
         command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
-    ]));
+        // Constants are staged and go up with the frame's submit, so the
+        // upload only exists once the frame is actually presented.
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 800, 600)),
+    ], { present: true }));
     await executor.idle();
 
     const vertexShader = find("createShaderModule").map(call => call[1].code)
@@ -3569,10 +4991,13 @@ await test("pre-transformed geometry subtracts the viewport origin",
     const writes = find("writeBuffer");
     assert.ok(writes.length > 0, "constants were uploaded");
     const carriesOrigin = writes.some(call => {
-        const data = call[3];
-        if (!data) return false;
-        const floats = new Float32Array(data.buffer || data, data.byteOffset || 0,
-            Math.floor((data.byteLength || data.length || 0) / 4));
+        // call[6] is the snapshot of exactly the bytes this write sent, which
+        // for a staged ring upload is its used prefix rather than the whole
+        // mirror.
+        const data = call[6];
+        if (!data || !data.byteLength) return false;
+        const floats = new Float32Array(data.buffer, data.byteOffset,
+            Math.floor(data.byteLength / 4));
         for (let i = 0; i + 3 < floats.length; ++i) {
             if (floats[i] === 110 && floats[i + 1] === 109 &&
                     floats[i + 2] === 368 && floats[i + 3] === 104)
@@ -3582,6 +5007,341 @@ await test("pre-transformed geometry subtracts the viewport origin",
     });
     assert.ok(carriesOrigin,
         "the viewport uniform must carry size in xy and origin in zw");
+});
+
+await test("volume textures allocate 3D storage and upload every slice", async () => {
+    const { executor, find } = makeExecutor();
+    const pixels = Buffer.alloc(32);
+    for (let i = 0; i < pixels.length; ++i) pixels[i] = i;
+    // D9WGUpdateTexture: handle, level, xyz, whd, row/slice pitch,
+    // byte count and batch-relative data offset.
+    const update = u32(0x900, 0, 0, 0, 0, 2, 2, 2, 8, 16, 32, 0);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_VOLUME,
+            u32(DEVICE, 0x900, 2, 2, 2, 1, 21, 0, 1, 0)),
+        command(OP.UPDATE_TEXTURE, update, pixels, 44),
+    ], { versionMinor: 3 }));
+    await executor.idle();
+
+    const resource = executor.resources.get(0x900);
+    assert.equal(resource.textureType, "3d");
+    const descriptor = find("createTexture").find(call =>
+        call[1].label === "D3D9 volume texture")[1];
+    assert.equal(descriptor.dimension, "3d");
+    assert.deepEqual(descriptor.size,
+        { width: 2, height: 2, depthOrArrayLayers: 2 });
+    const upload = find("writeTexture").pop();
+    assert.deepEqual(upload[4],
+        { width: 2, height: 2, depthOrArrayLayers: 2 });
+    assert.equal(upload[3].rowsPerImage, 2);
+    assert.equal(executor.stats.volumeTexturesCreated, 1);
+});
+
+await test("GPU render-target readback writes a converted D3D surface response",
+        async () => {
+    const { executor } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x901, 2, 1, 1, 21, 1, 0)),
+    ], { versionMinor: 3 }));
+    await executor.idle();
+    // The physical texture is rgba8unorm. GetRenderTargetData must return
+    // D3DFMT_A8R8G8B8's in-memory BGRA byte order.
+    executor.resources.get(0x901).gpuTexture.readbackData =
+        Uint8Array.from([0x11, 0x22, 0x33, 0x44,
+            0x55, 0x66, 0x77, 0x88]);
+    executor.resources.get(0x901).gpuTexture.readbackPitch = 8;
+    const writes = [];
+    const responseOffset = 16 * 1024;
+    await executor.submit(buildBatch([
+        command(OP.READBACK_SURFACE,
+            u32(DEVICE, 0x901, 0, 21, 2, 1, 0, 1, 8, 8,
+                responseOffset, 0x12345678)),
+    ], { versionMinor: 3 }), {
+        writeGuestMemory(offset, data) {
+            // The host bumps a liveness counter once per batch at the very top
+        // of the response region; it is not a response to anything, so it
+        // must not be counted as one.
+        if (offset === HEARTBEAT_WRITE_OFFSET) return;
+        writes.push({ offset, data: Buffer.from(data) });
+        },
+    });
+    await executor.idle();
+
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].offset, 12 * 1024 * 1024 + responseOffset);
+    assert.equal(writes[0].data.readUInt32LE(0), 0x12345678);
+    assert.equal(writes[0].data.readUInt32LE(4), 8);
+    assert.equal(writes[0].data.readUInt32LE(12), 1);
+    assert.deepEqual([...writes[0].data.subarray(16)],
+        [0x33, 0x22, 0x11, 0x44, 0x77, 0x66, 0x55, 0x88]);
+    assert.equal(executor.stats.renderTargetReadbacks, 1);
+});
+
+await test("back-buffer readback uses a persistent post-Present snapshot",
+        async () => {
+    const { executor, find } = makeExecutor();
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CLEAR, u32(DEVICE, 1, 0xff000000, 0x3f800000, 0, 0)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true, versionMinor: 3 }));
+    await executor.idle();
+    // The readback request arrives in a later task, by which time a canvas
+    // texture would have expired; the owned back buffer has not.
+    const snapshot = executor.backBufferTexture;
+    assert.ok(snapshot, "the back buffer must outlive the task that drew it");
+    snapshot.readbackData = new Uint8Array(640 * 4);
+    snapshot.readbackData.set([0x11, 0x22, 0x33, 0x44]);
+    snapshot.readbackPitch = 640 * 4;
+
+    const writes = [];
+    await executor.submit(buildBatch([
+        command(OP.READBACK_SURFACE,
+            u32(DEVICE, 0, 0, 21, 640, 480, 0, 1, 640 * 4, 640 * 4,
+                16 * 1024, 0x22334455)),
+    ], { versionMinor: 3 }), { writeGuestMemory(offset, data) {
+        // The host bumps a liveness counter once per batch at the very top
+        // of the response region; it is not a response to anything, so it
+        // must not be counted as one.
+        if (offset === HEARTBEAT_WRITE_OFFSET) return;
+        writes.push({ offset, data: Buffer.from(data) });
+    } });
+    await executor.idle();
+
+    const copy = find("copyTextureToBuffer").pop();
+    assert.equal(copy[1].texture, snapshot);
+    assert.equal(writes.length, 1);
+    // The canvas is physically BGRA, already the memory order D3D9 expects.
+    assert.deepEqual([...writes[0].data.subarray(16, 20)],
+        [0x11, 0x22, 0x33, 0x44]);
+    assert.equal(executor.stats.backBufferPresents, 1);
+});
+
+await test("event queries complete only after the submitted GPU fence", async () => {
+    const { executor, fake } = makeExecutor();
+    const writes = [];
+    const metadata = { writeGuestMemory(offset, data) {
+        // The host bumps a liveness counter once per batch at the very top
+        // of the response region; it is not a response to anything, so it
+        // must not be counted as one.
+        if (offset === HEARTBEAT_WRITE_OFFSET) return;
+        writes.push({ offset, data: Buffer.from(data) });
+    } };
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_QUERY, u32(DEVICE, 0x902, 8, 0)),
+        command(OP.END_QUERY, u32(DEVICE, 0x902, 0, 41)),
+    ], { versionMinor: 3 }), metadata);
+    await executor.idle();
+    assert.equal(writes.length, 0, "an event query is not an immediate CPU answer");
+    fake.completeSubmittedWork();
+    await Promise.resolve();
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].offset, 12 * 1024 * 1024);
+    assert.equal(writes[0].data.readUInt32LE(0), 41);
+    assert.equal(writes[0].data.readUInt32LE(4), 1);
+    assert.equal(writes[0].data.readUInt32LE(12), 1);
+    assert.equal(executor.stats.eventQueriesResolved, 1);
+});
+
+await test("occlusion queries return the GPU query-set sample count", async () => {
+    const { executor } = makeExecutor();
+    const writes = [];
+    const elements = [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)];
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x903, 1, 36)),
+        command(OP.SET_FVF, fvfPayload(0x2, elements)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x903, 12)),
+        command(OP.CREATE_QUERY, u32(DEVICE, 0x904, 9, 16)),
+        command(OP.BEGIN_QUERY, u32(DEVICE, 0x904, 16, 50)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.END_QUERY, u32(DEVICE, 0x904, 16, 51)),
+    ], { versionMinor: 3 }), { writeGuestMemory(offset, data) {
+        // The host bumps a liveness counter once per batch at the very top
+        // of the response region; it is not a response to anything, so it
+        // must not be counted as one.
+        if (offset === HEARTBEAT_WRITE_OFFSET) return;
+        writes.push({ offset, data: Buffer.from(data) });
+    } });
+    await executor.idle();
+    await Promise.resolve();
+
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].data.readUInt32LE(0), 51);
+    assert.equal(writes[0].data.readUInt32LE(4), 37);
+    assert.equal(writes[0].data.readUInt32LE(12), 1);
+    assert.equal(executor.stats.occlusionQueriesResolved, 1);
+});
+
+await test("occlusion queries accumulate GPU segments across Present", async () => {
+    const { executor } = makeExecutor();
+    const writes = [];
+    const metadata = { writeGuestMemory(offset, data) {
+        // The host bumps a liveness counter once per batch at the very top
+        // of the response region; it is not a response to anything, so it
+        // must not be counted as one.
+        if (offset === HEARTBEAT_WRITE_OFFSET) return;
+        writes.push({ offset, data: Buffer.from(data) });
+    } };
+    const elements = [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)];
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x914, 1, 36)),
+        command(OP.SET_FVF, fvfPayload(0x2, elements)),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x914, 12)),
+        command(OP.CREATE_QUERY, u32(DEVICE, 0x915, 9, 80)),
+        command(OP.BEGIN_QUERY, u32(DEVICE, 0x915, 80, 70)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true, versionMinor: 3 }), metadata);
+    await executor.idle();
+    await Promise.resolve();
+    assert.equal(writes.length, 0, "BEGIN remains pending across Present");
+
+    await executor.submit(buildBatch([
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.END_QUERY, u32(DEVICE, 0x915, 80, 71)),
+    ], { versionMinor: 3 }), metadata);
+    await executor.idle();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].data.readUInt32LE(0), 71);
+    assert.equal(writes[0].data.readUInt32LE(4), 74);
+    assert.equal(writes[0].data.readUInt32LE(12), 1);
+    assert.equal(executor.stats.occlusionQueriesResolved, 1);
+});
+
+await test("timestamp, frequency and disjoint query classes return real results",
+        async () => {
+    const { executor, fake } = makeExecutor();
+    const writes = [];
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_QUERY, u32(DEVICE, 0x908, 10, 32)),
+        command(OP.CREATE_QUERY, u32(DEVICE, 0x909, 12, 48)),
+        command(OP.CREATE_QUERY, u32(DEVICE, 0x90a, 11, 64)),
+        command(OP.END_QUERY, u32(DEVICE, 0x908, 32, 61)),
+        command(OP.END_QUERY, u32(DEVICE, 0x909, 48, 62)),
+        command(OP.END_QUERY, u32(DEVICE, 0x90a, 64, 63)),
+    ], { versionMinor: 3 }), { writeGuestMemory(offset, data) {
+        // The host bumps a liveness counter once per batch at the very top
+        // of the response region; it is not a response to anything, so it
+        // must not be counted as one.
+        if (offset === HEARTBEAT_WRITE_OFFSET) return;
+        writes.push({ offset, data: Buffer.from(data) });
+    } });
+    await executor.idle();
+    await Promise.resolve();
+    assert.equal(writes.length, 1, "the GPU timestamp maps independently");
+    assert.equal(writes[0].data.readUInt32LE(0), 61);
+    assert.equal(writes[0].data.readUInt32LE(4), 1000);
+    fake.completeSubmittedWork();
+    await Promise.resolve();
+    assert.equal(writes.length, 3);
+    const byRequest = new Map(writes.map(write =>
+        [write.data.readUInt32LE(0), write.data]));
+    assert.equal(byRequest.get(62).readBigUInt64LE(4), 1000000000n);
+    assert.equal(byRequest.get(63).readBigUInt64LE(4), 0n);
+    assert.equal(executor.stats.timestampQueriesResolved, 1);
+});
+
+await test("enabled user clip planes reach both fixed shader stages", async () => {
+    const D3DRS_CLIPPLANEENABLE = 152;
+    const { executor, find } = makeExecutor();
+    const plane = Buffer.alloc(24);
+    plane.writeUInt32LE(DEVICE, 0);
+    plane.writeUInt32LE(0, 4);
+    plane.writeFloatLE(1, 8);
+    plane.writeFloatLE(0, 12);
+    plane.writeFloatLE(0, 16);
+    plane.writeFloatLE(-0.25, 20);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x905, 1, 36)),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x905, 12)),
+        command(OP.SET_CLIP_PLANE, plane),
+        command(OP.SET_RENDER_STATE, u32(DEVICE, D3DRS_CLIPPLANEENABLE, 1, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true, versionMinor: 3 }));
+    await executor.idle();
+
+    const pipeline = find("createRenderPipeline").pop()[1];
+    assert.match(pipeline.vertex.module.code,
+        /dot\(d9_clip_position, uniforms\.clip_planes\[0\]\)/);
+    assert.match(pipeline.vertex.module.code,
+        /d9_clip_position = uniforms\.world_matrix \* in0/);
+    assert.match(pipeline.fragment.module.code,
+        /if \(stage_in\.clip0\.x < 0\.0\) \{ discard; \}/);
+    assert.deepEqual(executor.devices.get(DEVICE).clipPlanes[0],
+        [1, 0, 0, -0.25]);
+});
+
+await test("vs_3_0 vertex texture fetch binds D3D vertex sampler 0 at 34/35",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const vs = shaderCreatePayload(0x40000906, VS3_VERTEX_TEXTURE_FETCH);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x906, 1, 48)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x907, 4, 4, 1, 21, 0, 1)),
+        command(OP.CREATE_VERTEX_SHADER,
+            vs.payload, vs.blob, vs.blobOffsetField),
+        command(OP.SET_FVF, fvfPayload(0x2,
+            [element(0, 0, DECLTYPE.FLOAT4, DECLUSAGE.POSITION)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x906, 16)),
+        command(OP.SET_VERTEX_SHADER, u32(DEVICE, 0x40000906)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 256, 0x907, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true, versionMinor: 3 }));
+    await executor.idle();
+
+    assert.equal(executor.stats.droppedDraws, 0);
+    const layout = find("createBindGroupLayout").pop()[1];
+    assert.ok(layout.entries.some(entry => entry.binding === 34 &&
+        entry.visibility === 1));
+    assert.ok(layout.entries.some(entry => entry.binding === 35 &&
+        entry.visibility === 1));
+    const group = find("createBindGroup").pop()[1];
+    assert.ok(group.entries.some(entry => entry.binding === 34));
+    assert.ok(group.entries.some(entry => entry.binding === 35));
+});
+
+await test("programmable pixel samplers expose the complete s0 through s15 range",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const ps = shaderCreatePayload(0x40000908, PS_SAMPLER15_BYTECODE);
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_BUFFER, createBufferPayload(0x90b, 1, 60)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x90c, 4, 4, 1, 21, 0, 1)),
+        command(OP.SET_FVF, fvfPayload(0x102,
+            [element(0, 0, DECLTYPE.FLOAT3, DECLUSAGE.POSITION),
+             element(0, 12, DECLTYPE.FLOAT2, DECLUSAGE.TEXCOORD)])),
+        command(OP.SET_STREAM_SOURCE, setStreamSourcePayload(0, 0x90b, 20)),
+        command(OP.CREATE_PIXEL_SHADER,
+            ps.payload, ps.blob, ps.blobOffsetField),
+        command(OP.SET_PIXEL_SHADER, u32(DEVICE, 0x40000908)),
+        command(OP.SET_TEXTURE, u32(DEVICE, 15, 0x90c, 0)),
+        command(OP.DRAW_PRIMITIVE, drawPrimitivePayload(4, 0, 1)),
+        command(OP.PRESENT, u32(DEVICE, 0x1234, 0, 0, 640, 480)),
+    ], { present: true, versionMinor: 3 }));
+    await executor.idle();
+
+    assert.equal(executor.stats.droppedDraws, 0);
+    const layout = find("createBindGroupLayout").pop()[1];
+    assert.ok(layout.entries.some(entry => entry.binding === 32));
+    assert.ok(layout.entries.some(entry => entry.binding === 33));
 });
 
 // Guest-to-host diagnostics. Everything the guest DLL refuses used to be

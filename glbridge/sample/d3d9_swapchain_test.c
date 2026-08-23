@@ -208,6 +208,100 @@ static HRESULT verify_back_buffer_container(void)
     return D3D_OK;
 }
 
+/*
+ * GetFrontBufferData hands back the image on screen, and D3D9 documents its
+ * destination as D3DFMT_A8R8G8B8 whatever the swap chain's own format is. This
+ * device's back buffer is the adapter's display format -- D3DFMT_X8R8G8B8 on
+ * any ordinary desktop -- so the two formats differ by design, and treating
+ * that as a mismatch is exactly the bug 3DMark06's Image Quality test hit
+ * ("GetFrontBufferData failed: Invalid call").
+ *
+ * GetRenderTargetData is checked alongside it precisely because it must NOT
+ * accept the same pair: it is a copy, not a conversion.
+ */
+static HRESULT verify_front_buffer_data_into(D3DPOOL pool, const char *pool_name)
+{
+    IDirect3DSurface9 *destination = NULL;
+    D3DLOCKED_RECT locked;
+    HRESULT hr;
+    UINT opaque_checked = 0;
+    UINT y;
+
+    hr = IDirect3DDevice9_CreateOffscreenPlainSurface(g_device,
+            TEST_CLIENT_WIDTH, TEST_CLIENT_HEIGHT, D3DFMT_A8R8G8B8,
+            pool, &destination, NULL);
+    trace_hresult(pool_name, hr);
+    if (FAILED(hr) || !destination)
+        return fail_stage("CreateOffscreenPlainSurface for the frame dump",
+                FAILED(hr) ? hr : E_FAIL);
+
+    hr = IDirect3DDevice9_GetFrontBufferData(g_device, 0, destination);
+    trace_hresult("IDirect3DDevice9::GetFrontBufferData", hr);
+    if (FAILED(hr))
+    {
+        IDirect3DSurface9_Release(destination);
+        return fail_stage("IDirect3DDevice9::GetFrontBufferData", hr);
+    }
+
+    /* What is on screen is opaque. A dump saved with alpha 0 is a fully
+     * transparent image, which looks like a rendering failure rather than the
+     * readback bug it actually is. */
+    hr = IDirect3DSurface9_LockRect(destination, &locked, NULL, D3DLOCK_READONLY);
+    if (FAILED(hr))
+    {
+        IDirect3DSurface9_Release(destination);
+        return fail_stage("LockRect on the front-buffer copy", hr);
+    }
+    for (y = 0; y < TEST_CLIENT_HEIGHT; ++y)
+    {
+        const BYTE *row = (const BYTE *)locked.pBits + y * locked.Pitch;
+        UINT x;
+        for (x = 0; x < TEST_CLIENT_WIDTH; ++x)
+        {
+            if (row[x * 4 + 3] != 0xFF)
+            {
+                IDirect3DSurface9_UnlockRect(destination);
+                IDirect3DSurface9_Release(destination);
+                return fail_stage("front-buffer copy is not opaque", E_FAIL);
+            }
+            ++opaque_checked;
+        }
+    }
+    IDirect3DSurface9_UnlockRect(destination);
+    if (!opaque_checked)
+    {
+        IDirect3DSurface9_Release(destination);
+        return fail_stage("front-buffer copy had no pixels", E_FAIL);
+    }
+
+    /* The strict sibling: same surfaces, and it has to refuse. */
+    hr = IDirect3DDevice9_GetRenderTargetData(g_device, g_back_buffer,
+            destination);
+    trace_hresult("IDirect3DDevice9::GetRenderTargetData(mismatched)", hr);
+    IDirect3DSurface9_Release(destination);
+    if (SUCCEEDED(hr))
+        return fail_stage("GetRenderTargetData must reject a format mismatch",
+                E_FAIL);
+
+    trace_text("GetFrontBufferData converted the back buffer to A8R8G8B8");
+    return D3D_OK;
+}
+
+static HRESULT verify_front_buffer_data(void)
+{
+    HRESULT hr;
+
+    /* Both CPU pools. SCRATCH is not an afterthought: it is what 3DMark06's
+     * Image Quality dump asks for, because the surface exists only to be
+     * locked and written to a file, and refusing it was a real defect. */
+    hr = verify_front_buffer_data_into(D3DPOOL_SYSTEMMEM,
+            "CreateOffscreenPlainSurface(A8R8G8B8, SYSTEMMEM)");
+    if (FAILED(hr))
+        return hr;
+    return verify_front_buffer_data_into(D3DPOOL_SCRATCH,
+            "CreateOffscreenPlainSurface(A8R8G8B8, SCRATCH)");
+}
+
 static HRESULT verify_primary_swap_chain(HWND hwnd,
         const D3DPRESENT_PARAMETERS *created)
 {
@@ -291,6 +385,11 @@ static HRESULT verify_primary_swap_chain(HWND hwnd,
     trace_hresult("IDirect3DSwapChain9::Present", hr);
     if (FAILED(hr))
         return fail_stage("IDirect3DSwapChain9::Present", hr);
+
+    /* After a Present, so there is a presented image to ask for. */
+    hr = verify_front_buffer_data();
+    if (FAILED(hr))
+        return hr;
 
     return D3D_OK;
 }

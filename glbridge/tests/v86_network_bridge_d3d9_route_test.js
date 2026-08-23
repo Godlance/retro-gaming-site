@@ -31,8 +31,20 @@ const gl4es = {
     _free() {},
     _v86glResize() {},
 };
+/*
+ * write_memory is modelled on v86's real one rather than just recording its
+ * arguments, because the bug this guards against is invisible to a recorder:
+ * v86 spells it write_memory(blob, address) -- the opposite order to
+ * read_memory(address, length) -- and it bottoms out in mem8.set(blob, addr).
+ * Called the other way round, TypedArray.set() gets a number as its source,
+ * copies nothing and throws nothing. Every readback response and query answer
+ * was being dropped exactly that way, and the guest could only report a
+ * timeout.
+ */
+const guestMemory = new Uint8Array(4096);
 const bridge = globalThis.installV86GLNetworkBridge({
     add_listener(name, callback) { listeners[name] = callback; },
+    write_memory(blob, address) { guestMemory.set(blob, address); },
 }, canvas, {
     gl4es,
     d3d9Canvas,
@@ -49,7 +61,7 @@ bridge.lastPresentedFrameId = 999;
 const d9wg = Buffer.alloc(32);
 d9wg.writeUInt32LE(0x47573944, 0);
 d9wg.writeUInt16LE(1, 4);
-d9wg.writeUInt16LE(0, 6);
+d9wg.writeUInt16LE(3, 6);
 d9wg.writeUInt32LE(0xA0010001, 24);
 d9wg.writeUInt32LE(0x20260806, 28);
 const envelope = Buffer.alloc(8 + d9wg.length);
@@ -69,11 +81,21 @@ listeners["v86gl-pci-frame"]({
 assert.equal(routed.length, 1,
     "D9WG routing must not be rejected by the OpenGL stale-frame counter");
 assert.deepEqual(routed[0].bytes, d9wg);
-assert.deepEqual(routed[0].metadata, {
-    pciFrameId: 1,
-    submitCount: 7,
-    descriptorCommandCount: 1,
-});
+assert.equal(routed[0].metadata.pciFrameId, 1);
+assert.equal(routed[0].metadata.submitCount, 7);
+assert.equal(routed[0].metadata.descriptorCommandCount, 1);
+assert.equal(routed[0].metadata.descriptorBase, 0);
+assert.equal(typeof routed[0].metadata.writeGuestMemory, "function");
+
+// The bytes have to actually land, at the address asked for.
+routed[0].metadata.writeGuestMemory(64, Uint8Array.from([1, 2, 3, 4]));
+assert.deepEqual([...guestMemory.subarray(64, 68)], [1, 2, 3, 4],
+    "a host->guest write must reach guest memory at the requested offset");
+assert.deepEqual([...guestMemory.subarray(0, 4)], [0, 0, 0, 0],
+    "and must not land at offset 0 instead");
+// The arena bound is still enforced.
+assert.throws(() => routed[0].metadata.writeGuestMemory(16 * 1024 * 1024,
+    Uint8Array.from([9])), RangeError);
 
 d3d9Options.onSurface({ hwnd: 0x1234, x: 10, y: 20, width: 640,
     height: 480, displayWidth: 640, displayHeight: 480, visible: true }, "create");

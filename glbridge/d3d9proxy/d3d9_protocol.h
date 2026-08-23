@@ -4,44 +4,68 @@
 #include <stdint.h>
 
 /*
- * D9WG v0.1 (frozen at M1, see docs/d3d9-webgpu-implementation-plan.zh-CN.md
- * section 6 and milestone M1). This is an independent protocol from D8WG: it
+ * D9WG is an independent protocol from D8WG: it
  * does not share opcode numbering, resource handle namespace, or payload
  * shapes with the D3D8 path, even though both ride the same VGL2 DMA
  * transport (v86gl.sys, 16 MiB ring, PCI BAR) via a different outer record
  * type. A guest process loads either d3d8.dll or d3d9.dll, never both.
  *
- * As of M3, everything below has a guest emitter and a host handler except
- * CREATE_TEXTURE_VOLUME, UPDATE_SURFACE, SET_STREAM_SOURCE_FREQ,
- * SET_CLIP_PLANE, CREATE_STATE_BLOCK and the three query opcodes. Those six
- * remain part of the frozen v0.1 wire shape with no emitter: d3d9_proxy.c
- * returns D3DERR_INVALIDCALL/D3DERR_NOTAVAILABLE for the D3D9 calls that would
- * produce them (state blocks and queries are answered entirely inside the
- * guest and need no wire traffic at all -- see IDirect3DStateBlock9 and
- * IDirect3DQuery9 in d3d9_proxy.c), rather than emitting a command the host
- * cannot act on. Do not repurpose an opcode number when its real
- * implementation lands; add a new one instead so archived traces stay
- * decodable.
+ * Version 1.3 deliberately breaks the old layout: it adds multisample fields,
+ * volume textures, instancing, clip planes, GPU queries, and an asynchronous
+ * host-to-guest response tail for queries and render-target readback. The
+ * guest DLL and page executor are updated as one unit, so no compatibility
+ * decoder for pre-1.3 batches is retained.
  */
 #define V86GL_CTRL_D3D9_BATCH 0xFFE1u
 
 #define D9WG_MAGIC 0x47573944u /* "D9WG" */
 #define D9WG_VERSION_MAJOR 1u
-#define D9WG_VERSION_MINOR 1u
+#define D9WG_VERSION_MINOR 4u
+
+/* The last four MiB of v86gl.sys's mapped DMA allocation are never used for
+ * command batches.  The browser writes asynchronous query/readback results
+ * back into this region by adding these offsets to the submitted descriptor's
+ * physical base address. */
+#define D9WG_RESPONSE_REGION_BYTES (4u * 1024u * 1024u)
+#define D9WG_QUERY_SLOT_BYTES 16u
+#define D9WG_QUERY_SLOT_COUNT 1024u
+#define D9WG_QUERY_REGION_BYTES \
+    (D9WG_QUERY_SLOT_BYTES * D9WG_QUERY_SLOT_COUNT)
+#define D9WG_READBACK_REGION_OFFSET D9WG_QUERY_REGION_BYTES
+
+/*
+ * A liveness counter the host bumps once per batch it finishes, in the last
+ * bytes of the response region.
+ *
+ * It exists because a readback is a *synchronous* request -- the guest spins
+ * until the host answers -- while batch submission has no backpressure at all:
+ * the PCI write returns immediately and the host works through a queue. A host
+ * that has fallen thousands of batches behind (3DMark06's Image Quality test
+ * renders ~3.7M draws before asking for its frame dump) answers correctly, just
+ * far later than any wall-clock deadline the guest could pick. Timing out on
+ * elapsed time therefore reports "readback failed" for a host that is merely
+ * busy, which is a different fault with a different fix.
+ *
+ * Watching this instead makes the deadline mean what it should: give up only
+ * when the host has stopped making progress at all.
+ */
+#define D9WG_HEARTBEAT_BYTES 16u
+#define D9WG_HEARTBEAT_OFFSET \
+    (D9WG_RESPONSE_REGION_BYTES - D9WG_HEARTBEAT_BYTES)
+
+#define D9WG_RESPONSE_PENDING 0u
+#define D9WG_RESPONSE_OK 1u
+#define D9WG_RESPONSE_FAILED 2u
 
 #define D9WG_BATCH_FLAG_PRESENT (1u << 0)
 
 /*
- * D9WGHello.feature_bits. The host does not gate anything on these -- they
- * exist so a running session can be asked "which guest DLL is actually
- * loaded?" without guessing from behaviour. That question is not academic:
- * the host executor ships with the page and updates on reload, while the
- * guest DLL lives inside the disk image and only changes when someone copies
- * it in, so "new host + stale guest" is the normal failure mode after a
- * milestone lands, and its symptom (no shaders ever created) is
- * indistinguishable from "this scene genuinely uses no shaders".
+ * D9WGHello.feature_bits. The host does not gate anything on these; they let
+ * diagnostics report whether the active DLL selected the FFP, SM2, or default
+ * SM3 caps profile without guessing from rendered behaviour.
  */
 #define D9WG_FEATURE_SHADER_MODEL_2 (1u << 0)
+#define D9WG_FEATURE_SHADER_MODEL_3 (1u << 1)
 
 enum D9WGOpcode {
     D9WG_OP_HELLO = 1,
@@ -53,7 +77,7 @@ enum D9WGOpcode {
     D9WG_OP_END_SCENE = 7,
     D9WG_OP_STRETCH_RECT = 8,        /* M3 */
     D9WG_OP_COLOR_FILL = 9,          /* M3 */
-    D9WG_OP_UPDATE_SURFACE = 10,     /* not before M2 */
+    D9WG_OP_UPDATE_SURFACE = 10,
     /*
      * Guest -> host diagnostics. The only direction this protocol ever carried
      * was commands, so a call the guest DLL refused was invisible everywhere
@@ -69,18 +93,19 @@ enum D9WGOpcode {
      * message rather than one per frame.
      */
     D9WG_OP_GUEST_LOG = 11,
+    D9WG_OP_READBACK_SURFACE = 12,
 
     D9WG_OP_CREATE_BUFFER = 0x100,
     D9WG_OP_UPDATE_BUFFER = 0x101,
     D9WG_OP_DESTROY_RESOURCE = 0x103,
     D9WG_OP_CREATE_TEXTURE_2D = 0x110,
     D9WG_OP_CREATE_TEXTURE_CUBE = 0x111,     /* M3 */
-    D9WG_OP_CREATE_TEXTURE_VOLUME = 0x112,   /* still unimplemented */
+    D9WG_OP_CREATE_TEXTURE_VOLUME = 0x112,
     D9WG_OP_UPDATE_TEXTURE = 0x113,          /* M1; z = cube face / volume slice */
     D9WG_OP_CREATE_VERTEX_DECLARATION = 0x120,
     D9WG_OP_CREATE_VERTEX_SHADER = 0x121,     /* M2 */
     D9WG_OP_CREATE_PIXEL_SHADER = 0x122,      /* M2 */
-    D9WG_OP_CREATE_QUERY = 0x123,             /* unused: queries are guest-side */
+    D9WG_OP_CREATE_QUERY = 0x123,
     D9WG_OP_CREATE_STATE_BLOCK = 0x124,       /* unused: state blocks are guest-side */
 
     D9WG_OP_SET_RENDER_STATE = 0x200,
@@ -94,12 +119,13 @@ enum D9WGOpcode {
     D9WG_OP_SET_LIGHT = 0x208,               /* M1 wire, consumed since M3 */
     D9WG_OP_LIGHT_ENABLE = 0x209,            /* M1 wire, consumed since M3 */
     D9WG_OP_SET_STREAM_SOURCE = 0x20A,
-    D9WG_OP_SET_STREAM_SOURCE_FREQ = 0x20B,  /* instancing, M6 前不实现 */
+    D9WG_OP_SET_STREAM_SOURCE_FREQ = 0x20B,  /* indexed instancing */
     D9WG_OP_SET_INDICES = 0x20C,
     D9WG_OP_SET_VERTEX_DECLARATION = 0x20D,
     D9WG_OP_SET_FVF = 0x20E,                 /* 兼容路径 */
     D9WG_OP_SET_RENDER_TARGET = 0x20F,       /* M3, up to four MRT slots */
-    D9WG_OP_SET_DEPTH_STENCIL_SURFACE = 0x210, /* M3 */
+    /* Retired v1.0 opcode. Protocol 1.3 executors do not decode it. */
+    D9WG_OP_RESERVED_SET_DEPTH_STENCIL_SURFACE_V1_0 = 0x210,
     D9WG_OP_SET_VERTEX_SHADER = 0x211,       /* M2 */
     D9WG_OP_SET_PIXEL_SHADER = 0x212,        /* M2 */
     D9WG_OP_SET_VERTEX_SHADER_CONSTANT_F = 0x213, /* M2 */
@@ -108,7 +134,7 @@ enum D9WGOpcode {
     D9WG_OP_SET_PIXEL_SHADER_CONSTANT_F = 0x216,  /* M2 */
     D9WG_OP_SET_PIXEL_SHADER_CONSTANT_I = 0x217,  /* M2 */
     D9WG_OP_SET_PIXEL_SHADER_CONSTANT_B = 0x218,  /* M2 */
-    D9WG_OP_SET_CLIP_PLANE = 0x219,          /* still unimplemented, see 9.11 */
+    D9WG_OP_SET_CLIP_PLANE = 0x219,
     /* M2: the D3D9 hardware cursor. A fullscreen game draws its pointer
      * through these rather than through GDI, so with them unimplemented the
      * pointer is simply invisible -- the guest's GDI cursor never reaches the
@@ -124,19 +150,31 @@ enum D9WGOpcode {
      * entirely. Nothing about that is visible in the picture, which is why it
      * has to be reported rather than inferred. */
     D9WG_OP_WINDOW_STATE = 0x21D,
-    /* v1.1: the v1.0 SET_DEPTH_STENCIL_SURFACE payload can only name level
-     * zero. Keep that opcode frozen for archived traces and stale guest
-     * DLLs; this extension carries the GetSurfaceLevel subresource. */
+    /* Carries the GetSurfaceLevel subresource as well as the texture handle. */
     D9WG_OP_SET_DEPTH_STENCIL_SURFACE_LEVEL = 0x21E,
+
+    /* Protocol 1.4. D3D9 palettes are device state applied at sample time, not
+     * baked into the texture, so both the table and which table is current have
+     * to reach the host: the same P8 texture must change appearance when the
+     * app swaps palettes without re-uploading a byte. */
+    D9WG_OP_SET_PALETTE = 0x21F,
+    D9WG_OP_SET_CURRENT_TEXTURE_PALETTE = 0x220,
+
+    /* IDirect3DBaseTexture9::GenerateMipSubLevels. The *implicit* regeneration
+     * D3DUSAGE_AUTOGENMIPMAP asks for needs no opcode: the host sees level 0
+     * being written, by upload or by a render pass, and knows more precisely
+     * than the guest does when the chain went stale. This carries only the
+     * explicit call. */
+    D9WG_OP_GENERATE_MIPS = 0x221,
 
     D9WG_OP_DRAW_PRIMITIVE = 0x300,
     D9WG_OP_DRAW_INDEXED_PRIMITIVE = 0x301,
     D9WG_OP_DRAW_PRIMITIVE_UP = 0x302,
     D9WG_OP_DRAW_INDEXED_PRIMITIVE_UP = 0x303,
 
-    D9WG_OP_BEGIN_QUERY = 0x400,             /* unused: queries are guest-side */
-    D9WG_OP_END_QUERY = 0x401,               /* unused: queries are guest-side */
-    D9WG_OP_GET_QUERY_DATA = 0x402           /* unused: queries are guest-side */
+    D9WG_OP_BEGIN_QUERY = 0x400,
+    D9WG_OP_END_QUERY = 0x401,
+    D9WG_OP_GET_QUERY_DATA = 0x402
 };
 
 #define D9WG_RESOURCE_BUFFER_VERTEX      1u
@@ -200,6 +238,8 @@ typedef struct D9WGCreateDevice {
     uint32_t behavior_flags;
     uint32_t enable_auto_depth_stencil;
     uint32_t auto_depth_stencil_format;
+    uint32_t multisample_type;
+    uint32_t multisample_quality;
 } D9WGCreateDevice;
 
 typedef struct D9WGResetDevice {
@@ -215,6 +255,8 @@ typedef struct D9WGResetDevice {
     uint32_t behavior_flags;
     uint32_t enable_auto_depth_stencil;
     uint32_t auto_depth_stencil_format;
+    uint32_t multisample_type;
+    uint32_t multisample_quality;
 } D9WGResetDevice;
 
 typedef struct D9WGPresent {
@@ -269,6 +311,8 @@ typedef struct D9WGCreateTexture2D {
     uint32_t format;
     uint32_t usage;
     uint32_t pool;
+    uint32_t multisample_type;
+    uint32_t multisample_quality;
 } D9WGCreateTexture2D;
 
 /* depth/slice_pitch are always 1/0 for a 2D texture; the fields exist now so
@@ -385,6 +429,15 @@ typedef struct D9WGSetStreamSource {
     uint32_t reserved;
 } D9WGSetStreamSource;
 
+/* Raw D3D9 SetStreamSourceFreq value. Stream 0 carries
+ * D3DSTREAMSOURCE_INDEXEDDATA|instance_count; instance streams carry
+ * D3DSTREAMSOURCE_INSTANCEDATA|step_rate. */
+typedef struct D9WGSetStreamSourceFreq {
+    uint32_t device_handle;
+    uint32_t stream;
+    uint32_t divider;
+} D9WGSetStreamSourceFreq;
+
 /* D3D9's IDirect3DDevice9::SetIndices, unlike D3D8's, carries no base vertex
  * index -- that moved to a per-draw parameter (see D9WGDrawIndexedPrimitive).
  */
@@ -462,7 +515,32 @@ typedef struct D9WGSetRenderTarget {
     uint32_t target_index;         /* 0..3, MRT (M4) */
     uint32_t color_texture_handle; /* 0 = 解除绑定该槽位 */
     uint32_t color_level;
+    /* D3DCUBEMAP_FACES for a cube map face, 0 for a 2D surface. A cube render
+     * target is bound one face at a time -- SetRenderTarget takes the surface
+     * GetCubeMapSurface(face, level) returned -- so without this the host can
+     * only ever address layer 0 and every face of a dynamic environment map
+     * lands on top of the first one. */
+    uint32_t color_face;
 } D9WGSetRenderTarget;
+
+/* 256 D3DCOLOR (A8R8G8B8) entries follow at data_offset. Always the full
+ * table: D3D9's SetPaletteEntries replaces all 256 at once. */
+typedef struct D9WGSetPalette {
+    uint32_t device_handle;
+    uint32_t palette_index;
+    uint32_t entry_count;
+    uint32_t data_offset;
+} D9WGSetPalette;
+
+typedef struct D9WGSetCurrentTexturePalette {
+    uint32_t device_handle;
+    uint32_t palette_index;
+} D9WGSetCurrentTexturePalette;
+
+typedef struct D9WGGenerateMips {
+    uint32_t device_handle;
+    uint32_t resource_handle;
+} D9WGGenerateMips;
 
 typedef struct D9WGSetScissorRect {
     uint32_t device_handle;
@@ -524,9 +602,48 @@ typedef struct D9WGWindowState {
 typedef struct D9WGCreateQuery {
     uint32_t device_handle;
     uint32_t resource_handle;
-    uint32_t query_type; /* D3DQUERYTYPE_OCCLUSION / EVENT, 第一版仅这两种 */
-    uint32_t reserved;
+    uint32_t query_type;
+    uint32_t response_offset; /* from the start of the DMA response region */
 } D9WGCreateQuery;
+
+/* Written host->guest.  Status is deliberately last: emulator.write_memory()
+ * copies bytes in increasing order, so observing OK also observes the value. */
+typedef struct D9WGQueryResponse {
+    uint32_t request_id;
+    uint32_t value_low;
+    uint32_t value_high;
+    volatile uint32_t status;
+} D9WGQueryResponse;
+
+typedef struct D9WGQueryIssue {
+    uint32_t device_handle;
+    uint32_t resource_handle;
+    uint32_t response_offset;
+    uint32_t request_id;
+} D9WGQueryIssue;
+
+typedef struct D9WGReadbackSurface {
+    uint32_t device_handle;
+    uint32_t texture_handle; /* zero names the current/back-buffer target */
+    uint32_t level;
+    uint32_t format;
+    uint32_t width;
+    uint32_t height;
+    uint32_t first_row;
+    uint32_t row_count;
+    uint32_t destination_pitch;
+    uint32_t destination_bytes;
+    uint32_t response_offset;
+    uint32_t request_id;
+} D9WGReadbackSurface;
+
+typedef struct D9WGReadbackResponse {
+    uint32_t request_id;
+    uint32_t byte_count;
+    uint32_t reserved;
+    volatile uint32_t status;
+    /* byte_count bytes follow */
+} D9WGReadbackResponse;
 
 /* M3. A cube texture is six square faces at each mip level; the host maps it
  * onto a WebGPU 2D texture with six array layers, which is what a
@@ -622,6 +739,12 @@ typedef struct D9WGStretchRect {
     int32_t  destination_right;
     int32_t  destination_bottom;
     uint32_t filter_point;
+    /* Cube faces, 0 for 2D surfaces. Present for the same reason as
+     * D9WGSetRenderTarget::color_face: without them a blit that names one face
+     * of an environment map silently lands on face 0, which is a wrong-pixels
+     * bug rather than an error anything reports. */
+    uint32_t source_face;
+    uint32_t destination_face;
 } D9WGStretchRect;
 
 typedef struct D9WGColorFill {
@@ -633,6 +756,8 @@ typedef struct D9WGColorFill {
     int32_t  top;
     int32_t  right;
     int32_t  bottom;
+    uint32_t face; /* cube face, 0 for a 2D surface */
+    uint32_t reserved;
 } D9WGColorFill;
 
 /*
@@ -705,7 +830,9 @@ typedef char D9WGAssertCommandHeaderSize[
 typedef char D9WGAssertHelloSize[
         sizeof(D9WGHello) == 16 ? 1 : -1];
 typedef char D9WGAssertCreateDeviceSize[
-        sizeof(D9WGCreateDevice) == 44 ? 1 : -1];
+        sizeof(D9WGCreateDevice) == 52 ? 1 : -1];
+typedef char D9WGAssertResetDeviceSize[
+        sizeof(D9WGResetDevice) == 56 ? 1 : -1];
 typedef char D9WGAssertPresentSize[
         sizeof(D9WGPresent) == 24 ? 1 : -1];
 typedef char D9WGAssertCreateBufferSize[
@@ -713,7 +840,7 @@ typedef char D9WGAssertCreateBufferSize[
 typedef char D9WGAssertUpdateBufferSize[
         sizeof(D9WGUpdateBuffer) == 24 ? 1 : -1];
 typedef char D9WGAssertCreateTexture2DSize[
-        sizeof(D9WGCreateTexture2D) == 32 ? 1 : -1];
+        sizeof(D9WGCreateTexture2D) == 40 ? 1 : -1];
 typedef char D9WGAssertUpdateTextureSize[
         sizeof(D9WGUpdateTexture) == 48 ? 1 : -1];
 typedef char D9WGAssertSetTextureSize[
@@ -730,6 +857,8 @@ typedef char D9WGAssertLightEnableSize[
         sizeof(D9WGLightEnable) == 16 ? 1 : -1];
 typedef char D9WGAssertSetStreamSourceSize[
         sizeof(D9WGSetStreamSource) == 24 ? 1 : -1];
+typedef char D9WGAssertSetStreamSourceFreqSize[
+        sizeof(D9WGSetStreamSourceFreq) == 12 ? 1 : -1];
 typedef char D9WGAssertSetIndicesSize[
         sizeof(D9WGSetIndices) == 8 ? 1 : -1];
 typedef char D9WGAssertSetFVFSize[
@@ -757,18 +886,32 @@ typedef char D9WGAssertCreateTextureVolumeSize[
 typedef char D9WGAssertSetClipPlaneSize[
         sizeof(D9WGSetClipPlane) == 24 ? 1 : -1];
 typedef char D9WGAssertSetRenderTargetSize[
-        sizeof(D9WGSetRenderTarget) == 16 ? 1 : -1];
+        sizeof(D9WGSetRenderTarget) == 20 ? 1 : -1];
 typedef char D9WGAssertSetDepthStencilSurfaceSize[
         sizeof(D9WGSetDepthStencilSurface) == 16 ? 1 : -1];
 typedef char D9WGAssertSetDepthStencilSurfaceLevelSize[
         sizeof(D9WGSetDepthStencilSurfaceLevel) == 20 ? 1 : -1];
+typedef char D9WGAssertSetPaletteSize[
+        sizeof(D9WGSetPalette) == 16 ? 1 : -1];
+typedef char D9WGAssertSetCurrentTexturePaletteSize[
+        sizeof(D9WGSetCurrentTexturePalette) == 8 ? 1 : -1];
+typedef char D9WGAssertGenerateMipsSize[
+        sizeof(D9WGGenerateMips) == 8 ? 1 : -1];
 typedef char D9WGAssertSetScissorRectSize[
         sizeof(D9WGSetScissorRect) == 20 ? 1 : -1];
 typedef char D9WGAssertStretchRectSize[
-        sizeof(D9WGStretchRect) == 56 ? 1 : -1];
+        sizeof(D9WGStretchRect) == 64 ? 1 : -1];
 typedef char D9WGAssertColorFillSize[
-        sizeof(D9WGColorFill) == 32 ? 1 : -1];
+        sizeof(D9WGColorFill) == 40 ? 1 : -1];
 typedef char D9WGAssertCreateQuerySize[
         sizeof(D9WGCreateQuery) == 16 ? 1 : -1];
+typedef char D9WGAssertQueryResponseSize[
+        sizeof(D9WGQueryResponse) == 16 ? 1 : -1];
+typedef char D9WGAssertQueryIssueSize[
+        sizeof(D9WGQueryIssue) == 16 ? 1 : -1];
+typedef char D9WGAssertReadbackSurfaceSize[
+        sizeof(D9WGReadbackSurface) == 48 ? 1 : -1];
+typedef char D9WGAssertReadbackResponseSize[
+        sizeof(D9WGReadbackResponse) == 16 ? 1 : -1];
 
 #endif

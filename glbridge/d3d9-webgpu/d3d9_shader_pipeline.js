@@ -392,6 +392,23 @@
             this.usedInputs = new Map();       // register -> {usage, usageIndex}
             this.outputSemantics = new Map();  // vs_3_0 o# -> {usage, usageIndex}
             this.samplers = new Map();         // index -> "2d"|"cube"|"3d"
+            // Stages the caller has a D3D9 depth texture bound to. D3D9 has no
+            // syntax for a shadow sample: `tex2D`/`tex2Dproj` on a sampler
+            // whose texture is a depth format silently becomes a hardware
+            // depth comparison returning filtered visibility. WGSL demands the
+            // opposite -- texture_depth_2d and sampler_comparison are distinct
+            // types chosen at module scope -- so which stages are depth has to
+            // reach translation, and the same bytecode compiles to a different
+            // module depending on what is bound. See isDepthSampler() for why
+            // this is a request rather than a directive.
+            this.requestedDepthSamplers = new Set(
+                (this.options.depthSamplers || []).map(index => index | 0));
+            // The subset of those which read the stored depth back rather than
+            // comparing against it -- D3D9's ATI FOURCC depth formats. Same
+            // texture_depth_2d declaration, an ordinary sampler instead of a
+            // comparison one, and no reference value at all.
+            this.requestedDepthFetchSamplers = new Set(
+                (this.options.depthFetchSamplers || []).map(index => index | 0));
             this.writtenVaryings = new Set();
             this.usesAddress = false;
             this.usesLoopCounter = false;
@@ -412,6 +429,7 @@
             this.colorOutputs = new Set();
             this.controlDepth = 0;             // >0 => inside if/loop
             this.nonUniformDepth = 0;          // >0 => implicit-LOD sampling illegal
+            this.nonUniformFrames = [];        // open non-uniform regions
             this.levelZeroSamples = 0;
             this.temporaryId = 0;
             this.warnings = [];
@@ -640,6 +658,7 @@
         // statement per component rather than `dest.xy = ...`.
         store(dest, valueExpression, options) {
             const asBool = options && options.bool;
+            this.noteRegisterWrite(dest);
             const target = this.destTarget(dest);
             const name = this.fresh("v");
             let value = valueExpression;
@@ -717,9 +736,6 @@
             const dest = instruction.dest;
             if (dest.type === REG_SAMPLER) {
                 const type = TEXTURE_TYPE_NAMES[declaration.textureType] || "2d";
-                if (this.kind === "vertex")
-                    throw new Error("vertex texture fetch (vs_3_0 dcl sampler) " +
-                        "is deferred to a later milestone (plan 9.9)");
                 this.samplers.set(dest.index, type);
                 return;
             }
@@ -822,8 +838,10 @@
                 this.indent += 2;
                 ++this.controlDepth;
                 ++this.nonUniformDepth;
+                this.pushNonUniformFrame();
                 const inner = Object.assign({}, instruction, { predicated: false });
                 this.instruction(inner);
+                (this.nonUniformFrames || []).pop();
                 --this.nonUniformDepth;
                 --this.controlDepth;
                 this.indent -= 2;
@@ -927,8 +945,14 @@
                     "), 0.0, 0.0)");
                 return;
             }
-            case OP.DSX: this.store(dest, "dpdx(" + s(0) + ")"); return;
-            case OP.DSY: this.store(dest, "dpdy(" + s(0) + ")"); return;
+            case OP.DSX:
+            case OP.DSY: {
+                const builtin = opcode === OP.DSX ? "dpdx" : "dpdy";
+                this.store(dest, this.nonUniformDepth > 0
+                    ? this.derivativeExpression(builtin, sources[0])
+                    : builtin + "(" + s(0) + ")");
+                return;
+            }
             case OP.M4x4: this.matrix(dest, sources, 4, 4); return;
             case OP.M4x3: this.matrix(dest, sources, 4, 3); return;
             case OP.M3x4: this.matrix(dest, sources, 3, 4); return;
@@ -1055,12 +1079,30 @@
             }
         }
 
+        // A frame per open non-uniform region, recording where its opening
+        // statement began and which registers have been written since. Both are
+        // what dsx/dsy needs: see derivativeExpression().
+        pushNonUniformFrame(insertAt) {
+            this.nonUniformFrames = this.nonUniformFrames || [];
+            this.nonUniformFrames.push({
+                // The `if (...) {` line is emitted before enter() runs, so the
+                // position *before* the region is one line back.
+                insertAt: insertAt === undefined
+                    ? Math.max(0, this.lines.length - 1) : insertAt,
+                indent: Math.max(0, this.indent - 2),
+                written: new Set(),
+            });
+        }
+
         enter(nonUniform) {
             this.indent += 2;
             ++this.controlDepth;
             this.uniformityStack = this.uniformityStack || [];
             this.uniformityStack.push(!!nonUniform);
-            if (nonUniform) ++this.nonUniformDepth;
+            if (nonUniform) {
+                ++this.nonUniformDepth;
+                this.pushNonUniformFrame();
+            }
         }
 
         enterSameUniformity() {
@@ -1068,7 +1110,15 @@
             ++this.controlDepth;
             const nonUniform = this.lastLeftNonUniform;
             this.uniformityStack.push(nonUniform);
-            if (nonUniform) ++this.nonUniformDepth;
+            if (nonUniform) {
+                ++this.nonUniformDepth;
+                // An `else` branch hoists to before the whole `if`, not to
+                // before the `} else {` -- that position is inside the *then*
+                // branch, where the code would run under the wrong condition.
+                // Writes made by the then-branch do not reach here, so the
+                // written-register set starts empty again.
+                this.pushNonUniformFrame(this.lastLeftInsertAt);
+            }
         }
 
         leave() {
@@ -1076,7 +1126,65 @@
             --this.controlDepth;
             const nonUniform = (this.uniformityStack || []).pop();
             this.lastLeftNonUniform = nonUniform;
-            if (nonUniform) --this.nonUniformDepth;
+            if (nonUniform) {
+                --this.nonUniformDepth;
+                const frame = (this.nonUniformFrames || []).pop();
+                this.lastLeftInsertAt = frame ? frame.insertAt : undefined;
+            }
+        }
+
+        // Every register written inside an open non-uniform region, so a later
+        // hoist can tell whether the value it wants still exists above it.
+        noteRegisterWrite(dest) {
+            if (!this.nonUniformFrames || !this.nonUniformFrames.length) return;
+            const key = dest.type + ":" + dest.index;
+            for (const frame of this.nonUniformFrames) frame.written.add(key);
+        }
+
+        /*
+         * dsx/dsy inside data-dependent control flow.
+         *
+         * D3D9 runs both sides of a branch on real hardware, so a derivative
+         * taken inside an `if` is well defined there. WGSL forbids it outright,
+         * and the shader fails to compile -- which is not a subtle difference:
+         * 3DMark06's airship rendered as a black silhouette because its pixel
+         * shader would not build at all.
+         *
+         * The derivative almost always reads a register computed *before* the
+         * branch (screen-space coordinates, most often), so hoisting the call
+         * to just above the branch is both legal and exactly what the shader
+         * asked for. That is only true while nothing has overwritten the
+         * operand inside the region, which is what the written-register set
+         * tracks; when it has, there is no value above the branch to take a
+         * derivative of and the result degrades to zero -- flat, noted, and
+         * still a shader that compiles.
+         */
+        derivativeExpression(builtin, source) {
+            const registerKey = source.type + ":" + source.index;
+            const frames = this.nonUniformFrames || [];
+            const clobbered = frames.some(frame => frame.written.has(registerKey));
+            const before = this.lines.length;
+            const expression = this.sourceExpression(source);
+            // A source modifier that emits its own statement cannot be hoisted
+            // with the call; those statements would stay behind.
+            const emitted = this.lines.length !== before;
+            if (!clobbered && !emitted && !source.relative && frames.length) {
+                const outermost = frames[0];
+                const name = this.fresh("deriv");
+                this.lines.splice(outermost.insertAt, 0,
+                    " ".repeat(outermost.indent) + "let " + name + " = " +
+                    builtin + "(" + expression + ");");
+                for (const frame of frames) ++frame.insertAt;
+                this.note("a screen-space derivative inside data-dependent " +
+                    "control flow was hoisted above the branch, which WGSL " +
+                    "requires and D3D9 does not");
+                return name;
+            }
+            this.note("a screen-space derivative inside data-dependent control " +
+                "flow reads a register the branch itself overwrote; there is no " +
+                "value above the branch to differentiate, so it evaluates to " +
+                "zero (WGSL forbids the call there)");
+            return "vec4<f32>(0.0)";
         }
 
         comparison(control, left, right, componentwise) {
@@ -1130,45 +1238,193 @@
             return source.index;
         }
 
+        // Whether stage `index` is sampled as a depth comparison rather than as
+        // an ordinary texture. The caller asks; this decides, because a depth
+        // sample needs a comparison reference the shader must actually supply:
+        //
+        //  - Only 2D. A cube or volume depth texture cannot be created here at
+        //    all (the protocol's render target binding carries no face index),
+        //    so a request for one is a caller bug, not a shader to translate.
+        //  - Not ps_1_x. Its texreg2* forms build coordinates out of a
+        //    previously sampled register and have no z to compare against, and
+        //    hardware shadow maps postdate that shader model entirely.
+        //  - Pixel stage only. vs_3_0 vertex texture fetch on a shadow map is
+        //    legal in principle but has no caller, and supporting it would mean
+        //    a second binding-type path through the vertex sampler layout.
+        //
+        // Whatever survives is reported in the reflection so the host binds a
+        // depth view to exactly the slots declared texture_depth_2d, and the
+        // white fallback everywhere else. A mismatch there is a WebGPU
+        // validation error that takes down the whole submit, not one draw.
+        isDepthSampler(index) {
+            return this.requestedDepthSamplers.has(index)
+                && this.kind === "pixel" && this.major >= 2
+                && (this.samplers.get(index) || "2d") === "2d";
+        }
+
+        isDepthFetchSampler(index) {
+            return this.isDepthSampler(index)
+                && this.requestedDepthFetchSamplers.has(index);
+        }
+
         // Coordinate arity per sampler type; the extra components a D3D9
-        // shader leaves in the register are simply not read.
+        // shader leaves in the register are simply not read -- except on a
+        // depth sampler, where z is the comparison reference and so has to be
+        // carried out alongside the uv rather than dropped with the rest.
         coordinateFor(index, expression, projected) {
             const type = this.samplers.get(index) || "2d";
             const arity = type === "cube" ? 3 : (type === "3d" ? 3 : 2);
             const name = this.fresh("uv");
             this.emit("let " + name + " = " + expression + ";");
             const swizzle = arity === 3 ? "xyz" : "xy";
+            // A fetch sampler is depth but takes no reference: emitting one
+            // would send it down the comparison path in sampleExpression().
+            const wantsDepth = this.isDepthSampler(index)
+                && !this.isDepthFetchSampler(index);
+            // The divisor is spelled out twice rather than hoisted into a let:
+            // the non-projected and non-depth forms have to keep producing
+            // exactly the expression they produced before, and `a / b * c` does
+            // not reassociate to `a * (c / b)` in floating point.
+            const project = value => "(" + value + " / max(abs(" + name +
+                ".w), 1e-8) * sign(" + name + ".w + 1e-20))";
             if (projected)
-                return "(" + name + "." + swizzle + " / max(abs(" + name +
-                    ".w), 1e-8) * sign(" + name + ".w + 1e-20))";
-            return name + "." + swizzle;
+                return { coord: project(name + "." + swizzle),
+                    ref: wantsDepth ? project(name + ".z") : null };
+            return { coord: name + "." + swizzle,
+                ref: wantsDepth ? name + ".z" : null };
         }
 
         sampleExpression(index, coordinate, options) {
             const texture = "d9_tex" + index;
             const sampler = "d9_smp" + index;
+            const coord = coordinate.coord;
+            if (coordinate.ref !== null && coordinate.ref !== undefined)
+                return this.compareExpression(texture, sampler, coord,
+                    coordinate.ref, options);
+            if (this.isDepthFetchSampler(index))
+                return this.depthFetchExpression(texture, sampler, coord,
+                    options);
             if (options && options.gradients)
                 return "textureSampleGrad(" + texture + ", " + sampler + ", " +
-                    coordinate + ", " + options.ddx + ", " + options.ddy + ")";
+                    coord + ", " + options.ddx + ", " + options.ddy + ")";
             if (options && options.explicitLod)
                 return "textureSampleLevel(" + texture + ", " + sampler + ", " +
-                    coordinate + ", " + options.lod + ")";
+                    coord + ", " + options.lod + ")";
             if (options && options.bias !== undefined)
                 return this.nonUniformDepth > 0
-                    ? this.degradedSample(texture, sampler, coordinate)
+                    ? this.degradedSample(texture, sampler, coord)
                     : "textureSampleBias(" + texture + ", " + sampler + ", " +
-                        coordinate + ", " + options.bias + ")";
+                        coord + ", " + options.bias + ")";
             if (this.nonUniformDepth > 0)
-                return this.degradedSample(texture, sampler, coordinate);
-            return "textureSample(" + texture + ", " + sampler + ", " + coordinate + ")";
+                return this.degradedSample(texture, sampler, coord);
+            // Vertex shaders have no implicit derivatives. D3D9 permits VTF
+            // only in vs_3_0 and its ordinary texld form selects mip zero;
+            // texldl above still uses the explicit LOD carried in coord.w.
+            if (this.kind === "vertex")
+                return "textureSampleLevel(" + texture + ", " + sampler + ", " +
+                    coord + ", 0.0)";
+            return "textureSample(" + texture + ", " + sampler + ", " + coord + ")";
+        }
+
+        // Reading a depth texture's stored value. texture_depth_2d sampling
+        // returns a scalar, and D3D9 puts the depth in every channel -- shaders
+        // read .r or .x from an INTZ/DF24 fetch interchangeably.
+        //
+        // WebGPU refuses to filter a depth texture except through a comparison,
+        // so this is always a point sample of one level. That matches the
+        // formats' purpose: an app choosing DF24 wants the exact stored depth
+        // to filter itself, not a value the hardware already blended.
+        depthFetchExpression(texture, sampler, coord, options) {
+            // textureSampleLevel on a depth texture takes a *concrete integer*
+            // level, unlike the f32 every colour-texture overload takes. naga
+            // rejects the f32 form outright, which is the good outcome: the
+            // alternative was a driver-specific failure inside the browser.
+            const lod = (options && options.explicitLod)
+                ? "i32(" + options.lod + ")" : "0i";
+            return "vec4<f32>(textureSampleLevel(" + texture + ", " + sampler +
+                ", " + coord + ", " + lod + "))";
+        }
+
+        // The hardware shadow map path. D3D9 returns the filtered comparison
+        // result broadcast across all four channels -- shaders routinely read
+        // .x, .w or .rgb from it interchangeably -- so the scalar is splatted
+        // rather than placed in one component.
+        //
+        // WGSL has no comparison sampling with a gradient or a bias, and none
+        // at all under non-uniform control flow. Every one of those degrades to
+        // textureSampleCompareLevel, which samples level zero: shadow maps are
+        // very nearly always single-level to begin with, so this is a real
+        // approximation only for the rare mipped one.
+        compareExpression(texture, sampler, coord, ref, options) {
+            const explicitLevel = (options && (options.gradients ||
+                options.explicitLod || options.bias !== undefined)) ||
+                this.nonUniformDepth > 0;
+            if (explicitLevel) {
+                ++this.levelZeroSamples;
+                this.note("a depth comparison sample selects mip level 0: WGSL " +
+                    "has no gradient, bias or non-uniform form of " +
+                    "textureSampleCompare");
+                return "vec4<f32>(textureSampleCompareLevel(" + texture + ", " +
+                    sampler + ", " + coord + ", " + ref + "))";
+            }
+            return "vec4<f32>(textureSampleCompare(" + texture + ", " +
+                sampler + ", " + coord + ", " + ref + "))";
+        }
+
+        /*
+         * Recovers real gradients for a texture sample inside data-dependent
+         * control flow.
+         *
+         * WGSL forbids implicit-derivative sampling there, and the fallback
+         * below picks mip level 0 -- correct-ish but visibly aliased wherever
+         * the surface is minified, which in practice is most of a scene. When
+         * the coordinate comes from a register the branch has not touched,
+         * there *is* a value above the branch to differentiate: hoist the
+         * coordinate and both derivatives out, and sample with
+         * textureSampleGrad, which WGSL permits under any control flow because
+         * the gradients are explicit. That is not a degradation at all -- it is
+         * the mip level the shader would have selected on D3D9 hardware.
+         *
+         * Returns null when the coordinate cannot be reconstructed above the
+         * branch, leaving degradedSample() to handle it.
+         */
+        hoistedGradients(index, source, coordinateExpression, projected) {
+            const frames = this.nonUniformFrames || [];
+            if (!frames.length || !source || source.relative) return null;
+            if (frames.some(frame =>
+                    frame.written.has(source.type + ":" + source.index)))
+                return null;
+            const type = this.samplers.get(index) || "2d";
+            const swizzle = (type === "cube" || type === "3d") ? "xyz" : "xy";
+            const outermost = frames[0];
+            const pad = " ".repeat(outermost.indent);
+            const raw = this.fresh("guv");
+            const uv = this.fresh("gc");
+            const dx = this.fresh("gdx");
+            const dy = this.fresh("gdy");
+            const projectedExpression = projected
+                ? "(" + raw + "." + swizzle + " / max(abs(" + raw +
+                    ".w), 1e-8) * sign(" + raw + ".w + 1e-20))"
+                : raw + "." + swizzle;
+            this.lines.splice(outermost.insertAt, 0,
+                pad + "let " + raw + " = " + coordinateExpression + ";",
+                pad + "let " + uv + " = " + projectedExpression + ";",
+                pad + "let " + dx + " = dpdx(" + uv + ");",
+                pad + "let " + dy + " = dpdy(" + uv + ");");
+            for (const frame of frames) frame.insertAt += 4;
+            this.note("a texture sample inside data-dependent control flow " +
+                "keeps its real mip level: the coordinate and its derivatives " +
+                "are hoisted above the branch and the sample uses explicit " +
+                "gradients, which WGSL allows there");
+            return { coordinate: uv, ddx: dx, ddy: dy };
         }
 
         // WGSL forbids implicit-derivative sampling under non-uniform control
-        // flow, and there is no coordinate available outside the branch to
-        // hoist dpdx/dpdy out to. Sampling mip level 0 is the legal,
-        // deterministic fallback: visibly sharper/aliased rather than wrong
-        // colours, and counted so it is never a silent difference. Note this
-        // is unreachable for ps_2_0 (no flow control at all in that model)
+        // flow. When hoistedGradients() cannot reconstruct the coordinate above
+        // the branch -- because the branch computed it -- mip level 0 is the
+        // legal, deterministic fallback: visibly sharper/aliased rather than
+        // wrong colours, and counted so it is never a silent difference. Note
+        // this is unreachable for ps_2_0 (no flow control at all in that model)
         // and for uniform `if b#`/`rep`/`loop` bodies, whose conditions come
         // from the uniform buffer and so keep control flow uniform.
         degradedSample(texture, sampler, coordinate) {
@@ -1201,6 +1457,31 @@
                 index = this.samplerIndexFor(sources[1]);
                 coordinateExpression = this.sourceExpression(sources[0]);
             }
+            // Try to keep the real mip level before anything else decides the
+            // sample has to be level 0. Only the plain and biased forms need
+            // it: texldd already carries explicit gradients and texldl an
+            // explicit level, and both are legal in non-uniform flow as they
+            // stand.
+            //
+            // Depth samplers are excluded: WGSL has no textureSampleCompareGrad,
+            // so there is no gradient form to recover *to*, and the comparison
+            // reference must survive -- compareExpression() already handles
+            // them and drops to textureSampleCompareLevel.
+            const wantsImplicitLod = !(options &&
+                (options.explicitLod || options.gradients)) &&
+                !this.isDepthSampler(index);
+            const recovered = (this.nonUniformDepth > 0 && wantsImplicitLod)
+                ? this.hoistedGradients(index,
+                    (this.kind === "pixel" && this.major === 1 && this.minor < 4)
+                        ? null : sources[0],
+                    coordinateExpression, projected)
+                : null;
+            if (recovered) {
+                this.store(dest, this.sampleExpression(index,
+                    { coord: recovered.coordinate, ref: null },
+                    { gradients: true, ddx: recovered.ddx, ddy: recovered.ddy }));
+                return;
+            }
             const coordinate = this.coordinateFor(index, coordinateExpression, projected);
             const sampleOptions = {};
             if (options && options.explicitLod) {
@@ -1227,8 +1508,11 @@
             const index = dest.index;
             if (!this.samplers.has(index))
                 this.samplers.set(index, components.length === 3 ? "3d" : "2d");
-            const coordinate = "(" + this.sourceExpression(instruction.sources[0]) +
-                ")." + components;
+            // ps_1_x only, and isDepthSampler() excludes ps_1_x, so this form
+            // never carries a comparison reference.
+            const coordinate = { coord: "(" +
+                this.sourceExpression(instruction.sources[0]) + ")." + components,
+                ref: null };
             this.store(dest, this.sampleExpression(index, coordinate, {}));
         }
 
@@ -1252,6 +1536,9 @@
                 // xy = render target size in pixels, for the D3D9 half-pixel
                 // offset applied to o_position below.
                 out.push("    viewport: vec4<f32>,");
+                if (this.options.clipPlaneCount)
+                    out.push("    clip_planes: array<vec4<f32>, " +
+                        this.options.clipPlaneCount + ">,");
             }
             if (kind === "vertex" && this.options.pointExpansion) {
                 out.push("    point_viewport: vec4<f32>,");
@@ -1262,14 +1549,18 @@
                 ") var<uniform> d9c: D9Constants;");
 
             const samplerIndices = Array.from(this.samplers.keys()).sort((a, b) => a - b);
+            const samplerBindingBase = kind === "vertex" ? 34 : 2;
             for (const index of samplerIndices) {
                 const type = this.samplers.get(index);
-                const wgslType = type === "cube" ? "texture_cube<f32>"
-                    : (type === "3d" ? "texture_3d<f32>" : "texture_2d<f32>");
-                out.push("@group(0) @binding(" + (2 + index * 2) + ") var d9_tex" +
+                const depth = this.isDepthSampler(index);
+                const compare = depth && !this.isDepthFetchSampler(index);
+                const wgslType = depth ? "texture_depth_2d"
+                    : (type === "cube" ? "texture_cube<f32>"
+                        : (type === "3d" ? "texture_3d<f32>" : "texture_2d<f32>"));
+                out.push("@group(0) @binding(" + (samplerBindingBase + index * 2) + ") var d9_tex" +
                     index + ": " + wgslType + ";");
-                out.push("@group(0) @binding(" + (3 + index * 2) + ") var d9_smp" +
-                    index + ": sampler;");
+                out.push("@group(0) @binding(" + (samplerBindingBase + 1 + index * 2) + ") var d9_smp" +
+                    index + ": " + (compare ? "sampler_comparison" : "sampler") + ";");
             }
 
             out.push("");
@@ -1391,6 +1682,10 @@
             out.push("    @builtin(position) position: vec4<f32>,");
             for (let slot = 0; slot < VARYING_COUNT; ++slot)
                 out.push("    @location(" + slot + ") varying" + slot + ": vec4<f32>,");
+            const clipPlaneCount = this.options.clipPlaneCount || 0;
+            for (let group = 0; group < Math.ceil(clipPlaneCount / 4); ++group)
+                out.push("    @location(" + (VARYING_COUNT + group) +
+                    ") clip" + group + ": vec4<f32>,");
             out.push("};");
             out.push("");
             const inputType = location => ({
@@ -1450,6 +1745,12 @@
             out.push("        o_position.zw);");
             for (let slot = 0; slot < VARYING_COUNT; ++slot)
                 out.push("    result.varying" + slot + " = o_varying" + slot + ";");
+            for (let group = 0; group < Math.ceil(clipPlaneCount / 4); ++group)
+                out.push("    result.clip" + group + " = vec4<f32>(1.0);");
+            for (let plane = 0; plane < clipPlaneCount; ++plane)
+                out.push("    result.clip" + Math.floor(plane / 4) + "." +
+                    "xyzw"[plane & 3] + " = dot(o_position, " +
+                    "d9c.clip_planes[" + plane + "]);" );
             if (this.options.pointExpansion) {
                 out.push("    let d9_point_uvs = array<vec2<f32>, 6>(");
                 out.push("        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0),");
@@ -1508,6 +1809,10 @@
             out.push("    @builtin(position) position: vec4<f32>,");
             for (let slot = 0; slot < VARYING_COUNT; ++slot)
                 out.push("    @location(" + slot + ") varying" + slot + ": vec4<f32>,");
+            const clipPlaneCount = this.options.clipPlaneCount || 0;
+            for (let group = 0; group < Math.ceil(clipPlaneCount / 4); ++group)
+                out.push("    @location(" + (VARYING_COUNT + group) +
+                    ") clip" + group + ": vec4<f32>,");
             out.push("};");
             out.push("");
             // One @location per oC# the shader writes. D3D9 requires oC0 and
@@ -1532,6 +1837,9 @@
                 ? ", @builtin(front_facing) d9_front: bool" : "";
             out.push("fn d9_ps_main(stage_in: D9PixelInput" + faceParameter +
                 ") -> D9PixelOutput {");
+            for (let plane = 0; plane < clipPlaneCount; ++plane)
+                out.push("    if (stage_in.clip" + Math.floor(plane / 4) +
+                    "." + "xyzw"[plane & 3] + " < 0.0) { discard; }");
             for (const entry of declared)
                 out.push("    " + entry.register + " = stage_in.varying" + entry.slot + ";");
             if (this.usesFragPosition)
@@ -1566,9 +1874,14 @@
                     usageIndex: semantic.usageIndex, location: register });
             }
             inputs.sort((a, b) => a.register - b.register);
+            const samplerBindingBase = this.kind === "vertex" ? 34 : 2;
             const samplers = Array.from(this.samplers.entries())
                 .map(([index, type]) => ({ index, type,
-                    textureBinding: 2 + index * 2, samplerBinding: 3 + index * 2 }))
+                    depth: this.isDepthSampler(index)
+                        ? (this.isDepthFetchSampler(index) ? "fetch" : "compare")
+                        : false,
+                    textureBinding: samplerBindingBase + index * 2,
+                    samplerBinding: samplerBindingBase + 1 + index * 2 }))
                 .sort((a, b) => a.index - b.index);
             const floatDefaults = [];
             for (const [register, values] of this.floatDefaults)
@@ -1588,7 +1901,12 @@
             // optional point-sprite fields.
             const isVertex = this.kind === "vertex";
             const viewportOffset = isVertex ? registerUniformBytes : -1;
-            const trailingOffset = registerUniformBytes + (isVertex ? 16 : 0);
+            const clipPlaneCount = isVertex
+                ? (this.options.clipPlaneCount || 0) : 0;
+            const clipPlanesOffset = clipPlaneCount
+                ? registerUniformBytes + 16 : -1;
+            const trailingOffset = registerUniformBytes + (isVertex ? 16 : 0)
+                + clipPlaneCount * 16;
             return {
                 kind: this.kind,
                 version: { major: this.major, minor: this.minor },
@@ -1621,6 +1939,8 @@
                 intRegionBytes: intCount * 16,
                 boolRegionBytes: boolVectors * 16,
                 viewportOffset,
+                clipPlaneCount,
+                clipPlanesOffset,
                 pointExpansion,
                 pointSprite: pointExpansion && !!this.options.pointSprite,
                 pointViewportOffset: pointExpansion ? trailingOffset : -1,

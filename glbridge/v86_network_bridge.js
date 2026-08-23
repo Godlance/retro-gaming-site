@@ -5282,10 +5282,39 @@
                 return;
             }
             this.warnOnSharedD3DCanvasConflict("d3d9");
+            const descriptorBase = event.descAddr >>> 0;
+            const writeGuestMemory = (dmaOffset, data) => {
+                const offset = dmaOffset >>> 0;
+                const source = data instanceof Uint8Array
+                    ? data : new Uint8Array(data || []);
+                const end = offset + source.byteLength;
+                /* v86gl.sys currently maps a fixed 16 MiB DMA allocation.
+                 * Refuse wraparound or an out-of-arena host write even if a
+                 * malformed guest command asks for one. */
+                if (end < offset || end > 16 * 1024 * 1024)
+                    throw new RangeError("D9WG response write is outside DMA memory");
+                if (!this.emulator ||
+                        typeof this.emulator.write_memory !== "function")
+                    throw new Error("v86 physical-memory writer is unavailable");
+                /*
+                 * Blob first, address second. v86's two accessors take their
+                 * arguments in opposite orders -- read_memory(address, length)
+                 * but write_memory(blob, address), because write_blob() ends in
+                 * mem8.set(blob, address) -- and getting it backwards is silent
+                 * rather than fatal: TypedArray.set() with a number as its
+                 * source copies zero bytes and throws nothing. Every readback
+                 * response and query answer was being dropped that way, and the
+                 * only symptom was the guest spinning until its own timeout.
+                 */
+                this.emulator.write_memory(source,
+                    (descriptorBase + offset) >>> 0);
+            };
             this.d3d9Executor.submit(bytes.subarray(8), {
                 pciFrameId: event.frameId >>> 0,
                 submitCount: event.submitCount >>> 0,
                 descriptorCommandCount: event.commandCount >>> 0,
+                descriptorBase,
+                writeGuestMemory,
             });
         }
 

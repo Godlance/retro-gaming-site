@@ -191,6 +191,20 @@ const CORPUS = [
         instruction(OP.MOV, { length: 2 }), dst(REG.OUTPUT, 2), src(REG.INPUT, 1),
         END,
     ]],
+    ["vs_3_0 vertex texture fetch", [
+        VS(3, 0),
+        instruction(OP.DCL, { length: 2 }), dclToken(0, 0, 2),
+            dst(REG.SAMPLER, 0),
+        instruction(OP.DCL, { length: 2 }), dclToken(USAGE.POSITION),
+            dst(REG.INPUT, 0),
+        instruction(OP.DCL, { length: 2 }), dclToken(USAGE.POSITION),
+            dst(REG.OUTPUT, 0),
+        instruction(OP.TEXLDL, { length: 3 }), dst(REG.TEMP, 0),
+            src(REG.INPUT, 0), src(REG.SAMPLER, 0),
+        instruction(OP.MOV, { length: 2 }), dst(REG.OUTPUT, 0),
+            src(REG.TEMP, 0),
+        END,
+    ]],
     ["ps_1_1 modulate diffuse by texture", [
         PS(1, 1),
         instruction(OP.TEX), dst(REG.TEXTURE, 0),
@@ -319,6 +333,61 @@ const CORPUS = [
         instruction(OP.MOV, { length: 2 }), dst(REG.COLOROUT, 0), src(REG.TEMP, 0),
         END,
     ]],
+    // Sampling inside a data-dependent branch, with the coordinate available
+    // above it. This must come out as textureSampleGrad with hoisted
+    // derivatives -- naga proves the explicit-gradient form really is legal
+    // under non-uniform control flow, which is the whole basis for preferring
+    // it over dropping to mip level 0.
+    ["ps_3_0 in-branch sample keeps its mip level via hoisted gradients", [
+        PS(3, 0),
+        instruction(OP.DCL, { length: 2 }), dclToken(0, 0, 2), dst(REG.SAMPLER, 0),
+        instruction(OP.DCL, { length: 2 }), dclToken(USAGE.TEXCOORD, 0), dst(REG.INPUT, 0),
+        instruction(OP.DEF, { length: 5 }), dst(REG.CONST, 0),
+            floatBits(0.5), floatBits(0), floatBits(0), floatBits(0),
+        instruction(OP.IFC, { length: 2, control: 5 /* ne */ }),
+            src(REG.INPUT, 0), src(REG.CONST, 0),
+        instruction(OP.TEX, { length: 3 }), dst(REG.TEMP, 0),
+            src(REG.INPUT, 0), src(REG.SAMPLER, 0),
+        instruction(OP.ENDIF),
+        instruction(OP.MOV, { length: 2 }), dst(REG.COLOROUT, 0), src(REG.TEMP, 0),
+        END,
+    ]],
+    // The exact shape that made 3DMark06's airship a black silhouette: a
+    // derivative inside a data-dependent `if`. Legal in D3D9, which runs both
+    // sides of the branch; a compile error in WGSL, which is why naga has to
+    // see this one.
+    ["ps_3_0 dsx/dsy inside a data-dependent branch", [
+        PS(3, 0),
+        instruction(OP.DCL, { length: 2 }), dclToken(USAGE.TEXCOORD, 0), dst(REG.INPUT, 0),
+        instruction(OP.DEF, { length: 5 }), dst(REG.CONST, 0),
+            floatBits(0.5), floatBits(0), floatBits(0), floatBits(0),
+        // r1 is computed before the branch, so its derivative can be hoisted.
+        instruction(OP.MOV, { length: 2 }), dst(REG.TEMP, 1), src(REG.INPUT, 0),
+        instruction(OP.IFC, { length: 2, control: 5 /* ne */ }),
+            src(REG.TEMP, 1), src(REG.CONST, 0),
+        instruction(OP.DSX, { length: 2 }), dst(REG.TEMP, 2), src(REG.TEMP, 1),
+        instruction(OP.DSY, { length: 2 }), dst(REG.TEMP, 3), src(REG.TEMP, 1),
+        instruction(OP.ADD, { length: 3 }), dst(REG.TEMP, 0),
+            src(REG.TEMP, 2), src(REG.TEMP, 3),
+        instruction(OP.ENDIF),
+        instruction(OP.MOV, { length: 2 }), dst(REG.COLOROUT, 0), src(REG.TEMP, 0),
+        END,
+    ]],
+    // The case that cannot be hoisted: the branch overwrites the operand, so
+    // there is no value above it to differentiate.
+    ["ps_3_0 dsx of a register the branch itself rewrites", [
+        PS(3, 0),
+        instruction(OP.DCL, { length: 2 }), dclToken(USAGE.TEXCOORD, 0), dst(REG.INPUT, 0),
+        instruction(OP.DEF, { length: 5 }), dst(REG.CONST, 0),
+            floatBits(0.5), floatBits(0), floatBits(0), floatBits(0),
+        instruction(OP.IFC, { length: 2, control: 5 /* ne */ }),
+            src(REG.INPUT, 0), src(REG.CONST, 0),
+        instruction(OP.MOV, { length: 2 }), dst(REG.TEMP, 1), src(REG.CONST, 0),
+        instruction(OP.DSX, { length: 2 }), dst(REG.TEMP, 0), src(REG.TEMP, 1),
+        instruction(OP.ENDIF),
+        instruction(OP.MOV, { length: 2 }), dst(REG.COLOROUT, 0), src(REG.TEMP, 0),
+        END,
+    ]],
     ["ps_2_x predicated instruction with setp", [
         PS(2, 1),
         instruction(OP.DCL, { length: 2 }), dclToken(USAGE.TEXCOORD, 0), dst(REG.TEXTURE, 0),
@@ -398,6 +467,130 @@ for (const [name, kind] of [["ubyte4", "ubyte4"], ["short2", "short2"],
                 source: result.wgsl });
         else ++validated;
     }
+}
+
+// Programmable clip-plane variants add two inter-stage vec4s and extend the
+// vertex constant block. Validate both modules, not just their fixed-function
+// counterparts below.
+for (const [name, source] of [
+        ["programmable clip-plane vertex", CORPUS.find(entry =>
+            entry[0].startsWith("vs_3_0 dcl"))[1]],
+        ["programmable clip-plane pixel", CORPUS.find(entry =>
+            entry[0].startsWith("ps_2_0 two-sampler"))[1]],
+    ]) {
+    const result = pipeline.compileShader(new Uint32Array(source), {
+        clipPlaneCount: 6,
+    });
+    const file = path.join(directory,
+        name.replace(/[^a-z0-9]+/gi, "_") + ".wgsl");
+    if (!result.ok) {
+        failures.push({ name, message: "translation failed: " + result.error });
+    } else {
+        fs.writeFileSync(file, result.wgsl);
+        const run = spawnSync(naga, [file], { encoding: "utf8" });
+        if (run.status !== 0)
+            failures.push({ name,
+                message: (run.stderr || run.stdout || "").trim(),
+                source: result.wgsl });
+        else ++validated;
+    }
+}
+
+// Hardware shadow maps: a stage bound to a depth texture is declared
+// texture_depth_2d and sampled through a sampler_comparison, which is a
+// different WGSL type system from every other case above -- textureSample does
+// not accept a comparison sampler and textureSampleCompare does not accept an
+// ordinary one, so a mistake here is a compile error rather than a wrong
+// image. The projected form is included because that is what a shadow lookup
+// actually uses: tex2Dproj supplies the comparison reference as z/w.
+for (const [name, entry] of [
+        ["depth compare", "ps_2_0 two-sampler blend with def constants"],
+        ["depth compare projected", "ps_2_0 cube sampler with a projected " +
+            "coordinate"],
+        ["depth compare non-uniform", "ps_3_0 data-dependent branch degrades " +
+            "to level-0 sampling"],
+        ["depth compare explicit lod", "ps_2_0 texldl/texldd explicit LOD and " +
+            "gradients"],
+    ]) {
+    const source = CORPUS.find(item => item[0] === entry);
+    assert.ok(source, "validation corpus is missing " + entry);
+    const result = pipeline.compileShader(new Uint32Array(source[1]), {
+        depthSamplers: [0],
+    });
+    if (!result.ok) {
+        failures.push({ name, message: "translation failed: " + result.error });
+        continue;
+    }
+    // The cube case must *not* become a depth sampler: a cube depth texture
+    // cannot be created at all, and silently emitting texture_depth_2d for one
+    // would pair a cube view with a 2D layout entry.
+    const sampler0 = result.reflection.samplers.find(item => item.index === 0);
+    if (sampler0.type === "2d") {
+        assert.equal(sampler0.depth, "compare",
+            name + ": a 2D sampler asked to be depth must report it");
+        assert.ok(result.wgsl.includes("texture_depth_2d"),
+            name + ": expected a texture_depth_2d declaration");
+        assert.ok(result.wgsl.includes("sampler_comparison"),
+            name + ": expected a sampler_comparison declaration");
+        assert.ok(/textureSampleCompare(Level)?\(/.test(result.wgsl),
+            name + ": expected a comparison sample");
+        // Only stage 0 is the shadow map; the two-sampler case keeps an
+        // ordinary textureSample on stage 1, which is the point -- one module
+        // has to carry both kinds at once.
+        assert.ok(!/textureSample(Bias|Grad|Level)?\(d9_tex0\b/.test(result.wgsl),
+            name + ": a comparison sampler cannot be used with textureSample");
+    } else {
+        assert.equal(sampler0.depth, false,
+            name + ": only 2D samplers can be depth");
+    }
+    const file = path.join(directory,
+        name.replace(/[^a-z0-9]+/gi, "_") + ".wgsl");
+    fs.writeFileSync(file, result.wgsl);
+    const run = spawnSync(naga, [file], { encoding: "utf8" });
+    if (run.status !== 0)
+        failures.push({ name, message: (run.stderr || run.stdout || "").trim(),
+            source: result.wgsl });
+    else ++validated;
+}
+
+// The other half of the depth story: the ATI FOURCC formats read the stored
+// depth back instead of comparing against it. Same texture_depth_2d, an
+// ordinary sampler, textureSampleLevel rather than textureSampleCompare -- and
+// naga is the thing that proves those three agree, because pairing a
+// sampler_comparison with textureSampleLevel is a type error, not a bad image.
+for (const [name, entry] of [
+        ["depth fetch", "ps_2_0 two-sampler blend with def constants"],
+        ["depth fetch explicit lod", "ps_2_0 texldl/texldd explicit LOD and " +
+            "gradients"],
+    ]) {
+    const source = CORPUS.find(item => item[0] === entry);
+    assert.ok(source, "validation corpus is missing " + entry);
+    const result = pipeline.compileShader(new Uint32Array(source[1]), {
+        depthSamplers: [0], depthFetchSamplers: [0],
+    });
+    if (!result.ok) {
+        failures.push({ name, message: "translation failed: " + result.error });
+        continue;
+    }
+    const sampler0 = result.reflection.samplers.find(item => item.index === 0);
+    assert.equal(sampler0.depth, "fetch",
+        name + ": a raw-depth sampler must report the fetch mode");
+    assert.ok(result.wgsl.includes("texture_depth_2d"),
+        name + ": a depth fetch is still a depth texture");
+    assert.ok(!result.wgsl.includes("sampler_comparison"),
+        name + ": a fetch reads through an ordinary sampler");
+    assert.ok(!/textureSampleCompare/.test(result.wgsl),
+        name + ": a fetch does not compare");
+    assert.ok(/textureSampleLevel\(d9_tex0\b/.test(result.wgsl),
+        name + ": expected a level-explicit depth fetch");
+    const file = path.join(directory,
+        name.replace(/[^a-z0-9]+/gi, "_") + ".wgsl");
+    fs.writeFileSync(file, result.wgsl);
+    const run = spawnSync(naga, [file], { encoding: "utf8" });
+    if (run.status !== 0)
+        failures.push({ name, message: (run.stderr || run.stdout || "").trim(),
+            source: result.wgsl });
+    else ++validated;
 }
 
 // The synthesised fixed-function stages are part of the same contract and
@@ -538,6 +731,10 @@ for (const [name, kind] of [["ubyte4", "ubyte4"], ["short2", "short2"],
             coordStages: [{ index: 0, texCoordIndex: 0, tciMode: 0,
                 transformCount: 0, projected: false }],
         }))]);
+    fixedFunction.push(["ff vs six user clip planes",
+        executor.buildFixedFunctionVertexShader(vsBase({
+            hasColor: true, clipPlaneCount: 6,
+        }))]);
 
     // A pixel signature with a single default stage.
     const stage = overrides => Object.assign({
@@ -550,7 +747,7 @@ for (const [name, kind] of [["ubyte4", "ubyte4"], ["short2", "short2"],
         stages: [stage()], usesTextureFactor: false, fogMode: 0,
         tableFog: false,
         alphaTest: { enabled: false, func: 8, reference: 0 },
-        specularEnable: false,
+        specularEnable: false, clipPlaneCount: 0,
     }, overrides);
     for (const hasTexture of [false, true]) {
         for (const debugMode of [null, "solid", "color", "uv", "texture"]) {
@@ -615,6 +812,10 @@ for (const [name, kind] of [["ubyte4", "ubyte4"], ["short2", "short2"],
                 alphaTest: { enabled: true, func: 5, reference: 128 },
             }), null)]);
     }
+    fixedFunction.push(["ff ps six user clip planes",
+        executor.buildFixedFunctionPixelShader(psBase({
+            clipPlaneCount: 6,
+        }), null)]);
     for (const [name, wgsl] of fixedFunction) {
         const file = path.join(directory,
             name.replace(/[^a-z0-9]+/gi, "_").toLowerCase() + ".wgsl");

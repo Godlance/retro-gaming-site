@@ -15,8 +15,11 @@ for test_name in \
     world \
     reset \
     shader \
+    caps \
+    rt_viewport \
     swapchain \
     depth_texture \
+    cube_texture \
     surface_lifetime
 do
     "$compiler" -mwindows -std=gnu99 -Os -s -nostdlib \
