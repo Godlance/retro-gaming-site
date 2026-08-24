@@ -5,9 +5,9 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const proxyPath = path.join(
-    __dirname, "..", "winproxy", "opengl32_proxy.c");
+    __dirname, "..", "openglproxy", "opengl32_proxy.c");
 const headerPath = path.join(
-    __dirname, "..", "winproxy", "v86gl_ioctl.h");
+    __dirname, "..", "openglproxy", "v86gl_ioctl.h");
 const samplePath = path.join(
     __dirname, "..", "sample", "d3d8_triangle_test.c");
 const proxy = fs.readFileSync(proxyPath, "utf8");

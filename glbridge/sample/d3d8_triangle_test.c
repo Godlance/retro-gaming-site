@@ -4,7 +4,7 @@
 // d3d8.dll only and adds the smallest useful fixed-pipeline draw path:
 // a vertex buffer containing three pre-transformed, diffuse-colour vertices.
 //
-// Build for Windows XP as documented in ../winproxy/README.md.  The command
+// Build for Windows XP as documented in ../openglproxy/README.md.  The command
 // uses a 32-bit MinGW compiler and avoids the MinGW C runtime.
 
 #define WIN32_LEAN_AND_MEAN

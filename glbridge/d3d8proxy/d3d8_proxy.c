@@ -17,7 +17,7 @@
 #include <initguid.h>
 #include <d3d8.h>
 #include <stdint.h>
-#include "../winproxy/v86gl_ioctl.h"
+#include "../openglproxy/v86gl_ioctl.h"
 #include "d3d8_protocol.h"
 
 /* These legacy D3D shade-cap bits are omitted by some d3d8.h variants. */

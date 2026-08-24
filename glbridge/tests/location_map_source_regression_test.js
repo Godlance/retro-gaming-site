@@ -6,7 +6,7 @@ const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
 const proxy = fs.readFileSync(
-    path.join(root, "winproxy", "opengl32_proxy.c"), "utf8");
+    path.join(root, "openglproxy", "opengl32_proxy.c"), "utf8");
 const bridge = fs.readFileSync(
     path.join(root, "libglwasm", "gl4es_bridge.c"), "utf8");
 

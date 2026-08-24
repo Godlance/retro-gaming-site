@@ -103,7 +103,7 @@ sc start v86gl
 The driver exposes `\\.\v86gl`. Its `MAP_BUFFER` IOCTL maps the contiguous
 guest RAM into `opengl32.dll`; `SUBMIT` writes descriptor address, byte length,
 and doorbell through the PCI I/O BAR. The shared user/kernel declarations are
-in `../winproxy/v86gl_ioctl.h`.
+in `../openglproxy/v86gl_ioctl.h`.
 
 ## Transport diagnostics
 

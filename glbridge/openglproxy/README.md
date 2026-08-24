@@ -233,7 +233,7 @@ moving WineD3D to its `ps_consts >= 32` Pixel Shader 2 capability branch.
 From Linux/macOS with mingw-w64:
 
 ```bash
-cd src/glbridge/winproxy
+cd src/glbridge/openglproxy
 i686-w64-mingw32-gcc -shared -Os -s \
   -nostdlib -Wl,--subsystem,windows:5.01 -Wl,-e,_DllMain@12 \
   -o opengl32.dll opengl32_proxy.c opengl32.def \

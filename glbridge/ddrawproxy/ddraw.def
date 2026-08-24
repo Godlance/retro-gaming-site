@@ -1,0 +1,28 @@
+LIBRARY ddraw
+EXPORTS
+    DirectDrawCreate=DirectDrawCreate@12
+    DirectDrawCreateEx=DirectDrawCreateEx@16
+    DirectDrawCreateClipper=DirectDrawCreateClipper@12
+    DirectDrawEnumerateA=DirectDrawEnumerateA@8
+    DirectDrawEnumerateW=DirectDrawEnumerateW@8
+    DirectDrawEnumerateExA=DirectDrawEnumerateExA@12
+    DirectDrawEnumerateExW=DirectDrawEnumerateExW@12
+    DllGetClassObject=DllGetClassObject@12
+    DllCanUnloadNow=DllCanUnloadNow@0
+; The retail ddraw.dll exports these too. A title that statically imports any
+; of them fails to LOAD against a DLL that omits them, which surfaces as a
+; generic "unable to initialize DirectDraw" with no chance to run -- the
+; documented entry points above are never reached. The D3D8 path hit the
+; equivalent problem with Warcraft III's ValidateVertexShader import.
+    AcquireDDThreadLock=AcquireDDThreadLock@0
+    ReleaseDDThreadLock=ReleaseDDThreadLock@0
+    D3DParseUnknownCommand=D3DParseUnknownCommand@8
+    CompleteCreateSysmemSurface=CompleteCreateSysmemSurface@4
+    DDInternalLock=DDInternalLock@8
+    DDInternalUnlock=DDInternalUnlock@4
+    GetDDSurfaceLocal=GetDDSurfaceLocal@12
+    GetSurfaceFromDC=GetSurfaceFromDC@12
+    GetOLEThunkData=GetOLEThunkData@4
+    RegisterSpecialCase=RegisterSpecialCase@16
+    DSoundHelp=DSoundHelp@12
+    SetAppCompatData=SetAppCompatData@8

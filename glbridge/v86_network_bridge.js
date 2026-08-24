@@ -3804,6 +3804,17 @@
             const sharedD3DCanvas = this.options.d3dCanvas ||
                 (typeof document !== "undefined" ?
                     document.getElementById("d3d_webgpu_canvas") : null);
+            /*
+             * Which host runs the OpenGL stream. "webgpu" is gl_executor.js on
+             * the shared D3D canvas; "gl4es" is the historical WebGL2 path.
+             * The switch exists so a milestone that goes wrong is one string
+             * away from the previous behaviour rather than a revert -- see
+             * plan section 5.4. It is removed at M7.
+             */
+            this.glBackend = this.options.glBackend || "webgpu";
+            this.glCanvas = this.options.glCanvas || sharedD3DCanvas;
+            this.glExecutor = null;
+            this.glSurface = { hwnd: 0, x: 0, y: 0, width: 0, height: 0 };
             this.d3d8Canvas = this.options.d3d8Canvas || sharedD3DCanvas;
             this.d3d8Executor = null;
             this.d3d8BatchStreamSeen = false;
@@ -3863,10 +3874,80 @@
 
             this.setD3D8ExecutorFromOptions();
             this.setD3D9ExecutorFromOptions();
-            this.setRendererFromOptions();
+            this.setGLExecutorFromOptions();
+            if (this.glBackend !== "webgpu") this.setRendererFromOptions();
             emulator.add_listener("v86gl-pci-frame", event => this.pushPCIBatch(event));
             emulator.add_listener("emulator-loaded", () => this.attachPCIStateHooks());
             this.attachPCIStateHooks();
+        }
+
+        setGLExecutorFromOptions() {
+            if (this.glBackend !== "webgpu") return;
+            if (this.options.glExecutor) {
+                this.glExecutor = this.options.glExecutor;
+                return;
+            }
+            const install = this.options.installGLWebGPUExecutor ||
+                global.installGLWebGPUExecutor;
+            if (!this.glCanvas || typeof install !== "function") {
+                console.error("[gl-webgpu] the OpenGL WebGPU executor is " +
+                    "unavailable; load gl_executor.js and provide a canvas, or " +
+                    "pass glBackend: \"gl4es\" to use the old WebGL path");
+                return;
+            }
+            const executorOptions = { ...(this.options.gl || {}) };
+            executorOptions.onSurface = (surface, reason) => {
+                this.glSurface = { ...this.glSurface, ...surface };
+                if (reason === "hide" || surface.visible === false)
+                    this.hideGLCanvas();
+                else this.positionGLCanvas();
+            };
+            /*
+             * glReadPixels is answered after the GPU mapping resolves, by which
+             * time the guest is spinning on the status word in the record it
+             * submitted. The batch bytes alias guest RAM, so writing into them
+             * is enough; this writer is the belt-and-braces path for a wiring
+             * where they do not.
+             */
+            executorOptions.writeGuestMemory = (offsetInBatch, data, metadata) => {
+                if (!metadata || metadata.batchAddress === undefined) return;
+                if (!this.emulator ||
+                        typeof this.emulator.write_memory !== "function") return;
+                this.emulator.write_memory(data,
+                    (metadata.batchAddress + offsetInBatch) >>> 0);
+            };
+            this.glExecutor = install(this.glCanvas, executorOptions);
+        }
+
+        positionGLCanvas() {
+            if (!this.glCanvas) return;
+            const surface = this.glSurface;
+            this.styleOverlayCanvas(this.glCanvas, surface.x | 0, surface.y | 0,
+                surface.width || this.glCanvas.width,
+                surface.height || this.glCanvas.height, true);
+        }
+
+        hideGLCanvas() {
+            if (!this.glCanvas) return;
+            this.glCanvas.style.display = "none";
+        }
+
+        pushGLPCIBatch(event, bytes) {
+            if (!this.glExecutor ||
+                    typeof this.glExecutor.submit !== "function") {
+                console.error("[gl-webgpu] executor is unavailable; load " +
+                    "gl_executor.js and provide a WebGPU canvas");
+                return;
+            }
+            this.glExecutor.submit(bytes, {
+                pciFrameId: event.frameId >>> 0,
+                submitCount: event.submitCount >>> 0,
+                descriptorCommandCount: event.commandCount >>> 0,
+                batchAddress: event.batchAddr !== undefined ?
+                    (event.batchAddr >>> 0) : undefined,
+                responseBase: event.responseBase,
+            });
+            if (event.flags & 1) this.glExecutor.onSwapBuffers();
         }
 
         setD3D8ExecutorFromOptions() {
@@ -5186,6 +5267,18 @@
                 this.pushD3D9PCIBatch(event, incomingBytes);
                 return;
             }
+            if (this.glBackend === "webgpu") {
+                if (this.restoringState) {
+                    this.pendingPCIBatches.push({
+                        ...event,
+                        bytes: incomingBytes.slice(),
+                    });
+                    return;
+                }
+                this.pushGLPCIBatch(event, incomingBytes);
+                return;
+            }
+
             if (!this.renderer || this.restoringState) {
                 const bytes = incomingBytes.slice();
                 this.pendingPCIBatches.push({

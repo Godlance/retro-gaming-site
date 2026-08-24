@@ -225,7 +225,18 @@
          page: it resolves D3D9ShaderPipeline at load time, not lazily. -->
     <script src="glbridge/d3d9-webgpu/d3d9_shader_pipeline.js?v=d3d9-writepath-probe-20260823"></script>
     <script src="glbridge/d3d9-webgpu/d3d9_executor.js?v=d3d9-writepath-probe-20260823"></script>
-    <script src="glbridge/v86_network_bridge.js?v=d3d9-responses-20260822"></script>
+    <!-- The OpenGL path on WebGPU. Load order matters: the executor resolves
+         its constants, wire format, state layout, translator and fixed-function
+         generator at load time, not lazily, and webgpu_host.js has to exist
+         before any executor asks for the shared device. -->
+    <script src="glbridge/webgpu_host.js?v=gl-webgpu-m1-20260824"></script>
+    <script src="glbridge/gl-webgpu/gl_constants.js?v=gl-webgpu-m1-20260824"></script>
+    <script src="glbridge/gl-webgpu/gl_wire.js?v=gl-webgpu-m1-20260824"></script>
+    <script src="glbridge/gl-webgpu/gl_state_layout.js?v=gl-webgpu-m1-20260824"></script>
+    <script src="glbridge/gl-webgpu/gl_shader_translator.js?v=gl-webgpu-m1-20260824"></script>
+    <script src="glbridge/gl-webgpu/gl_fixed_function.js?v=gl-webgpu-m1-20260824"></script>
+    <script src="glbridge/gl-webgpu/gl_executor.js?v=gl-webgpu-m1-20260824"></script>
+    <script src="glbridge/v86_network_bridge.js?v=gl-webgpu-m1-20260824"></script>
     <script src="file-transfer/v8ft-protocol.js?v=v8ft-v1-phase3-20260811"></script>
     <script src="file-transfer/v8ft-client.js?v=v8ft-v1-phase4-20260812"></script>
     <script src="file-transfer/operation-coordinator.js?v=v8ft-v1-phase4-20260812"></script>

@@ -70,7 +70,7 @@
 
     const D9WG_MAGIC = 0x47573944; // "D9WG"
     const D9WG_VERSION_MAJOR = 1;
-    const D9WG_VERSION_MINOR = 6;
+    const D9WG_VERSION_MINOR = 7;
     // The oldest guest proxy this host still decodes. 1.3 payloads are simply
     // shorter than 1.4 ones; see the version check in executeBatch().
     const D9WG_VERSION_MIN_MINOR = 3;
@@ -294,6 +294,12 @@
     const D3DUSAGE_RENDERTARGET = 0x1;
     const D3DUSAGE_DEPTHSTENCIL = 0x2;
     const D3DUSAGE_AUTOGENMIPMAP = 0x400;
+    // Protocol 1.7, and not a D3DUSAGE bit -- see D9WG_USAGE_DDRAW_INDEXED in
+    // d3d9_protocol.h. A P8 texture carrying it is stored as r8uint indices
+    // resolved through a palette, rather than expanded to RGBA on the CPU,
+    // because DirectDraw blits P8 into P8 and a later palette change must
+    // still change those pixels' colour.
+    const D9WG_USAGE_DDRAW_INDEXED = 0x80000000;
     const D3DMULTISAMPLE_NONE = 0;
     const D3DMULTISAMPLE_4_SAMPLES = 4;
 
@@ -362,7 +368,12 @@
     const D3DRS_FOGSTART = 36;
     const D3DRS_FOGEND = 37;
     const D3DRS_FOGDENSITY = 38;
+    // Direct3D 7-only texture colour-key states.  The D3D7 guest deliberately
+    // sends their legacy numeric ids through SET_RENDER_STATE; D3D9 leaves
+    // both holes unused, so they cannot collide with native D3D9 state.
+    const D3DRS_COLORKEYENABLE = 41;
     const D3DRS_FOGVERTEXMODE = 140;
+    const D3DRS_COLORKEYBLENDENABLE = 144;
     const D3DRS_RANGEFOGENABLE = 48;
     const D3DRS_LIGHTING = 137;
     const D3DRS_AMBIENT = 139;
@@ -661,6 +672,7 @@
         D3DRS_CCW_STENCILFUNC, D3DRS_DEPTHBIAS, D3DRS_SLOPESCALEDEPTHBIAS,
         D3DRS_FOGENABLE, D3DRS_FOGCOLOR, D3DRS_FOGTABLEMODE,
         D3DRS_FOGSTART, D3DRS_FOGEND, D3DRS_FOGDENSITY, D3DRS_FOGVERTEXMODE,
+        D3DRS_COLORKEYENABLE, D3DRS_COLORKEYBLENDENABLE,
         D3DRS_RANGEFOGENABLE, D3DRS_LIGHTING, D3DRS_AMBIENT,
         D3DRS_SPECULARENABLE, D3DRS_TEXTUREFACTOR, D3DRS_COLORVERTEX,
         D3DRS_LOCALVIEWER, D3DRS_NORMALIZENORMALS, D3DRS_DIFFUSEMATERIALSOURCE,
@@ -909,7 +921,11 @@
             // The NULL FOURCC target's stand-in. It is renderable by
             // definition -- being a render target nothing reads is its whole
             // purpose -- and r8unorm is the cheapest format that can be one.
-            format === "r8unorm";
+            format === "r8unorm" ||
+            // Protocol 1.7: the storage a DirectDraw palettised surface uses.
+            // It has to be an attachment because a 2D title's whole frame is
+            // built by blitting P8 sprites into a P8 back buffer.
+            format === "r8uint";
     }
 
     function isFloat32GPUFormat(format) {
@@ -2569,6 +2585,7 @@ ${coordBody}${fogBody}${clipBody}${pointBody}    return result;
                        [stage.addressW, "z"]]
                     : [[stage.addressU, "x"], [stage.addressV, "y"]])
                 .filter(axis => axis[0] === 4).map(axis => axis[1]);
+            let colorKeyInside = null;
             if (borderAxes.length) {
                 // WebGPU has no border-colour sampler.  Clamp for the physical
                 // sample, then replace every coordinate outside the D3D unit
@@ -2579,6 +2596,7 @@ ${coordBody}${fogBody}${clipBody}${pointBody}    return result;
                 const inside = borderAxes.map(axis => "(" + coordExpression +
                     ")." + axis + " >= 0.0 && (" + coordExpression + ")." +
                     axis + " <= 1.0").join(" && ");
+                colorKeyInside = inside;
                 const color = stage.borderColor === undefined
                     ? 0 : stage.borderColor >>> 0;
                 const component = shift =>
@@ -2590,6 +2608,29 @@ ${coordBody}${fogBody}${clipBody}${pointBody}    return result;
                     border + ", " + sampled + ", " + inside + ");");
             } else {
                 samples.push("    let tex" + stage.index + " = " + sampled + ";");
+            }
+            if (stage.colorKey && !stage.colorKey.indexed) {
+                const low = stage.colorKey.low >>> 0;
+                const high = stage.colorKey.high >>> 0;
+                const rgb = value => "vec3<u32>(" +
+                    ((value >>> 16) & 0xff) + "u, " +
+                    ((value >>> 8) & 0xff) + "u, " +
+                    (value & 0xff) + "u)";
+                const withinTexture = colorKeyInside
+                    ? "(" + colorKeyInside + ") && " : "";
+                samples.push("    let d9_key_rgb" + stage.index +
+                    " = vec3<u32>(round(clamp(tex" + stage.index +
+                    ".rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * 255.0));\n" +
+                    "    if (" + withinTexture + "all(d9_key_rgb" +
+                    stage.index + " >= " + rgb(low) + ") && all(d9_key_rgb" +
+                    stage.index + " <= " + rgb(high) + ")) { discard; }");
+            } else if (stage.colorKey && stage.colorKey.indexed) {
+                // The indexed companion view was resolved from the original
+                // indices and writes alpha zero only for indices in the key
+                // range. Comparing palette RGB here would be wrong when two
+                // entries contain the same colour.
+                samples.push("    if (tex" + stage.index +
+                    ".a <= 0.0) { discard; }");
             }
             // D3DTOP_BUMPENVMAPLUMINANCE additionally modulates this stage's
             // colour by the bump texture's luminance channel, scaled and
@@ -3766,6 +3807,14 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 [OP_BEGIN_QUERY]: this.onBeginQuery,
                 [OP_END_QUERY]: this.onEndQuery,
             };
+            // Opcode groups that live in a sibling module -- currently
+            // ddraw_ops.js's 0x500 DirectDraw group. Merged here rather than
+            // listed above so this file stays the D3D9 command set, and so a
+            // page that never loads the sibling simply has those opcodes count
+            // as unsupported instead of failing to construct.
+            if (D3D9WebGPUExecutor.extensionHandlers)
+                Object.assign(this._handlers,
+                    D3D9WebGPUExecutor.extensionHandlers);
             return this._handlers;
         }
 
@@ -4370,6 +4419,7 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             const destinationBytes = view.getUint32(offset + 36, true);
             const responseOffset = view.getUint32(offset + 40, true);
             const requestId = view.getUint32(offset + 44, true);
+            const face = length >= 52 ? view.getUint32(offset + 48, true) : 0;
             const fail = error => {
                 ++this.stats.renderTargetReadbackFailures;
                 try {
@@ -4393,11 +4443,25 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             let buffer = null;
             let mapped = false;
             try {
-                const destinationBpp = d3dBytesPerTexel(format);
-                if (!destinationBpp || !width || !height || !rowCount ||
+                const resource = textureHandle
+                    ? this.resources.get(textureHandle) : null;
+                const compressed = !!(resource &&
+                    isCompressedFormat(format));
+                const indexed = !!(resource && resource.ddIndexed);
+                const blockBytes = compressed
+                    ? compressedBlockBytes(format) : 0;
+                const destinationBpp = indexed ? 1 : d3dBytesPerTexel(format);
+                const copiedRows = compressed ? Math.ceil(rowCount / 4)
+                    : rowCount;
+                const minimumPitch = compressed
+                    ? Math.ceil(width / 4) * blockBytes
+                    : width * destinationBpp;
+                if ((!destinationBpp && !compressed) || !width || !height ||
+                        !rowCount ||
                         firstRow >= height || rowCount > height - firstRow ||
-                        destinationPitch < width * destinationBpp ||
-                        destinationBytes !== rowCount * destinationPitch ||
+                        (compressed && (firstRow & 3)) ||
+                        destinationPitch < minimumPitch ||
+                        destinationBytes !== copiedRows * destinationPitch ||
                         responseOffset < D9WG_QUERY_REGION_BYTES ||
                         responseOffset + 16 + destinationBytes >
                             D9WG_RESPONSE_REGION_BYTES)
@@ -4407,8 +4471,6 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                  * submissions are ordered, so the following copy observes the
                  * resolved render target without a CPU-side GPU wait. */
                 if (this.frame) this.finishFrame(false);
-                const resource = textureHandle
-                    ? this.resources.get(textureHandle) : null;
                 const state = this.devices.get(deviceHandle);
                 let sourceTexture = resource && resource.gpuTexture
                     ? resource.gpuTexture : null;
@@ -4425,21 +4487,30 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 if (width !== sourceWidth || height !== sourceHeight)
                     throw new Error("readback dimensions do not match source");
 
-                const sourceBpp = gpuFormat === "rgba16float" ? 8
+                if (compressed && !String(gpuFormat).startsWith("bc"))
+                    throw new Error("compressed readback source is not BC storage");
+                if (indexed && gpuFormat !== "r8uint")
+                    throw new Error("indexed readback source is not index storage");
+                const sourceBpp = indexed ? 1
+                    : gpuFormat === "rgba16float" ? 8
                     : gpuFormat === "rg32float" ? 8
                     : gpuFormat === "rgba32float" ? 16 : 4;
-                const gpuRowPitch = alignUp(width * sourceBpp, 256);
+                const rawRowBytes = compressed
+                    ? Math.ceil(width / 4) * blockBytes : width * sourceBpp;
+                const gpuRowPitch = alignUp(rawRowBytes, 256);
                 buffer = this.device.createBuffer({
                     label: "D3D9 render-target readback",
-                    size: gpuRowPitch * rowCount,
+                    size: gpuRowPitch * copiedRows,
                     usage: BUFFER_USAGE_COPY_DST | BUFFER_USAGE_MAP_READ,
                 });
                 const encoder = this.device.createCommandEncoder();
                 encoder.copyTextureToBuffer({ texture: sourceTexture,
-                    mipLevel: level, origin: { x: 0, y: firstRow, z: 0 } },
+                    mipLevel: level, origin: { x: 0, y: firstRow, z: face } },
                     { buffer, bytesPerRow: gpuRowPitch,
-                        rowsPerImage: rowCount },
-                    { width, height: rowCount, depthOrArrayLayers: 1 });
+                        rowsPerImage: copiedRows },
+                    { width: blockAlignedCopyExtent(width, compressed),
+                        height: blockAlignedCopyExtent(rowCount, compressed),
+                        depthOrArrayLayers: 1 });
                 this.device.queue.submit([encoder.finish()]);
                 ++this.stats.queueSubmits;
                 /*
@@ -4466,10 +4537,17 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 mapped = true;
                 const mappedBytes = new Uint8Array(buffer.getMappedRange());
                 const packed = new Uint8Array(destinationBytes);
-                for (let row = 0; row < rowCount; ++row)
-                    packGPUReadbackRow(format, gpuFormat, mappedBytes,
-                        row * gpuRowPitch, width, packed,
-                        row * destinationPitch);
+                if (compressed || indexed) {
+                    for (let row = 0; row < copiedRows; ++row)
+                        packed.set(mappedBytes.subarray(row * gpuRowPitch,
+                            row * gpuRowPitch + rawRowBytes),
+                            row * destinationPitch);
+                } else {
+                    for (let row = 0; row < rowCount; ++row)
+                        packGPUReadbackRow(format, gpuFormat, mappedBytes,
+                            row * gpuRowPitch, width, packed,
+                            row * destinationPitch);
+                }
                 buffer.unmap();
                 mapped = false;
                 buffer.destroy();
@@ -4866,6 +4944,16 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                         if (transient) frame.transientBuffers.push(transient);
                         continue;
                     }
+                    if (op.kind === "ddblit") {
+                        // The DirectDraw blit: the same shape, plus colour
+                        // keying, mirroring and index/palette storage, so it is
+                        // replayed by ddraw_ops.js.
+                        closePass();
+                        const transient = this.replayDDBlit(encoder, op,
+                            swapView, backTexture);
+                        if (transient) frame.transientBuffers.push(transient);
+                        continue;
+                    }
                     if (op.kind === "present-swap-chain") {
                         // An additional chain's canvas is acquired here, in
                         // the same synchronous stretch as the submit that
@@ -5104,6 +5192,16 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                     const copyHeight = Math.min(swapTexture.height,
                         this.backBufferTextureHeight);
                     if (copyWidth && copyHeight) {
+                        let presentSource = backTexture;
+                        if (typeof this.replayDDOverlays === "function") {
+                            const composite = this.replayDDOverlays(encoder,
+                                this.presentingDevice, backTexture,
+                                copyWidth, copyHeight, frame);
+                            if (composite) {
+                                presentSource = composite;
+                                frame.transientBuffers.push(composite);
+                            }
+                        }
                         // A gamma ramp is applied here, at the one point every
                         // finished pixel passes through on its way to the
                         // canvas -- which is where the hardware applies it too.
@@ -5127,10 +5225,10 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                             ++this.stats.renderPasses;
                             pass.setPipeline(entry.pipeline);
                             pass.setBindGroup(0, this.device.createBindGroup({
-                                layout: entry.bindGroupLayout,
-                                entries: [
+                                    layout: entry.bindGroupLayout,
+                                    entries: [
                                     { binding: 0,
-                                      resource: backTexture.createView() },
+                                      resource: presentSource.createView() },
                                     { binding: 1, resource: entry.sampler },
                                     { binding: 2, resource: gammaView },
                                 ],
@@ -5141,7 +5239,7 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                             ++this.stats.gammaPresents;
                         } else {
                             encoder.copyTextureToTexture(
-                                { texture: backTexture },
+                                { texture: presentSource },
                                 { texture: swapTexture },
                                 { width: copyWidth, height: copyHeight,
                                     depthOrArrayLayers: 1 });
@@ -5941,6 +6039,8 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             const isDepth = (usage & D3DUSAGE_DEPTHSTENCIL) !== 0 ||
                 isFourCCDepthFormat(format);
             const isTarget = (usage & D3DUSAGE_RENDERTARGET) !== 0;
+            const ddIndexed = (usage & D9WG_USAGE_DDRAW_INDEXED) !== 0 &&
+                isPalettizedFormat(format) && !isDepth;
             const sampleCount = sampleCountForD3D(multisampleType,
                 multisampleQuality);
             if (!sampleCount) {
@@ -5979,7 +6079,8 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 !isDepth;
             if (autoGenerateMips)
                 levelCount = fullMipLevelCount(width, height);
-            const gpuFormat = isDepth ? DEPTH_FORMAT : formatToGPU(format);
+            const gpuFormat = isDepth ? DEPTH_FORMAT
+                : (ddIndexed ? "r8uint" : formatToGPU(format));
             if (!gpuFormat) {
                 console.warn("[d3d9-webgpu] unsupported texture format", format);
                 return;
@@ -6059,7 +6160,8 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 gpuTexture, msaaTexture, gpuFormat, srgbFormat, format, usage,
                 width, height, sampleCount,
                 multisampleType, multisampleQuality,
-                gpuBytesPerTexel: gpuBytesPerTexel(format),
+                gpuBytesPerTexel: ddIndexed ? 1 : gpuBytesPerTexel(format),
+                ddIndexed,
                 textureDescriptor,
                 levelCount: Math.max(1, levelCount),
                 // A mip level the guest never uploads has undefined contents.
@@ -6269,6 +6371,37 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             }
             let payload = source;
             let bytesPerRow = rowPitch;
+            if (resource.ddIndexed) {
+                // An indexed DirectDraw surface stores what the app wrote: the
+                // bytes are the texels, and nothing about them changes when the
+                // palette does. Only the row padding comes off, because
+                // writeTexture wants the rows tightly packed.
+                const packed = new Uint8Array(width * height * depth);
+                for (let slice = 0; slice < depth; ++slice) {
+                    for (let row = 0; row < height; ++row) {
+                        const from = slice * slicePitch + row * rowPitch;
+                        packed.set(source.subarray(from, from + width),
+                            slice * width * height + row * width);
+                    }
+                }
+                this.updateTextureShadow(resource, level, z, x, y, width,
+                    height, packed, width, false, depth, width * height);
+                ++this.stats.textureUploads;
+                this.stats.textureBytesUploaded += packed.length;
+                resource.ddContentSerial = (resource.ddContentSerial || 0) + 1;
+                if (level === 0) this.markMipsDirty(resource);
+                if (resource.uploadedLevels)
+                    resource.uploadedLevels.add(level * 6 + (z % 6));
+                // Keep the primary r8uint texture current for indexed-to-
+                // indexed DirectDraw blits.  The RGBA sampling companion is
+                // derived lazily from the same shadow by ddIndexedSampleViewFor.
+                this.device.queue.writeTexture(
+                    { texture: resource.gpuTexture, mipLevel: level,
+                        origin: { x, y, z } }, packed,
+                    { bytesPerRow: width, rowsPerImage: height },
+                    { width, height, depthOrArrayLayers: depth });
+                return;
+            }
             if (isPalettizedFormat(resource.format)) {
                 // The indices, not the colours, are what the app uploaded. A
                 // palette swap has to repaint this texture without any new
@@ -6371,7 +6504,9 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             const levelCount = Math.max(1, view.getUint32(offset + 12, true));
             const format = view.getUint32(offset + 16, true);
             const usage = view.getUint32(offset + 20, true);
-            const gpuFormat = formatToGPU(format);
+            const ddIndexed = (usage & D9WG_USAGE_DDRAW_INDEXED) !== 0 &&
+                isPalettizedFormat(format);
+            const gpuFormat = ddIndexed ? "r8uint" : formatToGPU(format);
             if (!gpuFormat) {
                 console.warn("[d3d9-webgpu] unsupported cube texture format", format);
                 return;
@@ -6403,7 +6538,8 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 deviceHandle: view.getUint32(offset, true),
                 gpuTexture, gpuFormat, srgbFormat,
                 format, usage, width: edge, height: edge, layerCount: 6,
-                gpuBytesPerTexel: gpuBytesPerTexel(format),
+                gpuBytesPerTexel: ddIndexed ? 1 : gpuBytesPerTexel(format),
+                ddIndexed,
                 textureDescriptor,
                 levelCount: textureDescriptor.mipLevelCount,
                 // Keyed by level*6+face, so the incomplete-mip warning counts a
@@ -8050,6 +8186,9 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 return value === undefined ? fallback : value;
             };
             const stages = [];
+            const textureColorKeyEnabled =
+                (state.renderStates.get(D3DRS_COLORKEYENABLE) || 0) !== 0 ||
+                (state.renderStates.get(D3DRS_COLORKEYBLENDENABLE) || 0) !== 0;
             let usesTextureFactor = false;
             let usesSpecular = false;
             const unsupported = [];
@@ -8139,6 +8278,18 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                     const usable = texture && !texture.isDepth;
                     stage.textureType = usable ? (texture.textureType || "2d") : "2d";
                     stage.hasTextureBound = !!usable;
+                    // DirectDraw stores four independent key kinds. Texture
+                    // rendering uses SRCBLT (kind 0), the same source-domain
+                    // key used by a keyed blit.  Keep the widened integer
+                    // endpoints in the immutable shader signature so changing
+                    // the surface key cannot reuse stale WGSL.
+                    const key = usable && textureColorKeyEnabled &&
+                        texture.ddColorKey && texture.ddColorKey[0];
+                    stage.colorKey = key ? {
+                        low: key.low >>> 0,
+                        high: key.high >>> 0,
+                        indexed: !!texture.ddIndexed,
+                    } : null;
                 }
                 const transformFlags =
                     stageState(index, D3DTSS_TEXTURETRANSFORMFLAGS, 0);
@@ -9530,6 +9681,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                      stage.samplesTexture
                          ? [stage.addressU, stage.addressV, stage.addressW,
                             stage.borderColor >>> 0].join("b") : "",
+                     stage.colorKey
+                         ? "k" + (stage.colorKey.indexed ? "i" : "r") +
+                            (stage.colorKey.low >>> 0) + ":" +
+                            (stage.colorKey.high >>> 0) : "",
                      // Baked into the WGSL as a literal (WebGPU samplers have
                      // no bias field), so two stages differing only in bias are
                      // different shaders and must not share a cache entry.
@@ -10953,8 +11108,16 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                 const wantsSRGB = texture &&
                     (state.samplerStates.get(index * 64 + D3DSAMP_SRGBTEXTURE)
                         || 0) !== 0;
-                const view = this.viewForStage(texture, index, depth, dimension,
-                    unfilterable, wantsSRGB,
+                const fixedStage = program.pixelSignature &&
+                    program.pixelSignature.stages.find(stage =>
+                        stage.index === index);
+                const indexedView = texture && texture.ddIndexed &&
+                    typeof this.ddIndexedSampleViewFor === "function"
+                    ? this.ddIndexedSampleViewFor(texture,
+                        fixedStage ? fixedStage.colorKey : null)
+                    : null;
+                const view = indexedView || this.viewForStage(texture, index,
+                    depth, dimension, unfilterable, wantsSRGB,
                     !!handle && handle === state.depthTargetHandle);
                 const sampler = compare
                     ? this.comparisonSamplerFor(state, index)

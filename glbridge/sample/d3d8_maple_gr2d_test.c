@@ -5,7 +5,7 @@
 //   A4R4G4B4, A8R8G8B8, R5G6B5, and DXT3 -> CreateDevice with 0x46,
 //   falling back to 0x26.
 //
-// Build for Windows XP as documented in ../winproxy/README.md. The command
+// Build for Windows XP as documented in ../openglproxy/README.md. The command
 // uses a 32-bit MinGW compiler and deliberately avoids the MinGW C runtime.
 
 #define WIN32_LEAN_AND_MEAN

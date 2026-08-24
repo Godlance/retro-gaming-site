@@ -9,7 +9,7 @@
 // farther green probe stripe.  The stripe must remain visible through the
 // depth test because the blended pass did not modify Z.
 //
-// Build for Windows XP as documented in ../winproxy/README.md.  The command
+// Build for Windows XP as documented in ../openglproxy/README.md.  The command
 // uses a 32-bit MinGW compiler and avoids the MinGW C runtime.
 
 #define WIN32_LEAN_AND_MEAN

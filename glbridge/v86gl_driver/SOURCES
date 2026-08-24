@@ -2,4 +2,4 @@ TARGETNAME=v86gl
 TARGETTYPE=DRIVER
 TARGETPATH=obj
 SOURCES=v86gl_driver.c
-INCLUDES=..\winproxy
+INCLUDES=..\openglproxy

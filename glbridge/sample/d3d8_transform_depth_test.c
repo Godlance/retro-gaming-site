@@ -5,7 +5,7 @@
 // Projection matrices, an automatic D24S8 depth-stencil surface, and Z testing.
 // The result is one static, rotated, colour-interpolated cube.
 //
-// Build for Windows XP as documented in ../winproxy/README.md.  The command
+// Build for Windows XP as documented in ../openglproxy/README.md.  The command
 // uses a 32-bit MinGW compiler and avoids the MinGW C runtime.
 
 #define WIN32_LEAN_AND_MEAN

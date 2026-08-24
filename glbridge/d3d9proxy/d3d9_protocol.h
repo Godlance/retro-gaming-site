@@ -10,6 +10,10 @@
  * transport (v86gl.sys, 16 MiB ring, PCI BAR) via a different outer record
  * type. A guest process loads either d3d8.dll or d3d9.dll, never both.
  *
+ * Version 1.7 adds the DirectDraw group (0x500) for ../ddrawproxy/ddraw.dll.
+ * It is additive only -- no existing structure changes -- so d3d8.dll and
+ * d3d9.dll do not need rebuilding for it.
+ *
  * Version 1.3 deliberately breaks the old layout: it adds multisample fields,
  * volume textures, instancing, clip planes, GPU queries, and an asynchronous
  * host-to-guest response tail for queries and render-target readback. The
@@ -20,7 +24,7 @@
 
 #define D9WG_MAGIC 0x47573944u /* "D9WG" */
 #define D9WG_VERSION_MAJOR 1u
-#define D9WG_VERSION_MINOR 6u
+#define D9WG_VERSION_MINOR 7u
 
 /* The last four MiB of v86gl.sys's mapped DMA allocation are never used for
  * command batches.  The browser writes asynchronous query/readback results
@@ -217,7 +221,30 @@ enum D9WGOpcode {
 
     D9WG_OP_BEGIN_QUERY = 0x400,
     D9WG_OP_END_QUERY = 0x401,
-    D9WG_OP_GET_QUERY_DATA = 0x402
+    D9WG_OP_GET_QUERY_DATA = 0x402,
+
+    /*
+     * Protocol 1.7. The DirectDraw group, emitted by ../ddrawproxy/ddraw.dll.
+     *
+     * DirectDraw surfaces are ordinary D9WG textures -- they are created,
+     * updated and destroyed by the 0x1xx opcodes like everything else -- and a
+     * Direct3D 7 device renders straight into one of them, which is exactly
+     * why DirectDraw does not get a protocol of its own. These five carry the
+     * semantics D3D9 has no equivalent for: a blit that tests a colour key, a
+     * palette that belongs to a surface rather than to the device, and the
+     * display mode an exclusive-fullscreen title asked for.
+     *
+     * Flipping is deliberately absent. A flip chain is rotated guest-side and
+     * the new front buffer is blitted into the swap-chain image before
+     * PRESENT, which costs one full-screen copy per frame and saves the host
+     * an entire lifecycle concept. Clip lists are likewise resolved guest-side
+     * into per-rectangle blits.
+     */
+    D9WG_OP_DD_BLT = 0x500,
+    D9WG_OP_DD_SET_COLOR_KEY = 0x501,
+    D9WG_OP_DD_SET_SURFACE_PALETTE = 0x502,
+    D9WG_OP_DD_SET_DISPLAY_MODE = 0x503,
+    D9WG_OP_DD_UPDATE_OVERLAY = 0x504
 };
 
 #define D9WG_RESOURCE_BUFFER_VERTEX      1u
@@ -240,6 +267,22 @@ enum D9WGOpcode {
  * parameter types, so the guest never needs to disambiguate a shader handle
  * from an FVF token on the wire -- each has its own opcode. */
 #define D9WG_SHADER_HANDLE_BASE 0x40000001u
+
+/*
+ * Protocol 1.7, D9WGCreateTexture2D.usage. Not a D3DUSAGE bit: D3DUSAGE never
+ * defines bit 31, and this is a storage decision rather than anything the app
+ * asked for.
+ *
+ * A P8 texture created with it is kept as an r8uint index texture resolved
+ * through its palette at sample and present time, instead of the CPU-expanded
+ * RGBA copy the D3D9 path uses. DirectDraw needs the indexed form for
+ * correctness, not speed: a 2D title blits P8 into P8 all frame long, and a
+ * surface holds indices, so a later palette change has to change the colour of
+ * pixels that were blitted earlier. An RGBA copy cannot be re-indexed, so a
+ * CPU-expanded destination freezes at whatever palette was current when the
+ * sprite landed. Colour keying on such a surface compares indices too.
+ */
+#define D9WG_USAGE_DDRAW_INDEXED 0x80000000u
 
 #pragma pack(push, 1)
 typedef struct D9WGBatchHeader {
@@ -727,6 +770,9 @@ typedef struct D9WGReadbackSurface {
     uint32_t destination_bytes;
     uint32_t response_offset;
     uint32_t request_id;
+    /* Protocol 1.7 extension. Zero for 2D; 0..5 selects a cube array layer.
+     * Appended so older 48-byte senders continue to read face zero. */
+    uint32_t face;
 } D9WGReadbackSurface;
 
 typedef struct D9WGReadbackResponse {
@@ -911,6 +957,133 @@ typedef struct D9WGDrawIndexedPrimitiveUP {
     uint32_t index_data_offset;
     uint32_t vertex_data_offset;
 } D9WGDrawIndexedPrimitiveUP;
+
+/* ------------------------------------------------------------------ *
+ * Protocol 1.7: the DirectDraw group
+ * ------------------------------------------------------------------ */
+
+/*
+ * Blt/BltFast/Load, and the flip-chain rotation the guest turns into a blit
+ * into the swap-chain image. Handle 0 is the swap-chain image on either side.
+ *
+ * A blit with no colour key, no mirror, matching formats and matching extents
+ * is a straight texture-to-texture copy; anything else is a draw through the
+ * blit pipeline cache, keyed by (source format, destination format, flags).
+ */
+typedef struct D9WGDDBlt {
+    uint32_t device_handle;
+    uint32_t source_handle;
+    uint32_t source_level;
+    uint32_t source_face;
+    int32_t source_rect[4]; /* left, top, right, bottom */
+    uint32_t destination_handle;
+    uint32_t destination_level;
+    uint32_t destination_face;
+    uint32_t flags;
+    int32_t destination_rect[4];
+    uint32_t fill_color; /* COLOR_FILL: the destination format's own value */
+    float fill_depth;
+    uint32_t fill_stencil;
+    uint32_t reserved;
+} D9WGDDBlt; /* 80 bytes */
+
+#define D9WG_DDBLT_KEY_SOURCE (1u << 0)
+#define D9WG_DDBLT_KEY_DESTINATION (1u << 1)
+#define D9WG_DDBLT_MIRROR_X (1u << 2)
+#define D9WG_DDBLT_MIRROR_Y (1u << 3)
+#define D9WG_DDBLT_COLOR_FILL (1u << 4)
+#define D9WG_DDBLT_DEPTH_FILL (1u << 5)
+#define D9WG_DDBLT_FILTER_LINEAR (1u << 6)
+
+/*
+ * A colour key is surface state, not a blit parameter: DDBLT_KEYSRC means
+ * "use the key attached to the source surface". DDBLT_KEYSRCOVERRIDE, which
+ * carries its own key, is resolved guest-side into a temporary key set around
+ * the blit rather than two more fields here.
+ *
+ * color_low/color_high are already in the comparison domain the host uses:
+ * 8-bit-per-channel values expanded from the surface format by truncating a
+ * value*255/max scale, or the raw index for a palettised surface. The guest
+ * and the host
+ * must expand by the same rule or sprite edges keep a rim of pixels that
+ * should have been transparent -- see ../ddrawproxy/ddraw_protocol.h.
+ */
+typedef struct D9WGDDSetColorKey {
+    uint32_t surface_handle;
+    uint32_t key_kind; /* D9WG_DDCKEY_* */
+    uint32_t color_low;
+    uint32_t color_high;
+    uint32_t present; /* 0 clears the key */
+    uint32_t reserved;
+} D9WGDDSetColorKey; /* 24 bytes */
+
+#define D9WG_DDCKEY_SOURCE_BLT 0u
+#define D9WG_DDCKEY_DESTINATION_BLT 1u
+#define D9WG_DDCKEY_SOURCE_OVERLAY 2u
+#define D9WG_DDCKEY_DESTINATION_OVERLAY 3u
+
+/*
+ * Binds a surface to one of the palette slots D9WG_OP_SET_PALETTE fills. D3D9
+ * palettes are device state and a texture samples through whichever one is
+ * current; DirectDraw attaches a palette to each surface, and two P8 surfaces
+ * with different palettes are routine. A surface with no binding falls back to
+ * the device's current palette.
+ */
+typedef struct D9WGDDSetSurfacePalette {
+    uint32_t surface_handle;
+    uint32_t palette_index;
+    uint32_t flags;
+    uint32_t reserved;
+} D9WGDDSetSurfacePalette; /* 16 bytes */
+
+/*
+ * SetDisplayMode plus the cooperative level it was set under.
+ *
+ * guest_mode_changed reports whether ChangeDisplaySettings actually moved the
+ * guest desktop to that mode. Only the guest knows, and the answer decides
+ * whether the overlay covers the whole emulated screen or just the window
+ * rectangle -- it cannot be inferred from the rendered image.
+ */
+typedef struct D9WGDDSetDisplayMode {
+    uint32_t device_handle;
+    uint32_t width;
+    uint32_t height;
+    uint32_t bits_per_pixel;
+    uint32_t refresh_rate;
+    uint32_t cooperative_flags; /* D9WG_DDSCL_* */
+    uint32_t guest_mode_changed;
+    uint32_t reserved;
+} D9WGDDSetDisplayMode; /* 32 bytes */
+
+#define D9WG_DDSCL_NORMAL (1u << 0)
+#define D9WG_DDSCL_EXCLUSIVE (1u << 1)
+#define D9WG_DDSCL_FULLSCREEN (1u << 2)
+
+/*
+ * UpdateOverlay. Approximated as a present-time composite: the overlay surface
+ * is drawn over the swap-chain image in z_order, honouring its colour key.
+ * Real hardware overlays are composited at scanout, independent of the flip
+ * chain and of GDI, and that part does not survive here.
+ */
+typedef struct D9WGDDUpdateOverlay {
+    uint32_t surface_handle;
+    uint32_t overlay_id; /* COM-surface identity; aliases share only pixels */
+    int32_t source_rect[4];
+    int32_t destination_rect[4];
+    uint32_t flags; /* D9WG_DDOVER_* */
+    uint32_t z_order;
+    uint32_t destination_handle; /* key state lives on the primary surface */
+} D9WGDDUpdateOverlay; /* 52 bytes */
+
+#define D9WG_DDOVER_SHOW (1u << 0)
+#define D9WG_DDOVER_HIDE (1u << 1)
+#define D9WG_DDOVER_KEY_SOURCE (1u << 2)
+#define D9WG_DDOVER_KEY_DESTINATION (1u << 3)
+#define D9WG_DDOVER_MIRROR_X (1u << 4)
+#define D9WG_DDOVER_MIRROR_Y (1u << 5)
+#define D9WG_DDOVER_KEY_SOURCE_OVERRIDE (1u << 6)
+#define D9WG_DDOVER_KEY_DESTINATION_OVERRIDE (1u << 7)
+
 #pragma pack(pop)
 
 #define D9WG_ALIGN8(value) (((uint32_t)(value) + 7u) & ~7u)
@@ -1012,8 +1185,18 @@ typedef char D9WGAssertQueryResponseSize[
 typedef char D9WGAssertQueryIssueSize[
         sizeof(D9WGQueryIssue) == 16 ? 1 : -1];
 typedef char D9WGAssertReadbackSurfaceSize[
-        sizeof(D9WGReadbackSurface) == 48 ? 1 : -1];
+        sizeof(D9WGReadbackSurface) == 52 ? 1 : -1];
 typedef char D9WGAssertReadbackResponseSize[
         sizeof(D9WGReadbackResponse) == 16 ? 1 : -1];
+typedef char D9WGAssertDDBltSize[
+        sizeof(D9WGDDBlt) == 80 ? 1 : -1];
+typedef char D9WGAssertDDSetColorKeySize[
+        sizeof(D9WGDDSetColorKey) == 24 ? 1 : -1];
+typedef char D9WGAssertDDSetSurfacePaletteSize[
+        sizeof(D9WGDDSetSurfacePalette) == 16 ? 1 : -1];
+typedef char D9WGAssertDDSetDisplayModeSize[
+        sizeof(D9WGDDSetDisplayMode) == 32 ? 1 : -1];
+typedef char D9WGAssertDDUpdateOverlaySize[
+        sizeof(D9WGDDUpdateOverlay) == 52 ? 1 : -1];
 
 #endif

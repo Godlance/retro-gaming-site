@@ -6,7 +6,7 @@
 // transforms, automatic D24S8 depth, and repeated Draw/Present calls.  The
 // cube rotates until its window is closed.
 //
-// Build for Windows XP as documented in ../winproxy/README.md.  The command
+// Build for Windows XP as documented in ../openglproxy/README.md.  The command
 // uses a 32-bit MinGW compiler and avoids the MinGW C runtime and libm.
 
 #define WIN32_LEAN_AND_MEAN

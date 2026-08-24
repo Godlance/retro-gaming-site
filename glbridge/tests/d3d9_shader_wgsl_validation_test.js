@@ -851,6 +851,18 @@ for (const [name, entry] of [
                 addressU: 4, addressV: 4, addressW: 1,
                 borderColor: 0x80402010 })],
         }), null)]);
+    fixedFunction.push(["ff ps d3d7 texture colour key",
+        executor.buildFixedFunctionPixelShader(psBase({
+            stages: [stage({ colorKey: {
+                low: 0x00102030, high: 0x00112233, indexed: false,
+            } })],
+        }), null)]);
+    fixedFunction.push(["ff ps d3d7 indexed texture colour key",
+        executor.buildFixedFunctionPixelShader(psBase({
+            stages: [stage({ colorKey: {
+                low: 9, high: 12, indexed: true,
+            } })],
+        }), null)]);
     for (const fogMode of [1, 2, 3]) {
         fixedFunction.push(["ff ps vertex fog " + fogMode,
             executor.buildFixedFunctionPixelShader(psBase({

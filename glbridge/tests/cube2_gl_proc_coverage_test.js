@@ -286,7 +286,7 @@ function setFromMatches(source, pattern, group) {
 }
 
 function main() {
-    const proxyDir = path.join(__dirname, "..", "winproxy");
+    const proxyDir = path.join(__dirname, "..", "openglproxy");
     const proxySource = fs.readFileSync(path.join(proxyDir, "opengl32_proxy.c"), "utf8");
     const defSource = fs.readFileSync(path.join(proxyDir, "opengl32.def"), "utf8");
 

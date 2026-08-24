@@ -4,7 +4,7 @@
 // path: one managed A8R8G8B8 checkerboard, TEX1 coordinates, fixed-function
 // MODULATE, a vertex buffer containing two triangles, and one Present.
 //
-// Build for Windows XP as documented in ../winproxy/README.md.  The command
+// Build for Windows XP as documented in ../openglproxy/README.md.  The command
 // uses a 32-bit MinGW compiler and avoids the MinGW C runtime.
 
 #define WIN32_LEAN_AND_MEAN

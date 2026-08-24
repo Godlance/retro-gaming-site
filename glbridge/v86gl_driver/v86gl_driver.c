@@ -1,6 +1,6 @@
 #define _KERNEL_MODE
 #include <ntddk.h>
-#include "../winproxy/v86gl_ioctl.h"
+#include "../openglproxy/v86gl_ioctl.h"
 
 #define V86GL_DEVICE_NAME L"\\Device\\v86gl"
 #define V86GL_DOS_NAME L"\\DosDevices\\v86gl"

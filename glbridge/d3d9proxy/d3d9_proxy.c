@@ -31,7 +31,7 @@
 #ifdef D9WG_DIAGNOSTIC_TRACE
 #include <stdarg.h>
 #endif
-#include "../winproxy/v86gl_ioctl.h"
+#include "../openglproxy/v86gl_ioctl.h"
 #include "d3d9_protocol.h"
 
 #ifndef D3DSTREAMSOURCE_INDEXEDDATA

@@ -5,7 +5,7 @@
 // vertices pre-transformed makes an index-buffer failure independent of the
 // transform and depth paths exercised by d3d8_transform_depth_test.c.
 //
-// Build for Windows XP as documented in ../winproxy/README.md.  The command
+// Build for Windows XP as documented in ../openglproxy/README.md.  The command
 // uses a 32-bit MinGW compiler and avoids the MinGW C runtime.
 
 #define WIN32_LEAN_AND_MEAN

@@ -22,7 +22,8 @@ const OP = {
     HELLO: 1, CREATE_DEVICE: 2, RESET: 3, PRESENT: 4, CLEAR: 5, COLOR_FILL: 9,
     BEGIN_SCENE: 6, END_SCENE: 7, GUEST_LOG: 11, READBACK_SURFACE: 12,
     CREATE_BUFFER: 0x100, UPDATE_BUFFER: 0x101, DESTROY_RESOURCE: 0x103,
-    CREATE_TEXTURE_2D: 0x110, CREATE_TEXTURE_VOLUME: 0x112,
+    CREATE_TEXTURE_2D: 0x110, CREATE_TEXTURE_CUBE: 0x111,
+    CREATE_TEXTURE_VOLUME: 0x112,
     UPDATE_TEXTURE: 0x113,
     CREATE_VERTEX_DECLARATION: 0x120,
     CREATE_VERTEX_SHADER: 0x121, CREATE_PIXEL_SHADER: 0x122,
@@ -385,7 +386,11 @@ function makeFakeWebGPU(options) {
             const input = texture.readbackData || new Uint8Array(0);
             const sourcePitch = texture.readbackPitch || size.width * 4;
             const originY = source.origin ? source.origin.y || 0 : 0;
-            for (let row = 0; row < size.height; ++row) {
+            // For BC formats size.height is a texel extent rounded to four,
+            // while rowsPerImage is the number of actual block rows in the
+            // buffer. They are equal for ordinary textures.
+            const copiedRows = destination.rowsPerImage || size.height;
+            for (let row = 0; row < copiedRows; ++row) {
                 const from = (originY + row) * sourcePitch;
                 destination.buffer.data.set(input.subarray(from,
                     from + Math.min(sourcePitch, destination.bytesPerRow)),
@@ -6000,6 +6005,71 @@ await test("GPU render-target readback writes a converted D3D surface response",
     assert.deepEqual([...writes[0].data.subarray(16)],
         [0x33, 0x22, 0x11, 0x44, 0x77, 0x66, 0x55, 0x88]);
     assert.equal(executor.stats.renderTargetReadbacks, 1);
+});
+
+await test("DirectDraw P8 readback preserves raw indices and destination pitch",
+        async () => {
+    const { executor } = makeExecutor();
+    const P8 = 41;
+    const DD_INDEXED = 0x80000000;
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_2D,
+            u32(DEVICE, 0x902, 4, 2, 1, P8, DD_INDEXED, 0, 0, 0)),
+    ], { versionMinor: 7 }));
+    await executor.idle();
+    const texture = executor.resources.get(0x902).gpuTexture;
+    texture.readbackData = Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8]);
+    texture.readbackPitch = 4;
+    const writes = [];
+    const responseOffset = 16 * 1024;
+    await executor.submit(buildBatch([
+        command(OP.READBACK_SURFACE,
+            u32(DEVICE, 0x902, 0, P8, 4, 2, 0, 2, 8, 16,
+                responseOffset, 0x31415926, 0)),
+    ], { versionMinor: 7 }), { writeGuestMemory(offset, data) {
+        if (offset !== HEARTBEAT_WRITE_OFFSET)
+            writes.push(Buffer.from(data));
+    } });
+    await executor.idle();
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].readUInt32LE(4), 16);
+    assert.deepEqual([...writes[0].subarray(16)],
+        [1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 7, 8, 0, 0, 0, 0]);
+});
+
+await test("DXT cube readback returns one raw block from the selected mip face",
+        async () => {
+    const { executor, find } = makeExecutor();
+    const DXT1 = 0x31545844;
+    await executor.submit(buildBatch([
+        command(OP.CREATE_DEVICE, createDevicePayload(640, 480)),
+        command(OP.CREATE_TEXTURE_CUBE,
+            u32(DEVICE, 0x903, 8, 4, DXT1, 0, 0, 0)),
+    ], { versionMinor: 7 }));
+    await executor.idle();
+    const texture = executor.resources.get(0x903).gpuTexture;
+    texture.readbackData = Uint8Array.from(
+        [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87]);
+    texture.readbackPitch = 8;
+    const writes = [];
+    await executor.submit(buildBatch([
+        command(OP.READBACK_SURFACE,
+            u32(DEVICE, 0x903, 2, DXT1, 2, 2, 0, 2, 8, 8,
+                16 * 1024, 0x27182818, 5)),
+    ], { versionMinor: 7 }), { writeGuestMemory(offset, data) {
+        if (offset !== HEARTBEAT_WRITE_OFFSET)
+            writes.push(Buffer.from(data));
+    } });
+    await executor.idle();
+    assert.equal(writes.length, 1);
+    assert.deepEqual([...writes[0].subarray(16)],
+        [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87]);
+    const copy = find("copyTextureToBuffer").pop();
+    assert.equal(copy[1].mipLevel, 2);
+    assert.deepEqual(copy[1].origin, { x: 0, y: 0, z: 5 });
+    assert.deepEqual(copy[3],
+        { width: 4, height: 4, depthOrArrayLayers: 1 });
 });
 
 await test("back-buffer readback uses a persistent post-Present snapshot",
