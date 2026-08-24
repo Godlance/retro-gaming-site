@@ -81,6 +81,7 @@
                     <canvas></canvas>
                     <canvas id="v86gl_canvas"></canvas>
                     <canvas id="d3d_webgpu_canvas"></canvas>
+                    <canvas id="ddraw_canvas"></canvas>
                     <div class="screen-placeholder" id="screen_placeholder">
                         <div class="pixel-loader" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
                         <strong>Waking up a classic PC…</strong>
@@ -225,6 +226,13 @@
          page: it resolves D3D9ShaderPipeline at load time, not lazily. -->
     <script src="glbridge/d3d9-webgpu/d3d9_shader_pipeline.js?v=d3d9-writepath-probe-20260823"></script>
     <script src="glbridge/d3d9-webgpu/d3d9_executor.js?v=d3d9-writepath-probe-20260823"></script>
+    <!-- ddraw-bridge.js is a standalone v86 I/O-port device (port 0xDE00),
+         not routed through v86_network_bridge.js's PCI/executor machinery.
+         ddraw-renderer.js must load first: it defines DDrawRenderer and
+         the BLT_*/SURF_* constants that ddraw-bridge.js references as
+         plain globals. -->
+    <script src="glbridge/ddraw-webgpu/ddraw-renderer.js?v=ddraw-skeleton-20260824"></script>
+    <script src="glbridge/ddraw-webgpu/ddraw-bridge.js?v=ddraw-skeleton-20260824"></script>
     <script src="glbridge/v86_network_bridge.js?v=d3d9-responses-20260822"></script>
     <script src="file-transfer/v8ft-protocol.js?v=v8ft-v1-phase3-20260811"></script>
     <script src="file-transfer/v8ft-client.js?v=v8ft-v1-phase4-20260812"></script>

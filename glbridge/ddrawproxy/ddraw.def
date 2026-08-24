@@ -1,0 +1,11 @@
+LIBRARY ddraw
+EXPORTS
+    DirectDrawCreate
+    DirectDrawCreateEx
+    DirectDrawEnumerateA
+    DirectDrawEnumerateExA
+    DirectDrawEnumerateExW
+    DllMain
+    DllCanUnloadNow          PRIVATE
+    DllGetClassObject        PRIVATE
+    DllRegisterServer        PRIVATE

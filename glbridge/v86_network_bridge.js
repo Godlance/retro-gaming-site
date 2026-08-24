@@ -3817,6 +3817,16 @@
             this.d3d9Surface = { hwnd: 0, x: 0, y: 0, width: 0, height: 0 };
             this.d3d9OwnerSessionKey = null;
             this.d3d9Visible = false;
+            // The ddraw bridge (glbridge/ddraw-webgpu) is a standalone v86
+            // I/O-port device — it does not route through this class's
+            // PCI/executor machinery at all, so there's no ddrawExecutor
+            // or install hook here. This option exists purely so
+            // findScreenCanvas() below can exclude the ddraw canvas from
+            // consideration; without it, a ddraw canvas sitting in the
+            // same container could be misidentified as "the screen" and
+            // break overlay positioning for every game, not just ddraw
+            // ones.
+            this.ddrawCanvas = this.options.ddrawCanvas || null;
             this.buf = [];
             this.pendingPackets = [];
             this.pendingPCIBatches = [];
@@ -4046,7 +4056,8 @@
             for (let i = 0; i < canvases.length; i++) {
                 if (canvases[i] !== this.canvas &&
                         canvases[i] !== this.d3d8Canvas &&
-                        canvases[i] !== this.d3d9Canvas) {
+                        canvases[i] !== this.d3d9Canvas &&
+                        canvases[i] !== this.ddrawCanvas) {
                     return canvases[i];
                 }
             }

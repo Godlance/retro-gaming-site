@@ -482,6 +482,11 @@ function attachEmulatorListeners(emulator, gameId) {
     // batch arrives), so only the backend the guest actually drives ever
     // configures the shared canvas.
     const d3dCanvas = document.getElementById("d3d_webgpu_canvas");
+    // ddraw-bridge.js is a standalone v86 I/O-port device (port 0xDE00) —
+    // it doesn't route through installV86GLBridge's PCI/executor system,
+    // so it gets its own dedicated canvas and is wired up separately below.
+    const ddrawCanvas = document.getElementById("ddraw_canvas");
+    let ddrawBridge = null;
     let glCanvasObserver = null;
 
     function syncGLCanvasPosition() {
@@ -502,11 +507,14 @@ function attachEmulatorListeners(emulator, gameId) {
             v86gl = installV86GLBridge(emulator, glCanvas, {
                 gl4es: window.GL4ES,
                 d3dCanvas: d3dCanvas,
+                // Not routed through this bridge — passed only so
+                // findScreenCanvas() can exclude it from consideration.
+                ddrawCanvas: ddrawCanvas,
             });
             window.v86gl = v86gl;
 
             const screenCanvas = document.querySelector(
-                "#screen_container canvas:not(#v86gl_canvas):not(#d3d_webgpu_canvas)");
+                "#screen_container canvas:not(#v86gl_canvas):not(#d3d_webgpu_canvas):not(#ddraw_canvas)");
             if (screenCanvas && typeof ResizeObserver === "function") {
                 glCanvasObserver = new ResizeObserver(function() {
                     requestAnimationFrame(syncGLCanvasPosition);
@@ -516,6 +524,20 @@ function attachEmulatorListeners(emulator, gameId) {
             }
         } catch (err) {
             console.warn("Failed to start v86 GL network bridge:", err);
+        }
+    }
+
+    // ddraw-bridge.js: registers real v86 ISA port 0xDE00 via cpu.io, so it
+    // must wait for the CPU to exist. attach() self-retries on
+    // "emulator-loaded" if called too early, so calling it here
+    // unconditionally is safe.
+    if (ddrawCanvas && typeof DDrawBridge === "function") {
+        try {
+            ddrawBridge = new DDrawBridge(emulator.bus, emulator, ddrawCanvas);
+            ddrawBridge.attach();
+            window.ddrawBridge = ddrawBridge;
+        } catch (err) {
+            console.warn("Failed to start ddraw bridge:", err);
         }
     }
 
