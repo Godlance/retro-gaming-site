@@ -27,11 +27,9 @@ const { createFakeHost } = require(path.join(root, "tests", "gl_fake_gpu.js"));
  * already resolved it.
  */
 const CLASSIFIED = {
-    DRAW_PIXELS: "D-15", BITMAP: "D-15", COPY_PIXELS: "D-15",
-    ACCUM: "D-09", CLEAR_ACCUM: "D-09",
-    POLYGON_STIPPLE: "D-16", LINE_STIPPLE: "D-16",
+    DRAW_PIXELS: "D-15", COPY_PIXELS: "D-15",
+    LINE_STIPPLE: "D-16",
     LOGIC_OP: "D-01",
-    PIXEL_MAPFV: "C", PIXEL_MAPUIV: "C", PIXEL_MAPUSV: "C",
     PUSH_ATTRIB: "C", POP_ATTRIB: "C",
     PUSH_CLIENT_ATTRIB: "C", POP_CLIENT_ATTRIB: "C",
     HINT: "C",

@@ -61,9 +61,9 @@ void APIENTRY glTranslatef(GLfloat x, GLfloat y, GLfloat z);
 #define GL_VERSION            0x1F02
 #define GL_EXTENSIONS         0x1F03
 /* Private synchronous query understood by v86_network_bridge.js.  It never
- * reaches desktop GL/gl4es: the browser bridge answers it from the live
- * WebGL2 context so optional desktop extensions are only exposed when their
- * complete WebGL backing is available. */
+ * reaches desktop GL: the browser executor answers it from the live WebGPU
+ * adapter so optional desktop extensions are only exposed when their complete
+ * WebGPU backing is available. */
 #define V86GL_QUERY_HOST_CAPABILITIES 0x76380001u
 #define V86GL_HOST_CAP_WEBGL2            0x00000001u
 #define V86GL_HOST_CAP_COLOR_BUFFER_FLOAT 0x00000002u
@@ -1309,7 +1309,7 @@ static V86GLCapsProfile g_caps_profile = V86GL_CAPS_PROFILE_UNRESOLVED;
  * WineD3D 1.7.52 changes several independent backends from the advertised GL
  * contract.  A 2.1 + GLSL + FBO profile selects its generated-GLSL fixed
  * function pipeline and FBO swapchain blit. Keep that contract separate from
- * the WebGL2/gl4es implementation used behind the proxy so each WineD3D
+ * the WebGPU implementation used behind the proxy so each WineD3D
  * backend can still be tested independently.
  *
  * V86GL_CAPS_PROFILE may override automatic selection:
@@ -1434,8 +1434,8 @@ static const char g_gl_extensions_wined3d_gl15[] =
     "GL_EXT_texture_lod_bias "
     "GL_EXT_texture_object";
 
-/* These extensions are implemented by the proxy/gl4es bridge itself or are
- * guaranteed by the required WebGL2 context.  Host-optional features are
+/* These extensions are implemented by the proxy/WebGPU executor itself or are
+ * guaranteed by WebGPU. Host-optional features are
  * appended to g_gl_extensions after a synchronous capability snapshot. */
 static const char g_gl_extensions_gl21_base[] =
     "GL_ARB_multitexture "
@@ -3303,7 +3303,7 @@ static int texenv_value_count(GLenum pname) {
         return 4;
     default:
         /* Combine/crossbar selectors and operands are scalar.  Validation is
-         * ultimately performed by gl4es, which has the complete token set. */
+         * ultimately performed by the WebGPU executor, which has the complete token set. */
         return 1;
     }
 }
@@ -3969,7 +3969,7 @@ static int emit_query_object_iv(uint32_t object_kind, GLuint name, GLenum pname,
 
 /* Cube 2 keeps two pools containing up to 2048 occlusion queries and reads the
  * previous pool at the start of a frame.  Sending one synchronous PCI request
- * per object dominates the actual WebGL query work, so refresh every pending
+ * per object dominates the actual WebGPU query work, so refresh every pending
  * object in one request and cache the results in the guest proxy. */
 static int emit_query_object_batch(void) {
     const uint32_t header_size = 16u;
@@ -4016,7 +4016,7 @@ static int emit_query_object_batch(void) {
         entry = args + header_size + entry_index * entry_size;
         write_u32le(entry, state->name);
         write_u32le(entry + 4, GL_FALSE);
-        /* An unavailable WebGL query is conservatively visible if a blocking
+        /* An unavailable WebGPU query is conservatively visible if a blocking
          * desktop GL result is requested before the GPU has completed it. */
         write_u32le(entry + 8, V86GL_QUERY_VISIBLE_SAMPLES);
         entry_index++;
@@ -6011,7 +6011,7 @@ static int read_framebuffer_tight(GLint x, GLint y, GLsizei width, GLsizei heigh
 }
 
 /* Refresh a texture level from the currently bound colour FBO when that
- * exact level is its attachment. WebGL has no glGetTexImage, but WineD3D's
+ * exact level is its attachment. The proxy has no glGetTexImage path, but WineD3D's
  * capability probes read a texture immediately after drawing to its bound
  * FBO. Returning the upload-only CPU cache here makes match_fbo_tex_update()
  * report a nonexistent driver bug and selects the wrong render-target path. */
@@ -7514,7 +7514,7 @@ static const char* current_gl_extensions(void) {
 
     if ((host_caps & float_caps) == float_caps) {
         /* Cube 2 renders into and linearly filters its floating-point shadow
-         * targets.  WebGL2 texture allocation alone is therefore not enough:
+         * targets. WebGPU texture allocation alone is therefore not enough:
          * require both renderability and linear filtering. */
         append_gl_extension("GL_ARB_texture_float");
         append_gl_extension("GL_ARB_half_float_pixel");
@@ -7539,7 +7539,7 @@ const GLubyte* APIENTRY glGetString(GLenum name) {
      * WineD3D 1.7.52 treats an unknown GL vendor as NVIDIA. With the GL 2.1 /
      * shader-model-2 capability set it then selects a GeForce FX 5800 and
      * applies its "Geforce 5 NP2 disable" quirk. That is incorrect for this
-     * WebGL2 bridge, which has full NPOT support, and makes a 640x480 D3D8
+     * WebGPU bridge, which has full NPOT support, and makes a 640x480 D3D8
      * backbuffer fall through from GL_TEXTURE_2D to an unsupported rectangle
      * texture and finally to a renderbuffer. Identify the adapter as the
      * virtual SVGA3D family Wine already knows instead of impersonating
@@ -7548,10 +7548,10 @@ const GLubyte* APIENTRY glGetString(GLenum name) {
     case GL_VENDOR:
         return (const GLubyte*)"VMware, Inc.";
     case GL_RENDERER:
-        return (const GLubyte*)"SVGA3D; v86 WebGL2 bridge";
+        return (const GLubyte*)"SVGA3D; v86 WebGPU bridge";
     case GL_VERSION:
         return caps_profile_is_gl21(current_caps_profile()) ?
-            (const GLubyte*)"2.1 v86gl (gl4es/WebGL2)" :
+            (const GLubyte*)"2.1 v86gl (WebGPU)" :
             (const GLubyte*)"1.5 v86gl (WineD3D backbuffer profile)";
     case GL_SHADING_LANGUAGE_VERSION:
         if (caps_profile_is_gl21(current_caps_profile())) {
@@ -7832,7 +7832,7 @@ void APIENTRY glGetIntegerv(GLenum pname, GLint* params) {
         break;
     case GL_POINT_SIZE_RANGE:
         params[0] = 1;
-        params[1] = 1;
+        params[1] = 64;
         break;
     case GL_POINT_SIZE_GRANULARITY:
         params[0] = 1;
@@ -8331,7 +8331,7 @@ void APIENTRY glGetFloatv(GLenum pname, GLfloat* params) {
         break;
     case GL_POINT_SIZE_RANGE:
         params[0] = 1.0f;
-        params[1] = 1.0f;
+        params[1] = 64.0f;
         break;
     case GL_POINT_SIZE_GRANULARITY:
         params[0] = 1.0f;
@@ -9230,7 +9230,7 @@ static BOOL valid_arb_program_target(GLenum target) {
 static GLuint arb_program_parameter_limit(GLenum target) {
     /*
      * WineD3D 1.7.52's ARB fixed-function fragment pipeline uses
-     * program.env[27].  The gl4es backend stores 28 fragment environment and
+     * program.env[27]. The WebGPU backend stores 28 fragment environment and
      * local parameters, so expose and validate the same limit end-to-end.
      * Returning the ARB minimum of 24 here corrupts WineD3D's 24-byte
      * pshader_const_dirty allocation during the first fixed-function draw.
@@ -11315,7 +11315,7 @@ void APIENTRY glGetQueryiv(GLenum target, GLenum pname, GLint* params) {
         params[0] = (GLint)g_current_samples_passed_query;
         break;
     case GL_QUERY_COUNTER_BITS:
-        /* WebGL2 exposes an any-samples boolean query.  The bridge maps a
+        /* WebGPU exposes an any-samples boolean query. The executor maps a
          * visible result to a saturated positive desktop-style sample count
          * so GL 2.x engines can retain thresholds such as Cube's oqfrags=8. */
         params[0] = 31;
@@ -11342,7 +11342,7 @@ static BOOL query_object_value(QueryObjectState* state, GLenum pname, GLuint* va
 
         /* A legal busy-wait loop may ask AVAILABLE repeatedly without a swap.
          * Reuse a negative answer briefly, then retry the host in batches.
-         * WebGL still needs the browser event loop to advance GPU work, so
+         * WebGPU still needs the browser event loop to advance GPU work, so
          * callers should prefer RESULT (handled conservatively below). */
         if (!should_poll && pname == GL_QUERY_RESULT_AVAILABLE) {
             if (state->poll_skip) {
@@ -11377,7 +11377,7 @@ static BOOL query_object_value(QueryObjectState* state, GLenum pname, GLuint* va
 
     if (pname == GL_QUERY_RESULT) {
         if (!state->available) {
-            /* WebGL cannot synchronously wait for a GPU query. Desktop GL's
+            /* WebGPU cannot synchronously wait for a GPU query. Desktop GL's
              * blocking RESULT contract is emulated conservatively: treat the
              * object as visible rather than incorrectly culling geometry. */
             state->result = V86GL_QUERY_VISIBLE_SAMPLES;
@@ -12853,8 +12853,8 @@ void APIENTRY glCopyTexSubImage2D(GLenum target, GLint level,
 
     /* The proxy already read the framebuffer to maintain its CPU texture
      * cache. Re-send those exact pixels as a tight TexSubImage update instead
-     * of asking WebGL to copy RGB drawing-buffer storage directly into an
-     * RGBA WineD3D render-target texture. Besides avoiding WebGL's incompatible
+     * of copying RGB drawing-buffer storage directly into an RGBA WineD3D
+     * render-target texture. Besides avoiding incompatible
      * copy-format error, the explicit bytes make save-state replay independent
      * of transient framebuffer contents. */
     if (capture.valid && capture.data_size <= UINT32_MAX - sizeof(upload)) {
@@ -12942,7 +12942,7 @@ void APIENTRY glCopyTexSubImage3D(GLenum target, GLint level,
                                          &capture)) return;
 
     /* Preserve the exact pixels already read for the CPU texture cache. This
-     * keeps WebGL2 format validation and save-state replay independent of the
+     * keeps WebGPU format validation and save-state replay independent of the
      * transient framebuffer while updating exactly one volume slice. */
     if (capture.valid && capture.data_size <= UINT32_MAX - sizeof(upload)) {
         upload_size = (uint32_t)sizeof(upload) + capture.data_size;
@@ -13968,7 +13968,7 @@ void APIENTRY glSecondaryColor3ubvEXT(const GLubyte* values) {
 
 /* GL_EXT_secondary_color uses the same normalized conversion rules as the
  * primary glColor family.  Keep all scalar/vector variants on one canonical
- * float implementation so the guest state and the gl4es command stream stay
+ * float implementation so the guest state and WebGPU command stream stay
  * identical regardless of the input type. */
 static GLfloat secondary_color_signed(GLint value, GLint max_positive) {
     if (value <= -max_positive - 1) return -1.0f;
@@ -18076,7 +18076,7 @@ DEFINE_RASTER_POS_VARIANT(s, GLshort)
 
 /* glWindowPos bypasses model-view/projection clipping.  Keep the proxy's
  * observable raster state in sync and send one canonical float command to
- * gl4es, which implements the same bypass on the browser side. */
+ * WebGPU executor, which implements the same bypass on the browser side. */
 static void window_pos3f_compat(GLfloat x, GLfloat y, GLfloat z) {
     struct { float x, y, z; } payload;
     raster_pos4f_compat(x, y, z, 1.0f);

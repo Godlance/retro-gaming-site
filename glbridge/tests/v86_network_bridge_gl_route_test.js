@@ -3,7 +3,7 @@
 // The bridge's OpenGL routing.
 //
 // A bare GL record stream -- no VGL2 envelope, which is how the OpenGL path has
-// always framed itself -- must reach gl_executor.js when glBackend is "webgpu",
+// always framed itself -- must reach gl_executor.js directly,
 // and the D3D8/D3D9 envelopes must keep reaching their own executors untouched.
 // The reason to test the negative is that all three arrive through one
 // v86gl-pci-frame listener, so a routing mistake sends a D3D batch into the GL
@@ -62,7 +62,6 @@ const bridge = globalThis.installV86GLNetworkBridge({
     },
 });
 
-assert.equal(bridge.glBackend, "webgpu", "the WebGPU host is the default");
 assert.ok(bridge.glExecutor, "the executor is installed at bridge creation");
 assert.ok(glOptions && typeof glOptions.writeGuestMemory === "function",
     "the executor is given a way to answer a readback after the batch returns");
@@ -105,27 +104,7 @@ listeners["v86gl-pci-frame"]({
 assert.equal(d3d9Batches.length, 1, "the D3D9 envelope is not swallowed by GL");
 assert.equal(glBatches.length, 2, "and it did not also reach the GL executor");
 
-/* ---- the fallback switch still selects the old host ---- */
-
-// The old path still demands its WASM module at construction, which is the
-// behaviour the switch has to preserve to be a real fallback.
-const gl4es = {
-    HEAPU8: new Uint8Array(4096),
-    _malloc() { return 256; },
-    _free() {},
-    _v86glResize() {},
-};
-const legacy = globalThis.installV86GLNetworkBridge({
-    add_listener() {}, write_memory() {},
-}, canvas, {
-    d3dCanvas,
-    gl4es,
-    glBackend: "gl4es",
-    installGLWebGPUExecutor() {
-        throw new Error("gl4es mode must not install the WebGPU executor");
-    },
-});
-assert.equal(legacy.glExecutor, null,
-    "glBackend: gl4es leaves the WebGPU executor uninstalled (plan 5.4)");
+assert.equal("glBackend" in bridge, false,
+    "the removed GL4ES fallback cannot be selected at runtime");
 
 console.log("v86_network_bridge_gl_route_test: ok");

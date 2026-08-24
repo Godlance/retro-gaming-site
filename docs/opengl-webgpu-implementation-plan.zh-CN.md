@@ -1,5 +1,11 @@
 # OpenGL 1.x / 2.x → WebGPU 完整实施方案
 
+> **实施状态（2026-08-24）**：主机运行时已经切换为唯一的
+> OpenGL → WebGPU 路径；`libglwasm/`、`Gl4esRenderer`、WebGL canvas 与后端
+> 选择开关均已删除。217/217 个 guest 操作码都有 host handler，覆盖表没有 A 类
+> 空缺。本文第 1 章保留的是迁移前背景，第 15 章保留原里程碑设计；当前能力与
+> 可见偏差以 `glbridge/gl-webgpu/README.md` 和 `COVERAGE.md` 为准。
+
 > 前置阅读：`d3d9-webgpu-architecture.md` 与
 > `d3d9-webgpu-implementation-plan.zh-CN.md`（D9WG 协议、host executor、
 > WGSL 生成与 pipeline 缓存的既有设计）、`ddraw-d3d7-webgpu-implementation-plan.zh-CN.md`
@@ -17,7 +23,7 @@
 
 ## 1. 背景与问题定义
 
-### 1.1 现有管线
+### 1.1 迁移前管线（历史）
 
 ```text
 game.exe
@@ -28,9 +34,8 @@ game.exe
   -> WebGL2                        (#v86gl_canvas)
 ```
 
-D3D8/D3D9/DirectDraw 三条路径已经全部落到 `d3d9_executor.js` + WebGPU，渲染
-进 `#d3d_webgpu_canvas`。OpenGL 是唯一还挂在 WebGL2 上的路径，也是唯一还依赖
-一个外部 C 项目（gl4es）的路径。
+D3D8/D3D9/DirectDraw 三条路径当时已经落到 WebGPU，而 OpenGL 仍挂在 WebGL2
+上并依赖外部 C 项目 gl4es。该状态现已结束。
 
 ### 1.2 为什么要迁
 
@@ -1484,10 +1489,12 @@ opengl32.dll ─> 裸 GL 记录流 ────> gl_executor.js ──┘
       `glCopyTexImage*`。
 - [x] **M4** —— GLSL 1.20 完整前端 + 兼容内建 + 反射 + 变体链接。
 - [x] **M5** —— ARB 汇编翻译器、遮挡查询、`glReadPixels` 异步回读路径。
-- [ ] **M6** —— 累积缓冲、`glDrawPixels`/`glBitmap`、点画、`glPolygonMode`、
-      宽线、`glLogicOp`、默认帧缓冲 MSAA。见偏差 D-01/D-04/D-09/D-15/D-16/D-17。
-- [ ] **M7** —— 删除 gl4es 与 A/B 开关、save/load 端到端验证、render bundle
-      与性能对比、`gl_executor.serializeState`。
+- [x] **M6（按 B 类偏差口径）** —— 累积缓冲、颜色
+      `glDrawPixels`/`glBitmap`/`glCopyPixels`、点精灵、多边形点画、
+      `glPolygonMode` 与固定/GLSL 普通 draw 的 `glLogicOp` 已实现；宽线、线点画、
+      默认帧缓冲 MSAA 和深度/模板 pixel rectangle 保留为登记偏差。
+- [ ] **M7** —— gl4es 与 A/B 开关已删除，host save/load 重放测试已通过；XP guest
+      中的 save/load 端到端验证、render bundle 与性能对比仍待真实环境验收。
 
 ### 未落地（按优先级）
 
@@ -1497,12 +1504,12 @@ opengl32.dll ─> 裸 GL 记录流 ────> gl_executor.js ──┘
    `sample/gl_triangle_test.exe`，然后是半条命，然后是 Cube 2。
 2. **M0 的调用面数据未采集**：`opengl-call-profile.md` 与运行时 GLSL 语料需要
    在 guest 里跑一遍才能产出，因此排在第 1 项之后。
-3. **M6 的长尾**（见上）。
+3. **精确语义偏差**：宽线/线点画、默认帧缓冲 MSAA、深度/模板 pixel
+   rectangle，以及少数 ARB assembly 组合，详见 README 的 D-01..D-18。
 4. **性能项未做**：立即模式批量记录（6.4）、连续批次合并（4.7）、render bundle
    （13.1 第 5 项）都还是原始形态——每个 `glBegin`…`glEnd` 一次 draw。
-5. **save/load**：`stateJournal` 的记录格式未变，理论上可直接重放到新 executor
-   （6.1 已论证），但未端到端验证；`gl_executor` 也还没有
-   `serializeState`/`restoreState`。
+5. **save/load 的 guest 验收**：bridge 已保存并重放原始 GL 记录流，host 测试覆盖
+   reset、顺序和恢复期间的新批次排队；尚未在 XP guest 的实际游戏会话中验收。
 
 ### 与计划的偏离
 

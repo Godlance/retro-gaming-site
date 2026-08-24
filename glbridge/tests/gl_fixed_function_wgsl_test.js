@@ -272,6 +272,55 @@ test("a point-sprite signature expands the point in clip space", () => {
     assert.ok(result.attributes.some(a => a.name === "corner" && a.location === 7));
 });
 
+test("point sprites honour a lower-left coordinate origin", () => {
+    const result = generate({
+        _name: "pointsprite_lower_left",
+        attributes: { position: { components: 3 }, color: true },
+        pointSprite: true,
+        pointCoordLowerLeft: true,
+    });
+    assert.ok(result.wgslVertex.indexOf(
+        "vin.corner.y * 0.5 + 0.5") >= 0);
+});
+
+test("polygon stipple tests the 32 by 32 pattern in fragment coordinates", () => {
+    const result = generate({
+        _name: "polygon_stipple",
+        attributes: { position: { components: 3 }, color: true },
+        polygonStipple: true,
+    });
+    assert.ok(result.stateFields.includes("polygonStipple"));
+    assert.ok(result.wgslFragment.indexOf("stippleByteIndex") >= 0);
+    assert.ok(result.wgslFragment.indexOf("stippleBit") >= 0);
+});
+
+test("colour logic XOR is emitted as an attachment-sampling bit operation", () => {
+    const result = generate({
+        _name: "logic_xor",
+        attributes: { position: { components: 3 }, color: true },
+        logicOp: 0x1506,
+    });
+    assert.ok(result.wgslFragment.includes(
+        "@group(3) @binding(0) var glLogicTarget0"));
+    assert.ok(result.wgslFragment.includes("let r = (s ^ d)"));
+    assert.ok(result.wgslFragment.includes("glApplyLogic(frag"));
+});
+
+test("point-sprite coordinate replacement samples gl_PointCoord", () => {
+    const result = generate({
+        _name: "point_coord_replace",
+        attributes: { position: { components: 3 },
+            texCoord: [{ components: 4 }] },
+        pointSprite: true,
+        texture: [{ enabled: true, target: "2D", format: "RGBA",
+            texGen: [null, null, null, null],
+            env: { mode: "REPLACE", coordReplace: true } }],
+    });
+    assert.ok(result.wgslFragment.indexOf(
+        "vec4<f32>(fin.pointCoord, 0.0, 1.0)") >= 0,
+    "GL_COORD_REPLACE uses the generated point coordinate");
+});
+
 test("eight textured units still fit the varying budget", () => {
     const result = generate({
         _name: "eight_units",
@@ -295,6 +344,7 @@ test("every field that changes the code changes the key", () => {
         { attributes: base.attributes, alphaTest: "less" },
         { attributes: base.attributes, clipPlaneCount: 1 },
         { attributes: base.attributes, pointSprite: true },
+        { attributes: base.attributes, polygonStipple: true },
         { attributes: base.attributes, flatShading: true },
         { attributes: base.attributes, colorTargets: 2 },
         { attributes: base.attributes, lighting: { enabled: true,

@@ -320,6 +320,14 @@
           write: (s, o, off) => writeVec4(o, off, [s.lineWidth,
               s.lineStipple.pattern, s.lineStipple.factor,
               s.polygonStippleEnabled ? 1 : 0]) },
+        { id: "polygonStipple", wgsl: "polygonStipple",
+          type: "array<vec4<f32>, 32>", floats: 128,
+          /* One byte per float keeps all 1024 pattern bits exact while staying
+           * inside the existing f32-only uniform staging layout. */
+          write: (s, o, off) => {
+              for (let i = 0; i < 128; ++i) o[off++] = s.polygonStipple[i];
+              return off;
+          } },
     ];
 
     const FIELD_BY_ID = new Map();

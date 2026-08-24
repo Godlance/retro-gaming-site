@@ -16,7 +16,7 @@ Classes follow section 2.3 of the implementation plan:
 - **MISSING** -- no handler at all. The plan's M7 exit condition is zero
   of these.
 
-Counts: A 201, B 8, C 8 of 217 opcodes.
+Counts: A 208, B 4, C 5 of 217 opcodes.
 
 | Op | Record | GL entry point | Class |
 | ---: | --- | --- | --- |
@@ -141,18 +141,18 @@ Counts: A 201, B 8, C 8 of 217 opcodes.
 | 119 | `PIXEL_TRANSFERI` | `glPixelTransferi` | A |
 | 120 | `PIXEL_ZOOM` | `glPixelZoom` | A |
 | 121 | `DRAW_PIXELS` | `DRAW_PIXELS` | B (D-15) |
-| 122 | `BITMAP` | `BITMAP` | B (D-15) |
+| 122 | `BITMAP` | `BITMAP` | A |
 | 123 | `COPY_PIXELS` | `glCopyPixels` | B (D-15) |
 | 124 | `TEX_IMAGE_1D` | `TEX_IMAGE_1D` | A |
 | 125 | `TEX_SUB_IMAGE_1D` | `TEX_SUB_IMAGE_1D` | A |
 | 126 | `COPY_TEX_IMAGE_1D` | `glCopyTexImage1D` | A |
 | 127 | `COPY_TEX_SUB_IMAGE_1D` | `glCopyTexSubImage1D` | A |
-| 128 | `CLEAR_ACCUM` | `glClearAccum` | B (D-09) |
-| 129 | `ACCUM` | `glAccum` | B (D-09) |
-| 130 | `POLYGON_STIPPLE` | `POLYGON_STIPPLE` | B (D-16) |
-| 131 | `PIXEL_MAPFV` | `PIXEL_MAPFV` | C |
-| 132 | `PIXEL_MAPUIV` | `PIXEL_MAPUIV` | C |
-| 133 | `PIXEL_MAPUSV` | `PIXEL_MAPUSV` | C |
+| 128 | `CLEAR_ACCUM` | `glClearAccum` | A |
+| 129 | `ACCUM` | `glAccum` | A |
+| 130 | `POLYGON_STIPPLE` | `POLYGON_STIPPLE` | A |
+| 131 | `PIXEL_MAPFV` | `PIXEL_MAPFV` | A |
+| 132 | `PIXEL_MAPUIV` | `PIXEL_MAPUIV` | A |
+| 133 | `PIXEL_MAPUSV` | `PIXEL_MAPUSV` | A |
 | 134 | `TEX_COORD4F` | `glTexCoord4f` | A |
 | 135 | `VERTEX4F` | `glVertex4f` | A |
 | 136 | `RASTER_POS4F` | `glRasterPos4f` | A |

@@ -124,20 +124,28 @@ class FakeDevice {
         const pipeline = {
             descriptor,
             getBindGroupLayout: index => {
-                // The generated shaders always declare group 1; group 2 exists
-                // only when the shader has textures, and asking for a group the
-                // shader does not declare is an error in WebGPU -- so the fake
-                // reproduces that rather than papering over it.
-                const code = (descriptor.fragment && descriptor.fragment.module.code) || "";
-                if (index === 2 && code.indexOf("@group(2)") < 0)
-                    throw new Error("no bind group layout at index 2");
-                return { index };
+                const code = (descriptor.vertex && descriptor.vertex.module.code || "") +
+                    "\n" + (descriptor.fragment &&
+                        descriptor.fragment.module.code || "");
+                const bindings = new Set();
+                const expression = /@group\((\d+)\)\s+@binding\((\d+)\)/g;
+                for (const match of code.matchAll(expression))
+                    if (Number(match[1]) === index) bindings.add(Number(match[2]));
+                if (!bindings.size)
+                    throw new Error("no bind group layout at index " + index);
+                return { index, bindings };
             },
         };
         this.log.pipelines.push(pipeline);
         return pipeline;
     }
     createBindGroup(descriptor) {
+        if (descriptor.layout && descriptor.layout.bindings) {
+            for (const entry of descriptor.entries)
+                if (!descriptor.layout.bindings.has(entry.binding))
+                    throw new Error("binding " + entry.binding +
+                        " is not declared by group " + descriptor.layout.index);
+        }
         const group = { descriptor };
         this.log.bindGroups.push(group);
         return group;

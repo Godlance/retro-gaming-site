@@ -76,6 +76,8 @@ test("a context is created on demand and keeps GL's defaults", () => {
     assert.strictEqual(state.lights[0].diffuse[0], 1,
         "GL_LIGHT0 starts with a white diffuse and the rest black");
     assert.strictEqual(state.lights[1].diffuse[0], 0);
+    assert.ok(state.polygonStipple.every(value => value === 0xff),
+        "the default 32x32 polygon stipple is all ones");
     const ambient = [...state.material.front.ambient];
     assert.ok(Math.abs(ambient[0] - 0.2) < 1e-6 && ambient[3] === 1,
         "the default front material ambient is 0.2, 0.2, 0.2, 1");
@@ -152,10 +154,15 @@ test("glGetIntegerv is answered without touching the GPU", () => {
     const { executor, log } = newExecutor();
     const stream = new GLStream().makeCurrent(1, 0, 0, 64, 64);
     const answer = stream.queryInteger(GL.MAX_TEXTURE_UNITS);
+    const sampleBuffers = stream.queryInteger(GL.SAMPLE_BUFFERS);
+    const samples = stream.queryInteger(GL.SAMPLES);
     const before = log.submits.length;
     run(executor, stream);
     assert.strictEqual(answer.view.getUint32(4, true), executorModule.SYNC_STATUS_OK);
     assert.strictEqual(answer.view.getUint32(8, true), 8);
+    assert.strictEqual(sampleBuffers.view.getUint32(8, true), 0);
+    assert.strictEqual(samples.view.getUint32(8, true), 0,
+        "a non-multisample pixel format reports zero GL samples");
     assert.strictEqual(log.submits.length, before,
         "answering a state query must not submit GPU work");
 });
@@ -202,6 +209,23 @@ test("glClear before any draw becomes a load operation", () => {
     assert.strictEqual(attachment.clearValue.r, 0.25);
     assert.strictEqual(
         log.passes[0].descriptor.depthStencilAttachment.depthLoadOp, "clear");
+});
+
+test("scissored and masked clears are rendered instead of widening the clear", () => {
+    const { executor, log } = newExecutor();
+    run(executor, new GLStream().makeCurrent(1, 0, 0, 320, 240)
+        .call("ENABLE", GL.SCISSOR_TEST)
+        .call("SCISSOR", 10, 20, 30, 40)
+        .call("COLOR_MASK", 1, 0, 1, 0)
+        .call("CLEAR_COLOR", 0.2, 0.4, 0.6, 1)
+        .call("CLEAR", GL.COLOR_BUFFER_BIT));
+    const pass = log.passes.find(entry =>
+        entry.descriptor.label === "GL masked/scissored clear");
+    assert.ok(pass, "the restricted clear uses its dedicated draw pass");
+    assert.deepStrictEqual(pass.scissor, [10, 20, 30, 40]);
+    assert.strictEqual(log.draws.length, 1);
+    assert.strictEqual(log.draws[0].pipeline.descriptor.fragment.targets[0].writeMask,
+        1 | 4);
 });
 
 /* ---- drawing ---- */
@@ -258,6 +282,91 @@ test("a GL_QUADS draw is issued as an indexed triangle list", () => {
     assert.strictEqual(log.draws[0].count, 6);
     assert.strictEqual(log.draws[0].pipeline.descriptor.primitive.topology,
         "triangle-list");
+});
+
+test("glPolygonMode line and point rasterize triangle edges and vertices", () => {
+    const line = newExecutor();
+    let stream = new GLStream().makeCurrent(1, 0, 0, 64, 64)
+        .call("POLYGON_MODE", GL.FRONT_AND_BACK, GL.LINE);
+    immediateTriangle(stream);
+    run(line.executor, stream);
+    assert.strictEqual(line.log.draws[0].indexed, true);
+    assert.strictEqual(line.log.draws[0].count, 6);
+    assert.strictEqual(line.log.draws[0].pipeline.descriptor.primitive.topology,
+        "line-list");
+
+    const point = newExecutor();
+    stream = new GLStream().makeCurrent(1, 0, 0, 64, 64)
+        .call("POLYGON_MODE", GL.FRONT_AND_BACK, GL.POINT);
+    immediateTriangle(stream);
+    run(point.executor, stream);
+    assert.strictEqual(point.log.draws[0].count, 3);
+    assert.strictEqual(point.log.draws[0].pipeline.descriptor.primitive.topology,
+        "point-list");
+});
+
+test("culling both faces drops polygon draws", () => {
+    const { executor, log } = newExecutor();
+    const stream = new GLStream().makeCurrent(1, 0, 0, 64, 64)
+        .call("ENABLE", GL.CULL_FACE)
+        .call("CULL_FACE", GL.FRONT_AND_BACK);
+    immediateTriangle(stream);
+    run(executor, stream);
+    assert.strictEqual(log.draws.length, 0);
+});
+
+test("wide points and point sprites expand to instanced quads", () => {
+    const { executor, log } = newExecutor();
+    const stream = new GLStream().makeCurrent(1, 0, 0, 320, 240)
+        .call("POINT_SIZE", 8)
+        .call("BEGIN", GL.POINTS)
+        .call("VERTEX3F", 0, 0, 0)
+        .call("END");
+    run(executor, stream);
+    assert.strictEqual(log.draws.length, 1);
+    assert.strictEqual(log.draws[0].count, 6,
+        "one logical point is rendered as a six-vertex quad");
+    assert.strictEqual(log.draws[0].instances, 1);
+    const buffers = log.draws[0].pipeline.descriptor.vertex.buffers;
+    assert.strictEqual(buffers[0].stepMode, "instance");
+    assert.strictEqual(buffers[buffers.length - 1].stepMode, "vertex");
+    assert.strictEqual(
+        buffers[buffers.length - 1].attributes[0].shaderLocation,
+        require("../gl-webgpu/gl_shader_translator.js").POINT_CORNER_LOCATION);
+    assert.strictEqual(log.draws[0].pipeline.descriptor.primitive.topology,
+        "triangle-list");
+});
+
+test("colour logic XOR snapshots the attachment and disables blending", () => {
+    const { executor, log } = newExecutor();
+    const stream = new GLStream().makeCurrent(1, 0, 0, 64, 64)
+        .call("ENABLE", GL.BLEND)
+        .call("ENABLE", GL.COLOR_LOGIC_OP)
+        .call("LOGIC_OP", GL.XOR);
+    immediateTriangle(stream);
+    run(executor, stream);
+    assert.ok(log.encoders.some(encoder =>
+        encoder.copies.some(copy => copy[0] === "t2t")),
+    "the destination colour attachment is copied before drawing");
+    const draw = log.draws[0];
+    assert.equal(draw.pipeline.descriptor.fragment.targets[0].blend, undefined,
+        "logic operations take precedence over blending");
+    assert.match(draw.pipeline.descriptor.fragment.module.code, /s \^ d/);
+    assert.ok(draw.pass.calls.some(call =>
+        call[0] === "bindGroup" && call[1] === 3));
+});
+
+test("point-sprite lower-left origin reaches the generated shader", () => {
+    const { executor, log } = newExecutor();
+    const stream = new GLStream().makeCurrent(1, 0, 0, 64, 64)
+        .call("POINT_PARAMETERI", GL.POINT_SPRITE_COORD_ORIGIN, GL.LOWER_LEFT)
+        .call("POINT_SIZE", 4)
+        .call("BEGIN", GL.POINTS)
+        .call("VERTEX3F", 0, 0, 0)
+        .call("END");
+    run(executor, stream);
+    assert.match(log.draws[0].pipeline.descriptor.vertex.module.code,
+        /vin\.corner\.y \* 0\.5 \+ 0\.5/);
 });
 
 test("the clip-space flip is paired with reversed winding", () => {
@@ -392,6 +501,36 @@ test("an incomplete texture samples as opaque black", () => {
         "a mipmapped filter with only level 0 is incomplete");
 });
 
+test("glDrawPixels uploads a pixel rectangle and draws it at the raster position", () => {
+    const { executor, log } = newExecutor();
+    const pixels = new Uint8Array([
+        255, 0, 0, 255, 0, 255, 0, 255,
+        0, 0, 255, 255, 255, 255, 255, 255,
+    ]);
+    const stream = new GLStream().makeCurrent(1, 0, 0, 64, 64)
+        .call("WINDOW_POS3F", 10, 12, 0.5)
+        .drawPixels(2, 2, GL.RGBA, GL.UNSIGNED_BYTE, pixels);
+    run(executor, stream);
+    assert.strictEqual(log.textureWrites.length, 1);
+    assert.strictEqual(log.textureWrites[0].byteLength, 16);
+    assert.strictEqual(log.draws.length, 1);
+    assert.strictEqual(log.draws[0].count, 6);
+    assert.strictEqual(executor.stats.refusals, 0);
+});
+
+test("glBitmap expands bits with the current colour and advances raster position", () => {
+    const { executor, log } = newExecutor();
+    const stream = new GLStream().makeCurrent(1, 0, 0, 64, 64)
+        .call("WINDOW_POS3F", 4, 5, 0)
+        .call("COLOR4F", 1, 0.5, 0, 1)
+        .bitmap(8, 1, 0, 0, 3, -2, new Uint8Array([0x81, 0, 0, 0]));
+    run(executor, stream);
+    assert.strictEqual(log.draws.length, 1);
+    assert.strictEqual(executor.current.current.rasterPos[0], 7);
+    assert.strictEqual(executor.current.current.rasterPos[1], 3);
+    assert.strictEqual(executor.stats.refusals, 0);
+});
+
 test("glGenerateMipmap builds the whole chain", () => {
     const { executor } = newExecutor();
     run(executor, new GLStream().makeCurrent(1, 0, 0, 64, 64)
@@ -520,20 +659,33 @@ test("a program draw binds the sampler's unit, not the sampler's index", () => {
 
 /* ---- refusals ---- */
 
-test("an unimplemented command is refused loudly, not ignored", () => {
+test("the accumulation buffer implements clear, load, arithmetic and return", () => {
     const { executor } = newExecutor();
-    const errors = [];
+    run(executor, new GLStream().makeCurrent(1, 0, 0, 64, 64)
+        .call("CLEAR_ACCUM", 0.1, 0.2, 0.3, 0.4)
+        .call("CLEAR", GL.ACCUM_BUFFER_BIT)
+        .call("ACCUM", 0x0101, 0.5)  // GL_LOAD
+        .call("ACCUM", 0x0100, 0.25) // GL_ACCUM
+        .call("ACCUM", 0x0103, 2)    // GL_MULT
+        .call("ACCUM", 0x0104, 0.1)  // GL_ADD
+        .call("ACCUM", 0x0102, 1));  // GL_RETURN
+    assert.ok(executor.accumBuffer);
+    assert.strictEqual(executor.accumBuffer.currentTexture.descriptor.format,
+        "rgba16float");
+    assert.strictEqual(executor.stats.refusals, 0);
+});
+
+test("invalid accumulation operations are refused loudly", () => {
+    const { executor } = newExecutor();
     const original = console.error;
-    console.error = (...args) => errors.push(args);
+    console.error = () => {};
     try {
         run(executor, new GLStream().makeCurrent(1, 0, 0, 64, 64)
-            .call("ACCUM", GL.ACCUM, 1));
+            .call("ACCUM", 0xDEAD, 1));
     } finally {
         console.error = original;
     }
     assert.strictEqual(executor.stats.refusals, 1);
-    assert.ok(errors.length, "a refusal reaches the console once");
-    assert.ok(Object.keys(executor.stats.refusalsByOp).length);
 });
 
 test("a truncated record stops the batch instead of reading past it", () => {

@@ -25,16 +25,10 @@ const canvas = {
         getBoundingClientRect() { return { left: 0, top: 0, width: 1024, height: 768 }; },
     },
 };
-const gl4es = {
-    HEAPU8: new Uint8Array(4096),
-    _malloc() { return 256; },
-    _free() {},
-    _v86glResize() {},
-};
 const bridge = globalThis.installV86GLNetworkBridge({
     add_listener(name, callback) { listeners[name] = callback; },
 }, canvas, {
-    gl4es,
+    glExecutor: { submit() {}, onSwapBuffers() {} },
     d3d8Canvas,
     installD3D8WebGPUExecutor(installedCanvas, options) {
         assert.equal(installedCanvas, d3d8Canvas);

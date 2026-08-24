@@ -36,18 +36,16 @@ address to the v86gl PCI I/O BAR at `0xF100`.
                                                                     ▼
 ┌──────────────────────────────────── Browser / host ───────────────────────────────────┐
 │  ┌─────────────────────────────────────────────────────────────────────────────────┐ │
-│  │ v86_network_bridge.js                                                            │ │
-│  │ • Receives and decodes the PCI command stream                                    │ │
-│  │ • Dispatches to v86gl_gl* wrappers                                               │ │
+│  │ v86_network_bridge.js: routes untagged VGL2 records to the GL WebGPU executor    │ │
 │  └──────────────────────────────────────────┬──────────────────────────────────────┘ │
 │                                             ▼                                         │
 │  ┌─────────────────────────────────────────────────────────────────────────────────┐ │
-│  │ gl4es.js + gl4es.wasm: OpenGL 1.x fixed pipeline → OpenGL ES / WebGL             │ │
+│  │ gl-webgpu/gl_executor.js: GL state, GLSL/fixed-function WGSL, resources, draws  │ │
 │  └──────────────────────────────────────────┬──────────────────────────────────────┘ │
 │                                             ▼                                         │
 │                              ┌──────────────────────────────────┐                    │
-│                              │ WebGL / GLES backend              │                    │
-│                              │ v86gl_canvas (overlay canvas)     │                    │
+│                              │ WebGPU / WGSL                    │                    │
+│                              │ d3d_webgpu_canvas (shared)       │                    │
 │                              └──────────────────────────────────┘                    │
 └───────────────────────────────────────────────────────────────────────────────────────┘
 
@@ -117,5 +115,5 @@ debugger.
 
 `V86GLDMADesc.reserved0` and `reserved1` remain reserved and must be zero.
 The PRESENT flag asks the synchronous browser listener to issue the explicit
-WebGL commit. It does not claim that the browser compositor has already
+WebGPU present blit. It does not claim that the browser compositor has already
 displayed the canvas, so no Present-completion extension is defined.

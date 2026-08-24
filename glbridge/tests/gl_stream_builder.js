@@ -123,6 +123,34 @@ class GLStream {
         return this.record(GLFN.TEX_IMAGE_2D, payload.subarray(0, at + bytes.byteLength));
     }
 
+    drawPixels(width, height, format, type, data) {
+        const bytes = data || new Uint8Array(0);
+        const payload = new Uint8Array(20 + bytes.byteLength);
+        const view = new DataView(payload.buffer);
+        view.setInt32(0, width, true);
+        view.setInt32(4, height, true);
+        view.setUint32(8, format, true);
+        view.setUint32(12, type, true);
+        view.setUint32(16, bytes.byteLength, true);
+        payload.set(bytes, 20);
+        return this.record(GLFN.DRAW_PIXELS, payload);
+    }
+
+    bitmap(width, height, xorig, yorig, xmove, ymove, data) {
+        const bytes = data || new Uint8Array(0);
+        const payload = new Uint8Array(28 + bytes.byteLength);
+        const view = new DataView(payload.buffer);
+        view.setInt32(0, width, true);
+        view.setInt32(4, height, true);
+        view.setFloat32(8, xorig, true);
+        view.setFloat32(12, yorig, true);
+        view.setFloat32(16, xmove, true);
+        view.setFloat32(20, ymove, true);
+        view.setUint32(24, bytes.byteLength, true);
+        payload.set(bytes, 28);
+        return this.record(GLFN.BITMAP, payload);
+    }
+
     /*
      * The packed client-array draw. Thirteen blocks in the guest's order --
      * vertex, colour, normal, eight texture coordinates, secondary colour, fog

@@ -3583,6 +3583,25 @@
                 }
             }
             if (this.iface.samplers.length) this.emit("");
+            if (this.stage === "fragment" && this.options.logicOp &&
+                    this.options.logicOp !== 0x1503) {
+                for (let i = 0; i < this.iface.colorTargets; ++i)
+                    this.emit("@group(3) @binding(" + i +
+                        ") var glLogicTarget" + i + " : texture_2d<f32>;");
+                this.emit("fn glApplyLogic(src : vec4<f32>, dst : vec4<f32>) " +
+                    "-> vec4<f32> {");
+                ++this.indent;
+                this.emit("let s = vec4<u32>(round(clamp(src, vec4<f32>(0.0), " +
+                    "vec4<f32>(1.0)) * 255.0));");
+                this.emit("let d = vec4<u32>(round(clamp(dst, vec4<f32>(0.0), " +
+                    "vec4<f32>(1.0)) * 255.0));");
+                this.emit("let r = (" + logicOpExpression(this.options.logicOp) +
+                    ") & vec4<u32>(255u);");
+                this.emit("return vec4<f32>(r) / 255.0;");
+                --this.indent;
+                this.emit("}");
+                this.emit("");
+            }
             for (const accessor of this.iface.uniformLayout.accessors) {
                 this.emitAll(accessor.split("\n"));
             }
@@ -4553,7 +4572,10 @@
                     "clip.w / glState.viewportParams.w;");
                 // GL_POINT_SPRITE_COORD_ORIGIN defaults to GL_UPPER_LEFT.
                 this.emit("out.glPointCoord = vec2<f32>(" +
-                    "vsin.glCorner.x * 0.5 + 0.5, 0.5 - vsin.glCorner.y * 0.5);");
+                    "vsin.glCorner.x * 0.5 + 0.5, " +
+                    (this.options.pointCoordLowerLeft ?
+                        "vsin.glCorner.y * 0.5 + 0.5);" :
+                        "0.5 - vsin.glCorner.y * 0.5);"));
             }
 
             // GL clip space is z in [-w, w]; WebGPU wants [0, w]. The Y flip
@@ -4627,6 +4649,19 @@
                 // discards fragments rather than clipping geometry.
                 this.emit("if (any(fsin.glClipDist < vec4<f32>(0.0))) { discard; }");
             }
+            if (this.options.polygonStipple) {
+                this.emit("let stippleX = u32(floor(fsin.position.x)) & 31u;");
+                this.emit("let stippleY = u32(floor(fsin.position.y)) & 31u;");
+                this.emit("let stippleByteIndex = stippleY * 4u + (stippleX >> 3u);");
+                this.emit("let stippleWord = glState.polygonStipple[stippleByteIndex >> 2u];");
+                this.emit("let stippleLane = stippleByteIndex & 3u;");
+                this.emit("var stippleByte = stippleWord.x;");
+                this.emit("if (stippleLane == 1u) { stippleByte = stippleWord.y; }");
+                this.emit("if (stippleLane == 2u) { stippleByte = stippleWord.z; }");
+                this.emit("if (stippleLane == 3u) { stippleByte = stippleWord.w; }");
+                this.emit("let stippleBit = 0x80u >> (stippleX & 7u);");
+                this.emit("if ((u32(stippleByte) & stippleBit) == 0u) { discard; }");
+            }
 
             if (this.usage.builtinInputs.has("gl_FragCoord"))
                 this.emit("gl_FragCoord = fsin.position;");
@@ -4671,12 +4706,18 @@
             this.emit("var out : FSOut;");
             const targets = this.iface.colorTargets;
             for (let i = 0; i < targets; ++i) {
+                let source;
                 if (this.usage.usesFragData)
-                    this.emit("out.color" + i + " = gl_FragData[" + i + "];");
+                    source = "gl_FragData[" + i + "]";
                 else if (this.usage.usesFragColor)
-                    this.emit("out.color" + i + " = gl_FragColor;");
+                    source = "gl_FragColor";
                 else
-                    this.emit("out.color" + i + " = vec4<f32>(0.0);");
+                    source = "vec4<f32>(0.0)";
+                if (this.options.logicOp && this.options.logicOp !== 0x1503)
+                    source = "glApplyLogic(" + source +
+                        ", textureLoad(glLogicTarget" + i +
+                        ", vec2<i32>(floor(fsin.position.xy)), 0))";
+                this.emit("out.color" + i + " = " + source + ";");
             }
             if (this.usage.writesFragDepth)
                 this.emit("out.depth = gl_FragDepth;");
@@ -4712,6 +4753,28 @@
         less: "<", equal: "==", lequal: "<=",
         greater: ">", notequal: "!=", gequal: ">=",
     };
+
+    function logicOpExpression(op) {
+        switch (op >>> 0) {
+        case 0x1500: return "vec4<u32>(0u)";
+        case 0x1501: return "s & d";
+        case 0x1502: return "s & ~d";
+        case 0x1503: return "s";
+        case 0x1504: return "~s & d";
+        case 0x1505: return "d";
+        case 0x1506: return "s ^ d";
+        case 0x1507: return "s | d";
+        case 0x1508: return "~(s | d)";
+        case 0x1509: return "~(s ^ d)";
+        case 0x150A: return "~d";
+        case 0x150B: return "s | ~d";
+        case 0x150C: return "~s";
+        case 0x150D: return "~s | d";
+        case 0x150E: return "~(s & d)";
+        case 0x150F: return "vec4<u32>(255u)";
+        default: return "s";
+        }
+    }
 
     /* ---- small code-generation helpers ---- */
 
@@ -4937,6 +5000,7 @@
                 stateFields.add("pointParams");
                 stateFields.add("viewportParams");
             }
+            if (variant.polygonStipple) stateFields.add("polygonStipple");
             const stateLayoutInfo = stateLayout.buildLayout([...stateFields]);
 
             /* ---- attributes ---- */
@@ -4996,6 +5060,9 @@
             };
             const genOptions = {
                 pointSprite: !!variant.pointSprite,
+                pointCoordLowerLeft: !!variant.pointCoordLowerLeft,
+                polygonStipple: !!variant.polygonStipple,
+                logicOp: variant.logicOp ? (variant.logicOp >>> 0) : 0,
                 pointCornerLocation: POINT_CORNER_LOCATION,
                 alphaTest: variant.alphaTest || null,
                 nonUniformSampleStrategy: opts.nonUniformSampleStrategy || "grad",
@@ -5048,6 +5115,9 @@
             "a" + (variant.alphaTest || "-"),
             "c" + (variant.clipPlaneCount || 0),
             variant.pointSprite ? "p" : "-",
+            variant.pointCoordLowerLeft ? "l" : "u",
+            variant.polygonStipple ? "s" : "-",
+            "o" + (variant.logicOp || 0).toString(16),
             variant.twoSided ? "2" : "-",
             variant.flatShading ? "f" : "-",
             opts.nonUniformSampleStrategy || "grad",

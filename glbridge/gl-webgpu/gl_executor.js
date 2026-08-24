@@ -1,7 +1,7 @@
 // OpenGL 1.1-2.1 executed on WebGPU.
 //
 // This is the host half of the OpenGL path. The guest DLL
-// (openglproxy/opengl32_proxy.c) is unchanged by the move off gl4es: it still
+// (openglproxy/opengl32_proxy.c) remains the guest-side command encoder: it
 // serialises the same 217 opcodes into the same PCI DMA arena. What changed is
 // everything after the opcode -- the GL state machine, the resources and the
 // shaders now live here, in JavaScript, against a GPUDevice shared with
@@ -397,6 +397,56 @@
         case GL.LINE_LOOP: return count < 2 ? 0 : count + 1;
         default: return count;
         }
+    }
+
+    function isPolygonPrimitive(mode) {
+        return mode === GL.TRIANGLES || mode === GL.TRIANGLE_STRIP ||
+            mode === GL.TRIANGLE_FAN || mode === GL.QUADS ||
+            mode === GL.QUAD_STRIP || mode === GL.POLYGON;
+    }
+
+    /* Produces independent triangles before polygon raster mode is applied.
+     * `source` is the application's optional index array; without it the
+     * vertices are numbered from zero and drawIndexed's baseVertex preserves
+     * glDrawArrays(first). */
+    function triangleListIndices(mode, count, source) {
+        const input = source || (() => {
+            const out = new Uint32Array(count);
+            for (let i = 0; i < count; ++i) out[i] = i;
+            return out;
+        })();
+        if (mode === GL.TRIANGLES)
+            return input.slice(0, Math.floor(input.length / 3) * 3);
+        if (mode === GL.TRIANGLE_STRIP) {
+            if (input.length < 3) return new Uint32Array(0);
+            const out = new Uint32Array((input.length - 2) * 3);
+            let at = 0;
+            for (let i = 0; i + 2 < input.length; ++i) {
+                if (i & 1) {
+                    out[at++] = input[i + 1]; out[at++] = input[i];
+                } else {
+                    out[at++] = input[i]; out[at++] = input[i + 1];
+                }
+                out[at++] = input[i + 2];
+            }
+            return out;
+        }
+        return expandIndexArray(mode, input);
+    }
+
+    function polygonRasterIndices(mode, count, source, rasterMode) {
+        const triangles = triangleListIndices(mode, count, source);
+        if (rasterMode === GL.POINT) return triangles;
+        if (rasterMode !== GL.LINE) return triangles;
+        const out = new Uint32Array(triangles.length * 2);
+        let at = 0;
+        for (let i = 0; i + 2 < triangles.length; i += 3) {
+            const a = triangles[i], b = triangles[i + 1], c = triangles[i + 2];
+            out[at++] = a; out[at++] = b;
+            out[at++] = b; out[at++] = c;
+            out[at++] = c; out[at++] = a;
+        }
+        return out;
     }
 
     /* ================================================================== */
@@ -967,7 +1017,7 @@
             shadeModel: GL.SMOOTH,
             lineWidth: 1,
             lineStipple: { pattern: 0xffff, factor: 1 },
-            polygonStipple: new Uint8Array(128),
+            polygonStipple: new Uint8Array(128).fill(0xff),
             pointSize: 1,
             point: {
                 size: 1, sizeMin: 0, sizeMax: 64, fadeThreshold: 1,
@@ -1372,6 +1422,10 @@
             // the shadow copies the next time each is used.
             this.device = this.host.device;
             this.pipelineCache.clear();
+            if (this.pixelPipelineCache) this.pixelPipelineCache.clear();
+            if (this.accumPipelineCache) this.accumPipelineCache.clear();
+            if (this.accumClearPipelineCache) this.accumClearPipelineCache.clear();
+            if (this.clearPipelineCache) this.clearPipelineCache.clear();
             this.bindGroupCache.clear();
             this.samplerCache.clear();
             this.moduleCache.clear();
@@ -1388,6 +1442,7 @@
             }
             this.backBuffer = null;
             this.depthTarget = null;
+            this.accumBuffer = null;
             this.uniformRing = null;
             this.vertexRing = null;
             this.readyPromise = null;
@@ -1480,6 +1535,62 @@
             }
             this.current = null;
             this.surface = { ...this.surface, visible: false };
+            this.notifySurface("hide");
+        }
+
+        resetForReplay() {
+            this.finishFrame(false);
+            const release = object => {
+                if (!object || typeof object.destroy !== "function") return;
+                try { object.destroy(); } catch (ignored) { /* already gone */ }
+            };
+            for (const group of this.shareGroups.values()) {
+                for (const texture of group.textures.values())
+                    release(texture.gpuTexture);
+                for (const buffer of group.buffers.values())
+                    release(buffer.gpuBuffer);
+                for (const rb of group.renderbuffers.values())
+                    release(rb.gpuTexture);
+            }
+            release(this.backBuffer);
+            release(this.depthTarget);
+            if (this.accumBuffer) {
+                release(this.accumBuffer.textures && this.accumBuffer.textures[0]);
+                release(this.accumBuffer.textures && this.accumBuffer.textures[1]);
+            }
+            for (const texture of this.logicTargetTextures || []) release(texture);
+            this.releaseRetired();
+
+            this.shareGroups.clear();
+            this.contexts.clear();
+            this.framebuffers.clear();
+            this.queries.clear();
+            this.nextContextId = 1;
+            this.nextShareGroupId = 1;
+            this.current = null;
+            this.pipelineCache.clear();
+            this.bindGroupCache.clear();
+            this.samplerCache.clear();
+            this.moduleCache.clear();
+            this.shaderCache.clear();
+            this.indexExpansionCache.clear();
+            if (this.ffCache) this.ffCache.clear();
+            if (this.pixelPipelineCache) this.pixelPipelineCache.clear();
+            if (this.accumPipelineCache) this.accumPipelineCache.clear();
+            if (this.accumClearPipelineCache) this.accumClearPipelineCache.clear();
+            if (this.clearPipelineCache) this.clearPipelineCache.clear();
+            this.backBuffer = null;
+            this.backBufferView = null;
+            this.depthTarget = null;
+            this.depthTargetView = null;
+            this.accumBuffer = null;
+            this.logicTargetTextures = [];
+            this.logicTargetViews = [];
+            this.pendingClear = null;
+            this.vertexCursor = 0;
+            this.uniformCursor = 0;
+            this.surface = { hwnd: 0, x: 0, y: 0, width: 0, height: 0,
+                             visible: false };
             this.notifySurface("hide");
         }
 
@@ -4067,6 +4178,9 @@
         variantKeyFor(variant) {
             return [variant.alphaTest || "-", variant.clipPlaneCount || 0,
                     variant.pointSprite ? "p" : "-",
+                    variant.pointCoordLowerLeft ? "l" : "u",
+                    variant.polygonStipple ? "s" : "-",
+                    "o" + (variant.logicOp || 0).toString(16),
                     variant.twoSided ? "2" : "-",
                     variant.flatShading ? "f" : "-",
                     variant.colorTargets || 1].join("|");
@@ -4853,9 +4967,9 @@
          * whose index pattern depends on nothing but the vertex count.
          */
         uploadIndices(mode, type, data, count) {
+            const source = readIndices(type, data, count);
             let indices;
             if (needsIndexExpansion(mode)) {
-                const source = readIndices(type, data, count);
                 indices = expandIndexArray(mode, source);
                 ++this.stats.expandedIndices;
             } else {
@@ -4867,7 +4981,7 @@
             const slice = this.uploadVertices(bytes);
             if (!slice) return null;
             return { offset: slice.offset, count: indices.length,
-                     format: "uint32" };
+                     format: "uint32", cpu: indices, source };
         },
 
         /* Draw with no index buffer still needs one when the mode expands. */
@@ -4955,7 +5069,9 @@
             if (!s.drawFramebuffer) {
                 const view = this.ensureBackBuffer();
                 return {
-                    color: [{ view, format: this.backBufferFormat }],
+                    color: [{ view, format: this.backBufferFormat,
+                              texture: this.backBuffer, mipLevel: 0,
+                              origin: { x: 0, y: 0, z: 0 } }],
                     depth: this.ensureDepthTarget(),
                     depthFormat: "depth24plus-stencil8",
                     width: this.backBufferWidth, height: this.backBufferHeight,
@@ -4998,11 +5114,16 @@
                         dimension: "2d",
                     }),
                     format: texture.gpuFormat,
+                    texture: gpuTexture,
+                    mipLevel: attachment.level,
+                    origin: { x: 0, y: 0, z: attachment.layer },
                 };
             }
             const rb = this.current.shareGroup.renderbuffers.get(attachment.name);
             if (!rb || !rb.gpuTexture) return null;
-            return { view: rb.gpuTexture.createView(), format: rb.gpuFormat };
+            return { view: rb.gpuTexture.createView(), format: rb.gpuFormat,
+                     texture: rb.gpuTexture, mipLevel: 0,
+                     origin: { x: 0, y: 0, z: 0 } };
         },
 
         ensureBackBuffer() {
@@ -5122,16 +5243,26 @@
         },
 
         /*
-         * glClear. When no pass is open the clear becomes the next pass's load
-         * operation, which is free; otherwise the pass has to end so that the
-         * clear can be expressed as a load operation on a new one. GL's scissor
-         * and colour mask restrict a clear, and a load operation cannot express
-         * either -- so a scissored clear falls back to ending the pass and
-         * re-opening it with the clear applied to the whole target, and is
-         * reported when that is visibly wrong.
+         * glClear. An unrestricted clear becomes the next pass's load
+         * operation. Scissor and write masks cannot be represented by loadOp,
+         * so those cases use a full-screen triangle with exact colour, depth
+         * and stencil write masks.
          */
         clearBuffers(mask) {
             const s = this.current;
+            const gpuMask = mask & (GL.COLOR_BUFFER_BIT | GL.DEPTH_BUFFER_BIT |
+                GL.STENCIL_BUFFER_BIT);
+            const maskedColor = !!(mask & GL.COLOR_BUFFER_BIT) &&
+                s.colorMask.some(value => !value);
+            const maskedDepth = !!(mask & GL.DEPTH_BUFFER_BIT) && !s.depthMask;
+            const maskedStencil = !!(mask & GL.STENCIL_BUFFER_BIT) &&
+                (s.stencil.front.writeMask >>> 0) !== 0xffffffff;
+            if (gpuMask && ((s.enabled.has(GL.SCISSOR_TEST) && s.scissor.set) ||
+                    maskedColor || maskedDepth || maskedStencil)) {
+                if (mask & GL.ACCUM_BUFFER_BIT) this.clearAccumBuffer();
+                this.clearBuffersWithDraw(gpuMask);
+                return;
+            }
             const pending = this.pendingClear || {};
             if (mask & GL.COLOR_BUFFER_BIT) {
                 pending.color = {
@@ -5145,11 +5276,6 @@
             if (!(mask & (GL.COLOR_BUFFER_BIT | GL.DEPTH_BUFFER_BIT |
                     GL.STENCIL_BUFFER_BIT)))
                 return;
-            if (s.enabled.has(GL.SCISSOR_TEST) && s.scissor.set)
-                this.warnOnce("scissored-clear",
-                    "glClear with GL_SCISSOR_TEST clears the whole attachment; " +
-                    "the scissored form is not yet expressed as a draw",
-                    { scissor: s.scissor });
             this.endPass();
             this.pendingClear = pending;
             // Opening the pass immediately makes the clear happen even if no
@@ -5157,9 +5283,152 @@
             this.ensurePass();
         },
 
+        clearBuffersWithDraw(mask) {
+            const s = this.current;
+            this.endPass();
+            const targets = this.currentTargets();
+            if (!targets) return;
+            const clearColor = !!(mask & GL.COLOR_BUFFER_BIT);
+            const clearDepth = !!(mask & GL.DEPTH_BUFFER_BIT) && s.depthMask &&
+                !!targets.depth;
+            const clearStencil = !!(mask & GL.STENCIL_BUFFER_BIT) &&
+                (s.stencil.front.writeMask >>> 0) !== 0 && !!targets.depth &&
+                targets.depthFormat && targets.depthFormat.indexOf("stencil") >= 0;
+            if (!clearColor && !clearDepth && !clearStencil) return;
+            const pipeline = this.clearPipeline(targets, clearColor, clearDepth,
+                clearStencil);
+            if (!pipeline) return;
+            const pass = this.ensureEncoder().beginRenderPass({
+                label: "GL masked/scissored clear",
+                colorAttachments: targets.color.map(target => target ? {
+                    view: target.view, loadOp: "load", storeOp: "store",
+                } : null),
+                ...(targets.depth ? { depthStencilAttachment: {
+                    view: targets.depth,
+                    depthLoadOp: "load", depthStoreOp: "store",
+                    stencilLoadOp: "load", stencilStoreOp: "store",
+                } } : {}),
+            });
+            this.applyAccumScissor(pass, targets);
+            if (clearStencil) pass.setStencilReference(s.clearStencil >>> 0);
+            pass.setPipeline(pipeline);
+            pass.draw(3, 1, 0, 0);
+            pass.end();
+        },
+
+        clearPipeline(targets, clearColor, clearDepth, clearStencil) {
+            const s = this.current;
+            const colorFormats = targets.color.map(target => target ?
+                target.format : "-").join(",");
+            const key = [colorFormats, targets.depthFormat || "-",
+                clearColor ? s.colorMask.map(v => v ? 1 : 0).join("") : "-",
+                clearDepth ? 1 : 0, clearStencil ?
+                    (s.stencil.front.writeMask >>> 0) : 0,
+                [...s.clearColor], s.clearDepth].join("|");
+            this.clearPipelineCache = this.clearPipelineCache || new Map();
+            let pipeline = this.clearPipelineCache.get(key);
+            if (pipeline) return pipeline;
+            const colorFields = clearColor ? targets.color.map((target, i) =>
+                target ? "    @location(" + i + ") color" + i +
+                    " : vec4<f32>," : "").join("\n") : "";
+            const depthField = clearDepth ?
+                "    @builtin(frag_depth) depth : f32," : "";
+            const colorWrites = clearColor ? targets.color.map((target, i) =>
+                target ? "    out.color" + i + " = vec4<f32>(" +
+                    Array.from(s.clearColor).map(v => Number(v).toPrecision(9))
+                        .join(", ") + ");" : "").join("\n") : "";
+            const depthWrite = clearDepth ? "    out.depth = " +
+                Number(s.clearDepth).toPrecision(9) + ";" : "";
+            const fragmentCode = colorFields || depthField ? `
+struct ClearOut {
+${colorFields}
+${depthField}
+}
+@fragment fn fs_main() -> ClearOut {
+    var out : ClearOut;
+${colorWrites}
+${depthWrite}
+    return out;
+}` : "@fragment fn fs_main() {}";
+            const code = `
+@vertex fn vs_main(@builtin(vertex_index) i : u32) -> @builtin(position) vec4<f32> {
+    let x = f32((i << 1u) & 2u) * 2.0 - 1.0;
+    let y = f32(i & 2u) * 2.0 - 1.0;
+    return vec4<f32>(x, y, 0.0, 1.0);
+}
+${fragmentCode}`;
+            const module = this.shaderModule(code);
+            const descriptor = {
+                label: "GL clear pipeline",
+                layout: "auto",
+                vertex: { module, entryPoint: "vs_main" },
+                fragment: { module, entryPoint: "fs_main",
+                    targets: targets.color.map(target => target ? {
+                        format: target.format,
+                        writeMask: clearColor ?
+                            (s.colorMask[0] ? 1 : 0) |
+                            (s.colorMask[1] ? 2 : 0) |
+                            (s.colorMask[2] ? 4 : 0) |
+                            (s.colorMask[3] ? 8 : 0) : 0,
+                    } : null) },
+                primitive: { topology: "triangle-list" },
+            };
+            if (targets.depthFormat) {
+                descriptor.depthStencil = {
+                    format: targets.depthFormat,
+                    depthWriteEnabled: clearDepth,
+                    depthCompare: "always",
+                    ...(clearStencil ? {
+                        stencilFront: { compare: "always", failOp: "keep",
+                            depthFailOp: "keep", passOp: "replace" },
+                        stencilBack: { compare: "always", failOp: "keep",
+                            depthFailOp: "keep", passOp: "replace" },
+                        stencilReadMask: 0xffffffff,
+                        stencilWriteMask: s.stencil.front.writeMask >>> 0,
+                    } : {}),
+                };
+            }
+            try {
+                pipeline = this.device.createRenderPipeline(descriptor);
+            } catch (error) {
+                this.refuse("glClear", "could not create masked clear pipeline",
+                    { message: String(error) }, GL.INVALID_OPERATION);
+                return null;
+            }
+            this.clearPipelineCache.set(key, pipeline);
+            return pipeline;
+        },
+
         clearAccumBuffer() {
-            this.refuse("glClear", "the accumulation buffer is not implemented",
-                {}, 0);
+            this.endPass();
+            const targets = this.currentTargets();
+            if (!targets) return;
+            const accum = this.ensureAccumBuffer(targets);
+            const scissored = this.current.enabled.has(GL.SCISSOR_TEST) &&
+                this.current.scissor.set;
+            const pass = this.ensureEncoder().beginRenderPass({
+                label: "GL accumulation clear",
+                colorAttachments: [{
+                    view: accum.currentView,
+                    loadOp: scissored ? "load" : "clear",
+                    clearValue: {
+                        r: this.current.clearAccum[0],
+                        g: this.current.clearAccum[1],
+                        b: this.current.clearAccum[2],
+                        a: this.current.clearAccum[3],
+                    },
+                    storeOp: "store",
+                }],
+            });
+            this.applyAccumScissor(pass, targets);
+            if (scissored) {
+                const pipeline = this.accumClearPipeline();
+                if (pipeline) {
+                    pass.setPipeline(pipeline);
+                    pass.draw(3, 1, 0, 0);
+                }
+            }
+            pass.end();
         },
 
         /* ---- the draw ---- */
@@ -5167,6 +5436,25 @@
         issueDraw(request) {
             const s = this.current;
             if (s.renderMode !== GL.RENDER) return;   // GL_SELECT/GL_FEEDBACK
+            if (s.enabled.has(GL.CULL_FACE) && s.cullFace === GL.FRONT_AND_BACK)
+                return;
+            let index = request.index;
+            if (isPolygonPrimitive(request.mode)) {
+                const rasterMode = this.effectivePolygonMode();
+                if (rasterMode === GL.LINE || rasterMode === GL.POINT) {
+                    const rasterIndices = polygonRasterIndices(request.mode,
+                        request.vertexCount, index && index.source, rasterMode);
+                    if (!rasterIndices.length) return;
+                    const slice = this.uploadVertices(new Uint8Array(
+                        rasterIndices.buffer, rasterIndices.byteOffset,
+                        rasterIndices.byteLength));
+                    if (!slice) return;
+                    index = { offset: slice.offset, count: rasterIndices.length,
+                        format: "uint32", cpu: rasterIndices };
+                    request = { ...request,
+                        mode: rasterMode === GL.LINE ? GL.LINES : GL.POINTS };
+                }
+            }
             this.drawingPoints = request.mode === GL.POINTS;
             if (s.enabled.has(GL.STENCIL_TEST) && stencilMasksDiverge(s))
                 this.warnOnce("stencil-masks",
@@ -5174,16 +5462,51 @@
                     "pair for both faces, so the front face's are used " +
                     "(deviation D-02)", { front: s.stencil.front,
                                           back: s.stencil.back });
+            const shaders = this.resolveShaders();
+            if (!shaders) return;
+            if (s.enabled.has(GL.COLOR_LOGIC_OP) && s.logicOp !== GL.COPY &&
+                    !this.prepareLogicOpTargets()) return;
             const pass = this.ensurePass();
             if (!pass) {
                 this.refuse("draw", "no render target is bound", {},
                     GL.INVALID_FRAMEBUFFER_OPERATION);
                 return;
             }
-            const shaders = this.resolveShaders();
-            if (!shaders) return;
 
-            let index = request.index;
+            /* WebGPU only rasterises one-pixel points. GL point size and point
+             * sprites are implemented as an instanced six-vertex quad: the
+             * application's attributes advance once per point, while this
+             * extra corner attribute advances for the six quad vertices. */
+            const expandedPoints = request.mode === GL.POINTS && !index &&
+                (s.point.size !== 1 || s.enabled.has(GL.POINT_SPRITE));
+            if (expandedPoints) {
+                const corners = new Float32Array([
+                    -1, -1,  1, -1, -1,  1,
+                    -1,  1,  1, -1,  1,  1,
+                ]);
+                const cornerSlice = this.uploadVertices(
+                    new Uint8Array(corners.buffer));
+                if (!cornerSlice) return;
+                request = {
+                    ...request,
+                    expandedPoints: true,
+                    buffers: request.buffers.map(buffer => ({
+                        ...buffer,
+                        stepMode: "instance",
+                    })).concat([{
+                        gpuBuffer: this.vertexRing,
+                        baseOffset: cornerSlice.offset,
+                        stride: 8,
+                        stepMode: "vertex",
+                        attributes: [{
+                            location: translator.POINT_CORNER_LOCATION,
+                            format: "float32x2",
+                            offset: 0,
+                        }],
+                    }]),
+                };
+            }
+
             if (!index && needsIndexExpansion(request.mode)) {
                 const expanded = this.expansionIndices(request.mode,
                     request.vertexCount);
@@ -5192,7 +5515,7 @@
                     expanded.byteOffset, expanded.byteLength));
                 if (!slice) return;
                 index = { offset: slice.offset, count: expanded.length,
-                          format: "uint32" };
+                          format: "uint32", cpu: expanded };
             }
 
             const pipeline = this.ensurePipeline(shaders, request, index);
@@ -5210,6 +5533,8 @@
             if (index) {
                 pass.setIndexBuffer(this.vertexRing, index.format, index.offset);
                 pass.drawIndexed(index.count, 1, 0, request.firstVertex || 0, 0);
+            } else if (expandedPoints) {
+                pass.draw(6, request.vertexCount, 0, request.firstVertex || 0);
             } else {
                 pass.draw(request.vertexCount, 1, request.firstVertex || 0, 0);
             }
@@ -5252,6 +5577,79 @@
                     b: s.blend.color[2], a: s.blend.color[3],
                 });
         },
+
+        prepareLogicOpTargets() {
+            // Consume a pending loadOp clear before taking the destination
+            // snapshot, then continue in a second pass that samples only the
+            // copy. Sampling the live attachment would be a WebGPU feedback
+            // loop and is rejected by validation.
+            const initialPass = this.ensurePass();
+            if (!initialPass) {
+                this.refuse("draw", "no render target is bound", {},
+                    GL.INVALID_FRAMEBUFFER_OPERATION);
+                return false;
+            }
+            this.endPass();
+            const targets = this.currentTargets();
+            if (!targets) return false;
+            const width = Math.max(1, targets.width);
+            const height = Math.max(1, targets.height);
+            this.logicTargetTextures = this.logicTargetTextures || [];
+            this.logicTargetViews = [];
+            const encoder = this.ensureEncoder();
+            let fallbackView = null;
+            for (let i = 0; i < targets.color.length; ++i) {
+                const source = targets.color[i];
+                if (!source || !source.texture) {
+                    this.logicTargetViews.push(fallbackView || this.fallbackView);
+                    continue;
+                }
+                let copy = this.logicTargetTextures[i];
+                const key = source.format + ":" + width + "x" + height;
+                if (!copy || copy.glLogicKey !== key) {
+                    this.retire(copy);
+                    copy = this.device.createTexture({
+                        label: "GL logic-op destination copy " + i,
+                        size: { width, height, depthOrArrayLayers: 1 },
+                        format: source.format,
+                        usage: TEXTURE_USAGE_COPY_DST | TEXTURE_USAGE_TEXTURE_BINDING,
+                    });
+                    copy.glLogicKey = key;
+                    this.logicTargetTextures[i] = copy;
+                }
+                encoder.copyTextureToTexture({
+                    texture: source.texture,
+                    mipLevel: source.mipLevel || 0,
+                    origin: source.origin || { x: 0, y: 0, z: 0 },
+                }, { texture: copy },
+                { width, height, depthOrArrayLayers: 1 });
+                const view = copy.createView();
+                if (!fallbackView) fallbackView = view;
+                this.logicTargetViews.push(view);
+            }
+            if (fallbackView) {
+                for (let i = 0; i < this.logicTargetViews.length; ++i)
+                    if (this.logicTargetViews[i] === this.fallbackView)
+                        this.logicTargetViews[i] = fallbackView;
+            }
+            return true;
+        },
+
+        effectivePolygonMode() {
+            const s = this.current;
+            const front = s.polygonMode.front;
+            const back = s.polygonMode.back;
+            if (front === back) return front;
+            if (s.enabled.has(GL.CULL_FACE)) {
+                if (s.cullFace === GL.FRONT) return back;
+                if (s.cullFace === GL.BACK) return front;
+            }
+            this.warnOnce("two-face-polygon-mode",
+                "front and back polygon modes differ without face culling; " +
+                "the front mode is used for both faces",
+                { front, back });
+            return front;
+        },
     });
 
     /* ================================================================== */
@@ -5272,7 +5670,12 @@
                 alphaTest: s.enabled.has(GL.ALPHA_TEST) ?
                     (ALPHA_TEST_NAMES[s.alphaFunc.func] || "always") : "always",
                 clipPlaneCount,
-                pointSprite: this.drawingPoints && s.enabled.has(GL.POINT_SPRITE),
+                pointSprite: this.drawingPoints &&
+                    (s.enabled.has(GL.POINT_SPRITE) || s.point.size !== 1),
+                pointCoordLowerLeft:
+                    s.point.spriteCoordOrigin === GL.LOWER_LEFT,
+                polygonStipple: s.enabled.has(GL.POLYGON_STIPPLE),
+                logicOp: s.enabled.has(GL.COLOR_LOGIC_OP) ? s.logicOp : 0,
                 twoSided: s.lightModel.twoSide,
                 flatShading: s.shadeModel === GL.FLAT,
                 colorTargets: this.colorTargetCount(),
@@ -5282,7 +5685,7 @@
         colorTargetCount() {
             const s = this.current;
             if (!s.drawFramebuffer) return 1;
-            return Math.max(1, s.drawBuffers.filter(b => b !== GL.NONE).length);
+            return Math.max(1, s.drawBuffers.length);
         },
 
         arbShaders() {
@@ -5290,6 +5693,11 @@
             const vertexOn = s.enabled.has(GL.VERTEX_PROGRAM_ARB);
             const fragmentOn = s.enabled.has(GL.FRAGMENT_PROGRAM_ARB);
             if (!vertexOn && !fragmentOn) return null;
+            if (s.enabled.has(GL.COLOR_LOGIC_OP)) {
+                this.refuse("draw", "colour logic operations cannot be injected " +
+                    "into an ARB assembly fragment program", { op: s.logicOp }, 0);
+                return null;
+            }
             const vertex = vertexOn ? this.arbProgramFor(GL.VERTEX_PROGRAM_ARB) : null;
             const fragment = fragmentOn ?
                 this.arbProgramFor(GL.FRAGMENT_PROGRAM_ARB) : null;
@@ -5334,8 +5742,9 @@
         },
 
         resolveShaders() {
-            const arbPair = this.arbShaders();
-            if (arbPair) return arbPair;
+            if (this.current.enabled.has(GL.VERTEX_PROGRAM_ARB) ||
+                    this.current.enabled.has(GL.FRAGMENT_PROGRAM_ARB))
+                return this.arbShaders();
             const program = this.currentProgramObject();
             const variant = this.currentVariant();
             if (program) {
@@ -5458,6 +5867,9 @@
                 alphaTest: variant.alphaTest,
                 clipPlaneCount: variant.clipPlaneCount,
                 pointSprite: variant.pointSprite,
+                pointCoordLowerLeft: variant.pointCoordLowerLeft,
+                polygonStipple: variant.polygonStipple,
+                logicOp: variant.logicOp,
                 flatShading: variant.flatShading,
                 colorTargets: variant.colorTargets,
             };
@@ -5465,9 +5877,13 @@
 
         texEnvSignature(env) {
             const mode = TEXENV_MODE_NAMES[env.mode] || "MODULATE";
-            if (mode !== "COMBINE") return { mode };
+            if (mode !== "COMBINE") return {
+                mode,
+                coordReplace: !!env.pointSprite,
+            };
             return {
                 mode,
+                coordReplace: !!env.pointSprite,
                 combineRGB: COMBINE_RGB_NAMES[env.combineRGB] || "MODULATE",
                 combineAlpha: COMBINE_RGB_NAMES[env.combineAlpha] || "MODULATE",
                 srcRGB: env.srcRGB.map(v => COMBINE_SOURCE_NAMES[v] || "TEXTURE"),
@@ -5512,13 +5928,16 @@
             const signature = [
                 shaders.key,
                 layoutKey,
-                needsIndexExpansion(request.mode) ? "triangle-list" : topology,
+                request.expandedPoints ? "triangle-list" :
+                    (needsIndexExpansion(request.mode) ? "triangle-list" : topology),
                 strip && index ? "u32" : "-",
                 this.gpuFrontFace(s), this.gpuCullMode(s),
                 s.enabled.has(GL.DEPTH_TEST) ? s.depthFunc : "off",
                 s.depthMask ? 1 : 0,
                 s.enabled.has(GL.STENCIL_TEST) ? stencilKey(s) : "off",
-                s.enabled.has(GL.BLEND) ? blendKey(s) : "off",
+                s.enabled.has(GL.COLOR_LOGIC_OP) ?
+                    "logic:" + s.logicOp.toString(16) :
+                    (s.enabled.has(GL.BLEND) ? blendKey(s) : "off"),
                 s.colorMask.map(v => v ? 1 : 0).join(""),
                 polygonOffsetKey(s),
                 s.enabled.has(GL.SAMPLE_ALPHA_TO_COVERAGE) ? "a2c" : "-",
@@ -5534,7 +5953,7 @@
             const fragmentModule = this.shaderModule(shaders.wgslFragment);
             const buffers = request.buffers.map(buffer => ({
                 arrayStride: buffer.stride,
-                stepMode: "vertex",
+                stepMode: buffer.stepMode || "vertex",
                 attributes: buffer.attributes.map(a => ({
                     shaderLocation: a.location,
                     format: a.format,
@@ -5544,7 +5963,9 @@
             const colorTargets = (targets ? targets.color : [null]).map(target =>
                 target ? {
                     format: target.format,
-                    blend: s.enabled.has(GL.BLEND) ? gpuBlendState(s) : undefined,
+                    blend: s.enabled.has(GL.BLEND) &&
+                        !s.enabled.has(GL.COLOR_LOGIC_OP) ?
+                        gpuBlendState(s) : undefined,
                     writeMask: (s.colorMask[0] ? 1 : 0) | (s.colorMask[1] ? 2 : 0) |
                         (s.colorMask[2] ? 4 : 0) | (s.colorMask[3] ? 8 : 0),
                 } : null);
@@ -5556,9 +5977,10 @@
                 fragment: { module: fragmentModule, entryPoint: "fs_main",
                             targets: colorTargets },
                 primitive: {
-                    topology: needsIndexExpansion(request.mode) ?
+                    topology: request.expandedPoints ? "triangle-list" :
+                        (needsIndexExpansion(request.mode) ?
                         (request.mode === GL.LINE_LOOP ? "line-strip" : "triangle-list") :
-                        topology,
+                        topology),
                     frontFace: this.gpuFrontFace(s),
                     cullMode: this.gpuCullMode(s),
                     ...(strip && index ? { stripIndexFormat: "uint32" } : {}),
@@ -5568,8 +5990,9 @@
                 },
                 multisample: {
                     count: 1,
-                    alphaToCoverageEnabled:
-                        !!s.enabled.has(GL.SAMPLE_ALPHA_TO_COVERAGE),
+                    // WebGPU validation only permits alpha-to-coverage on a
+                    // multisampled target. D-06 documents the current 1x path.
+                    alphaToCoverageEnabled: false,
                 },
             };
             if (targets && targets.depthFormat) {
@@ -5632,17 +6055,24 @@
 
             const groups = [];
             try {
+                const shaderText = shaders.wgslVertex + "\n" +
+                    shaders.wgslFragment;
+                const uniformEntries = [];
+                if (shaderText.indexOf("@group(1) @binding(0)") >= 0) {
+                    uniformEntries.push({ binding: 0,
+                        resource: { buffer: this.uniformRing,
+                            offset: stateSlice.offset, size: stateSlice.size } });
+                }
+                if (shaderText.indexOf("@group(1) @binding(1)") >= 0) {
+                    uniformEntries.push({ binding: 1,
+                        resource: { buffer: this.uniformRing,
+                            offset: uniformSlice.offset, size: uniformSlice.size } });
+                }
                 groups.push({
                     index: 1,
                     group: this.device.createBindGroup({
                         layout: pipeline.getBindGroupLayout(1),
-                        entries: [
-                            { binding: 0, resource: { buffer: this.uniformRing,
-                                offset: stateSlice.offset, size: stateSlice.size } },
-                            { binding: 1, resource: { buffer: this.uniformRing,
-                                offset: uniformSlice.offset,
-                                size: uniformSlice.size } },
-                        ],
+                        entries: uniformEntries,
                     }),
                 });
                 const textureEntries = this.textureBindEntries(shaders);
@@ -5652,6 +6082,22 @@
                         group: this.device.createBindGroup({
                             layout: pipeline.getBindGroupLayout(2),
                             entries: textureEntries,
+                        }),
+                    });
+                }
+                if (this.current.enabled.has(GL.COLOR_LOGIC_OP) &&
+                        this.current.logicOp !== GL.COPY) {
+                    const views = this.logicTargetViews || [];
+                    groups.push({
+                        index: 3,
+                        group: this.device.createBindGroup({
+                            layout: pipeline.getBindGroupLayout(3),
+                            entries: Array.from({ length: shaders.colorTargets || 1 },
+                                (unused, binding) => ({
+                                    binding,
+                                    resource: views[binding] || views[0] ||
+                                        this.fallbackView,
+                                })),
                         }),
                     });
                 }
@@ -6004,6 +6450,7 @@
                 lineWidth: 1,
                 lineStipple: { pattern: 0xffff, factor: 1 },
                 polygonStippleEnabled: false,
+                polygonStipple: new Uint8Array(128),
             });
 
             const modelview = this.topOf(GL.MODELVIEW);
@@ -6143,6 +6590,7 @@
             snapshot.lineStipple.pattern = s.lineStipple.pattern;
             snapshot.lineStipple.factor = s.lineStipple.factor;
             snapshot.polygonStippleEnabled = s.enabled.has(GL.POLYGON_STIPPLE);
+            snapshot.polygonStipple.set(s.polygonStipple);
             return snapshot;
         },
     });
@@ -6611,19 +7059,469 @@ fn fs_main(inp : VSOut) -> @location(0) vec4<f32> {
             if (size >= 4) view.setUint32(offset, SYNC_STATUS_OK, true);
         },
 
-        /* ---- not yet implemented, reported rather than ignored ---- */
+        /* ---- legacy pixel rectangles ---- */
 
-        drawPixels() {
-            this.refuse("glDrawPixels", "pixel rectangles are an M6 item", {}, 0);
+        drawPixels(bytes, view, offset, size) {
+            if (size < 20) throw new GLStreamError("glDrawPixels record is short");
+            const width = view.getInt32(offset, true);
+            const height = view.getInt32(offset + 4, true);
+            const format = view.getUint32(offset + 8, true);
+            const type = view.getUint32(offset + 12, true);
+            const dataSize = view.getUint32(offset + 16, true);
+            if (width <= 0 || height <= 0 || !this.current.current.rasterValid)
+                return;
+            if (20 + dataSize > size)
+                throw new GLStreamError("glDrawPixels data is truncated");
+            const source = bytes.subarray(offset + 20, offset + 20 + dataSize);
+            const store = this.current.pixelStore;
+            const rgba = convertPixels(source, 0, width, height, 1,
+                format, type, "RGBA", {
+                    alignment: store.unpackAlignment,
+                    rowLength: store.unpackRowLength,
+                    skipPixels: store.unpackSkipPixels,
+                    skipRows: store.unpackSkipRows,
+                    imageHeight: store.unpackImageHeight,
+                    skipImages: store.unpackSkipImages,
+                });
+            if (!rgba)
+                return this.refuse("glDrawPixels", "unsupported or truncated pixel data",
+                    { width, height, format, type }, GL.INVALID_ENUM);
+            this.applyPixelTransfer(rgba);
+            this.drawPixelRGBA(rgba, width, height,
+                this.current.current.rasterPos[0],
+                this.current.current.rasterPos[1], false);
         },
-        drawBitmap() {
-            this.refuse("glBitmap", "pixel rectangles are an M6 item", {}, 0);
+
+        drawBitmap(bytes, view, offset, size) {
+            if (size < 28) throw new GLStreamError("glBitmap record is short");
+            const width = view.getInt32(offset, true);
+            const height = view.getInt32(offset + 4, true);
+            const xorig = view.getFloat32(offset + 8, true);
+            const yorig = view.getFloat32(offset + 12, true);
+            const xmove = view.getFloat32(offset + 16, true);
+            const ymove = view.getFloat32(offset + 20, true);
+            const dataSize = view.getUint32(offset + 24, true);
+            const s = this.current;
+            if (28 + dataSize > size)
+                throw new GLStreamError("glBitmap data is truncated");
+            if (s.current.rasterValid && width > 0 && height > 0 && dataSize) {
+                const source = bytes.subarray(offset + 28,
+                    offset + 28 + dataSize);
+                const rgba = this.expandBitmap(source, width, height);
+                this.drawPixelRGBA(rgba, width, height,
+                    s.current.rasterPos[0] - xorig,
+                    s.current.rasterPos[1] - yorig, true);
+            }
+            if (s.current.rasterValid) {
+                s.current.rasterPos[0] += xmove;
+                s.current.rasterPos[1] += ymove;
+            }
         },
-        copyPixels() {
-            this.refuse("glCopyPixels", "pixel rectangles are an M6 item", {}, 0);
+
+        copyPixels(x, y, width, height, type) {
+            if (width <= 0 || height <= 0 || !this.current.current.rasterValid)
+                return;
+            if (type !== GL.COLOR)
+                return this.refuse("glCopyPixels",
+                    "depth and stencil pixel copies need typed attachment copies",
+                    { type }, GL.INVALID_OPERATION);
+            const source = this.readAttachmentView();
+            if (!source) return this.refuse("glCopyPixels",
+                "no readable colour attachment", {},
+                GL.INVALID_FRAMEBUFFER_OPERATION);
+            this.endPass();
+            const texture = this.device.createTexture({
+                label: "GL copy-pixels source",
+                size: { width, height, depthOrArrayLayers: 1 },
+                format: source.format,
+                usage: TEXTURE_USAGE_COPY_DST | TEXTURE_USAGE_TEXTURE_BINDING,
+            });
+            this.ensureEncoder().copyTextureToTexture(
+                { texture: source.texture, origin: { x, y, z: 0 } },
+                { texture }, { width, height, depthOrArrayLayers: 1 });
+            this.drawPixelTexture(texture, texture.createView(), width, height,
+                this.current.current.rasterPos[0],
+                this.current.current.rasterPos[1], false);
+            this.retire(texture);
         },
-        accum() {
-            this.refuse("glAccum", "the accumulation buffer is an M6 item", {}, 0);
+
+        applyPixelTransfer(rgba) {
+            const transfer = this.current.pixelTransfer;
+            const maps = this.pixelMaps || Object.create(null);
+            const scales = [transfer.redScale, transfer.greenScale,
+                transfer.blueScale, transfer.alphaScale];
+            const biases = [transfer.redBias, transfer.greenBias,
+                transfer.blueBias, transfer.alphaBias];
+            const mapNames = [GL.PIXEL_MAP_R_TO_R, GL.PIXEL_MAP_G_TO_G,
+                GL.PIXEL_MAP_B_TO_B, GL.PIXEL_MAP_A_TO_A];
+            for (let at = 0; at < rgba.length; at += 4) {
+                for (let c = 0; c < 4; ++c) {
+                    let value = clamp(rgba[at + c] / 255 * scales[c] +
+                        biases[c], 0, 1);
+                    const map = transfer.mapColor ? maps[mapNames[c]] : null;
+                    if (map && map.length) {
+                        const index = clamp(Math.round(value * (map.length - 1)),
+                            0, map.length - 1);
+                        value = clamp(map[index], 0, 1);
+                    }
+                    rgba[at + c] = Math.round(value * 255);
+                }
+            }
+        },
+
+        expandBitmap(source, width, height) {
+            const store = this.current.pixelStore;
+            const rowLength = store.unpackRowLength || width;
+            const rowBytes = Math.ceil(rowLength / 8);
+            const stride = alignUp(rowBytes, store.unpackAlignment || 1);
+            const skip = store.unpackSkipPixels || 0;
+            const rgba = new Uint8Array(width * height * 4);
+            const color = this.current.current.color;
+            for (let row = 0; row < height; ++row) {
+                const rowStart = (store.unpackSkipRows + row) * stride;
+                for (let x = 0; x < width; ++x) {
+                    const bit = skip + x;
+                    const byte = source[rowStart + (bit >> 3)] || 0;
+                    const mask = store.unpackLsbFirst ? 1 << (bit & 7) :
+                        0x80 >> (bit & 7);
+                    if (!(byte & mask)) continue;
+                    const at = (row * width + x) * 4;
+                    rgba[at] = Math.round(clamp(color[0], 0, 1) * 255);
+                    rgba[at + 1] = Math.round(clamp(color[1], 0, 1) * 255);
+                    rgba[at + 2] = Math.round(clamp(color[2], 0, 1) * 255);
+                    rgba[at + 3] = Math.round(clamp(color[3], 0, 1) * 255);
+                }
+            }
+            return rgba;
+        },
+
+        drawPixelRGBA(rgba, width, height, x, y, discardZeroAlpha) {
+            const texture = this.device.createTexture({
+                label: "GL pixel rectangle",
+                size: { width, height, depthOrArrayLayers: 1 },
+                format: "rgba8unorm",
+                usage: TEXTURE_USAGE_COPY_DST | TEXTURE_USAGE_TEXTURE_BINDING,
+            });
+            this.device.queue.writeTexture({ texture }, rgba,
+                { bytesPerRow: width * 4, rowsPerImage: height },
+                { width, height, depthOrArrayLayers: 1 });
+            this.drawPixelTexture(texture, texture.createView(), width, height,
+                x, y, discardZeroAlpha);
+            this.retire(texture);
+        },
+
+        drawPixelTexture(texture, textureView, width, height, x, y,
+                discardZeroAlpha) {
+            const s = this.current;
+            const vp = s.viewport;
+            if (!vp.width || !vp.height) return;
+            const x0 = x, y0 = y;
+            const x1 = x + width * s.pixelZoom.x;
+            const y1 = y + height * s.pixelZoom.y;
+            const ndcX = value => (value - vp.x) * 2 / vp.width - 1;
+            // The normal GL vertex path negates clip-space Y. Expressing the
+            // window coordinate directly therefore uses the same negated map.
+            const ndcY = value => 1 - (value - vp.y) * 2 / vp.height;
+            const range = s.depthRange.far - s.depthRange.near;
+            const z = Math.abs(range) > 1e-12 ?
+                (s.current.rasterPos[2] - s.depthRange.near) / range : 0;
+            const vertices = new Float32Array([
+                ndcX(x0), ndcY(y0), z, 1, 0, 0,
+                ndcX(x1), ndcY(y0), z, 1, 1, 0,
+                ndcX(x0), ndcY(y1), z, 1, 0, 1,
+                ndcX(x0), ndcY(y1), z, 1, 0, 1,
+                ndcX(x1), ndcY(y0), z, 1, 1, 0,
+                ndcX(x1), ndcY(y1), z, 1, 1, 1,
+            ]);
+            const slice = this.uploadVertices(new Uint8Array(vertices.buffer));
+            if (!slice) return;
+            const pass = this.ensurePass();
+            if (!pass) return;
+            const pipeline = this.pixelPipeline(discardZeroAlpha);
+            if (!pipeline) return;
+            pass.setPipeline(pipeline);
+            this.applyPassState(pass);
+            pass.setVertexBuffer(0, this.vertexRing, slice.offset);
+            pass.setBindGroup(0, this.device.createBindGroup({
+                layout: pipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: textureView },
+                    { binding: 1, resource: this.pixelSampler ||
+                        (this.pixelSampler = this.device.createSampler({
+                            minFilter: "nearest", magFilter: "nearest",
+                        })) },
+                ],
+            }));
+            pass.draw(6, 1, 0, 0);
+            ++this.stats.draws;
+            void texture;
+        },
+
+        pixelPipeline(discardZeroAlpha) {
+            const s = this.current;
+            const targets = this.passTargets;
+            if (!targets) return null;
+            const alpha = s.enabled.has(GL.ALPHA_TEST) ?
+                (ALPHA_TEST_NAMES[s.alphaFunc.func] || "always") : "always";
+            const key = [discardZeroAlpha ? 1 : 0, alpha, s.alphaFunc.ref,
+                s.enabled.has(GL.DEPTH_TEST) ? s.depthFunc : "off",
+                s.depthMask ? 1 : 0,
+                s.enabled.has(GL.STENCIL_TEST) ? stencilKey(s) : "off",
+                s.enabled.has(GL.BLEND) ? blendKey(s) : "off",
+                s.colorMask.map(v => v ? 1 : 0).join(""),
+                targets.color.map(c => c ? c.format : "-").join(","),
+                targets.depthFormat || "-"].join("|");
+            this.pixelPipelineCache = this.pixelPipelineCache || new Map();
+            let pipeline = this.pixelPipelineCache.get(key);
+            if (pipeline) return pipeline;
+            const conditions = [];
+            if (discardZeroAlpha) conditions.push("color.a <= 0.0");
+            if (alpha === "never") conditions.push("true");
+            else if (alpha !== "always") {
+                const op = {
+                    less: "<", equal: "==", lequal: "<=", greater: ">",
+                    notequal: "!=", gequal: ">=",
+                }[alpha];
+                if (op) conditions.push("!(color.a " + op + " " +
+                    Number(s.alphaFunc.ref).toPrecision(9) + ")");
+            }
+            const outputFields = targets.color.map((target, i) => target ?
+                "    @location(" + i + ") color" + i + " : vec4<f32>," : "").join("\n");
+            const outputWrites = targets.color.map((target, i) => target ?
+                "    out.color" + i + " = color;" : "").join("\n");
+            const code = `
+struct VSIn { @location(0) position : vec4<f32>, @location(1) uv : vec2<f32>, }
+struct Varying { @builtin(position) position : vec4<f32>, @location(0) uv : vec2<f32>, }
+@vertex fn vs_main(v : VSIn) -> Varying {
+    var out : Varying; out.position = v.position; out.uv = v.uv; return out;
+}
+@group(0) @binding(0) var pixels : texture_2d<f32>;
+@group(0) @binding(1) var pixelSampler : sampler;
+struct PixelOut {
+${outputFields}
+}
+@fragment fn fs_main(v : Varying) -> PixelOut {
+    let color = textureSample(pixels, pixelSampler, v.uv);
+    ${conditions.length ? "if (" + conditions.join(" || ") + ") { discard; }" : ""}
+    var out : PixelOut;
+${outputWrites}
+    return out;
+}`;
+            const colorTargets = targets.color.map(target => target ? {
+                format: target.format,
+                blend: s.enabled.has(GL.BLEND) ? gpuBlendState(s) : undefined,
+                writeMask: (s.colorMask[0] ? 1 : 0) | (s.colorMask[1] ? 2 : 0) |
+                    (s.colorMask[2] ? 4 : 0) | (s.colorMask[3] ? 8 : 0),
+            } : null);
+            const module = this.shaderModule(code);
+            const descriptor = {
+                label: "GL pixel rectangle pipeline",
+                layout: "auto",
+                vertex: { module, entryPoint: "vs_main", buffers: [{
+                    arrayStride: 24, stepMode: "vertex", attributes: [
+                        { shaderLocation: 0, format: "float32x4", offset: 0 },
+                        { shaderLocation: 1, format: "float32x2", offset: 16 },
+                    ],
+                }] },
+                fragment: { module, entryPoint: "fs_main", targets: colorTargets },
+                primitive: { topology: "triangle-list", cullMode: "none" },
+                multisample: { count: 1 },
+            };
+            if (targets.depthFormat) {
+                descriptor.depthStencil = {
+                    format: targets.depthFormat,
+                    depthWriteEnabled: !!(s.enabled.has(GL.DEPTH_TEST) && s.depthMask),
+                    depthCompare: s.enabled.has(GL.DEPTH_TEST) ?
+                        (COMPARE_FUNCTIONS[s.depthFunc] || "less") : "always",
+                    ...(targets.depthFormat.indexOf("stencil") >= 0 &&
+                        s.enabled.has(GL.STENCIL_TEST) ? gpuStencilState(s) : {}),
+                };
+            }
+            try {
+                pipeline = this.device.createRenderPipeline(descriptor);
+            } catch (error) {
+                this.refuse("glDrawPixels", "could not create pixel pipeline",
+                    { message: String(error) }, GL.INVALID_OPERATION);
+                return null;
+            }
+            this.pixelPipelineCache.set(key, pipeline);
+            return pipeline;
+        },
+
+        accum(op, value) {
+            const ACCUM = 0x0100, LOAD = 0x0101, RETURN = 0x0102;
+            const MULT = 0x0103, ADD = 0x0104;
+            if (![ACCUM, LOAD, RETURN, MULT, ADD].includes(op))
+                return this.refuse("glAccum", "invalid accumulation operation",
+                    { op }, GL.INVALID_ENUM);
+            this.endPass();
+            const targets = this.currentTargets();
+            if (!targets || !targets.color[0])
+                return this.refuse("glAccum", "no colour buffer is bound", {},
+                    GL.INVALID_OPERATION);
+            const accum = this.ensureAccumBuffer(targets);
+            const returning = op === RETURN;
+            const destination = returning ? targets.color[0].view : accum.nextView;
+            const targetFormat = returning ? targets.color[0].format : "rgba16float";
+            const pipeline = this.accumPipeline(op, targetFormat);
+            if (!pipeline) return;
+            const params = this.allocateUniform(16);
+            if (!params) return;
+            new Float32Array(this.uniformStaging.buffer, params.offset, 4)
+                .set([value, 0, 0, 0]);
+            this.device.queue.writeBuffer(this.uniformRing, params.offset,
+                this.uniformStaging, params.offset, params.size);
+            const pass = this.ensureEncoder().beginRenderPass({
+                label: "GL accumulation operation",
+                colorAttachments: [{ view: destination, loadOp: "load",
+                    storeOp: "store" }],
+            });
+            this.applyAccumScissor(pass, targets);
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, this.device.createBindGroup({
+                layout: pipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: accum.currentView },
+                    { binding: 1, resource: returning ? this.fallbackView :
+                        targets.color[0].view },
+                    { binding: 2, resource: { buffer: this.uniformRing,
+                        offset: params.offset, size: 16 } },
+                ],
+            }));
+            pass.draw(3, 1, 0, 0);
+            pass.end();
+            if (!returning) {
+                const texture = accum.currentTexture;
+                accum.currentTexture = accum.nextTexture;
+                accum.currentView = accum.nextView;
+                accum.nextTexture = texture;
+                accum.nextView = texture.createView();
+            }
+        },
+
+        ensureAccumBuffer(targets) {
+            const width = Math.max(1, targets.width);
+            const height = Math.max(1, targets.height);
+            const key = this.current.id + ":" + this.current.drawFramebuffer +
+                ":" + width + "x" + height;
+            if (this.accumBuffer && this.accumBuffer.key === key)
+                return this.accumBuffer;
+            if (this.accumBuffer) {
+                this.retire(this.accumBuffer.currentTexture);
+                this.retire(this.accumBuffer.nextTexture);
+            }
+            const create = label => this.device.createTexture({
+                label,
+                size: { width, height, depthOrArrayLayers: 1 },
+                format: "rgba16float",
+                usage: TEXTURE_USAGE_RENDER_ATTACHMENT |
+                    TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_SRC |
+                    TEXTURE_USAGE_COPY_DST,
+            });
+            const currentTexture = create("GL accumulation buffer A");
+            const nextTexture = create("GL accumulation buffer B");
+            this.accumBuffer = {
+                key, width, height,
+                currentTexture, currentView: currentTexture.createView(),
+                nextTexture, nextView: nextTexture.createView(),
+            };
+            return this.accumBuffer;
+        },
+
+        applyAccumScissor(pass, targets) {
+            const s = this.current;
+            if (s.enabled.has(GL.SCISSOR_TEST) && s.scissor.set) {
+                const x = clamp(s.scissor.x, 0, targets.width);
+                const y = clamp(s.scissor.y, 0, targets.height);
+                pass.setScissorRect(x, y,
+                    Math.max(0, Math.min(s.scissor.width, targets.width - x)),
+                    Math.max(0, Math.min(s.scissor.height, targets.height - y)));
+            } else {
+                pass.setScissorRect(0, 0, targets.width, targets.height);
+            }
+        },
+
+        accumPipeline(op, targetFormat) {
+            this.accumPipelineCache = this.accumPipelineCache || new Map();
+            const returning = op === 0x0102;
+            const mask = returning ? this.current.colorMask.map(v => v ? 1 : 0)
+                .join("") : "1111";
+            const key = op + "|" + targetFormat + "|" + mask;
+            let pipeline = this.accumPipelineCache.get(key);
+            if (pipeline) return pipeline;
+            const expression = {
+                0x0100: "oldAccum + framebuffer * params.value.x",
+                0x0101: "framebuffer * params.value.x",
+                0x0102: "oldAccum * params.value.x",
+                0x0103: "oldAccum * params.value.x",
+                0x0104: "oldAccum + vec4<f32>(params.value.x)",
+            }[op];
+            const code = `
+struct Params { value : vec4<f32>, }
+@group(0) @binding(0) var accumulation : texture_2d<f32>;
+@group(0) @binding(1) var colorBuffer : texture_2d<f32>;
+@group(0) @binding(2) var<uniform> params : Params;
+@vertex fn vs_main(@builtin(vertex_index) i : u32) -> @builtin(position) vec4<f32> {
+    let x = f32((i << 1u) & 2u) * 2.0 - 1.0;
+    let y = f32(i & 2u) * 2.0 - 1.0;
+    return vec4<f32>(x, y, 0.0, 1.0);
+}
+@fragment fn fs_main(@builtin(position) p : vec4<f32>) -> @location(0) vec4<f32> {
+    let xy = vec2<i32>(p.xy);
+    let oldAccum = textureLoad(accumulation, xy, 0);
+    let framebuffer = textureLoad(colorBuffer, xy, 0);
+    return ${expression};
+}`;
+            const module = this.shaderModule(code);
+            const writeMask = returning ?
+                (this.current.colorMask[0] ? 1 : 0) |
+                (this.current.colorMask[1] ? 2 : 0) |
+                (this.current.colorMask[2] ? 4 : 0) |
+                (this.current.colorMask[3] ? 8 : 0) : 15;
+            try {
+                pipeline = this.device.createRenderPipeline({
+                    label: "GL accumulation pipeline",
+                    layout: "auto",
+                    vertex: { module, entryPoint: "vs_main" },
+                    fragment: { module, entryPoint: "fs_main",
+                        targets: [{ format: targetFormat, writeMask }] },
+                    primitive: { topology: "triangle-list" },
+                });
+            } catch (error) {
+                this.refuse("glAccum", "could not create accumulation pipeline",
+                    { message: String(error) }, GL.INVALID_OPERATION);
+                return null;
+            }
+            this.accumPipelineCache.set(key, pipeline);
+            return pipeline;
+        },
+
+        accumClearPipeline() {
+            const color = Array.from(this.current.clearAccum)
+                .map(value => Number(value).toPrecision(9));
+            const key = color.join(",");
+            this.accumClearPipelineCache = this.accumClearPipelineCache || new Map();
+            let pipeline = this.accumClearPipelineCache.get(key);
+            if (pipeline) return pipeline;
+            const code = `
+@vertex fn vs_main(@builtin(vertex_index) i : u32) -> @builtin(position) vec4<f32> {
+    let x = f32((i << 1u) & 2u) * 2.0 - 1.0;
+    let y = f32(i & 2u) * 2.0 - 1.0;
+    return vec4<f32>(x, y, 0.0, 1.0);
+}
+@fragment fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(${color.join(", ")});
+}`;
+            const module = this.shaderModule(code);
+            pipeline = this.device.createRenderPipeline({
+                label: "GL accumulation clear pipeline", layout: "auto",
+                vertex: { module, entryPoint: "vs_main" },
+                fragment: { module, entryPoint: "fs_main",
+                    targets: [{ format: "rgba16float" }] },
+                primitive: { topology: "triangle-list" },
+            });
+            this.accumClearPipelineCache.set(key, pipeline);
+            return pipeline;
         },
         setRasterPos(x, y, z, w) {
             // The raster position is transformed like a vertex; keeping it is
@@ -6885,6 +7783,9 @@ fn fs_main(inp : VSOut) -> @location(0) vec4<f32> {
             const limits = this.limits || {};
             const s = this.current;
             switch (pname) {
+            case 0x76380001: // private v86gl host-capability bitset
+                return 0x1 | 0x2 |
+                    (this.deviceFeatures.float32Filterable ? 0x4 : 0) | 0x8;
             case GL.MAX_TEXTURE_SIZE:
                 return Math.min(16384, limits.maxTextureDimension2D || 8192);
             case GL.MAX_3D_TEXTURE_SIZE:
@@ -6916,7 +7817,10 @@ fn fs_main(inp : VSOut) -> @location(0) vec4<f32> {
             case GL.MAX_ELEMENTS_VERTICES: return 65536;
             case GL.MAX_ELEMENTS_INDICES: return 65536;
             case GL.SAMPLE_BUFFERS: return 0;
-            case GL.SAMPLES: return 1;
+            // GL_SAMPLES is zero when the selected framebuffer has no
+            // multisample buffer; one is the raster sample count, not the GL
+            // query value for this pixel format.
+            case GL.SAMPLES: return 0;
             case GL.SUBPIXEL_BITS: return 8;
             case GL.RED_BITS: case GL.GREEN_BITS:
             case GL.BLUE_BITS: case GL.ALPHA_BITS: return 8;

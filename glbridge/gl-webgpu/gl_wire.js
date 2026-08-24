@@ -1,7 +1,7 @@
 // Wire-format decoding for the OpenGL command stream.
 //
 // Generated from the payload layouts in openglproxy/opengl32_proxy.c by way of
-// the decoder v86_network_bridge.js has used since the gl4es path shipped.
+// the decoder v86_network_bridge.js forwards to the WebGPU executor.
 // 140 of the 217 opcodes are a flat argument list, so they are described
 // declaratively here rather than hand-decoded 140 times; the rest carry
 // variable-length data and get explicit decoders in gl_executor.js.

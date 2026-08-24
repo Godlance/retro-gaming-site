@@ -222,6 +222,15 @@ test("a program's uniform block places each member on a 16-byte boundary", () =>
     assert.strictEqual(byName.get("m").matrixColumnStrideBytes, 16);
 });
 
+test("a GLSL program variant injects colour logic operations", () => {
+    const program = link(TRIVIAL_VS,
+        "void main(void) { gl_FragColor = vec4(0.25); }",
+        { variant: { logicOp: 0x150A, colorTargets: 1 } });
+    assert.ok(program.ok, program.log);
+    assert.ok(program.wgslFragment.includes("let r = (~d)"));
+    assert.ok(program.wgslFragment.includes("glApplyLogic(gl_FragColor"));
+});
+
 test("a uniform array of floats is widened to a vec4 stride", () => {
     const program = link(TRIVIAL_VS,
         "uniform float weights[4];\n" +
@@ -313,6 +322,18 @@ test("a variant changes the cache key and the generated code", () => {
     assert.ok(tested.wgslFragment.indexOf("discard") >= 0);
     assert.ok(plain.wgslFragment.indexOf("discard") < 0);
     assert.ok(tested.reflection.stateFields.indexOf("alphaRef") >= 0);
+});
+
+test("a programmable polygon-stipple variant injects the fragment test", () => {
+    const vs = compile(TRIVIAL_VS, "vertex");
+    const fs = compile("void main(void) { gl_FragColor = vec4(1.0); }");
+    const plain = t.linkProgram(vs, fs, {});
+    const stippled = t.linkProgram(vs, fs,
+        { variant: { polygonStipple: true } });
+    assert.ok(stippled.ok, stippled.log);
+    assert.notStrictEqual(plain.cacheKey, stippled.cacheKey);
+    assert.ok(stippled.reflection.stateFields.includes("polygonStipple"));
+    assert.ok(stippled.wgslFragment.indexOf("stippleByteIndex") >= 0);
 });
 
 test("gl_FragData decides the colour target count", () => {

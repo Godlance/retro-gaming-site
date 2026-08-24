@@ -1,5 +1,8 @@
 # D3D8 → WebGPU 直接转译完整实施方案
 
+> 状态说明：本文保留早期迁移方案及当时的旧链路描述。文中“保留
+> OpenGL/gl4es/WebGL 回退”的决定已经作废；当前 OpenGL 只有 WebGPU 后端。
+
 > 项目：`retro-gaming-site`
 >
 > 首要兼容目标：MapleStory v0.83（Windows XP / v86）

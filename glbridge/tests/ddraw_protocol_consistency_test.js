@@ -371,6 +371,15 @@ check("advanced DirectDraw surface features are real core paths, not stubs",
     assert.match(guestSource,
         /tag##_DuplicateSurface[\s\S]*?ddraw_DuplicateSurface/,
         "DirectDraw1-4 DuplicateSurface thunks must reach the v7 core");
+    assert.match(guestSource,
+        /copy_caps_to_caller[\s\S]*?caller_size\s*<\s*sizeof\(caps\)[\s\S]*?CopyMemory\(destination,\s*&caps,\s*copy_size\)/,
+        "GetCaps must copy only the caller-sized prefix for old DDCAPS layouts");
+    assert.match(guestSource,
+        /destination->dwSize\s*=\s*caller_size/,
+        "GetCaps must preserve the DDCAPS version requested by the caller");
+    assert.doesNotMatch(guestSource,
+        /(?:driver|emulation)->dwSize\s*!=\s*sizeof\(DDCAPS\)/,
+        "GetCaps must not reject pre-DX7 DDCAPS sizes");
     for (const removedStub of ["UNSUPPORTED(\"DuplicateSurface",
             "UNSUPPORTED(\"SetSurfaceDesc", "UNSUPPORTED(\"UpdateOverlay\""])
         assert.ok(!guestSource.includes(removedStub),

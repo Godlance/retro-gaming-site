@@ -25,12 +25,6 @@ const canvas = {
         getBoundingClientRect() { return { left: 0, top: 0, width: 1024, height: 768 }; },
     },
 };
-const gl4es = {
-    HEAPU8: new Uint8Array(4096),
-    _malloc() { return 256; },
-    _free() {},
-    _v86glResize() {},
-};
 /*
  * write_memory is modelled on v86's real one rather than just recording its
  * arguments, because the bug this guards against is invisible to a recorder:
@@ -46,7 +40,7 @@ const bridge = globalThis.installV86GLNetworkBridge({
     add_listener(name, callback) { listeners[name] = callback; },
     write_memory(blob, address) { guestMemory.set(blob, address); },
 }, canvas, {
-    gl4es,
+    glExecutor: { submit() {}, onSwapBuffers() {} },
     d3d9Canvas,
     installD3D9WebGPUExecutor(installedCanvas, options) {
         assert.equal(installedCanvas, d3d9Canvas);

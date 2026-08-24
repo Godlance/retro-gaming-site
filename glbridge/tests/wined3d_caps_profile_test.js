@@ -62,11 +62,11 @@ assert.match(proxy,
 assert.match(proxy,
     /caps_profile_is_gl21\(current_caps_profile\(\)\)[\s\S]*"2\.1 v86gl/);
 assert.match(proxy,
-    /case GL_VENDOR:[\s\S]*"VMware, Inc\."[\s\S]*case GL_RENDERER:[\s\S]*"SVGA3D; v86 WebGL2 bridge"/);
+    /case GL_VENDOR:[\s\S]*"VMware, Inc\."[\s\S]*case GL_RENDERER:[\s\S]*"SVGA3D; v86 WebGPU bridge"/);
 assert.equal(proxy.includes('case GL_VENDOR:     return (const GLubyte*)"v86"'),
     false, "unknown vendor must not trigger WineD3D's NVIDIA/GeForce FX fallback");
 assert.ok(gl21.includes("GL_ARB_texture_non_power_of_two"),
-    "the WebGL2 profile must retain the NPOT capability selected by SVGA3D");
+    "the WebGPU profile must retain the NPOT capability selected by SVGA3D");
 
 for (const stage of [
     "23 VertexBuffer::Release",

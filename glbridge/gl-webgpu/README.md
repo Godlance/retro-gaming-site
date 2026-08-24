@@ -1,7 +1,7 @@
 # OpenGL 1.1-2.1 on WebGPU
 
 The host half of the OpenGL path. The guest DLL
-(`../openglproxy/opengl32_proxy.c`) is unchanged by the move off gl4es: it still
+(`../openglproxy/opengl32_proxy.c`) retains the same wire ABI: it
 serialises the same 217 opcodes into the same PCI DMA arena. What changed is
 everything after the opcode.
 
@@ -56,23 +56,23 @@ if a deviation is later eliminated the entry stays, marked as such.
 
 | Code | Feature | What happens instead | When it shows |
 | --- | --- | --- | --- |
-| D-01 | `glLogicOp` | WebGPU has no logic-op blending. `GL_COPY` (the default) is free; enabling `GL_COLOR_LOGIC_OP` is currently refused and counted rather than emulated | Rubber-band selection drawn with `GL_XOR` does not appear |
+| D-01 | `glLogicOp` | **Resolved for fixed-function and GLSL draws.** The executor snapshots the destination attachment and applies all 16 8-bit channel Boolean operations in WGSL. Pixel-rectangle and ARB-assembly draws remain outside this rewrite path | Logic-op draws cost one attachment copy; logic op combined with those two exceptional paths is still refused or approximated |
 | D-02 | Separate two-sided stencil masks | WebGPU has one `stencilReadMask` and one `stencilWriteMask` for both faces; the front face's are used and the divergence is reported once | Only algorithms that set different front and back masks -- a rare stencil-shadow variant |
 | D-03 | `GL_CLAMP`, `GL_CLAMP_TO_BORDER` | WebGPU has no border addressing; the sampler clamps to edge | A texture sampled outside [0,1] with a border colour shows the edge texel instead of the border |
 | D-04 | Line width > 1, `GL_LINE_SMOOTH`, `GL_POLYGON_SMOOTH` | WebGPU draws one-pixel lines and has no smooth hint. Wide lines are not yet expanded to quads | Wide or antialiased lines draw one pixel wide and hard-edged |
 | D-05 | User clip planes | Implemented as a fragment `discard` on an interpolated distance, not as geometry clipping (WebGPU's `clip-distances` feature is not yet available anywhere) | Geometry is not actually clipped, only its fragments; a depth pre-pass combined with clip planes can differ |
-| D-06 | Multisampling | WebGPU defines sample counts 1 and 4 only; `glSampleCoverage`'s value has no exact expression | 2x and 8x requests get 4x; the coverage value's subsample pattern differs |
+| D-06 | Multisampling | The current render targets are single-sampled; sample-coverage state is retained but cannot change a 1x target | Edge antialiasing and coverage masks do not gain multisample quality |
 | D-07 | Occlusion query sample counts | WebGPU's occlusion query answers "did any sample pass"; a visible result reports a saturated count | An algorithm thresholding on the *number* of samples sees the saturated value |
 | D-08 | `glDrawBuffer(GL_FRONT)` | There is no front buffer; writes to it are refused and counted | Old debugging code that draws directly to the front buffer produces nothing |
-| D-09 | Accumulation buffer | `glAccum` and `GL_ACCUM_BUFFER_BIT` are refused and counted | Motion blur and full-scene antialiasing built on the accumulation buffer do not render |
+| D-09 | Accumulation buffer | **Resolved with an RGBA16Float ping-pong accumulation target.** `GL_ACCUM`, `GL_LOAD`, `GL_RETURN`, `GL_MULT`, `GL_ADD` and masked/scissored clears are implemented | Extremely high dynamic-range accumulation has 16-bit-float precision rather than an implementation-selected desktop format |
 | D-10 | Texture fetch in non-uniform control flow | `textureSample` requires uniform control flow; a fetch inside a conditional or loop uses `textureSampleGrad` with the coordinate's derivatives. Counted as `stats.nonUniformSamples` | Mip selection inside a divergent branch can differ slightly from desktop |
 | D-11 | `noise1()` … `noise4()` | Return 0, which the GLSL spec permits and every desktop driver does | A shader genuinely relying on GLSL noise -- already broken on real hardware |
 | D-12 | `GL_MAX_VARYING_FLOATS` | 16 vec4 slots (WebGPU's `maxInterStageShaderVariables`), reported as 64 floats. Linking fails with a message naming this code when a program needs more | A program with more than 16 packed varying slots does not link. Desktop's floor is 8 vec4, so this is the more generous limit |
 | D-13 | `glFinish` | Answered after `queue.submit()` rather than after `onSubmittedWorkDone()` | Code using `glFinish` to time GPU work measures submission, not completion |
 | D-14 | Colour-index rendering | `glIndex*` and a colour-index framebuffer are not implemented (paletted *textures* are) | 1996-era colour-index code produces nothing; no target game uses it |
-| D-15 | `glDrawPixels`, `glBitmap`, `glCopyPixels` | Refused and counted; the textured-quad implementation is an M6 item | Loading screens and text drawn with pixel rectangles do not appear |
-| D-16 | Line and polygon stipple | The patterns are stored and reported but not yet applied in the shader | Stippled lines and polygons draw solid |
-| D-17 | `glPolygonMode(GL_LINE\|GL_POINT)` | Not yet expanded into line or point primitives | Wireframe mode draws filled |
+| D-15 | `glDrawPixels`, `glBitmap`, `glCopyPixels` | Colour `DrawPixels`, bitmaps and colour copies use textured quads/copies with pixel-store, transfer, zoom, alpha, depth/stencil, blending, masks and scissor state. Depth/stencil pixel copies remain refused | Software paths that copy depth/stencil rectangles cannot use the pixel API |
+| D-16 | Line and polygon stipple | **Polygon stipple is resolved** with the exact 32x32 pattern in fragment coordinates. Line stipple is retained but not yet applied | Stippled lines draw solid; stippled polygons do not |
+| D-17 | `glPolygonMode(GL_LINE\|GL_POINT)` | **Resolved by converting triangles to edge or vertex index lists.** If front/back modes differ without culling, the front mode is used for both and reported | Shared triangle edges may be rasterized twice; different uncullled front/back modes cannot be represented in one WebGPU draw |
 | D-18 | An ARB program on one stage with the fixed pipeline on the other | Refused: the two do not share a varying layout | A program enabling only `GL_VERTEX_PROGRAM_ARB` draws nothing, loudly |
 
 Refusals are never silent. Each one logs once with enough context to locate
@@ -108,8 +108,21 @@ node tests/gl_fixed_function_wgsl_test.js      # the fixed pipeline, through nag
 node tests/gl_arb_program_test.js              # ARB assembly, through naga
 node tests/gl_executor_test.js                 # the state machine and draw path
 node tests/v86_network_bridge_gl_route_test.js # routing
+node tests/v86_network_bridge_webgpu_state_test.js # WebGPU save/restore replay
 node tools/gen_gl_coverage.js                  # regenerate COVERAGE.md
 ```
+
+The checked-in browser smoke test also exercises the native WebGPU validation
+layer (fixed-function drawing, logic ops, accumulation and `glDrawPixels`):
+
+```bash
+cd ../..
+python3 -m http.server 8765
+# Open http://127.0.0.1:8765/glbridge/tests/gl_webgpu_browser_test.html
+```
+
+It reports `PASS` in both the page title and body only after the WebGPU error
+scope is clean.
 
 The three suites that say "through naga" validate their generated WGSL with
 the compiler wgpu and Firefox use. It is optional -- they skip without it --
@@ -120,17 +133,9 @@ translator produced a shader", so install it:
 cargo install naga-cli
 ```
 
-## Falling back
-
-`installV86GLNetworkBridge(..., { glBackend: "gl4es" })`, or `?glBackend=gl4es`
-on the game page, routes the OpenGL stream to the old WebGL2 host instead. The
-switch exists so that a milestone going wrong is one string away from the
-previous behaviour rather than a revert. It is removed, along with
-`../libglwasm/`, at M7.
-
 ## Where new work goes
 
-New OpenGL work belongs in this directory or in `../openglproxy/` -- never a
-second backend, and never in `../libglwasm/`, which is on its way out. A new
-deviation gets the next free code in the table above; an eliminated one keeps
-its code and is marked resolved.
+New OpenGL work belongs in this directory or in `../openglproxy/`. The old
+GL4ES/WebGL backend and its runtime selector were removed; there is one OpenGL
+host path. A new deviation gets the next free code in the table above; an
+eliminated one keeps its code and is marked resolved.

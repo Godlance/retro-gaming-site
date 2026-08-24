@@ -130,6 +130,9 @@
             alphaTest: s.alphaTest || "always",
             clipPlaneCount: Math.max(0, Math.min(6, s.clipPlaneCount || 0)),
             pointSprite: !!s.pointSprite,
+            pointCoordLowerLeft: !!s.pointCoordLowerLeft,
+            polygonStipple: !!s.polygonStipple,
+            logicOp: s.logicOp ? (s.logicOp >>> 0) : 0,
             flatShading: !!s.flatShading,
             colorTargets: Math.max(1, Math.min(8, s.colorTargets || 1)),
         };
@@ -138,9 +141,13 @@
     function normalizeEnv(env) {
         const e = env || {};
         const mode = e.mode || "MODULATE";
-        if (mode !== "COMBINE") return { mode };
+        if (mode !== "COMBINE") return {
+            mode,
+            coordReplace: !!e.coordReplace,
+        };
         return {
             mode,
+            coordReplace: !!e.coordReplace,
             combineRGB: e.combineRGB || "MODULATE",
             combineAlpha: e.combineAlpha || "MODULATE",
             srcRGB: (e.srcRGB || ["TEXTURE", "PREVIOUS", "CONSTANT"]).slice(0, 3),
@@ -213,6 +220,7 @@
             fields.add("pointAttenuation");
             fields.add("viewportParams");
         }
+        if (sig.polygonStipple) fields.add("polygonStipple");
         return fields;
     }
 
@@ -394,7 +402,9 @@
             emit("    clip.y = clip.y + vin.corner.y * ptSize * clip.w / " +
                 "glState.viewportParams.w;");
             emit("    out.pointCoord = vec2<f32>(vin.corner.x * 0.5 + 0.5, " +
-                "0.5 - vin.corner.y * 0.5);");
+                (sig.pointCoordLowerLeft ?
+                    "vin.corner.y * 0.5 + 0.5);" :
+                    "0.5 - vin.corner.y * 0.5);"));
         }
 
         if (sig.clipPlaneCount) {
@@ -707,6 +717,9 @@
         }
         if (binding) emit("");
 
+        if (sig.logicOp && sig.logicOp !== 0x1503)
+            emitLogicOpDeclarations(emit, sig.logicOp, sig.colorTargets);
+
         emit("struct FSIn {");
         emit("    @builtin(position) position : vec4<f32>,");
         if (sig.lighting.enabled && sig.lighting.twoSide)
@@ -733,6 +746,7 @@
         emit("fn fs_main(fin : FSIn) -> FSOut {");
         if (layout.clip >= 0)
             emit("    if (any(fin.clipDist < vec4<f32>(0.0))) { discard; }");
+        if (sig.polygonStipple) emitPolygonStippleTest(emit, "fin.position");
 
         const colorRead = readVarying(layout.color);
         if (sig.lighting.enabled && sig.lighting.twoSide && layout.backColor)
@@ -790,8 +804,14 @@
         emitAlphaTest(emit, sig);
 
         emit("    var out : FSOut;");
-        for (let i = 0; i < sig.colorTargets; ++i)
-            emit("    out.color" + i + " = frag;");
+        for (let i = 0; i < sig.colorTargets; ++i) {
+            if (sig.logicOp && sig.logicOp !== 0x1503)
+                emit("    out.color" + i + " = glApplyLogic(frag, " +
+                    "textureLoad(glLogicTarget" + i +
+                    ", vec2<i32>(floor(fin.position.xy)), 0));");
+            else
+                emit("    out.color" + i + " = frag;");
+        }
         emit("    return out;");
         emit("}");
         return L.join("\n") + "\n";
@@ -804,6 +824,57 @@
         return "fin.v" + entry.slot + "." + swz(entry.offset, entry.components);
     }
 
+    function emitPolygonStippleTest(emit, position) {
+        emit("    let stippleX = u32(floor(" + position + ".x)) & 31u;");
+        emit("    let stippleY = u32(floor(" + position + ".y)) & 31u;");
+        emit("    let stippleByteIndex = stippleY * 4u + (stippleX >> 3u);");
+        emit("    let stippleWord = glState.polygonStipple[stippleByteIndex >> 2u];");
+        emit("    let stippleLane = stippleByteIndex & 3u;");
+        emit("    var stippleByte = stippleWord.x;");
+        emit("    if (stippleLane == 1u) { stippleByte = stippleWord.y; }");
+        emit("    if (stippleLane == 2u) { stippleByte = stippleWord.z; }");
+        emit("    if (stippleLane == 3u) { stippleByte = stippleWord.w; }");
+        emit("    let stippleBit = 0x80u >> (stippleX & 7u);");
+        emit("    if ((u32(stippleByte) & stippleBit) == 0u) { discard; }");
+    }
+
+    function logicOpExpression(op) {
+        switch (op >>> 0) {
+        case 0x1500: return "vec4<u32>(0u)";       // GL_CLEAR
+        case 0x1501: return "s & d";
+        case 0x1502: return "s & ~d";
+        case 0x1503: return "s";
+        case 0x1504: return "~s & d";
+        case 0x1505: return "d";
+        case 0x1506: return "s ^ d";
+        case 0x1507: return "s | d";
+        case 0x1508: return "~(s | d)";
+        case 0x1509: return "~(s ^ d)";
+        case 0x150A: return "~d";
+        case 0x150B: return "s | ~d";
+        case 0x150C: return "~s";
+        case 0x150D: return "~s | d";
+        case 0x150E: return "~(s & d)";
+        case 0x150F: return "vec4<u32>(255u)";    // GL_SET
+        default: return "s";
+        }
+    }
+
+    function emitLogicOpDeclarations(emit, op, colorTargets) {
+        for (let i = 0; i < colorTargets; ++i)
+            emit("@group(3) @binding(" + i + ") var glLogicTarget" + i +
+                " : texture_2d<f32>;");
+        emit("fn glApplyLogic(src : vec4<f32>, dst : vec4<f32>) -> vec4<f32> {");
+        emit("    let s = vec4<u32>(round(clamp(src, vec4<f32>(0.0), " +
+            "vec4<f32>(1.0)) * 255.0));");
+        emit("    let d = vec4<u32>(round(clamp(dst, vec4<f32>(0.0), " +
+            "vec4<f32>(1.0)) * 255.0));");
+        emit("    let r = (" + logicOpExpression(op) + ") & vec4<u32>(255u);");
+        emit("    return vec4<f32>(r) / 255.0;");
+        emit("}");
+        emit("");
+    }
+
     function textureTypeFor(unit) {
         if (unit.shadow) return "texture_depth_2d";
         switch (unit.target) {
@@ -814,25 +885,35 @@
     }
 
     function sampleExpression(i, unit, entry, sig) {
-        void sig;
-        const coord = readVarying(entry);
+        const pointCoord = sig.pointSprite && unit.env.coordReplace;
+        const coord = pointCoord ?
+            "vec4<f32>(fin.pointCoord, 0.0, 1.0)" : readVarying(entry);
+        const components = pointCoord ? 4 : (entry ? entry.components : 4);
+        const q = components >= 4 ? "(" + coord + ").w" : "1.0";
+        const xy = components >= 2 ? "(" + coord + ").xy" :
+            "vec2<f32>((" + coord + ").x, 0.0)";
+        const xyz = components >= 3 ? "(" + coord + ").xyz" :
+            "vec3<f32>(" + xy + ", 0.0)";
         if (unit.shadow) {
             // A shadow lookup's reference is the third coordinate after the
             // projective divide, which is what GL's GL_COMPARE_R_TO_TEXTURE
             // means; the result replicates into all four components.
-            return "vec4<f32>(textureSampleCompare(t" + i + ", s" + i + ", (" +
-                coord + ").xy / max((" + coord + ").w, 1e-8), (" + coord +
-                ").z / max((" + coord + ").w, 1e-8)))";
+            return "vec4<f32>(textureSampleCompare(t" + i + ", s" + i + ", " +
+                xy + " / max(" + q + ", 1e-8), " + xyz +
+                ".z / max(" + q + ", 1e-8)))";
         }
         switch (unit.target) {
         case "1D":
-            return "textureSample(t" + i + ", s" + i + ", vec2<f32>(" +
-                coord + ", 0.5))";
+            return "textureSample(t" + i + ", s" + i + ", vec2<f32>((" +
+                coord + ").x / max(" + q + ", 1e-8), 0.5))";
         case "3D":
+            return "textureSample(t" + i + ", s" + i + ", " + xyz +
+                " / max(" + q + ", 1e-8))";
         case "Cube":
-            return "textureSample(t" + i + ", s" + i + ", " + coord + ")";
+            return "textureSample(t" + i + ", s" + i + ", " + xyz + ")";
         default:
-            return "textureSample(t" + i + ", s" + i + ", " + coord + ")";
+            return "textureSample(t" + i + ", s" + i + ", " + xy +
+                " / max(" + q + ", 1e-8))";
         }
     }
 

@@ -79,7 +79,6 @@
                 <div id="screen_container">
                     <div class="text-screen"></div>
                     <canvas></canvas>
-                    <canvas id="v86gl_canvas"></canvas>
                     <canvas id="d3d_webgpu_canvas"></canvas>
                     <div class="screen-placeholder" id="screen_placeholder">
                         <div class="pixel-loader" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
@@ -218,8 +217,6 @@
     </footer>
 
     <script src="libv86.js?v=parallel-port-20260809"></script>
-    <script src="glbridge/libglwasm/gl4es.js?v=webgl-clean-v1-20260801"></script>
-    <script src="glbridge/libglwasm/gl4es_loader.js?v=webgl-clean-v1-20260801"></script>
     <script src="glbridge/d3d8-webgpu/d3d8_executor.js?v=direct-webgpu-m6-session-v4-20260802"></script>
     <!-- d3d9_executor.js requires the shader translator to already be on the
          page: it resolves D3D9ShaderPipeline at load time, not lazily. -->
@@ -235,6 +232,7 @@
     <script src="glbridge/gl-webgpu/gl_state_layout.js?v=gl-webgpu-m1-20260824"></script>
     <script src="glbridge/gl-webgpu/gl_shader_translator.js?v=gl-webgpu-m1-20260824"></script>
     <script src="glbridge/gl-webgpu/gl_fixed_function.js?v=gl-webgpu-m1-20260824"></script>
+    <script src="glbridge/gl-webgpu/gl_arb_program.js?v=gl-webgpu-m1-20260824"></script>
     <script src="glbridge/gl-webgpu/gl_executor.js?v=gl-webgpu-m1-20260824"></script>
     <script src="glbridge/v86_network_bridge.js?v=gl-webgpu-m1-20260824"></script>
     <script src="file-transfer/v8ft-protocol.js?v=v8ft-v1-phase3-20260811"></script>

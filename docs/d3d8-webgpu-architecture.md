@@ -18,9 +18,10 @@ MapleStory.exe
   -> WebGPU / WGSL
 ```
 
-The old OpenGL path remains available as a deployment fallback. The two paths
-share `v86gl.sys`, the 16 MiB contiguous DMA arena, the PCI BAR and the
-`v86gl-pci-frame` event, but not a rendering backend.
+The D3D8 and OpenGL paths share `v86gl.sys`, the 16 MiB contiguous DMA arena,
+the PCI BAR, the `v86gl-pci-frame` event and one WebGPU canvas/device host. The
+old GL4ES/WebGL deployment fallback has been removed; OpenGL records now route
+only to `gl-webgpu/gl_executor.js`.
 
 ## Why D8WG is nested in VGL2
 
@@ -61,8 +62,8 @@ Host:
 - one pre-transformed fixed-pipeline WGSL shader;
 - pipeline and bind-group caches;
 - aligned partial buffer updates through a host shadow buffer;
-- a separate WebGPU overlay canvas, allowing the gl4es canvas to remain a
-  fallback without trying to acquire two incompatible contexts on one canvas;
+- a WebGPU canvas shared with the other accelerated graphics frontends, with
+  explicit ownership changes on present;
 - counters for batches, commands, draws, uploads, presents and pipeline
   creation.
 

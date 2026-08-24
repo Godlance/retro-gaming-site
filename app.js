@@ -406,13 +406,9 @@ function startEmulator9xMultiDisk(gameId) {
         emulator = null;
         v86gl = null;
 
-        const glCanvas = document.getElementById("v86gl_canvas");
-        if (glCanvas) {
-            glCanvas.style.display = "none";
-        }
-        const d3dCanvas = document.getElementById("d3d_webgpu_canvas");
-        if (d3dCanvas) {
-            d3dCanvas.style.display = "none";
+        const graphicsCanvas = document.getElementById("d3d_webgpu_canvas");
+        if (graphicsCanvas) {
+            graphicsCanvas.style.display = "none";
         }
     }
 
@@ -473,15 +469,9 @@ function startEmulator9xMultiDisk(gameId) {
 }
 
 function attachEmulatorListeners(emulator, gameId) {
-    const glCanvas = document.getElementById("v86gl_canvas");
-    // A game directory only ever loads one of d3d8.dll/d3d9.dll/opengl32
-    // proxy (see docs/d3d9-webgpu-implementation-plan.zh-CN.md section 4.6),
-    // so the D3D8 and D3D9 executors share this one overlay canvas rather
-    // than each getting a dedicated element. Both bridge-side executor
-    // instances are lazy (no WebGPU context is touched until the first real
-    // batch arrives), so only the backend the guest actually drives ever
-    // configures the shared canvas.
-    const d3dCanvas = document.getElementById("d3d_webgpu_canvas");
+    // OpenGL, D3D8 and D3D9 are mutually exclusive for a game directory and
+    // share one WebGPU overlay. The tagged PCI envelopes choose the executor.
+    const graphicsCanvas = document.getElementById("d3d_webgpu_canvas");
     let glCanvasObserver = null;
 
     function syncGLCanvasPosition() {
@@ -497,16 +487,15 @@ function attachEmulatorListeners(emulator, gameId) {
     const installV86GLBridge =
         typeof installV86GLNetworkBridge === "function" ? installV86GLNetworkBridge : null;
 
-    if (glCanvas && installV86GLBridge) {
+    if (graphicsCanvas && installV86GLBridge) {
         try {
-            v86gl = installV86GLBridge(emulator, glCanvas, {
-                gl4es: window.GL4ES,
-                d3dCanvas: d3dCanvas,
+            v86gl = installV86GLBridge(emulator, graphicsCanvas, {
+                graphicsCanvas: graphicsCanvas,
             });
             window.v86gl = v86gl;
 
             const screenCanvas = document.querySelector(
-                "#screen_container canvas:not(#v86gl_canvas):not(#d3d_webgpu_canvas)");
+                "#screen_container canvas:not(#d3d_webgpu_canvas)");
             if (screenCanvas && typeof ResizeObserver === "function") {
                 glCanvasObserver = new ResizeObserver(function() {
                     requestAnimationFrame(syncGLCanvasPosition);
@@ -739,7 +728,7 @@ window.onload = function() {
             updateStatus((restoreCompleted ? "State restored, but resume failed: " : "Restore Failed: ") +
                 (err && err.message || err));
             // A partially restored VM must stay paused; running it with an
-            // incomplete WebGL reconstruction would recreate the corruption.
+            // incomplete GPU reconstruction would recreate the corruption.
         } finally {
             operationLease.end();
             input.value = "";

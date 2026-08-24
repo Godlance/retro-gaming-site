@@ -4077,26 +4077,51 @@ static void fill_caps(DDCAPS *caps)
         DDSCAPS2_CUBEMAP_ALLFACES;
 }
 
+static HRESULT copy_caps_to_caller(LPDDCAPS destination, DWORD visible,
+        WINBOOL emulation)
+{
+    DDCAPS caps;
+    DWORD caller_size = destination->dwSize;
+    DWORD copy_size;
+
+    /* DDCAPS grew in DirectX 5 and 6.  The older layouts are prefixes of the
+     * DX7 layout, and callers select one by putting its size in dwSize.  In
+     * particular, XP dxdiag creates the version 1 DirectDraw interface and
+     * may ask for an older layout.  Fill a full temporary structure and copy
+     * only the part the caller provided so those probes do not fail or write
+     * past their buffer. */
+    if (caller_size < sizeof(destination->dwSize))
+        return DDERR_INVALIDPARAMS;
+    caps.dwSize = sizeof(caps);
+    fill_caps(&caps);
+    caps.dwCurrVisibleOverlays = visible;
+    if (emulation) caps.dwCaps = 0;
+
+    copy_size = caller_size < sizeof(caps) ? caller_size : sizeof(caps);
+    CopyMemory(destination, &caps, copy_size);
+    destination->dwSize = caller_size;
+    return DD_OK;
+}
+
 static HRESULT WINAPI ddraw_GetCaps(IDirectDraw7 *iface, LPDDCAPS driver,
         LPDDCAPS emulation)
 {
     DDrawObject *object = object_from_iface(iface);
     DDSurface *surface;
+    HRESULT result;
     DWORD visible = 0;
     for (surface = object->surfaces; surface; surface = surface->next)
         if (surface->overlay_visible) ++visible;
     if (!driver && !emulation) return DDERR_INVALIDPARAMS;
     if (driver) {
-        if (driver->dwSize != sizeof(DDCAPS)) return DDERR_INVALIDPARAMS;
-        fill_caps(driver);
-        driver->dwCurrVisibleOverlays = visible;
+        result = copy_caps_to_caller(driver, visible, FALSE);
+        if (FAILED(result)) return result;
     }
     if (emulation) {
-        if (emulation->dwSize != sizeof(DDCAPS)) return DDERR_INVALIDPARAMS;
         /* Everything here is "hardware": there is no software fallback layer
          * underneath, and claiming one would invite a title to ask for it. */
-        fill_caps(emulation);
-        emulation->dwCaps = 0;
+        result = copy_caps_to_caller(emulation, visible, TRUE);
+        if (FAILED(result)) return result;
     }
     return DD_OK;
 }
