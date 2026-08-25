@@ -70,7 +70,7 @@
 
     const D9WG_MAGIC = 0x47573944; // "D9WG"
     const D9WG_VERSION_MAJOR = 1;
-    const D9WG_VERSION_MINOR = 7;
+    const D9WG_VERSION_MINOR = 8;
     // The oldest guest proxy this host still decodes. 1.3 payloads are simply
     // shorter than 1.4 ones; see the version check in executeBatch().
     const D9WG_VERSION_MIN_MINOR = 3;
@@ -89,6 +89,13 @@
     const D9WG_BATCH_HEADER_BYTES = 32;
     const D9WG_COMMAND_HEADER_BYTES = 16;
     const D9WG_BATCH_FLAG_PRESENT = 1 << 0;
+    // D3DPRESENT_PARAMETERS::PresentationInterval values this host cares
+    // about. Everything except IMMEDIATE is treated as "wait for the next
+    // display refresh" -- see awaitDisplayRefresh(). D3DPRESENT_INTERVAL_TWO/
+    // THREE/FOUR (present every 2nd/3rd/4th vblank) collapse into the same
+    // single-vblank wait as ONE; a real but minor gap.
+    const D3DPRESENT_INTERVAL_DEFAULT = 0;
+    const D3DPRESENT_INTERVAL_IMMEDIATE = 0x80000000;
     const D9WG_FEATURE_SHADER_MODEL_2 = 1 << 0;
     const D9WG_FEATURE_SHADER_MODEL_3 = 1 << 1;
 
@@ -3528,8 +3535,17 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             }
 
             const present = (view.getUint32(12, true) & D9WG_BATCH_FLAG_PRESENT) !== 0;
-            if (present) this.finishFrame(true);
-            else if (this.flushRequested) this.finishFrame(false);
+            if (present) {
+                // Real vsync hardware blocks Present until the next display
+                // refresh; nothing downstream of this used to, so the guest's
+                // own software frame limiter was the only thing pacing
+                // output -- and on the launches where that limiter's first
+                // delta-time read races (a known startup-timing bug class in
+                // engines this age), nothing caught the fall and frames ran
+                // unthrottled. Gate here instead, the way the hardware would.
+                await this.awaitDisplayRefresh();
+                this.finishFrame(true);
+            } else if (this.flushRequested) this.finishFrame(false);
             this.flushRequested = false;
             this.beat(metadata);
             if (this.shaderCacheDirty) this.schedulePersistentShaderCacheSave();
@@ -3865,6 +3881,13 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             const enableAutoDepth = view.getUint32(offset + 36, true);
             const multisampleType = view.getUint32(offset + 44, true);
             const multisampleQuality = view.getUint32(offset + 48, true);
+            // presentation_interval was added in protocol 1.8, appended after
+            // every field this struct had at 1.3-1.7 -- length-gated so an
+            // older guest DLL's shorter payload still decodes, defaulting to
+            // D3DPRESENT_INTERVAL_DEFAULT (0), which is what "no opinion,
+            // vsync as usual" meant before this field existed.
+            const presentationInterval = length >= 56
+                ? view.getUint32(offset + 52, true) : D3DPRESENT_INTERVAL_DEFAULT;
             // A frame left un-presented by a previous device -- typically a
             // process that exited mid-frame -- must not bleed into this one.
             // Its recorded ops reference that device's depth target and
@@ -3877,6 +3900,7 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 sessionKey: this.sessionKey };
             state.backBufferWidth = width;
             state.backBufferHeight = height;
+            state.presentationInterval = presentationInterval;
             this.resizeCanvasIfNeeded(width, height);
             this.configureBackBufferMSAA(state, width, height,
                 multisampleType, multisampleQuality);
@@ -3899,6 +3923,11 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
             const enableAutoDepth = view.getUint32(offset + 40, true);
             const multisampleType = view.getUint32(offset + 48, true);
             const multisampleQuality = view.getUint32(offset + 52, true);
+            // See the identical comment in onCreateDevice(); the field sits
+            // 4 bytes later here because D9WGResetDevice carries an extra
+            // handle (old + new) that D9WGCreateDevice doesn't.
+            const presentationInterval = length >= 60
+                ? view.getUint32(offset + 56, true) : D3DPRESENT_INTERVAL_DEFAULT;
             const oldState = this.devices.get(oldHandle);
             if (oldState) {
                 this.retireGPUObject(oldState.depthTexture);
@@ -3920,6 +3949,7 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 sessionKey: this.sessionKey };
             state.backBufferWidth = width;
             state.backBufferHeight = height;
+            state.presentationInterval = presentationInterval;
             this.resizeCanvasIfNeeded(width, height);
             this.configureBackBufferMSAA(state, width, height,
                 multisampleType, multisampleQuality);
@@ -4683,6 +4713,21 @@ fn d9_ps_main() -> @location(0) vec4<f32> {
                 color: this.debug.forceClearColor || { r, g, b, a },
                 depth, stencil,
             });
+        }
+
+        // Resolves at the next display refresh, unless the presenting
+        // device asked to run uncapped (D3DPRESENT_INTERVAL_IMMEDIATE) --
+        // then it resolves synchronously, so an app that explicitly opted
+        // out of vsync sees no behavior change. Degrades to a synchronous
+        // no-op when requestAnimationFrame doesn't exist (the Node test
+        // harness), so existing tests are unaffected.
+        awaitDisplayRefresh() {
+            const interval = this.presentingDevice
+                ? this.presentingDevice.presentationInterval
+                : D3DPRESENT_INTERVAL_DEFAULT;
+            if (interval === D3DPRESENT_INTERVAL_IMMEDIATE) return Promise.resolve();
+            if (typeof requestAnimationFrame !== "function") return Promise.resolve();
+            return new Promise(resolve => requestAnimationFrame(() => resolve()));
         }
 
         // Replays every recorded clear/draw op against a freshly-acquired

@@ -4706,6 +4706,7 @@ static HRESULT WINAPI d3d_create_device(IDirect3D9 *iface, UINT adapter,
     command.auto_depth_stencil_format = parameters->AutoDepthStencilFormat;
     command.multisample_type = parameters->MultiSampleType;
     command.multisample_quality = parameters->MultiSampleQuality;
+    command.presentation_interval = parameters->PresentationInterval;
     if (!emit_command(D9WG_OP_CREATE_DEVICE, &command, sizeof(command))) {
         IDirect3D9_Release(iface);
         HeapFree(GetProcessHeap(), 0, device);
@@ -5562,6 +5563,7 @@ static HRESULT WINAPI device_reset(IDirect3DDevice9 *iface,
     reset.auto_depth_stencil_format = parameters->AutoDepthStencilFormat;
     reset.multisample_type = parameters->MultiSampleType;
     reset.multisample_quality = parameters->MultiSampleQuality;
+    reset.presentation_interval = parameters->PresentationInterval;
     if (reset.width > 8192 || reset.height > 8192)
         return TRACE_REFUSE(D3DERR_INVALIDCALL);
     if (!emit_command(D9WG_OP_RESET, &reset, sizeof(reset)))

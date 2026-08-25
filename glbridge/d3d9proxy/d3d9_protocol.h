@@ -24,7 +24,7 @@
 
 #define D9WG_MAGIC 0x47573944u /* "D9WG" */
 #define D9WG_VERSION_MAJOR 1u
-#define D9WG_VERSION_MINOR 7u
+#define D9WG_VERSION_MINOR 8u
 
 /* The last four MiB of v86gl.sys's mapped DMA allocation are never used for
  * command batches.  The browser writes asynchronous query/readback results
@@ -326,6 +326,11 @@ typedef struct D9WGCreateDevice {
     uint32_t auto_depth_stencil_format;
     uint32_t multisample_type;
     uint32_t multisample_quality;
+    /* D3DPRESENT_PARAMETERS::PresentationInterval, added in protocol 1.8.
+     * Length-gated at the decode site like every other field added after
+     * D9WG_VERSION_MIN_MINOR: an older payload is simply shorter, and the
+     * host defaults this to D3DPRESENT_INTERVAL_DEFAULT (0). */
+    uint32_t presentation_interval;
 } D9WGCreateDevice;
 
 typedef struct D9WGResetDevice {
@@ -343,6 +348,8 @@ typedef struct D9WGResetDevice {
     uint32_t auto_depth_stencil_format;
     uint32_t multisample_type;
     uint32_t multisample_quality;
+    /* See D9WGCreateDevice::presentation_interval. */
+    uint32_t presentation_interval;
 } D9WGResetDevice;
 
 typedef struct D9WGPresent {
@@ -1095,9 +1102,9 @@ typedef char D9WGAssertCommandHeaderSize[
 typedef char D9WGAssertHelloSize[
         sizeof(D9WGHello) == 16 ? 1 : -1];
 typedef char D9WGAssertCreateDeviceSize[
-        sizeof(D9WGCreateDevice) == 52 ? 1 : -1];
+        sizeof(D9WGCreateDevice) == 56 ? 1 : -1];
 typedef char D9WGAssertResetDeviceSize[
-        sizeof(D9WGResetDevice) == 56 ? 1 : -1];
+        sizeof(D9WGResetDevice) == 60 ? 1 : -1];
 typedef char D9WGAssertPresentSize[
         sizeof(D9WGPresent) == 24 ? 1 : -1];
 typedef char D9WGAssertCreateBufferSize[
